@@ -100,11 +100,21 @@ impl From<AstEdge> for CallSite {
 /// Returns `None` for unsupported languages.
 pub fn get_language(ext: &str) -> Option<tree_sitter::Language> {
     match ext {
+        // Original 5
         "rs" => Some(tree_sitter_rust::LANGUAGE.into()),
         "go" => Some(tree_sitter_go::LANGUAGE.into()),
         "py" | "pyi" => Some(tree_sitter_python::LANGUAGE.into()),
         "ts" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
         "tsx" => Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        // Batch 2 — 8 new languages
+        "java" => Some(tree_sitter_java::LANGUAGE.into()),
+        "c" | "h" => Some(tree_sitter_c::LANGUAGE.into()),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Some(tree_sitter_cpp::LANGUAGE.into()),
+        "cs" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
+        "rb" => Some(tree_sitter_ruby::LANGUAGE.into()),
+        "php" => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+        "scala" | "sc" => Some(tree_sitter_scala::LANGUAGE.into()),
+        "js" | "mjs" | "cjs" => Some(tree_sitter_javascript::LANGUAGE.into()),
         _ => None,
     }
 }
@@ -135,7 +145,16 @@ pub fn extract(content: &str, language: &str, file_path: &str) -> (Vec<AstNode>,
         "rs" => extract_rust(&tree.root_node(), content, file_path),
         "go" => extract_go(&tree.root_node(), content, file_path),
         "py" | "pyi" => extract_python(&tree.root_node(), content, file_path),
-        "ts" | "tsx" => extract_typescript(&tree.root_node(), content, file_path),
+        "ts" | "tsx" | "js" | "mjs" | "cjs" => {
+            extract_typescript(&tree.root_node(), content, file_path)
+        }
+        "java" => extract_java(&tree.root_node(), content, file_path),
+        "c" | "h" => extract_c(&tree.root_node(), content, file_path),
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => extract_cpp(&tree.root_node(), content, file_path),
+        "cs" => extract_csharp(&tree.root_node(), content, file_path),
+        "rb" => extract_ruby(&tree.root_node(), content, file_path),
+        "php" => extract_php(&tree.root_node(), content, file_path),
+        "scala" | "sc" => extract_scala(&tree.root_node(), content, file_path),
         _ => (Vec::new(), Vec::new()),
     }
 }
@@ -846,6 +865,1037 @@ fn extract_typescript(
 
     (nodes, edges)
 }
+
+// ─── Java ─────────────────────────────────────────────────────────
+
+fn extract_java(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    fn walk_java(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        match node.kind() {
+            "class_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    let line = (node.start_position().row + 1) as u32;
+                    // Inheritance
+                    if let Some(superclass) = node.child_by_field_name("superclass") {
+                        let parent = node_text(&superclass, source);
+                        if !parent.is_empty() {
+                            edges.push(AstEdge {
+                                source: name.clone(),
+                                kind: EdgeKind::Inherits,
+                                target: parent,
+                                file: file_path.to_string(),
+                                line,
+                            });
+                        }
+                    }
+                    // Interfaces
+                    if let Some(interfaces) = node.child_by_field_name("interfaces") {
+                        let mut ic = interfaces.walk();
+                        if ic.goto_first_child() {
+                            loop {
+                                let iface = node_text(&ic.node(), source);
+                                if !iface.is_empty() {
+                                    edges.push(AstEdge {
+                                        source: name.clone(),
+                                        kind: EdgeKind::Implements,
+                                        target: iface,
+                                        file: file_path.to_string(),
+                                        line,
+                                    });
+                                }
+                                if !ic.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Class,
+                        file: file_path.to_string(),
+                        line,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Methods inside class body
+                    if let Some(body) = find_child_by_kind(node, &["class_body", "block"]) {
+                        let mut mc = body.walk();
+                        if mc.goto_first_child() {
+                            loop {
+                                let mn = mc.node();
+                                if mn.kind() == "method_declaration"
+                                    || mn.kind() == "constructor_declaration"
+                                {
+                                    let mname = node_name(&mn, source);
+                                    if !mname.is_empty() {
+                                        nodes.push(AstNode {
+                                            name: mname,
+                                            kind: SymbolKind::Method,
+                                            file: file_path.to_string(),
+                                            line: (mn.start_position().row + 1) as u32,
+                                            signature: signature_for_node(&mn, source),
+                                            parent: Some(name.clone()),
+                                        });
+                                    }
+                                } else if mn.kind() == "field_declaration" {
+                                    let mut fc = mn.walk();
+                                    if fc.goto_first_child() {
+                                        loop {
+                                            if fc.node().kind() == "variable_declarator" {
+                                                let fname = node_name(&fc.node(), source);
+                                                if !fname.is_empty() {
+                                                    nodes.push(AstNode {
+                                                        name: fname,
+                                                        kind: SymbolKind::Variable,
+                                                        file: file_path.to_string(),
+                                                        line: (fc.node().start_position().row + 1)
+                                                            as u32,
+                                                        signature: signature_for_node(
+                                                            &fc.node(),
+                                                            source,
+                                                        ),
+                                                        parent: Some(name.clone()),
+                                                    });
+                                                }
+                                            }
+                                            if !fc.goto_next_sibling() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !mc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "interface_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Interface,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "method_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(node, source, file_path, &name, edges);
+                }
+            }
+            "import_declaration" => {
+                edges.push(AstEdge {
+                    source: file_path.to_string(),
+                    kind: EdgeKind::Imports,
+                    target: signature_for_node(node, source),
+                    file: file_path.to_string(),
+                    line: (node.start_position().row + 1) as u32,
+                });
+            }
+            "enum_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Enum,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for child in root.children(&mut cursor) {
+        walk_java(&child, source, file_path, &mut nodes, &mut edges);
+    }
+    (nodes, edges)
+}
+
+// ─── C ─────────────────────────────────────────────────────────────
+
+fn extract_c(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                let name = node_name(&child, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (child.start_position().row + 1) as u32,
+                        signature: signature_for_node(&child, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(&child, source, file_path, &name, &mut edges);
+                }
+            }
+            "struct_specifier" => {
+                let name = node_name(&child, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Struct,
+                        file: file_path.to_string(),
+                        line: (child.start_position().row + 1) as u32,
+                        signature: signature_for_node(&child, source),
+                        parent: None,
+                    });
+                }
+            }
+            "enum_specifier" => {
+                let name = node_name(&child, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Enum,
+                        file: file_path.to_string(),
+                        line: (child.start_position().row + 1) as u32,
+                        signature: signature_for_node(&child, source),
+                        parent: None,
+                    });
+                }
+            }
+            "type_definition" => {
+                let name = node_name(&child, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::TypeAlias,
+                        file: file_path.to_string(),
+                        line: (child.start_position().row + 1) as u32,
+                        signature: signature_for_node(&child, source),
+                        parent: None,
+                    });
+                }
+            }
+            "preproc_include" => {
+                let mut pc = child.walk();
+                if pc.goto_first_child() {
+                    loop {
+                        if pc.node().kind() == "string_literal"
+                            || pc.node().kind() == "system_lib_string"
+                        {
+                            let inc = node_text(&pc.node(), source).trim_matches('"').to_string();
+                            if !inc.is_empty() {
+                                edges.push(AstEdge {
+                                    source: file_path.to_string(),
+                                    kind: EdgeKind::Imports,
+                                    target: inc,
+                                    file: file_path.to_string(),
+                                    line: (child.start_position().row + 1) as u32,
+                                });
+                            }
+                            break;
+                        }
+                        if !pc.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+            "declaration" => {
+                // Top-level const/typedef etc
+                if let Some(decl) = child.child_by_field_name("declarator") {
+                    // Only capture if it looks like a function pointer or named constant
+                    let mut dc = child.walk();
+                    if dc.goto_first_child() {
+                        loop {
+                            if dc.node().kind() == "type_qualifier" {
+                                // const — skip for now (too noisy)
+                            }
+                            if !dc.goto_next_sibling() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (nodes, edges)
+}
+
+// ─── C++ ───────────────────────────────────────────────────────────
+
+fn extract_cpp(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    fn walk_cpp(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        match node.kind() {
+            "function_definition" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(node, source, file_path, &name, edges);
+                }
+            }
+            "class_specifier" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    let line = (node.start_position().row + 1) as u32;
+                    // Inheritance
+                    if let Some(bases) = node.child_by_field_name("base_list_clause") {
+                        let mut bc = bases.walk();
+                        if bc.goto_first_child() {
+                            loop {
+                                if bc.node().kind() == "type_identifier" {
+                                    let parent = node_text(&bc.node(), source);
+                                    if !parent.is_empty() {
+                                        edges.push(AstEdge {
+                                            source: name.clone(),
+                                            kind: EdgeKind::Inherits,
+                                            target: parent,
+                                            file: file_path.to_string(),
+                                            line,
+                                        });
+                                    }
+                                }
+                                if !bc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Class,
+                        file: file_path.to_string(),
+                        line,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Methods inside class body
+                    if let Some(body) =
+                        find_child_by_kind(node, &["field_declaration_list", "class_body"])
+                    {
+                        let mut mc = body.walk();
+                        if mc.goto_first_child() {
+                            loop {
+                                let mn = mc.node();
+                                if mn.kind() == "function_definition" {
+                                    let mname = node_name(&mn, source);
+                                    if !mname.is_empty() {
+                                        nodes.push(AstNode {
+                                            name: mname,
+                                            kind: SymbolKind::Method,
+                                            file: file_path.to_string(),
+                                            line: (mn.start_position().row + 1) as u32,
+                                            signature: signature_for_node(&mn, source),
+                                            parent: Some(name.clone()),
+                                        });
+                                    }
+                                }
+                                if !mc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "struct_specifier" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Struct,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "enum_specifier" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Enum,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "namespace_definition" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Module,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Recurse into namespace body
+                    if let Some(body) = find_child_by_kind(node, &["declaration_list"]) {
+                        let mut nc = body.walk();
+                        if nc.goto_first_child() {
+                            loop {
+                                walk_cpp(&nc.node(), source, file_path, nodes, edges);
+                                if !nc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "template_declaration" => {
+                // Unwrap template and recurse into inner declaration
+                let mut tc = node.walk();
+                if tc.goto_first_child() {
+                    loop {
+                        let inner = tc.node();
+                        if inner.kind() != "template" && inner.kind() != ">" {
+                            walk_cpp(&inner, source, file_path, nodes, edges);
+                        }
+                        if !tc.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+            "preproc_include" => {
+                let mut pc = node.walk();
+                if pc.goto_first_child() {
+                    loop {
+                        if pc.node().kind() == "string_literal"
+                            || pc.node().kind() == "system_lib_string"
+                        {
+                            let inc = node_text(&pc.node(), source).trim_matches('"').to_string();
+                            if !inc.is_empty() {
+                                edges.push(AstEdge {
+                                    source: file_path.to_string(),
+                                    kind: EdgeKind::Imports,
+                                    target: inc,
+                                    file: file_path.to_string(),
+                                    line: (node.start_position().row + 1) as u32,
+                                });
+                            }
+                            break;
+                        }
+                        if !pc.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for child in root.children(&mut cursor) {
+        walk_cpp(&child, source, file_path, &mut nodes, &mut edges);
+    }
+    (nodes, edges)
+}
+
+// ─── C# ────────────────────────────────────────────────────────────
+
+fn extract_csharp(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    fn walk_csharp(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        match node.kind() {
+            "class_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "interface_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    let line = (node.start_position().row + 1) as u32;
+                    let kind = match node.kind() {
+                        "interface_declaration" => SymbolKind::Interface,
+                        "struct_declaration" => SymbolKind::Struct,
+                        "record_declaration" => SymbolKind::Struct,
+                        _ => SymbolKind::Class,
+                    };
+                    // Inheritance / implementation
+                    if let Some(bases) = node.child_by_field_name("bases") {
+                        let mut bc = bases.walk();
+                        if bc.goto_first_child() {
+                            loop {
+                                let base = node_text(&bc.node(), source);
+                                if !base.is_empty() {
+                                    let edge_kind = if kind == SymbolKind::Interface {
+                                        EdgeKind::Inherits
+                                    } else {
+                                        EdgeKind::Implements
+                                    };
+                                    // Heuristic: base type starting with 'I' is likely an interface
+                                    let ek = if base.starts_with('I')
+                                        && base
+                                            .chars()
+                                            .nth(1)
+                                            .map_or(false, |c| c.is_ascii_uppercase())
+                                    {
+                                        EdgeKind::Implements
+                                    } else if kind == SymbolKind::Interface {
+                                        EdgeKind::Inherits
+                                    } else {
+                                        EdgeKind::Inherits
+                                    };
+                                    edges.push(AstEdge {
+                                        source: name.clone(),
+                                        kind: ek,
+                                        target: base,
+                                        file: file_path.to_string(),
+                                        line,
+                                    });
+                                }
+                                if !bc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind,
+                        file: file_path.to_string(),
+                        line,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Members
+                    if let Some(body) = find_child_by_kind(node, &["declaration_list"]) {
+                        let mut mc = body.walk();
+                        if mc.goto_first_child() {
+                            loop {
+                                let mn = mc.node();
+                                if mn.kind() == "method_declaration"
+                                    || mn.kind() == "constructor_declaration"
+                                {
+                                    let mname = node_name(&mn, source);
+                                    if !mname.is_empty() {
+                                        nodes.push(AstNode {
+                                            name: mname,
+                                            kind: SymbolKind::Method,
+                                            file: file_path.to_string(),
+                                            line: (mn.start_position().row + 1) as u32,
+                                            signature: signature_for_node(&mn, source),
+                                            parent: Some(name.clone()),
+                                        });
+                                    }
+                                } else if mn.kind() == "property_declaration" {
+                                    let pname = node_name(&mn, source);
+                                    if !pname.is_empty() {
+                                        nodes.push(AstNode {
+                                            name: pname,
+                                            kind: SymbolKind::Variable,
+                                            file: file_path.to_string(),
+                                            line: (mn.start_position().row + 1) as u32,
+                                            signature: signature_for_node(&mn, source),
+                                            parent: Some(name.clone()),
+                                        });
+                                    }
+                                }
+                                if !mc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "enum_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Enum,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "method_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(node, source, file_path, &name, edges);
+                }
+            }
+            "namespace_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Module,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    if let Some(body) = find_child_by_kind(node, &["declaration_list"]) {
+                        let mut nc = body.walk();
+                        if nc.goto_first_child() {
+                            loop {
+                                walk_csharp(&nc.node(), source, file_path, nodes, edges);
+                                if !nc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "using_directive" => {
+                edges.push(AstEdge {
+                    source: file_path.to_string(),
+                    kind: EdgeKind::Imports,
+                    target: signature_for_node(node, source),
+                    file: file_path.to_string(),
+                    line: (node.start_position().row + 1) as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    for child in root.children(&mut cursor) {
+        walk_csharp(&child, source, file_path, &mut nodes, &mut edges);
+    }
+    (nodes, edges)
+}
+
+// ─── Ruby ──────────────────────────────────────────────────────────
+
+fn extract_ruby(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    fn walk_ruby(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        match node.kind() {
+            "module" => {
+                let name = if let Some(n) = node.child_by_field_name("name") {
+                    node_text(&n, source)
+                } else {
+                    String::new()
+                };
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Module,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "class" => {
+                let name = if let Some(n) = node.child_by_field_name("name") {
+                    node_text(&n, source)
+                } else {
+                    String::new()
+                };
+                if !name.is_empty() {
+                    let line = (node.start_position().row + 1) as u32;
+                    // Parent class
+                    if let Some(superclass) = node.child_by_field_name("superclass") {
+                        let parent = node_text(&superclass, source);
+                        if !parent.is_empty() {
+                            edges.push(AstEdge {
+                                source: name.clone(),
+                                kind: EdgeKind::Inherits,
+                                target: parent,
+                                file: file_path.to_string(),
+                                line,
+                            });
+                        }
+                    }
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Class,
+                        file: file_path.to_string(),
+                        line,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Methods inside class
+                    let mut mc = node.walk();
+                    if mc.goto_first_child() {
+                        loop {
+                            if mc.node().kind() == "method" {
+                                let mname = if let Some(n) = mc.node().child_by_field_name("name") {
+                                    node_text(&n, source)
+                                } else {
+                                    String::new()
+                                };
+                                if !mname.is_empty() {
+                                    nodes.push(AstNode {
+                                        name: mname,
+                                        kind: SymbolKind::Method,
+                                        file: file_path.to_string(),
+                                        line: (mc.node().start_position().row + 1) as u32,
+                                        signature: signature_for_node(&mc.node(), source),
+                                        parent: Some(name.clone()),
+                                    });
+                                }
+                            }
+                            if !mc.goto_next_sibling() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            "method" => {
+                let name = if let Some(n) = node.child_by_field_name("name") {
+                    node_text(&n, source)
+                } else {
+                    String::new()
+                };
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(node, source, file_path, &name, edges);
+                }
+            }
+            "require" => {
+                edges.push(AstEdge {
+                    source: file_path.to_string(),
+                    kind: EdgeKind::Imports,
+                    target: signature_for_node(node, source),
+                    file: file_path.to_string(),
+                    line: (node.start_position().row + 1) as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    for child in root.children(&mut cursor) {
+        walk_ruby(&child, source, file_path, &mut nodes, &mut edges);
+    }
+    (nodes, edges)
+}
+
+// ─── PHP ───────────────────────────────────────────────────────────
+
+fn extract_php(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    fn walk_php(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        match node.kind() {
+            "class_declaration" | "anonymous_class_creation_expression" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    let line = (node.start_position().row + 1) as u32;
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Class,
+                        file: file_path.to_string(),
+                        line,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Methods
+                    if let Some(body) =
+                        find_child_by_kind(node, &["declaration_list", "class_body"])
+                    {
+                        let mut mc = body.walk();
+                        if mc.goto_first_child() {
+                            loop {
+                                if mc.node().kind() == "method_declaration" {
+                                    let mname = node_name(&mc.node(), source);
+                                    if !mname.is_empty() {
+                                        nodes.push(AstNode {
+                                            name: mname,
+                                            kind: SymbolKind::Method,
+                                            file: file_path.to_string(),
+                                            line: (mc.node().start_position().row + 1) as u32,
+                                            signature: signature_for_node(&mc.node(), source),
+                                            parent: Some(name.clone()),
+                                        });
+                                    }
+                                }
+                                if !mc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "interface_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Interface,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "function_definition" | "method_declaration" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(node, source, file_path, &name, edges);
+                }
+            }
+            "namespace_definition" => {
+                let name = if let Some(n) = node.child_by_field_name("name") {
+                    node_text(&n, source)
+                } else {
+                    String::new()
+                };
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Module,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "use_declaration" => {
+                edges.push(AstEdge {
+                    source: file_path.to_string(),
+                    kind: EdgeKind::Imports,
+                    target: signature_for_node(node, source),
+                    file: file_path.to_string(),
+                    line: (node.start_position().row + 1) as u32,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    for child in root.children(&mut cursor) {
+        walk_php(&child, source, file_path, &mut nodes, &mut edges);
+    }
+    (nodes, edges)
+}
+
+// ─── Scala ─────────────────────────────────────────────────────────
+
+fn extract_scala(
+    root: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut cursor = root.walk();
+
+    fn walk_scala(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        match node.kind() {
+            "class_definition" | "object_definition" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    let line = (node.start_position().row + 1) as u32;
+                    let kind = if node.kind() == "object_definition" {
+                        SymbolKind::Module
+                    } else {
+                        SymbolKind::Class
+                    };
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind,
+                        file: file_path.to_string(),
+                        line,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "trait_definition" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Trait,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            "function_definition" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Function,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    extract_calls_from_node(node, source, file_path, &name, edges);
+                }
+            }
+            "import_declaration" => {
+                edges.push(AstEdge {
+                    source: file_path.to_string(),
+                    kind: EdgeKind::Imports,
+                    target: signature_for_node(node, source),
+                    file: file_path.to_string(),
+                    line: (node.start_position().row + 1) as u32,
+                });
+            }
+            "enum_definition" => {
+                let name = node_name(node, source);
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name,
+                        kind: SymbolKind::Enum,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for child in root.children(&mut cursor) {
+        walk_scala(&child, source, file_path, &mut nodes, &mut edges);
+    }
+    (nodes, edges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,8 +1912,12 @@ mod tests {
 
     #[test]
     fn test_get_language_unsupported() {
-        assert!(get_language("rb").is_none());
-        assert!(get_language("java").is_none());
+        // Previously unsupported, now all supported via tree-sitter
+        assert!(get_language("rb").is_some());
+        assert!(get_language("java").is_some());
+        assert!(get_language("cs").is_some());
+        assert!(get_language("scala").is_some());
+        assert!(get_language("php").is_some());
         assert!(get_language("").is_none());
     }
 
@@ -987,7 +2041,8 @@ export function getUser(id: string): User {
 
     #[test]
     fn test_extract_unsupported_fallback() {
-        let (nodes, edges) = extract("fn test() {}", "rb", "test.rb");
+        // "rb" is now supported; use a truly unsupported language
+        let (nodes, edges) = extract("fn test() {}", "xyz", "test.xyz");
         assert!(nodes.is_empty());
         assert!(edges.is_empty());
     }
