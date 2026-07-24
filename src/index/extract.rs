@@ -146,27 +146,22 @@ static RE_ZIG_CONST: LazyLock<Regex> =
 
 // ─── Dart ───
 
-static RE_DART_CLASS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*(?:abstract\s+)?(?:class|mixin)\s+(\w+)").unwrap()
-});
+static RE_DART_CLASS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:abstract\s+)?(?:class|mixin)\s+(\w+)").unwrap());
 
-static RE_DART_ENUM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*enum\s+(\w+)").unwrap());
+static RE_DART_ENUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*enum\s+(\w+)").unwrap());
 
-static RE_DART_EXTENDS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*extension\s+(?:type\s+)?(\w+)\s+on\s+\w+").unwrap()
-});
-static RE_DART_EXTENDS_UNNAMED: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*extension\s+(?:type\s+)?on\s+(\w+)").unwrap()
-});
+static RE_DART_EXTENDS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*extension\s+(?:type\s+)?(\w+)\s+on\s+\w+").unwrap());
+static RE_DART_EXTENDS_UNNAMED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*extension\s+(?:type\s+)?on\s+(\w+)").unwrap());
 
 static RE_DART_FN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:static\s+)?(?:external\s+)?(?:@[\w()<>]+\s+)*(?:covariant\s+)?(?:late\s+)?(?:final\s+)?(?:const\s+)?(?:[A-Z]\w*\s+)?(?:Future<[^>]+>\s+)?(?:void|[A-Z]\w*<[^>]+>|[a-zA-Z]\w*(?:<[^>]+>)?)\s+(\w+)\s*\(").unwrap()
 });
 
-static RE_DART_TYPEDEF: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*typedef\s+(\w+)").unwrap()
-});
+static RE_DART_TYPEDEF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*typedef\s+(\w+)").unwrap());
 
 static RE_DART_GETTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:[A-Z]\w*\s+)?(?:[a-zA-Z]\w*(?:<[^>]+>)?)\s+get\s+(\w+)").unwrap()
@@ -941,7 +936,10 @@ abstract class Shape {
         assert!(names.contains(&"validate"), "mixin method validate");
         assert!(names.contains(&"area"), "abstract method area");
         assert!(names.contains(&"Status"), "Status enum");
-        assert!(names.contains(&"UserServiceHelpers"), "extension on UserService");
+        assert!(
+            names.contains(&"UserServiceHelpers"),
+            "extension on UserService"
+        );
         assert!(names.contains(&"UserCallback"), "typedef UserCallback");
     }
 
