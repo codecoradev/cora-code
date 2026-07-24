@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Dart symbol indexing.** `cora index` now extracts classes, mixins, enums, extensions, functions, getters, and typedefs from `.dart` files. Closes #373.
+
 ## [0.8.1] - 2026-07-24
 
 ### Fixed

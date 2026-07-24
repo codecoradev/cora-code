@@ -228,7 +228,7 @@ pub fn extract_symbols_from_line(line: &str, language: &str) -> Vec<SymbolKind> 
                 }
             }
         }
-        "java" | "kt" | "kts" => {
+        "java" | "kt" | "kts" | "dart" => {
             for cap in RE_JAVA_IMPORT.captures_iter(line) {
                 add_unique(
                     &mut symbols,
@@ -387,7 +387,7 @@ pub fn extract_definitions_from_diff(
                         (Some(&RE_DEF_JS_FN), Some(&RE_DEF_JS_TYPE))
                     }
                     "go" => (Some(&RE_DEF_GO_FN), Some(&RE_DEF_GO_TYPE)),
-                    "java" | "kt" | "kts" => (None, Some(&RE_DEF_JAVA_TYPE)),
+                    "java" | "kt" | "kts" | "dart" => (None, Some(&RE_DEF_JAVA_TYPE)),
                     _ => (None, None),
                 };
 

@@ -144,6 +144,29 @@ static RE_ZIG_FN: LazyLock<Regex> =
 static RE_ZIG_CONST: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?const\s+(\w+)").unwrap());
 
+// ─── Dart ───
+
+static RE_DART_CLASS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?:abstract\s+)?(?:class|mixin)\s+(\w+)").unwrap());
+
+static RE_DART_ENUM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*enum\s+(\w+)").unwrap());
+
+static RE_DART_EXTENDS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*extension\s+(?:type\s+)?(\w+)\s+on\s+\w+").unwrap());
+static RE_DART_EXTENDS_UNNAMED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*extension\s+(?:type\s+)?on\s+(\w+)").unwrap());
+
+static RE_DART_FN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:static\s+)?(?:external\s+)?(?:@[\w()<>]+\s+)*(?:covariant\s+)?(?:late\s+)?(?:final\s+)?(?:const\s+)?(?:[A-Z]\w*\s+)?(?:Future<[^>]+>\s+)?(?:void|[A-Z]\w*<[^>]+>|[a-zA-Z]\w*(?:<[^>]+>)?)\s+(\w+)\s*\(").unwrap()
+});
+
+static RE_DART_TYPEDEF: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*typedef\s+(\w+)").unwrap());
+
+static RE_DART_GETTER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:[A-Z]\w*\s+)?(?:[a-zA-Z]\w*(?:<[^>]+>)?)\s+get\s+(\w+)").unwrap()
+});
+
 /// Extract symbols from source code.
 ///
 /// When the `tree-sitter` feature is enabled, uses AST-based extraction for
@@ -182,6 +205,7 @@ pub fn extract_symbols(content: &str, language: &str, file_path: &str) -> Vec<Ex
             "scala" => extract_scala(line, line_no, file_path, line, &mut symbols),
             "lua" => extract_lua(line, line_no, file_path, line, &mut symbols),
             "zig" => extract_zig(line, line_no, file_path, line, &mut symbols),
+            "dart" => extract_dart(line, line_no, file_path, line, &mut symbols),
             _ => {}
         }
     }
@@ -362,6 +386,29 @@ fn extract_zig(line: &str, line_no: u32, file: &str, raw: &str, out: &mut Vec<Ex
     }
 }
 
+fn extract_dart(line: &str, line_no: u32, file: &str, raw: &str, out: &mut Vec<ExtractedDef>) {
+    if let Some(cap) = RE_DART_CLASS.captures(line) {
+        out.push(def(cap, SymbolKind::Struct, line_no, file, raw));
+    }
+    if let Some(cap) = RE_DART_ENUM.captures(line) {
+        out.push(def(cap, SymbolKind::Enum, line_no, file, raw));
+    }
+    if let Some(cap) = RE_DART_EXTENDS.captures(line) {
+        out.push(def(cap, SymbolKind::Trait, line_no, file, raw));
+    } else if let Some(cap) = RE_DART_EXTENDS_UNNAMED.captures(line) {
+        out.push(def(cap, SymbolKind::Trait, line_no, file, raw));
+    }
+    if let Some(cap) = RE_DART_FN.captures(line) {
+        out.push(def(cap, SymbolKind::Function, line_no, file, raw));
+    }
+    if let Some(cap) = RE_DART_TYPEDEF.captures(line) {
+        out.push(def(cap, SymbolKind::TypeAlias, line_no, file, raw));
+    }
+    if let Some(cap) = RE_DART_GETTER.captures(line) {
+        out.push(def(cap, SymbolKind::Function, line_no, file, raw));
+    }
+}
+
 /// Extract function call sites from source code.
 ///
 /// When the `tree-sitter` feature is enabled, uses AST-based extraction for
@@ -398,6 +445,8 @@ pub fn extract_calls(content: &str, language: &str, file_path: &str) -> Vec<Call
             || language == "c"
             || language == "cpp"
             || language == "java"
+            || language == "kt"
+            || language == "dart"
         {
             // Check if we're entering a function
             if let Some(fn_name) = detect_function_entry(line, language) {
@@ -480,7 +529,7 @@ fn detect_function_entry(line: &str, language: &str) -> Option<String> {
             RE.captures(trimmed)
                 .map(|c| c.get(1).unwrap().as_str().to_string())
         }
-        "java" | "kt" => {
+        "java" | "kt" | "dart" => {
             static RE: LazyLock<Regex> =
                 LazyLock::new(|| Regex::new(r"\b(\w+)\s*\([^)]*\)\s*\{").unwrap());
             RE.captures(trimmed)
@@ -564,6 +613,29 @@ fn is_builtin(name: &str) -> bool {
             | "send"
             | "sync"
             | "main"
+            // Dart builtins
+            | "debugPrint"
+            | "throw"
+            | "rethrow"
+            | "late"
+            | "required"
+            | "covariant"
+            | "show"
+            | "hide"
+            | "Future"
+            | "Stream"
+            | "Completer"
+            | "List"
+            | "Map"
+            | "Set"
+            | "int"
+            | "double"
+            | "num"
+            | "bool"
+            | "dynamic"
+            | "Object"
+            | "Null"
+            | "Never"
     )
 }
 
@@ -810,5 +882,88 @@ const MAX_RETRIES: u32 = 3;
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"main"));
         assert!(names.contains(&"MAX_RETRIES"));
+    }
+
+    #[test]
+    fn test_extract_dart() {
+        let code = r#"
+class UserService {
+  String? name;
+  void login(String email) {
+    print(email);
+  }
+
+  static Future<void> fetchData() async {
+    return Future.value();
+  }
+
+  String get displayName => name ?? '';
+
+  set displayName(String value) {}
+}
+
+enum Status { active, inactive }
+
+extension UserServiceHelpers on UserService {
+  String greet() => "Hello";
+}
+
+typedef UserCallback = void Function(User);
+
+mixin Validator {
+  bool validate(String input) => true;
+}
+
+abstract class Shape {
+  double area();
+}
+"#;
+        let symbols = extract_symbols(code, "dart", "lib/models/user.dart");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        let kinds: Vec<(String, &str)> = symbols
+            .iter()
+            .map(|s| (s.name.clone(), s.kind.as_str()))
+            .collect();
+        eprintln!("Dart symbols: {:?}", kinds);
+
+        assert!(names.contains(&"UserService"), "UserService class");
+        assert!(names.contains(&"Shape"), "Shape abstract class");
+        assert!(names.contains(&"Validator"), "Validator mixin");
+        assert!(names.contains(&"login"), "login method");
+        assert!(names.contains(&"fetchData"), "fetchData async method");
+        assert!(names.contains(&"displayName"), "displayName getter");
+        assert!(names.contains(&"greet"), "extension method greet");
+        assert!(names.contains(&"validate"), "mixin method validate");
+        assert!(names.contains(&"area"), "abstract method area");
+        assert!(names.contains(&"Status"), "Status enum");
+        assert!(
+            names.contains(&"UserServiceHelpers"),
+            "extension on UserService"
+        );
+        assert!(names.contains(&"UserCallback"), "typedef UserCallback");
+    }
+
+    #[test]
+    fn test_extract_dart_issue_373_repro() {
+        let code = r#"class UserService {
+  String? name;
+  void login(String email) {
+    print(email);
+  }
+}
+
+Future<void> fetchData() async {
+  return Future.value();
+}
+
+enum Status { active, inactive }"#;
+        let symbols = extract_symbols(code, "dart", "sample.dart");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+
+        assert!(!symbols.is_empty(), "Should extract at least 1 Dart symbol");
+        assert!(names.contains(&"UserService"), "UserService class");
+        assert!(names.contains(&"login"), "login method");
+        assert!(names.contains(&"fetchData"), "fetchData function");
+        assert!(names.contains(&"Status"), "Status enum");
     }
 }
