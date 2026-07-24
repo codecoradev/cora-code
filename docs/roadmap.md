@@ -102,16 +102,22 @@ Query layer built on top of the v0.6 index — call graph traversal, test impact
 - [#268](https://github.com/codecoradev/cora-code/issues/268) Language expansion — 6 → 15+ language support — ✓ Done
 - [#269](https://github.com/codecoradev/cora-code/issues/269) Auto-sync file watcher daemon — ✓ Done
 
-## Future — What's Next
+## v0.8 — Brain Mode & Tree-sitter Expansion
 
-### Brain Mode Roadmap
+Hybrid semantic search and deep language support via AST parsing.
 
 - [Phase 1](https://github.com/codecoradev/cora-code/pull/354) — Static token embedding engine (256d) — ✓ Done
-- [Phase 2](https://github.com/codecoradev/cora-code/pull/356) — tree-sitter AST + schema v3 edges table — ✓ Done
+- [Phase 2](https://github.com/codecoradev/cora-code/pull/356) — Tree-sitter AST + schema v3 edges table — ✓ Done
 - [Phase 2C](https://github.com/codecoradev/cora-code/pull/358) — `cora trace` + `cora arch` — ✓ Done
 - [Phase 3](https://github.com/codecoradev/cora-code/pull/362) — Brain Mode hybrid search (usearch + RRF) — ✓ Done
-- [Phase 4](https://github.com/codecoradev/cora-code/issues/360) — Uteke integration upgrade → Planned
-- [Phase 5](https://github.com/codecoradev/cora-code/issues/361) — Voyage-4-Nano ONNX (opt-in, 1024d) → Deferred
+- [#374](https://github.com/codecoradev/cora-code/pull/374) Dart symbol indexing — ✓ Done
+- [#375](https://github.com/codecoradev/cora-code/pull/375) Svelte symbol indexing — ✓ Done
+- [#376](https://github.com/codecoradev/cora-code/pull/376) Tree-sitter expansion: 4 → 12 languages (Java, C, C++, C#, Ruby, PHP, Scala, JS) — ✓ Done
+- [#338](https://github.com/codecoradev/cora-code/pull/338) Renamed `cora-cli` → `cora-code` — ✓ Done
+- [#369](https://github.com/codecoradev/cora-code/pull/369) Security scanner false positive suppression — ✓ Done
+- [#355](https://github.com/codecoradev/cora-code/pull/355) Global index database (`~/.codecora/cora-code/graph.db`) — ✓ Done
+
+## Future — What's Next
 
 ### Other
 

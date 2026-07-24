@@ -66,6 +66,14 @@ Complete command reference for the cora CLI.
 | `cora brain` `--limit N` | Max results (default: 20) |
 | `cora index` | Index project symbols into SQLite + usearch |
 | `cora index --rebuild` | Rebuild index from scratch |
+| `cora index --watch` | Auto-sync file watcher (2s poll interval) |
+| `cora index --stats` | Show index statistics (symbol count, languages, DB size) |
+| `cora index --prune` | Remove stale entries for deleted files |
+| `cora callers` `<symbol>` | Find all callers of a symbol (reverse call graph) |
+| `cora callers` `--limit N` | Max callers to return (default: 50) |
+| `cora impact` `<symbol>` | Analyze blast radius of changing a symbol |
+| `cora impact` `--depth N` | Traversal depth (default: 3) |
+| `cora affected` `<files...>` | Find test files affected by source changes |
 | `cora completion` `<shell>` | Generate shell completions (bash/zsh/fish) |
 | `cora mcp` | Start MCP server for AI coding agents (Claude Code, Cursor, Windsurf) |
 
@@ -110,4 +118,11 @@ $ cora brain "TokenEmbedding" --json --limit 5
 # Trace call chains and view architecture
 $ cora trace main
 $ cora arch
+```
+
+```bash
+# Find callers and analyze impact
+$ cora callers handle_request
+$ cora impact process_order --depth 5
+$ cora affected src/order.rs src/payment.rs
 ```
