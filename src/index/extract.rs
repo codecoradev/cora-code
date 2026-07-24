@@ -166,6 +166,24 @@ static RE_DART_TYPEDEF: LazyLock<Regex> =
 static RE_DART_GETTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?:[A-Z]\w*\s+)?(?:[a-zA-Z]\w*(?:<[^>]+>)?)\s+get\s+(\w+)").unwrap()
 });
+// ─── Svelte ───
+
+static RE_SVELTE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?s)<script(?:\s[^>]*)?>
+?(.*?)
+?</script>",
+    )
+    .unwrap()
+});
+static RE_SVELTE_EXPORT_PROP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*export\s+let\s+(\w+)").unwrap());
+static RE_SVELTE_STATE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*let\s+(\w+)\s*=\s*\$state(?:<[^>]*>)?\s*\(").unwrap());
+static RE_SVELTE_DERIVED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*let\s+(\w+)\s*=\s*\$derived(?:<[^>]*>)?\s*\(").unwrap());
+static RE_SVELTE_EFFECT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*\$effect\s*\(\s*(?:async\s+)?\(\s*\)\s*=>").unwrap());
 
 /// Extract symbols from source code.
 ///
@@ -206,6 +224,7 @@ pub fn extract_symbols(content: &str, language: &str, file_path: &str) -> Vec<Ex
             "lua" => extract_lua(line, line_no, file_path, line, &mut symbols),
             "zig" => extract_zig(line, line_no, file_path, line, &mut symbols),
             "dart" => extract_dart(line, line_no, file_path, line, &mut symbols),
+            "svelte" => extract_svelte(content, file_path, &mut symbols),
             _ => {}
         }
     }
@@ -406,6 +425,79 @@ fn extract_dart(line: &str, line_no: u32, file: &str, raw: &str, out: &mut Vec<E
     }
     if let Some(cap) = RE_DART_GETTER.captures(line) {
         out.push(def(cap, SymbolKind::Function, line_no, file, raw));
+    }
+}
+
+/// Extract Svelte symbols:
+/// 1. Derive component name from filename (PascalCase or kebab → PascalCase)
+/// 2. Strip `<script>` blocks and delegate to TS/JS extractor
+/// 3. Extract Svelte-specific: export props, $state, $derived
+fn extract_svelte(content: &str, file: &str, out: &mut Vec<ExtractedDef>) {
+    // 1. Component name from filename
+    let component_name = std::path::Path::new(file)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            let mut result = String::new();
+            let mut capitalize_next = true;
+            for ch in s.chars() {
+                if ch == '-' || ch == '_' {
+                    capitalize_next = true;
+                } else if capitalize_next {
+                    result.push(ch.to_ascii_uppercase());
+                    capitalize_next = false;
+                } else {
+                    result.push(ch);
+                }
+            }
+            result
+        })
+        .unwrap_or_default();
+
+    if !component_name.is_empty() {
+        out.push(ExtractedDef {
+            name: component_name.clone(),
+            kind: SymbolKind::Struct,
+            file: file.to_string(),
+            line: 1,
+            signature: format!("<!-- {} component -->", component_name),
+        });
+    }
+
+    // 2. Extract <script> content and delegate to TS/JS extractor
+    if let Some(cap) = RE_SVELTE_SCRIPT.captures(content) {
+        let script_content = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+
+        for (line_num, line) in script_content.lines().enumerate() {
+            let line_no = (line_num + 1) as u32;
+            extract_typescript(line, line_no, file, line, out);
+
+            if let Some(cap) = RE_SVELTE_EXPORT_PROP.captures(line) {
+                out.push(def(cap, SymbolKind::Variable, line_no, file, line));
+            }
+            if let Some(cap) = RE_SVELTE_STATE.captures(line) {
+                out.push(def(cap, SymbolKind::Variable, line_no, file, line));
+            }
+            if let Some(cap) = RE_SVELTE_DERIVED.captures(line) {
+                out.push(def(cap, SymbolKind::Variable, line_no, file, line));
+            }
+            if RE_SVELTE_EFFECT.is_match(line) {
+                out.push(ExtractedDef {
+                    name: "$effect".to_string(),
+                    kind: SymbolKind::Function,
+                    file: file.to_string(),
+                    line: line_no,
+                    signature: line.trim().to_string(),
+                });
+            }
+        }
+
+        // Dedup: TS extractor may produce duplicates for Svelte-specific symbols
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|s| {
+            let key = (s.name.clone(), s.line);
+            seen.insert(key)
+        });
     }
 }
 
@@ -965,5 +1057,62 @@ enum Status { active, inactive }"#;
         assert!(names.contains(&"login"), "login method");
         assert!(names.contains(&"fetchData"), "fetchData function");
         assert!(names.contains(&"Status"), "Status enum");
+    }
+
+    #[test]
+    fn test_extract_svelte() {
+        let content = r#"<script lang="ts">
+  import { onMount } from 'svelte';
+  export let name: string = 'world';
+  export let count: number = 0;
+  let doubled = $derived(count * 2);
+  let items = $state<string[]>([]);
+
+  function handleClick(): void {
+    count++;
+  }
+
+  async function fetchData(): Promise<void> {
+    const res = await fetch('/api');
+  }
+
+  onMount(() => {
+    console.log('mounted');
+  });
+</script>
+
+<button onclick={handleClick}>
+  {name} — count: {count}
+</button>
+
+{#if count > 0}
+  <p>Counting!</p>
+{/if}
+
+<style>
+  button { padding: 8px; }
+</style>
+"#;
+
+        let symbols = extract_symbols(content, "svelte", "src/lib/Counter.svelte");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        println!("Svelte symbols: {:?}", names);
+
+        assert!(names.contains(&"Counter"), "missing component name");
+        assert!(names.contains(&"name"), "missing prop: name");
+        assert!(names.contains(&"count"), "missing prop: count");
+        assert!(
+            names.iter().any(|n| n.starts_with("doubled")),
+            "missing $derived: doubled"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("items")),
+            "missing $state: items"
+        );
+        assert!(
+            names.contains(&"handleClick"),
+            "missing function: handleClick"
+        );
+        assert!(names.contains(&"fetchData"), "missing function: fetchData");
     }
 }
