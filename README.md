@@ -22,7 +22,7 @@
 - ⚡ **Native Rust** — fast binary, no runtime dependencies, cross-platform
 - 🪝 **Pre-commit hooks** — catch issues before they reach CI
 - 📋 **SARIF output** — upload to GitHub Code Scanning
-- 🛡️ **Deterministic scanners** — 11 security patterns + 12 secret detection patterns that run without LLM
+- 🛡️ **Deterministic scanners** — 12 built-in rules + 13 security patterns + 15 secret detection patterns that run without LLM
 - 🧠 **Language-specific analysis** — tailored review guidance for Dart/Flutter, Svelte, TypeScript, Go, Rust, Python
 - 🚧 **Quality gate** — configurable pass/fail thresholds for CI enforcement
 - 📐 **Quality profiles** — strict, balanced, or lax presets for different project needs
@@ -31,8 +31,9 @@
 - 🔍 **Code Intelligence** — index symbols across 15 languages, call graph, trace, impact analysis
 - 🧠 **Brain Mode** — hybrid semantic search (FTS5 + vector KNN + graph) with RRF fusion
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
-- 🌳 **tree-sitter** (opt-in) — AST-based call graph extraction for Rust, Go, Python, TypeScript
-- 🔌 **MCP server** — 15 tools for AI agents (review, search, brain, debt, trace, ...)
+- 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 12 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript
+- 📄 **Svelte support** — review Svelte components with specialized analysis
+- 🔌 **MCP server** — 15 tools for AI coding agents (review, search, brain, debt, trace, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
 - 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
 

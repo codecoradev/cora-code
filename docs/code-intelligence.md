@@ -32,10 +32,11 @@ cora arch
 Scans your project, extracts symbol definitions (functions, structs, enums, traits, etc.), and builds:
 
 | Component | Technology | Storage |
------------|-----------|---------|
-| Symbol table | Regex extractors (15 languages) | SQLite FTS5 |
+|-----------|-----------|---------|
+| Symbol table (regex) | Regex extractors (15 languages) | SQLite FTS5 |
+| Symbol table (AST) | Tree-sitter grammars (12 languages, opt-in) | SQLite FTS5 |
 | Vector embeddings | Static token hashing (256d) | usearch HNSW index |
-| Call graph | Regex scope tracking (+ tree-sitter opt-in) | SQLite `edges` table |
+| Call graph | Regex scope tracking + tree-sitter AST edges | SQLite `edges` table |
 
 ```bash
 cora index              # Index current project (incremental)
@@ -47,7 +48,34 @@ cora index --prune     # Remove symbols from deleted files
 
 ### Supported Languages
 
-15 language extractors: Rust, Python, TypeScript/TSX, Go, Java, C, Ruby, PHP, Swift, Scala, Lua, Zig, Dart, Kotlin, JavaScript.
+Cora extracts symbols using two strategies — **regex** (always available) and **tree-sitter AST** (opt-in via `--features tree-sitter` at build time):
+
+| | Regex Extraction | AST (Tree-sitter) |
+|--|-----------------|-------------------|
+| **Rust** | ✅ | ✅ |
+| **Go** | ✅ | ✅ |
+| **Python** | ✅ | ✅ |
+| **TypeScript/TSX** | ✅ | ✅ |
+| **Svelte** | ✅ | ✅ (via TypeScript) |
+| **Java** | ✅ | ✅ |
+| **C** | ✅ | ✅ |
+| **C++** | ✅ | ✅ |
+| **C#** | ✅ | ✅ |
+| **Ruby** | ✅ | ✅ |
+| **PHP** | ✅ | ✅ |
+| **Scala** | ✅ | ✅ |
+| **JavaScript** | ✅ | ✅ |
+| **Swift** | ✅ | — |
+| **Kotlin** | ✅ | — |
+| **Dart** | ✅ | — |
+| **Lua** | ✅ | — |
+| **Zig** | ✅ | — |
+
+**Regex-only** languages work out of the box. For **AST-accurate** extraction (full call graph, precise imports/exports), build with tree-sitter:
+
+```bash
+cargo install --git https://github.com/codecoradev/cora-code --features tree-sitter
+```
 
 ### Multi-Project Index
 
@@ -167,10 +195,12 @@ cora trace "process" --depth 4         # Limit traversal depth
 cora trace --json                     # JSON output
 ```
 
-Requires schema v3 edges table. Enable tree-sitter for AST-based edge extraction:
+Requires schema v3 edges table. When built with `--features tree-sitter`, Cora uses AST-based edge extraction for more accurate call graphs. Regex-only builds still generate edges via scope tracking.
 
 ```bash
-cora index --rebuild  # With tree-sitter feature compiled
+# Build with tree-sitter for best call graph accuracy
+cargo install --git https://github.com/codecoradev/cora-code --features tree-sitter
+cora index --rebuild  # Re-index to get AST edges
 ```
 
 ### `cora arch` — Architecture Overview
@@ -202,13 +232,15 @@ cora affected --json                     # JSON output
 All code intelligence features are available as MCP tools for AI coding agents:
 
 | Tool | Description |
-------|-------------|
+|------|-------------|
 | `cora.search_symbols` | FTS5 symbol search |
 | `cora.find_callers` | Find callers of a symbol |
 | `cora.find_impact` | Impact analysis |
 | `cora.find_affected_tests` | Test impact analysis |
 | `cora.index_status` | Index statistics |
 | `cora.brain_search` | Hybrid semantic search |
+| `cora.get_project_info` | Project metadata & config |
+| `cora.get_memory` | Review memory recall |
 
 ## Data Directory
 

@@ -5,7 +5,78 @@ All notable changes to cora-code are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-07-24
+
+### Added — Code Intelligence
+
+- **Tree-sitter AST extraction for 8 additional languages** (#376)
+  - Java, C, C++, C#, Ruby, PHP, Scala, JavaScript — full AST-based symbol extraction.
+  - Tree-sitter now covers **12 languages** total (previously: Rust, Go, Python, TypeScript/TSX).
+  - AST path takes priority when tree-sitter is compiled; regex extractors remain as fallback.
+
+- **Svelte symbol indexing** (#375)
+  - Svelte components are now indexed (scripts, props, stores, imports).
+  - Uses TypeScript tree-sitter parser for script blocks.
+
+- **Dart symbol indexing** (#374)
+  - Classes, mixins, extensions, methods, top-level functions, and enums.
+
+### Changed — Documentation
+
+- Updated README, changelog (v0.8.0 + v0.8.1 entries), roadmap (v0.8 section), CLI reference, and code intelligence docs.
+
 ## [Unreleased]
+
+## [0.8.1] - 2026-07-24
+
+### Changed
+
+- **Version bump for crates.io publish** — no functional changes.
+
+## [0.8.0] - 2026-07-16
+
+### Highlights
+
+- **Brain Mode** — hybrid semantic search combining FTS5, vector KNN (usearch), and call-graph BFS with Reciprocal Rank Fusion (RRF). All local, no model download.
+- **Tree-sitter AST extraction** — opt-in `--features tree-sitter` builds get accurate symbol extraction and call graph edges for Rust, Go, Python, TypeScript/TSX.
+- **Architecture commands** — `cora trace` for call chain tracing, `cora arch` for module/edge overview.
+- **VitePress documentation** — migrated from SvelteKit to VitePress at `codecora.dev`.
+
+### Added
+
+- **Brain Mode** — hybrid semantic search (#362)
+  - Three search signals fused via RRF (k=60): FTS5 keyword, usearch HNSW vector KNN, call-graph BFS.
+  - `cora brain <query>` command with `--json` and `--limit` flags.
+  - `cora.brain_search` MCP tool.
+
+- **Static token embedding engine** (#354)
+  - Zero-dependency bag-of-tokens hashing producing 256d vectors.
+  - No model download, no GPU, no external service.
+  - Integrated into `cora index` for vector index population.
+
+- **Tree-sitter AST extraction** (#356)
+  - Opt-in via `--features tree-sitter` at build time.
+  - Initial 4 languages: Rust, Go, Python, TypeScript/TSX.
+  - Schema v3 `edges` table for AST-derived call graph relationships.
+
+- **`cora trace` and `cora arch`** (#358)
+  - `cora trace <symbol>` — depth-limited BFS call chain tracing (outgoing/incoming).
+  - `cora arch` — architecture overview showing modules, edge types, and top connectors.
+
+- **Global index database** (#355)
+  - Migrated from `.cora/index.db` (per-project) to `~/.codecora/cora-code/graph.db` (global).
+  - Multi-project search: index multiple repos, search across all of them.
+
+- **Code Intelligence documentation** (#365)
+  - New `docs/code-intelligence.md` covering indexing, search, call graph, and MCP tools.
+
+### Changed
+
+- **Renamed `cora-cli` → `cora-code`** (#338) — crate name, repo description, all references.
+- **Security scanner false positives suppressed** (#369) — `sec-hardcoded-url` and `sec-hardcoded-secret/crypto` patterns refined to reduce noise (#357, #364).
+- **Uteke memory integration hidden from user-facing docs** (#367) — still functional, just not advertised externally.
+- **VitePress docs** — adopted `@codecora-theme`, retired SvelteKit `website/` directory.
+- **CI** — decoupled GitHub Release from crates.io publish (#371).
 
 ## [0.7.0] - 2026-07-16
 
@@ -596,9 +667,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.6.1...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.8.2...develop
+[0.8.2]: https://github.com/codecoradev/cora-code/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/codecoradev/cora-code/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/codecoradev/cora-code/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/codecoradev/cora-code/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/codecoradev/cora-code/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/codecoradev/cora-code/compare/v0.6.0...v0.6.1
-[0.6.0]: https://github.com/codecoradev/cora-code/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/codecoradev/cora-code/compare/v0.4.6...v0.5.0
 [0.4.6]: https://github.com/codecoradev/cora-code/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/codecoradev/cora-code/compare/v0.4.4...v0.4.5

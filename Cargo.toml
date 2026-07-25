@@ -1,6 +1,6 @@
 [package]
 name = "cora-code"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 description = "CLI-first AI code review — BYOK, diff/scan/branch, pre-commit hooks"
 license = "MIT"
@@ -69,6 +69,14 @@ tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+tree-sitter-scala = { version = "0.26", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
 
 [features]
 default = []
@@ -78,6 +86,14 @@ tree-sitter = [
     "dep:tree-sitter-go",
     "dep:tree-sitter-python",
     "dep:tree-sitter-typescript",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-ruby",
+    "dep:tree-sitter-php",
+    "dep:tree-sitter-scala",
+    "dep:tree-sitter-javascript",
 ]
 
 [dev-dependencies]
