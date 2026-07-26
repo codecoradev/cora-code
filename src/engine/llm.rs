@@ -880,13 +880,19 @@ pub(crate) fn parse_scan_response(
     // Repair common LLM JSON mistakes before strict parse
     let json_str = repair_json_string(&json_str);
 
-    // Attempt strict parse first; if it fails due to truncation, try to repair
+    // Attempt strict parse first; if it fails, try repair + partial extraction
     let issues: Vec<ReviewIssue> = match serde_json::from_str(&json_str) {
         Ok(v) => v,
         Err(e) => {
             let err_msg = e.to_string();
-            if err_msg.contains("EOF") || err_msg.contains("unexpected end") {
-                debug!(error = %err_msg, "attempting truncated JSON repair for scan response");
+            let is_truncation = err_msg.contains("EOF")
+                || err_msg.contains("unexpected end")
+                || err_msg.contains("expected");
+
+            if is_truncation {
+                debug!(error = %err_msg, "attempting JSON repair for scan response");
+
+                // Try repair first
                 let repaired = repair_truncated_json(&json_str);
                 match serde_json::from_str(&repaired) {
                     Ok(v) => {
@@ -894,10 +900,41 @@ pub(crate) fn parse_scan_response(
                         v
                     }
                     Err(repair_err) => {
-                        return Err(CoraError::LlmParse(format!(
-                            "parse failed (original: {err_msg}, after repair: {repair_err}). Raw response prefix: {}",
-                            preview_raw(raw)
-                        )));
+                        debug!(error = %repair_err, "repair failed, trying partial object extraction");
+
+                        // Last resort: extract individual complete JSON objects
+                        // from the truncated response. This recovers valid
+                        // findings that appeared before truncation.
+                        let partials = extract_partial_json_objects(&json_str);
+                        if !partials.is_empty() {
+                            let mut recovered = Vec::with_capacity(partials.len());
+                            let mut parse_errors = 0;
+                            for obj_str in &partials {
+                                match serde_json::from_str::<ReviewIssue>(obj_str) {
+                                    Ok(issue) => recovered.push(issue),
+                                    Err(_) => parse_errors += 1,
+                                }
+                            }
+                            if !recovered.is_empty() {
+                                debug!(
+                                    recovered = recovered.len(),
+                                    skipped_partial = parse_errors,
+                                    "partial JSON object extraction recovered findings from truncated response"
+                                );
+                                recovered
+                            } else {
+                                return Err(CoraError::LlmParse(format!(
+                                    "parse failed (original: {err_msg}, after repair: {repair_err}). Could not recover any valid objects from {} partial objects. Raw response prefix: {}",
+                                    partials.len(),
+                                    preview_raw(raw)
+                                )));
+                            }
+                        } else {
+                            return Err(CoraError::LlmParse(format!(
+                                "parse failed (original: {err_msg}, after repair: {repair_err}). No complete JSON objects found in truncated response. Raw response prefix: {}",
+                                preview_raw(raw)
+                            )));
+                        }
                     }
                 }
             } else {
@@ -1066,6 +1103,57 @@ fn repair_truncated_json(json: &str) -> String {
     }
 
     repaired
+}
+
+/// Extract individual complete JSON objects from a potentially truncated JSON array.
+///
+/// When an LLM response is truncated mid-array (e.g. `[{"file":"a",...}, {"file":"b",`),
+/// `repair_truncated_json` may produce syntactically valid but semantically broken JSON
+/// (the truncated object has a partial string value). This function takes a different
+/// approach: it walks the JSON character-by-character and extracts every *complete*
+/// top-level object (balanced braces, respecting strings and escapes). Each extracted
+/// object is then parsed individually — partial/invalid tail objects are discarded.
+fn extract_partial_json_objects(json: &str) -> Vec<String> {
+    let trimmed = json.trim_start();
+    let trimmed = trimmed
+        .strip_prefix('[')
+        .or_else(|| trimmed.strip_prefix("```json\n["))
+        .or_else(|| trimmed.strip_prefix("```\n["))
+        .unwrap_or(trimmed);
+
+    let mut objects = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut obj_start = None;
+
+    for (i, ch) in trimmed.char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => {
+                if depth == 0 {
+                    obj_start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = obj_start.take() {
+                        objects.push(trimmed[start..=i].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    objects
 }
 
 /// Replace invalid escape sequences in JSON string values.
@@ -1925,5 +2013,94 @@ mod tests {
             serialized.contains(r#""max_tokens":8192"#),
             "Expected max_tokens key in JSON, got: {serialized}"
         );
+    }
+
+    // ─── extract_partial_json_objects ───
+
+    #[test]
+    fn extract_partial_complete_array() {
+        let json = r#"[
+  {"file":"a.rs","line":1,"severity":"major","issue_type":"bugs","title":"A","body":"b"},
+  {"file":"b.rs","line":2,"severity":"minor","issue_type":"bugs","title":"B","body":"b"}
+]"#;
+        let objs = extract_partial_json_objects(json);
+        assert_eq!(objs.len(), 2);
+        // Each should be valid
+        assert!(serde_json::from_str::<serde_json::Value>(&objs[0]).is_ok());
+        assert!(serde_json::from_str::<serde_json::Value>(&objs[1]).is_ok());
+    }
+
+    #[test]
+    fn extract_partial_truncated_second_object() {
+        // Second object truncated mid-string — should only extract the first
+        let json = r#"[
+  {"file":"a.rs","line":1,"severity":"major","issue_type":"bugs","title":"A","body":"valid body"},
+  {"file":"b.rs","line":2,"severity":"minor","issue_type":"bugs","title":"B","body":"truncated without closing quote or brace"#;
+        let objs = extract_partial_json_objects(json);
+        assert_eq!(objs.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&objs[0]).unwrap();
+        assert_eq!(parsed["file"], "a.rs");
+    }
+
+    #[test]
+    fn extract_partial_truncated_mid_string() {
+        // Truncation inside a string value with escaped quotes
+        let json = r#"[
+  {"file":"a.rs","line":1,"severity":"major","issue_type":"bugs","title":"A","body":"has \"escaped\" quotes"},
+  {"file":"b.rs","line":2,"severity":"minor","issue_type":"bugs","title":"B","body":"trunc"#;
+        let objs = extract_partial_json_objects(json);
+        assert_eq!(
+            objs.len(),
+            1,
+            "Should extract only the complete first object"
+        );
+    }
+
+    #[test]
+    fn extract_partial_nested_braces_in_strings() {
+        // Braces inside string values should not affect depth tracking
+        let json = r#"[
+  {"file":"a.rs","line":1,"severity":"info","issue_type":"style","title":"A","body":"function() { /* code */ }"},
+  {"file":"b.rs","line":2,"severity":"info","issue_type":"style","title":"B","body":"also { valid }"}
+]"#;
+        let objs = extract_partial_json_objects(json);
+        assert_eq!(objs.len(), 2);
+    }
+
+    #[test]
+    fn extract_partial_empty_array() {
+        assert_eq!(extract_partial_json_objects("[]").len(), 0);
+    }
+
+    #[test]
+    fn extract_partial_no_complete_objects() {
+        // Single object truncated immediately
+        let json = r#"[{"file":"truncated"#;
+        assert_eq!(extract_partial_json_objects(json).len(), 0);
+    }
+
+    #[test]
+    fn parse_scan_response_recovers_from_truncation() {
+        // Simulates the scenario from issue #383:
+        // Truncation inside a nested brace makes repair produce invalid JSON.
+        // After repair fails, partial object extraction recovers the first finding.
+        let truncated = concat!(
+            r#"[{"file":"fixtures.ts","line":90,"severity":"major","#,
+            r#""issue_type":"bugs","title":"X","body":"valid body","#,
+            r#""suggested_fix":"fix it"},"#,
+            r#"{"file":"settings.ts","line":15,"severity":"minor","#,
+            r#""issue_type":"bugs","title":"Y","body":{"detail":"trunc"#,
+        );
+
+        let result = parse_scan_response(truncated, None);
+        assert!(
+            result.is_ok(),
+            "Should recover partial findings, got: {:?}",
+            result.err()
+        );
+        let (issues, _summary, _tokens) = result.unwrap();
+        assert_eq!(issues.len(), 1, "Should recover exactly 1 complete finding");
+        assert_eq!(issues[0].file, "fixtures.ts");
+        assert_eq!(issues[0].line, Some(90));
     }
 }
