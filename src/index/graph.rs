@@ -156,17 +156,14 @@ pub fn find_callers_cross_project(
          LIMIT ?2",
     )?;
 
-    let rows = stmt.query_map(
-        rusqlite::params![pattern, limit as i64],
-        |row| {
-            Ok(CrossProjectCallerResult {
-                caller: row.get(0)?,
-                file: row.get(1)?,
-                line: row.get::<_, i64>(2)? as u32,
-                project_root: row.get(3)?,
-            })
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+        Ok(CrossProjectCallerResult {
+            caller: row.get(0)?,
+            file: row.get(1)?,
+            line: row.get::<_, i64>(2)? as u32,
+            project_root: row.get(3)?,
+        })
+    })?;
 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
