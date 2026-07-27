@@ -588,6 +588,7 @@ async fn main() -> Result<()> {
             verbose,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let conn = index::open_global_index()?;
             let project_id = index::ensure_project(&conn, &project_root)?;
 
@@ -688,6 +689,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
 
             if !db_path.exists() {
@@ -760,6 +762,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -840,6 +843,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run 'cora index' first.".yellow());
@@ -888,6 +892,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -946,6 +951,7 @@ async fn main() -> Result<()> {
 
         Command::Arch { json } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -995,6 +1001,7 @@ async fn main() -> Result<()> {
             }
 
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -1041,6 +1048,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());

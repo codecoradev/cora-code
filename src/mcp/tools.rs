@@ -389,16 +389,16 @@ fn handle_list_profiles() -> ToolResult {
 
 // ─── Code Intelligence Handlers ───
 
-/// Open the global index database and resolve project_id for the current directory.
+/// Open the global index database and resolve project_id for the project root.
+/// Uses project root detection (walks up from CWD looking for markers).
 /// Returns helpful error if not found.
 fn open_index_db() -> anyhow::Result<(rusqlite::Connection, i64)> {
-    let cwd = std::env::current_dir()?;
     let db_path = crate::data_dir::graph_db_path();
     if !db_path.exists() {
         anyhow::bail!("No symbol index found. Run 'cora index' first to build the index.");
     }
     let conn = crate::index::open_global_index()?;
-    let project_id = crate::index::ensure_project(&conn, &cwd)?;
+    let (project_id, _root) = crate::index::resolve_project_id(&conn)?;
     Ok((conn, project_id))
 }
 
