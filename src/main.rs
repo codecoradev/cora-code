@@ -588,6 +588,7 @@ async fn main() -> Result<()> {
             verbose,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let conn = index::open_global_index()?;
             let project_id = index::ensure_project(&conn, &project_root)?;
 
@@ -688,6 +689,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
 
             if !db_path.exists() {
@@ -760,6 +762,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -769,8 +772,51 @@ async fn main() -> Result<()> {
             let project_id = index::ensure_project(&conn, &project_root)?;
             let callers = index::graph::find_callers(&conn, project_id, &symbol, limit)?;
 
+            // Cross-project fallback: if no callers in current project,
+            // search across all indexed projects.
+            let cross_project_results = if callers.is_empty() {
+                let cp = index::graph::find_callers_cross_project(&conn, &symbol, limit)?;
+                if !cp.is_empty() {
+                    if !json {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "No callers in current project. Found {} in other project(s):",
+                                cp.len()
+                            )
+                            .yellow()
+                        );
+                    }
+                    Some(cp)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             if json {
-                println!("{}", serde_json::to_string_pretty(&callers)?);
+                if let Some(ref cp) = cross_project_results {
+                    println!("{}", serde_json::to_string_pretty(cp)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&callers)?);
+                }
+            } else if callers.is_empty() && cross_project_results.is_some() {
+                let cp = cross_project_results.as_ref().unwrap();
+                println!(
+                    "{}",
+                    format!("Callers of '{symbol}' ({}):", cp.len()).cyan()
+                );
+                println!("{}", "─".repeat(50).dimmed());
+                for c in cp {
+                    println!(
+                        "  {} {}:{}  {}",
+                        c.caller.white().bold(),
+                        c.file.dimmed(),
+                        c.line,
+                        c.project_root.dimmed().italic(),
+                    );
+                }
             } else if callers.is_empty() {
                 eprintln!("{}", format!("No callers found for '{symbol}'.").yellow());
             } else {
@@ -797,6 +843,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run 'cora index' first.".yellow());
@@ -845,6 +892,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -903,6 +951,7 @@ async fn main() -> Result<()> {
 
         Command::Arch { json } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -952,6 +1001,7 @@ async fn main() -> Result<()> {
             }
 
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());
@@ -998,6 +1048,7 @@ async fn main() -> Result<()> {
             json,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let db_path = crate::data_dir::graph_db_path();
             if !db_path.exists() {
                 eprintln!("{}", "No index found. Run `cora index` first.".yellow());

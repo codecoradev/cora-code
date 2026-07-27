@@ -136,6 +136,38 @@ pub fn find_callers(
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// Find callers of a symbol across ALL projects (cross-project fallback).
+///
+/// Used when project-scoped `find_callers` returns empty — the symbol may
+/// exist in another indexed project. Returns results with the project root
+/// path so the caller can display which project the match came from.
+pub fn find_callers_cross_project(
+    conn: &Connection,
+    symbol_name: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<CrossProjectCallerResult>> {
+    let pattern = format!("%{symbol_name}%");
+
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT cg.caller, cg.file, cg.line, p.root_path
+         FROM call_graph cg
+         JOIN projects p ON cg.project_id = p.id
+         WHERE cg.callee LIKE ?1
+         LIMIT ?2",
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+        Ok(CrossProjectCallerResult {
+            caller: row.get(0)?,
+            file: row.get(1)?,
+            line: row.get::<_, i64>(2)? as u32,
+            project_root: row.get(3)?,
+        })
+    })?;
+
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 /// Find all callees of a symbol (what does this call?), scoped to a project.
 ///
 /// Returns symbols that are called by the given name.
@@ -229,6 +261,15 @@ pub struct CallerResult {
     pub caller: String,
     pub file: String,
     pub line: u32,
+}
+
+/// A cross-project caller result (includes which project the caller belongs to).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrossProjectCallerResult {
+    pub caller: String,
+    pub file: String,
+    pub line: u32,
+    pub project_root: String,
 }
 
 /// A callee result entry.
@@ -581,6 +622,58 @@ mod tests {
         let names: Vec<&str> = callers.iter().map(|c| c.caller.as_str()).collect();
         assert!(names.contains(&"main"));
         assert!(names.contains(&"handler"));
+    }
+
+    #[test]
+    fn test_find_callers_cross_project() {
+        let conn = mem_conn();
+        let project_a =
+            super::super::schema::get_or_create_project(&conn, "/tmp/project-a").unwrap();
+        let project_b =
+            super::super::schema::get_or_create_project(&conn, "/tmp/project-b").unwrap();
+
+        // Store edges in project A
+        store_edges(
+            &conn,
+            &[CallEdge {
+                caller: "handler_a".to_string(),
+                callee: "shared_util".to_string(),
+                file: "handler.rs".to_string(),
+                line: 5,
+            }],
+            project_a,
+        )
+        .unwrap();
+
+        // Store edges in project B
+        store_edges(
+            &conn,
+            &[CallEdge {
+                caller: "handler_b".to_string(),
+                callee: "shared_util".to_string(),
+                file: "lib.rs".to_string(),
+                line: 10,
+            }],
+            project_b,
+        )
+        .unwrap();
+
+        // Scoped to project A: only finds handler_a
+        let scoped = find_callers(&conn, project_a, "shared_util", 10).unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].caller, "handler_a");
+
+        // Scoped to project B: only finds handler_b
+        let scoped_b = find_callers(&conn, project_b, "shared_util", 10).unwrap();
+        assert_eq!(scoped_b.len(), 1);
+        assert_eq!(scoped_b[0].caller, "handler_b");
+
+        // Cross-project: finds BOTH
+        let cross = find_callers_cross_project(&conn, "shared_util", 10).unwrap();
+        assert_eq!(cross.len(), 2);
+        let roots: Vec<&str> = cross.iter().map(|c| c.project_root.as_str()).collect();
+        assert!(roots.contains(&"/tmp/project-a"));
+        assert!(roots.contains(&"/tmp/project-b"));
     }
 
     #[test]

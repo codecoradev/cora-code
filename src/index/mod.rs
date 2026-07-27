@@ -45,6 +45,46 @@ pub fn ensure_project(conn: &Connection, root: &Path) -> anyhow::Result<i64> {
     schema::get_or_create_project(conn, &root_str)
 }
 
+/// Detect the project root by walking up from `start` looking for marker files.
+///
+/// Search order: `.cora.yaml` → `Cargo.toml` → `package.json` → `.git` (dir or file).
+/// Returns the directory containing the first marker found, or `None` if none is found.
+pub fn resolve_project_root(start: &Path) -> Option<std::path::PathBuf> {
+    let dir = if start.is_file() {
+        start.parent()?
+    } else {
+        start
+    };
+
+    const MARKERS: &[&str] = &[".cora.yaml", "Cargo.toml", "package.json", ".git"];
+
+    let mut current = dir.to_path_buf();
+    loop {
+        for marker in MARKERS {
+            let candidate = current.join(marker);
+            if candidate.exists() {
+                debug!(root = %current.display(), marker, "detected project root");
+                return Some(current);
+            }
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return None,
+        }
+    }
+}
+
+/// Resolve `project_id` from the current directory, using project root detection.
+///
+/// Walks up from CWD to find a project root (`.cora.yaml`, `Cargo.toml`, etc.).
+/// Falls back to CWD if no marker is found.
+pub fn resolve_project_id(conn: &Connection) -> anyhow::Result<(i64, std::path::PathBuf)> {
+    let cwd = std::env::current_dir()?;
+    let root = resolve_project_root(&cwd).unwrap_or_else(|| cwd.clone());
+    let project_id = ensure_project(conn, &root)?;
+    Ok((project_id, root))
+}
+
 /// Index a single file: extract symbols and store in the database.
 ///
 /// `project_id` is written to every row so data is scoped per-project
@@ -510,5 +550,65 @@ pub struct AuthService {
         let stats = index_stats(&conn, project_id).unwrap();
         // Should have 1 symbol (replaced, not 2)
         assert_eq!(stats.total_symbols, 1);
+    }
+
+    #[test]
+    fn test_resolve_project_root_finds_cargo_toml() {
+        // CWD of the test process is the crate root — Cargo.toml exists here.
+        let cwd = std::env::current_dir().unwrap();
+        let root = resolve_project_root(&cwd);
+        assert!(root.is_some(), "should find project root from CWD");
+        let root = root.unwrap();
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "resolved root should contain Cargo.toml"
+        );
+    }
+
+    #[test]
+    fn test_resolve_project_root_finds_cora_yaml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join(".cora.yaml"), "version: 1\n").unwrap();
+        let subdir = root.join("src").join("deep").join("nested");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let resolved = resolve_project_root(&subdir);
+        assert_eq!(resolved, Some(root));
+    }
+
+    #[test]
+    fn test_resolve_project_root_returns_none_in_tmp() {
+        // /tmp itself should have no markers (or at least a very deep /tmp subdirectory
+        // that we create and then check).
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Create a deep directory with no markers.
+        let deep = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        // Walk up from `deep` — tempfile dirs are under /tmp which typically has no
+        // Cargo.toml/.cora.yaml/.git. If it does find one we just skip this assertion.
+        let resolved = resolve_project_root(&deep);
+        // /tmp should not have project markers, but if the test machine has a git
+        // repo at /tmp, we can't guarantee this. Only assert if /tmp is clean.
+        if !std::path::Path::new("/tmp/.git").exists()
+            && !std::path::Path::new("/tmp/Cargo.toml").exists()
+            && !std::path::Path::new("/tmp/.cora.yaml").exists()
+        {
+            assert!(
+                resolved.is_none(),
+                "should not find project root in empty tmp dir, got {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_project_id_uses_project_root() {
+        let conn = mem_conn();
+        // resolve_project_id uses CWD — which is the cora-code crate root.
+        let (pid, root) = resolve_project_id(&conn).unwrap();
+        assert!(pid > 0);
+        assert!(
+            root.join("Cargo.toml").exists(),
+            "resolved root should contain Cargo.toml"
+        );
     }
 }

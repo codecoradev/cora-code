@@ -6,11 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- Added Svelte symbol indexing — components (from filename), props, $state, $derived, functions via TS delegation (#375)
+
+## [0.8.3] - 2026-07-27
 
 ### Added
 
+- **Svelte AST symbol indexing.** `cora index` with `--features tree-sitter` now extracts functions, arrow functions, and types from `<script>` blocks in `.svelte` files. Uses TypeScript/JavaScript grammar delegation — zero new dependencies. Supports `lang="ts"` and `lang="js"` attributes with correct line number offsets. Closes #384.
+- **TypeScript arrow function extraction.** `export const handler = () => {}` and `const cb = function() {}` are now captured as symbols with call edges. Previously only ALL_CAPS constants were indexed from `lexical_declaration`/`variable_declaration` nodes.
+
+### Fixed
+
+- **Project root detection for scoped queries** (#380, #382). `resolve_project_root()` now walks up from CWD to find `.cora.yaml`, `Cargo.toml`, or `.git` instead of always using CWD. Fixes `cora brain` and `cora callers` returning results from wrong projects.
+- **Vector search filtered by project_id** (#382). `brain_search()` now over-fetches from the global usearch index and filters by project_id at the DB layer, preventing cross-project noise in results.
+- **Cross-project fallback for `cora callers`** (#381). When a symbol has no callers in the current project, falls back to searching across all projects in the global index.
+- **Partial JSON recovery for scan results** (#383). `extract_partial_json_objects()` added as last-resort fallback when LLM returns truncated JSON arrays in scan output.
+
+## [0.8.2] - 2026-07-25
+
+### Added
+
+- **8 additional tree-sitter languages.** Added AST extraction for C, C++, C#, Ruby, PHP, Scala, and JavaScript. Total tree-sitter supported languages: 12.
 - **Dart symbol indexing.** `cora index` now extracts classes, mixins, enums, extensions, functions, getters, and typedefs from `.dart` files. Closes #373.
+- **Svelte symbol indexing (regex).** Initial Svelte support via regex-based extraction — components (from filename), props, `$state`, `$derived`, functions. Closes #375. (Replaced by AST extraction in v0.8.3.)
 
 ## [0.8.1] - 2026-07-24
 

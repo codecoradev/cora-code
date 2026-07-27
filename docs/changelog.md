@@ -5,6 +5,26 @@ All notable changes to cora-code are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-07-27
+
+### Added — Code Intelligence
+
+- **Svelte AST symbol indexing** (#384)
+  - `cora index` with `--features tree-sitter` now extracts functions, arrow functions, and types from `<script>` blocks in `.svelte` files.
+  - Uses TypeScript/JavaScript grammar delegation — zero new dependencies.
+  - Supports `lang="ts"` and `lang="js"` attributes with correct line number offsets.
+  - Replaces the v0.8.2 regex-based Svelte extractor with proper AST parsing.
+- **TypeScript arrow function extraction** (#384)
+  - `export const handler = () => {}` and `const cb = function() {}` are now captured as symbols with call edges.
+  - Previously only ALL_CAPS constants were indexed from `lexical_declaration`/`variable_declaration` nodes.
+
+### Fixed
+
+- **Project root detection for scoped queries** (#380, #382) — `resolve_project_root()` walks up from CWD to find project root instead of always using CWD.
+- **Vector search filtered by project_id** (#382) — `brain_search()` over-fetches + filters by project_id, preventing cross-project noise.
+- **Cross-project fallback for `cora callers`** (#381) — falls back to global index when no callers found in current project.
+- **Partial JSON recovery for scan results** (#383) — `extract_partial_json_objects()` handles truncated LLM JSON output.
+
 ## [0.8.2] - 2026-07-24
 
 ### Added — Code Intelligence
