@@ -111,7 +111,7 @@ Hybrid semantic search and deep language support via AST parsing.
 - [Phase 2C](https://github.com/codecoradev/cora-code/pull/358) — `cora trace` + `cora arch` — ✓ Done
 - [Phase 3](https://github.com/codecoradev/cora-code/pull/362) — Brain Mode hybrid search (usearch + RRF) — ✓ Done
 - [#374](https://github.com/codecoradev/cora-code/pull/374) Dart symbol indexing — ✓ Done
-- [#375](https://github.com/codecoradev/cora-code/pull/375) Svelte symbol indexing — ✓ Done
+- [#375](https://github.com/codecoradev/cora-code/pull/375) Svelte symbol indexing (regex) → [#384](https://github.com/codecoradev/cora-code/pull/384) upgraded to AST — ✓ Done
 - [#376](https://github.com/codecoradev/cora-code/pull/376) Tree-sitter expansion: 4 → 12 languages (Java, C, C++, C#, Ruby, PHP, Scala, JS) — ✓ Done
 - [#338](https://github.com/codecoradev/cora-code/pull/338) Renamed `cora-cli` → `cora-code` — ✓ Done
 - [#369](https://github.com/codecoradev/cora-code/pull/369) Security scanner false positive suppression — ✓ Done
