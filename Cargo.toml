@@ -9,6 +9,13 @@ readme = "README.md"
 keywords = ["cli", "code-review", "ai", "git", "pre-commit"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.85"
+exclude = [
+    "vendored/",
+    "docs/",
+    ".github/",
+    "tests/",
+    "target/",
+]
 
 [dependencies]
 # CLI
@@ -80,6 +87,7 @@ tree-sitter-javascript = { version = "0.25", optional = true }
 
 [features]
 default = []
+pretrained-embed = []
 tree-sitter = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
