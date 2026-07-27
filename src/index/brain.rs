@@ -92,7 +92,7 @@ pub fn brain_search(
     let fetch_limit = limit * 2;
 
     let fts_hits = fts5_search(conn, project_id, query, fetch_limit);
-    let vec_hits = vector_search(query, fetch_limit);
+    let vec_hits = vector_search(conn, project_id, query, fetch_limit);
     let graph_hits = graph_proximity_search(conn, project_id, &fts_hits, fetch_limit);
 
     // ── RRF Fusion ──────────────────────────────────────────────────────
@@ -168,8 +168,9 @@ fn fts5_search(conn: &Connection, project_id: i64, query: &str, limit: usize) ->
     }
 }
 
-/// usearch vector search → (symbol_id, cosine_similarity) pairs.
-fn vector_search(query: &str, limit: usize) -> Vec<(i64, f32)> {
+/// usearch vector search → (symbol_id, cosine_similarity) pairs, filtered to project.
+/// Over-fetches from global vector index then filters by project_id via DB lookup.
+fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) -> Vec<(i64, f32)> {
     let vi_path = vector_index_path();
     if !vi_path.exists() {
         return Vec::new();
@@ -189,8 +190,26 @@ fn vector_search(query: &str, limit: usize) -> Vec<(i64, f32)> {
     let embedding = embed_code(query);
     let vec: Vec<f32> = embedding.as_slice().iter().map(|&v| v as f32).collect();
 
-    vi.search(&vec, limit)
-        .into_iter()
+    // Over-fetch to compensate for post-filter by project_id.
+    let over_fetch = (limit * 5).max(50);
+    let raw = vi.search(&vec, over_fetch);
+
+    // Build a set of symbol IDs belonging to this project.
+    let project_ids: std::collections::HashSet<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM symbols WHERE project_id = ?1")
+            .unwrap();
+        let rows: Vec<i64> = stmt
+            .query_map([project_id], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        rows.into_iter().collect()
+    };
+
+    raw.into_iter()
+        .filter(|(sym_id, _)| project_ids.contains(sym_id))
+        .take(limit)
         .map(|(sym_id, dist)| (sym_id, cosine_distance_to_similarity(dist)))
         .collect()
 }
