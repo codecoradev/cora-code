@@ -131,6 +131,11 @@ pub fn parse(source: &[u8], language: tree_sitter::Language) -> Option<tree_sitt
 /// Returns `(nodes, edges)`. Empty vectors for unsupported languages
 /// or parse failures.
 pub fn extract(content: &str, language: &str, file_path: &str) -> (Vec<AstNode>, Vec<AstEdge>) {
+    // Svelte: extract <script> blocks and parse as TS/JS (no dedicated grammar needed)
+    if language == "svelte" {
+        return extract_svelte(content, file_path);
+    }
+
     let lang = match get_language(language) {
         Some(l) => l,
         None => return (Vec::new(), Vec::new()),
@@ -783,20 +788,56 @@ fn extract_typescript(
                 }
             }
             "lexical_declaration" => {
-                // const/let declarations
+                // const/let declarations — extract constants AND function-valued vars
                 let mut vc = node.walk();
                 if vc.goto_first_child() {
                     loop {
                         if vc.node().kind() == "variable_declarator" {
-                            let name = node_name(&vc.node(), source);
-                            // Only extract as constant if ALL_CAPS
-                            if !name.is_empty() && name == name.to_uppercase() && name.len() > 1 {
+                            let decl_node = vc.node();
+                            let name = node_name(&decl_node, source);
+                            if name.is_empty() {
+                                if !vc.goto_next_sibling() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // Check if the value is a function (arrow or function expression)
+                            let is_function = decl_node
+                                .child_by_field_name("value")
+                                .map(|v| {
+                                    v.kind() == "arrow_function"
+                                        || v.kind() == "function_expression"
+                                })
+                                .unwrap_or(false);
+
+                            if is_function {
+                                // Exported arrow function / function expression
+                                nodes.push(AstNode {
+                                    name: name.clone(),
+                                    kind: SymbolKind::Function,
+                                    file: file_path.to_string(),
+                                    line: (decl_node.start_position().row + 1) as u32,
+                                    signature: signature_for_node(&decl_node, source),
+                                    parent: None,
+                                });
+                                // Extract calls from the function body
+                                if let Some(value_node) = decl_node.child_by_field_name("value") {
+                                    extract_calls_from_node(
+                                        &value_node,
+                                        source,
+                                        file_path,
+                                        &name,
+                                        edges,
+                                    );
+                                }
+                            } else if name == name.to_uppercase() && name.len() > 1 {
+                                // ALL_CAPS constant
                                 nodes.push(AstNode {
                                     name,
                                     kind: SymbolKind::Constant,
                                     file: file_path.to_string(),
-                                    line: (vc.node().start_position().row + 1) as u32,
-                                    signature: signature_for_node(&vc.node(), source),
+                                    line: (decl_node.start_position().row + 1) as u32,
+                                    signature: signature_for_node(&decl_node, source),
                                     parent: None,
                                 });
                             }
@@ -812,14 +853,47 @@ fn extract_typescript(
                 if vc.goto_first_child() {
                     loop {
                         if vc.node().kind() == "variable_declarator" {
-                            let name = node_name(&vc.node(), source);
-                            if !name.is_empty() && name == name.to_uppercase() && name.len() > 1 {
+                            let decl_node = vc.node();
+                            let name = node_name(&decl_node, source);
+                            if name.is_empty() {
+                                if !vc.goto_next_sibling() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let is_function = decl_node
+                                .child_by_field_name("value")
+                                .map(|v| {
+                                    v.kind() == "arrow_function"
+                                        || v.kind() == "function_expression"
+                                })
+                                .unwrap_or(false);
+
+                            if is_function {
+                                nodes.push(AstNode {
+                                    name: name.clone(),
+                                    kind: SymbolKind::Function,
+                                    file: file_path.to_string(),
+                                    line: (decl_node.start_position().row + 1) as u32,
+                                    signature: signature_for_node(&decl_node, source),
+                                    parent: None,
+                                });
+                                if let Some(value_node) = decl_node.child_by_field_name("value") {
+                                    extract_calls_from_node(
+                                        &value_node,
+                                        source,
+                                        file_path,
+                                        &name,
+                                        edges,
+                                    );
+                                }
+                            } else if name == name.to_uppercase() && name.len() > 1 {
                                 nodes.push(AstNode {
                                     name,
                                     kind: SymbolKind::Constant,
                                     file: file_path.to_string(),
-                                    line: (vc.node().start_position().row + 1) as u32,
-                                    signature: signature_for_node(&vc.node(), source),
+                                    line: (decl_node.start_position().row + 1) as u32,
+                                    signature: signature_for_node(&decl_node, source),
                                     parent: None,
                                 });
                             }
@@ -864,6 +938,190 @@ fn extract_typescript(
     }
 
     (nodes, edges)
+}
+
+// ─── Svelte ──────────────────────────────────────────────────────────
+
+/// Extract `<script>` blocks from Svelte source, parse as TypeScript/JavaScript,
+/// and adjust line numbers to match the original file.
+///
+/// Svelte files look like:
+/// ```svelte
+/// <script lang="ts">
+///   import { foo } from './foo';
+///   export const handler = () => { foo(); };
+///   function bar() {}
+/// </script>
+///
+/// <div>...</div>
+/// ```
+///
+/// We extract the script content, determine the language from `lang="ts|js"`,
+/// parse with the TS/JS grammar, then offset all line numbers by the script
+/// block's start line.
+fn extract_svelte(content: &str, file_path: &str) -> (Vec<AstNode>, Vec<AstEdge>) {
+    let mut all_nodes = Vec::new();
+    let mut all_edges = Vec::new();
+
+    for script_block in extract_script_blocks(content) {
+        let script_content = &script_block.content;
+        let line_offset = script_block.start_line;
+
+        // Determine language: default to "ts" (SvelteKit convention), use "js" if explicitly set
+        let lang = if script_block.lang == "js" || script_block.lang == "javascript" {
+            "js"
+        } else {
+            "ts"
+        };
+
+        let tree_sitter_lang = match get_language(lang) {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let tree = match parse(script_content.as_bytes(), tree_sitter_lang) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let (mut nodes, mut edges) =
+            extract_typescript(&tree.root_node(), script_content, file_path);
+
+        // Adjust line numbers: tree-sitter rows are 0-based, we add 1 for display.
+        // The script content starts at `line_offset` (0-based) in the original file.
+        // So: original_line = script_local_line + line_offset
+        for node in &mut nodes {
+            node.line += line_offset as u32;
+        }
+        for edge in &mut edges {
+            edge.line += line_offset as u32;
+        }
+
+        all_nodes.extend(nodes);
+        all_edges.extend(edges);
+    }
+
+    (all_nodes, all_edges)
+}
+
+/// A extracted `<script>` block with its metadata.
+struct ScriptBlock {
+    content: String,
+    start_line: usize, // 0-based line offset in the original file
+    lang: String,      // "ts", "js", "javascript", or empty
+}
+
+/// Extract all `<script>` blocks from Svelte source.
+/// Returns blocks with their content, start line offset, and lang attribute.
+fn extract_script_blocks(content: &str) -> Vec<ScriptBlock> {
+    let mut blocks = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+
+        // Look for <script ...> tag (allow attributes like lang="ts")
+        if let Some(tag_end) = find_script_open_tag(line) {
+            // Extract lang attribute from the tag line
+            let lang = extract_lang_attr(line);
+
+            // Handle inline: <script>code</script> on one line
+            if let Some(close_pos) = rest_of_line_find_close(line, tag_end) {
+                let inline_content = &line[tag_end..close_pos];
+                if !inline_content.trim().is_empty() {
+                    blocks.push(ScriptBlock {
+                        content: inline_content.to_string(),
+                        start_line: i,
+                        lang,
+                    });
+                }
+                i += 1;
+                continue;
+            }
+
+            // Multi-line script block
+            let mut script_lines = Vec::new();
+            let mut start_line = i + 1; // content starts on the next line (0-based)
+            let mut j = i + 1;
+
+            // If content starts on the same line as the tag
+            if tag_end < line.len() {
+                let rest = &line[tag_end..];
+                if !rest.trim().is_empty() {
+                    script_lines.push(rest.to_string());
+                    start_line = i; // content starts on same line as tag
+                }
+            }
+
+            let mut found_close = false;
+            while j < lines.len() {
+                let j_line = lines[j];
+                if let Some(close_pos) = j_line.find("</script>") {
+                    // Content before </script> on this line
+                    let before = &j_line[..close_pos];
+                    if !before.trim().is_empty() {
+                        script_lines.push(before.to_string());
+                    }
+                    found_close = true;
+                    break;
+                } else {
+                    script_lines.push(j_line.to_string());
+                }
+                j += 1;
+            }
+
+            if found_close && !script_lines.is_empty() {
+                blocks.push(ScriptBlock {
+                    content: script_lines.join("\n"),
+                    start_line,
+                    lang,
+                });
+            }
+
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    blocks
+}
+
+/// Find the position after the opening `<script ...>` tag on a line.
+/// Returns the byte offset after `>`, or None if no script tag.
+fn find_script_open_tag(line: &str) -> Option<usize> {
+    let lower = line.to_lowercase();
+    let pos = lower.find("<script")?;
+    // Find the closing > after <script
+    let after_tag = &line[pos..];
+    after_tag.find('>').map(|p| pos + p + 1)
+}
+
+/// Extract the `lang` attribute value from a `<script lang="...">` tag.
+fn extract_lang_attr(line: &str) -> String {
+    let lower = line.to_lowercase();
+    if let Some(lang_pos) = lower.find("lang=") {
+        let after = &line[lang_pos + 5..];
+        // Skip optional whitespace
+        let after = after.trim_start();
+        if after.starts_with('"') {
+            let end = after[1..].find('"').map(|p| p + 1).unwrap_or(after.len());
+            return after[1..end].to_string();
+        } else if after.starts_with('\'') {
+            let end = after[1..].find('\'').map(|p| p + 1).unwrap_or(after.len());
+            return after[1..end].to_string();
+        }
+    }
+    String::new()
+}
+
+/// Check if `</script>` appears on the same line as `<script>` after `start_pos`.
+/// Returns the position of `</script>` if found.
+fn rest_of_line_find_close(line: &str, start_pos: usize) -> Option<usize> {
+    let after = &line[start_pos..];
+    let lower = after.to_lowercase();
+    lower.find("</script>").map(|p| start_pos + p)
 }
 
 // ─── Java ─────────────────────────────────────────────────────────
@@ -2052,5 +2310,160 @@ export function getUser(id: string): User {
         let (nodes, edges) = extract("", "rs", "empty.rs");
         assert!(nodes.is_empty());
         assert!(edges.is_empty());
+    }
+
+    // ─── Svelte + TS arrow function tests (#384) ───────────────────
+
+    #[test]
+    fn test_extract_ts_arrow_function() {
+        let code = r#"export const handler = () => {
+    return 42;
+};
+
+export const processForm = (data: string) => {
+    handler();
+    return data.toUpperCase();
+};"#;
+        let (nodes, edges) = extract(code, "ts", "handler.ts");
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"handler"),
+            "arrow function 'handler' should be extracted, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"processForm"),
+            "arrow function 'processForm' should be extracted, got: {:?}",
+            names
+        );
+        // Verify call edge: processForm calls handler
+        assert!(edges.iter().any(|e| e.source == "processForm"
+            && e.target == "handler"
+            && e.kind == EdgeKind::Calls));
+    }
+
+    #[test]
+    fn test_extract_ts_function_expression() {
+        let code = r#"const callback = function doStuff() {
+    console.log("hi");
+};"#;
+        let (nodes, _edges) = extract(code, "ts", "callback.ts");
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        // function_expression should be captured
+        assert!(
+            names.contains(&"callback"),
+            "function expression 'callback' should be extracted, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_extract_svelte_basic() {
+        let code = r#"<script lang="ts">
+    import { onMount } from 'svelte';
+
+    export let name: string;
+
+    function greet() {
+        return `Hello ${name}`;
+    }
+
+    export const handler = () => {
+        greet();
+    };
+
+    onMount(() => {
+        greet();
+    });
+</script>
+
+<h1>{greet()}</h1>"#;
+        let (nodes, edges) = extract(code, "svelte", "Hello.svelte");
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"greet"),
+            "function 'greet' should be extracted from Svelte script, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"handler"),
+            "arrow function 'handler' should be extracted from Svelte script, got: {:?}",
+            names
+        );
+        // Verify call edge: handler calls greet
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.source == "handler" && e.target == "greet" && e.kind == EdgeKind::Calls)
+        );
+    }
+
+    #[test]
+    fn test_extract_svelte_line_numbers() {
+        let code = r#"<script lang="ts">
+    function foo() {}
+    function bar() { foo(); }
+</script>"#;
+        let (nodes, _edges) = extract(code, "svelte", "test.svelte");
+        let foo_node = nodes
+            .iter()
+            .find(|n| n.name == "foo")
+            .expect("foo not found");
+        let bar_node = nodes
+            .iter()
+            .find(|n| n.name == "bar")
+            .expect("bar not found");
+        // foo is on line 2 (1-based), bar on line 3
+        assert_eq!(
+            foo_node.line, 2,
+            "foo should be on line 2, got {}",
+            foo_node.line
+        );
+        assert_eq!(
+            bar_node.line, 3,
+            "bar should be on line 3, got {}",
+            bar_node.line
+        );
+    }
+
+    #[test]
+    fn test_extract_svelte_no_script() {
+        // Svelte file with no script block — should return empty
+        let code = r#"<div>
+    <h1>Hello</h1>
+</div>"#;
+        let (nodes, edges) = extract(code, "svelte", "noscript.svelte");
+        assert!(nodes.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_extract_svelte_javascript_lang() {
+        let code = r#"<script lang="js">
+    function plainJs() {
+        return 42;
+    }
+</script>"#;
+        let (nodes, _edges) = extract(code, "svelte", "plain.svelte");
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"plainJs"),
+            "JS function in Svelte should be extracted, got: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_extract_svelte_inline_script() {
+        // Single-line script block
+        let code = r#"<script>function inline() { return 1; }</script>
+<div />"#;
+        let (nodes, _edges) = extract(code, "svelte", "inline.svelte");
+        let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            names.contains(&"inline"),
+            "inline script function should be extracted, got: {:?}",
+            names
+        );
     }
 }
