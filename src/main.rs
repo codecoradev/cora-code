@@ -436,6 +436,12 @@ enum Command {
     /// Start MCP server (Model Context Protocol for AI agents)
     Mcp,
 
+    /// Manage review findings (list, dismiss, reopen, stats)
+    Findings {
+        #[command(subcommand)]
+        action: commands::findings::FindingsAction,
+    },
+
     /// Show tech debt report from review history
     Debt {
         /// Output as JSON
@@ -1382,6 +1388,9 @@ async fn main() -> Result<()> {
         Command::Mcp => {
             mcp::server::run_server()?;
             0
+        }
+        Command::Findings { action } => {
+            commands::findings::execute_findings(&action)?
         }
         Command::Debt {
             json,

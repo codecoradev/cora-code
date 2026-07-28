@@ -187,6 +187,22 @@ fn open_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+/// Open cora.db in read-only mode (no migrations, no WAL).
+/// Returns `None` if the DB doesn't exist or can't be opened.
+pub fn open_db_for_read() -> Option<Connection> {
+    let db_path = crate::data_dir::graph_db_path();
+    if !std::path::Path::new(&db_path).exists() {
+        return None;
+    }
+    Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+}
+
+/// Open cora.db for read-write, running migrations if needed.
+/// Returns `None` on failure (best-effort, never panics).
+pub fn open_db_for_write() -> Option<Connection> {
+    open_db().ok()
+}
+
 /// Compute a fingerprint for dedup/auto-resolve: `file:line:title_slug`.
 /// Public wrapper so callers (review.rs, scan.rs) can compute fingerprints
 /// for the current review before calling `resolve_stale_findings`.
