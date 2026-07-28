@@ -47,6 +47,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-28
+
+### Highlights
+
+- **Single source of truth.** Findings, debt, and reviews persist to `cora.db` — one global database.
+- **52× faster incremental indexing** (414ms → 6ms) and **40× faster brain search** (250ms → 5ms).
+- **`cora findings` CLI.** Track, dismiss, and reopen findings across all reviews.
+
+### Added
+
+- **Persist review & scan findings to `cora.db`** (#397, #398). Best-effort logging — never blocks the pipeline.
+- **Auto-resolve stale findings** (#399). Prior findings auto-marked `resolved` when they no longer appear.
+- **`cora findings` CLI** (#400). `list`, `stats`, `dismiss`, `reopen` actions with `--json` support.
+- **Migration v5 schema** (#396). `reviews`, `findings`, `finding_events` tables. Auto-migrates.
+- **`cora index --rebuild`**. Drop and re-index from scratch.
+- **Rayon parallel processing** (#409, #422). File extraction and embedding in parallel.
+- **Vector index cached in memory** (#407). Eliminates file I/O on every brain search.
+- **Batch symbol lookup in RRF fusion** (#410). DB lookups batched instead of per-result.
+- **SQLite PRAGMA tuning** (#406). WAL, `synchronous=NORMAL`, mmap/cache sizing.
+- **Batch INSERT + transaction** (#404, #405, #411). Multi-row values, single transaction, FTS5 triggers disabled during bulk indexing.
+- **Mtime:size fingerprinting.** Replaces SHA256 for change detection.
+
+### Changed
+
+- **`cora debt` reads from `cora.db` as primary source** (#403). File snapshots are now fallback only.
+- **`graph.db` renamed to `cora.db`** (#395). Auto-migrates on first run.
+
+### Performance
+
+| Operation | Before (v0.8.3) | After (v0.9.0) | Speedup |
+|-----------|-----------------|-----------------|---------|
+| Cold index (full rebuild) | ~1,260ms | ~936ms | 1.3× |
+| Incremental (no changes) | ~414ms | ~6ms | **52×** |
+| Brain search (hybrid) | ~250ms | ~5ms | **40×** |
+
+### Fixed
+
+- **`cora brain` vector search filtered by project_id** (#382). Prevents cross-project noise.
+- **Project root detection** (#380). Walks up from CWD to find project config.
+
 ## [0.8.1] - 2026-07-24
 
 ### Changed

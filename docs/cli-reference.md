@@ -59,6 +59,10 @@ Complete command reference for the cora CLI.
 | `cora debt --estimate` | Show estimated fix time |
 | `cora debt --since v0.4.5` | Filter by git tag or date |
 | `cora debt --branch main` | Filter by branch |
+| `cora findings list` | Show open findings (use `--all`, `--severity`, `--file`, `--json`) |
+| `cora findings stats` | Summary counts with resolution rate (`--json`) |
+| `cora findings dismiss <id>` | Mark finding as won't-fix (optional `--reason`) |
+| `cora findings reopen <id>` | Reopen a dismissed/resolved finding |
 | `cora arch` | Architecture overview — modules, edge types, top connectors |
 | `cora trace` `<symbol>` | Trace call chains from a symbol (depth-limited BFS) |
 | `cora brain` `<query>` | Hybrid search: FTS5 + vector + graph → RRF fusion |

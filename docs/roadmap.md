@@ -117,6 +117,25 @@ Hybrid semantic search and deep language support via AST parsing.
 - [#369](https://github.com/codecoradev/cora-code/pull/369) Security scanner false positive suppression — ✓ Done
 - [#355](https://github.com/codecoradev/cora-code/pull/355) Global index database (`~/.codecora/cora-code/graph.db`) — ✓ Done
 
+## v0.9 — Findings SoT & Performance
+
+Unified data layer and massive performance improvements.
+
+- [#396](https://github.com/codecoradev/cora-code/issues/396) DB migration v5 — `reviews`, `findings`, `finding_events` tables — ✓ Done
+- [#397](https://github.com/codecoradev/cora-code/issues/397) Persist review findings to `cora.db` — ✓ Done
+- [#398](https://github.com/codecoradev/cora-code/issues/398) Persist scan findings to `cora.db` — ✓ Done
+- [#399](https://github.com/codecoradev/cora-code/issues/399) Auto-resolve stale findings — ✓ Done
+- [#400](https://github.com/codecoradev/cora-code/issues/400) `cora findings` CLI command — ✓ Done
+- [#395](https://github.com/codecoradev/cora-code/issues/395) Rename `graph.db` → `cora.db` — ✓ Done
+- [#404](https://github.com/codecoradev/cora-code/issues/404) Batch transaction for index_project — ✓ Done
+- [#405](https://github.com/codecoradev/cora-code/issues/405) Batch INSERT multi-row VALUES — ✓ Done
+- [#406](https://github.com/codecoradev/cora-code/issues/406) SQLite PRAGMA tuning — ✓ Done
+- [#407](https://github.com/codecoradev/cora-code/issues/407) Cache vector index in memory — ✓ Done
+- [#408](https://github.com/codecoradev/cora-code/issues/408) Incremental index via mtime:size — ✓ Done
+- [#409](https://github.com/codecoradev/cora-code/issues/409) Rayon parallel file processing — ✓ Done
+- [#410](https://github.com/codecoradev/cora-code/issues/410) Batch symbol lookup in RRF — ✓ Done
+- [#422](https://github.com/codecoradev/cora-code/pull/422) Rayon parallel embedding — ✓ Done
+
 ## Future — What's Next
 
 ### Other
