@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-07-28
+
+### Added
+
+- **Persist review & scan findings to `cora.db`** (#397, #398). `cora review` and `cora scan` now save findings (severity, file, line, title, fingerprint) to the global database. Uses best-effort logging — never blocks the review pipeline on DB errors.
+- **Auto-resolve stale findings** (#399). When a new review/scan completes, findings from prior reviews that no longer appear are automatically marked `resolved` with an `auto_resolved` event. Findings that reappear stay `open`.
+- **`cora findings` CLI command** (#400). New subcommand with four actions:
+  - `cora findings list` — show open findings (use `--all`, `--severity`, `--file`, `--json` for filtering)
+  - `cora findings stats` — summary counts with resolution rate (`--json` supported)
+  - `cora findings dismiss <id>` — mark as won't-fix with optional `--reason`
+  - `cora findings reopen <id>` — reopen a dismissed/resolved finding
+- **Read-only DB access for `cora findings list/stats`** via `open_db_for_read()` — no migrations, no WAL, safe for concurrent reads.
+
+### Changed
+
+- `db_writer` module now exposes `open_db_for_read()`, `open_db_for_write()`, and `compute_fingerprint_pub()` for use by the findings CLI.
+
 ## [0.8.3] - 2026-07-27
 
 ### Added

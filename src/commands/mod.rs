@@ -3,6 +3,7 @@ pub mod commit_cmd;
 pub mod completion;
 pub mod config_cmd;
 pub mod debt;
+pub mod findings;
 pub mod hook_cmd;
 pub mod init;
 pub mod profile;

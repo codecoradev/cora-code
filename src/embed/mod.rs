@@ -15,5 +15,9 @@
 
 // Embedding engine — consumed by brain module (Phase 3).
 
-pub mod token_vocab;
 pub mod tokens;
+
+// Pre-trained nomic-embed-code module — only compiled when vendored data
+// exists. Excluded from crates.io package (too large for 10 MB upload limit).
+#[cfg(feature = "pretrained-embed")]
+pub mod token_vocab;
