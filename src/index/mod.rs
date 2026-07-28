@@ -33,7 +33,14 @@ pub fn open_global_index() -> anyhow::Result<Connection> {
     let db_path = crate::data_dir::graph_db_path();
 
     let conn = Connection::open(&db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA foreign_keys=ON;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA cache_size=-65536;\
+         PRAGMA mmap_size=268435456;\
+         PRAGMA temp_store=MEMORY;"
+    )?;
     schema::run_migrations(&conn)?;
 
     debug!("Opened global index at {}", db_path.display());
@@ -99,10 +106,29 @@ pub fn index_file(
     language: &str,
 ) -> anyhow::Result<usize> {
     let fingerprint = file_fingerprint(content);
-    let symbols = extract::extract_symbols(content, language, file_path);
+    let extracted = extract::extract_all(content, language, file_path);
 
     let tx = conn.unchecked_transaction()?;
+    let count = index_file_in_tx(&tx, project_id, file_path, &fingerprint, language, &extracted)?;
+    tx.commit()?;
 
+    debug!(
+        "Indexed {file_path}: {count} symbols, {} call edges ({language})",
+        extracted.calls.len()
+    );
+    Ok(count)
+}
+
+/// Write extracted data for a single file within an existing transaction.
+/// Does NOT commit — caller is responsible for `tx.commit()`.
+fn index_file_in_tx(
+    tx: &rusqlite::Transaction,
+    project_id: i64,
+    file_path: &str,
+    fingerprint: &str,
+    language: &str,
+    extracted: &extract::ExtractedAll,
+) -> anyhow::Result<usize> {
     // Delete existing symbols for this file within this project
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1 AND project_id = ?2",
@@ -123,18 +149,20 @@ pub fn index_file(
             file_path,
             fingerprint,
             language,
-            symbols.len() as i64,
+            extracted.symbols.len() as i64,
             project_id
         ],
     )?;
 
-    // Insert symbols
-    let mut count = 0;
-    for sym in &symbols {
-        tx.execute(
+    // Batch INSERT symbols using prepared statement
+    let count = extracted.symbols.len();
+    if !extracted.symbols.is_empty() {
+        let mut stmt = tx.prepare(
             "INSERT INTO symbols (name, kind, file, line, signature, language, project_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+        )?;
+        for sym in &extracted.symbols {
+            stmt.execute(rusqlite::params![
                 sym.name,
                 sym.kind.as_str(),
                 sym.file,
@@ -142,39 +170,54 @@ pub fn index_file(
                 sym.signature,
                 language,
                 project_id,
-            ],
-        )?;
-        count += 1;
-    }
-
-    // Extract and store call graph edges
-    graph::clear_edges_for_file(&tx, file_path, project_id)?;
-    let call_sites = extract::extract_calls(content, language, file_path);
-    for site in &call_sites {
-        tx.execute(
-            "INSERT INTO call_graph (caller, callee, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![site.caller, site.callee, site.file, site.line as i64, project_id],
-        )?;
-    }
-
-    #[cfg(feature = "tree-sitter")]
-    {
-        graph::clear_kg_edges_for_file(&tx, file_path, project_id)?;
-        let kg_edges = extract::extract_edges(content, language, file_path);
-        for e in &kg_edges {
-            tx.execute(
-                "INSERT INTO edges (source, kind, target, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![e.source, e.kind.as_str(), e.target, e.file, e.line as i64, project_id],
-            )?;
+            ])?;
         }
     }
 
-    tx.commit()?;
+    // Clear and insert call graph edges
+    tx.execute(
+        "DELETE FROM call_graph WHERE file = ?1 AND project_id = ?2",
+        rusqlite::params![file_path, project_id],
+    )?;
+    if !extracted.calls.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)"
+        )?;
+        for site in &extracted.calls {
+            stmt.execute(rusqlite::params![
+                site.caller,
+                site.callee,
+                site.file,
+                site.line as i64,
+                project_id,
+            ])?;
+        }
+    }
 
-    debug!(
-        "Indexed {file_path}: {count} symbols, {} call edges ({language})",
-        call_sites.len()
-    );
+    // Clear and insert knowledge graph edges (tree-sitter only)
+    #[cfg(feature = "tree-sitter")]
+    {
+        tx.execute(
+            "DELETE FROM edges WHERE file = ?1 AND project_id = ?2",
+            rusqlite::params![file_path, project_id],
+        )?;
+        if !extracted.kg_edges.is_empty() {
+            let mut stmt = tx.prepare(
+                "INSERT INTO edges (source, kind, target, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            )?;
+            for e in &extracted.kg_edges {
+                stmt.execute(rusqlite::params![
+                    e.source,
+                    e.kind.as_str(),
+                    e.target,
+                    e.file,
+                    e.line as i64,
+                    project_id,
+                ])?;
+            }
+        }
+    }
+
     Ok(count)
 }
 
@@ -219,6 +262,8 @@ fn index_project_with_id(
         .git_exclude(true)
         .build();
 
+    // Collect files to index
+    let mut files_to_index: Vec<(String, String, String)> = Vec::new(); // (rel_str, content, language)
     for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -246,16 +291,71 @@ fn index_project_with_id(
             continue;
         }
 
-        stats.files_indexed += 1;
-        match index_file(conn, project_id, &rel_str, &content, language) {
-            Ok(n) => stats.symbols_indexed += n,
-            Err(e) => {
-                stats.errors += 1;
-                if verbose {
-                    eprintln!("  ⚠ Failed to index {rel_str}: {e}");
+        files_to_index.push((rel_str, content, language.to_string()));
+    }
+
+    if !files_to_index.is_empty() {
+        // Single transaction for ALL files — eliminates per-file fsync
+        let tx = conn.unchecked_transaction()?;
+
+        // Disable FTS5 triggers during bulk insert to avoid 3x write amplification.
+        // For a content-sync FTS5 table (content='symbols'), the correct bulk-load
+        // sequence is: drop triggers → insert rows → 'rebuild' command → recreate triggers.
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS symbols_fts_insert;\
+             DROP TRIGGER IF EXISTS symbols_fts_delete;\
+             DROP TRIGGER IF EXISTS symbols_fts_update;"
+        )?;
+
+        for (rel_str, content, language) in &files_to_index {
+            let fingerprint = file_fingerprint(content);
+            let extracted = extract::extract_all(content, language, rel_str);
+            match index_file_in_tx(&tx, project_id, rel_str, &fingerprint, language, &extracted) {
+                Ok(n) => {
+                    stats.files_indexed += 1;
+                    stats.symbols_indexed += n;
+                }
+                Err(e) => {
+                    stats.errors += 1;
+                    if verbose {
+                        eprintln!("  ⚠ Failed to index {rel_str}: {e}");
+                    }
                 }
             }
         }
+
+        // Rebuild FTS5 index from the content table in one shot.
+        // 'rebuild' tells FTS5 to discard its data and re-read from the
+        // external content table (symbols) — much cheaper than per-row triggers.
+        tx.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')", [])?;
+
+        // Recreate FTS5 triggers for incremental updates after bulk load
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS symbols_fts_insert
+             AFTER INSERT ON symbols
+             BEGIN
+                 INSERT INTO symbols_fts(rowid, name, signature)
+                 VALUES (new.id, new.name, new.signature);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS symbols_fts_delete
+             AFTER DELETE ON symbols
+             BEGIN
+                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature)
+                 VALUES ('delete', old.id, old.name, old.signature);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS symbols_fts_update
+             AFTER UPDATE ON symbols
+             BEGIN
+                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature)
+                 VALUES ('delete', old.id, old.name, old.signature);
+                 INSERT INTO symbols_fts(rowid, name, signature)
+                 VALUES (new.id, new.name, new.signature);
+             END;"
+        )?;
+
+        tx.commit()?;
     }
 
     // Update project's last_indexed timestamp

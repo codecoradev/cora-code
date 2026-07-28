@@ -731,6 +731,133 @@ fn is_builtin(name: &str) -> bool {
     )
 }
 
+/// All extracted data from a single file (symbols + calls + kg edges).
+/// Used by bulk indexing to parse tree-sitter only once.
+#[derive(Debug, Clone, Default)]
+pub struct ExtractedAll {
+    pub symbols: Vec<ExtractedDef>,
+    pub calls: Vec<CallSite>,
+    pub kg_edges: Vec<KgEdge>,
+}
+
+/// A knowledge-graph edge (calls, imports, implements, inherits, etc.).
+#[cfg(feature = "tree-sitter")]
+pub type KgEdge = crate::index::ast::AstEdge;
+
+/// A knowledge-graph edge stub when tree-sitter is disabled (never used).
+#[cfg(not(feature = "tree-sitter"))]
+#[derive(Debug, Clone)]
+pub struct KgEdge {
+    pub source: String,
+    pub kind: String,
+    pub target: String,
+    pub file: String,
+    pub line: u32,
+}
+
+/// Extract everything from a file in a single pass.
+/// When tree-sitter is available, this parses the source only once and returns
+/// all three outputs (symbols, call graph edges, knowledge graph edges).
+/// For unsupported languages, falls back to regex-based extraction.
+pub fn extract_all(content: &str, language: &str, file_path: &str) -> ExtractedAll {
+    #[cfg(feature = "tree-sitter")]
+    {
+        use super::ast;
+        if ast::get_language(language).is_some() || language == "svelte" {
+            let (nodes, edges) = ast::extract(content, language, file_path);
+            let calls: Vec<CallSite> = edges
+                .iter()
+                .filter(|e| e.kind == ast::EdgeKind::Calls)
+                .cloned()
+                .map(Into::into)
+                .collect();
+            let kg_edges: Vec<_> = edges
+                .into_iter()
+                .filter(|e| e.kind != ast::EdgeKind::Calls)
+                .collect();
+            let symbols = nodes.into_iter().map(Into::into).collect();
+            return ExtractedAll {
+                symbols,
+                calls,
+                kg_edges,
+            };
+        }
+    }
+
+    // Regex fallback
+    let symbols = extract_symbols(content, language, file_path);
+    let calls = {
+        // For regex path, we need calls without re-parsing via tree-sitter
+        // Call the regex fallback directly
+        #[cfg(feature = "tree-sitter")]
+        {
+            // When tree-sitter is compiled but language is unsupported,
+            // extract_calls will also fall through to regex path.
+            // We already have symbols, just get calls.
+            use crate::engine::context::extraction as ctx_extract;
+            use crate::engine::context::types::SymbolKind as CtxSymbolKind;
+
+            let lines: Vec<&str> = content.lines().collect();
+            let mut current_fn: Option<String> = None;
+            let mut brace_depth: i32 = 0;
+            let mut calls = Vec::new();
+
+            for (i, line) in lines.iter().enumerate() {
+                let line_no = (i + 1) as u32;
+                if language == "rs"
+                    || language == "go"
+                    || language == "c"
+                    || language == "cpp"
+                    || language == "java"
+                    || language == "kt"
+                    || language == "dart"
+                {
+                    if let Some(fn_name) = detect_function_entry(line, language) {
+                        current_fn = Some(fn_name);
+                        brace_depth = 0;
+                    }
+                }
+                brace_depth += line.chars().filter(|&c| c == '{').count() as i32
+                    - line.chars().filter(|&c| c == '}').count() as i32;
+                if brace_depth <= 0 && current_fn.is_some() {
+                    current_fn = None;
+                }
+                let syms = ctx_extract::extract_symbols_from_line(line, language);
+                for sym in syms {
+                    if let CtxSymbolKind::FunctionCall(name) = sym {
+                        if name == current_fn.as_deref().unwrap_or("") {
+                            continue;
+                        }
+                        if is_builtin(&name) {
+                            continue;
+                        }
+                        if let Some(caller) = &current_fn {
+                            calls.push(CallSite {
+                                caller: caller.clone(),
+                                callee: name,
+                                file: file_path.to_string(),
+                                line: line_no,
+                            });
+                        }
+                    }
+                }
+            }
+            calls
+        }
+        #[cfg(not(feature = "tree-sitter"))]
+        {
+            // Without tree-sitter, extract_calls uses regex fallback anyway
+            extract_calls(content, language, file_path)
+        }
+    };
+
+    ExtractedAll {
+        symbols,
+        calls,
+        kg_edges: Vec::new(),
+    }
+}
+
 /// A function call site extracted from source code.
 #[derive(Debug, Clone)]
 pub struct CallSite {
