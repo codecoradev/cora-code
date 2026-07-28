@@ -239,6 +239,25 @@ pub fn needs_reindex(conn: &Connection, project_id: i64, file_path: &str, conten
     }
 }
 
+/// Load all file fingerprints for a project in a single query.
+/// Returns `HashMap<file_path, fingerprint>` — O(1) lookup per file
+/// instead of N individual DB roundtrips.
+fn load_all_fingerprints(
+    conn: &Connection,
+    project_id: i64,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, fingerprint FROM files WHERE project_id = ?1",
+    )?;
+    let map: HashMap<String, String> = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(map)
+}
+
 /// Index a project directory, respecting .gitignore.
 ///
 /// Returns summary stats.
@@ -256,14 +275,19 @@ fn index_project_with_id(
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
 
+    // Collect files to index
+    let mut files_to_index: Vec<(String, String, String, String)> = Vec::new(); // (rel_str, content, language, cheap_fp)
+
+    // Batch-load all fingerprints in ONE query — eliminates N per-file DB roundtrips.
+    let stored_fingerprints = load_all_fingerprints(conn, project_id)
+        .unwrap_or_default();
+
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
         .git_exclude(true)
         .build();
 
-    // Collect files to index
-    let mut files_to_index: Vec<(String, String, String)> = Vec::new(); // (rel_str, content, language)
     for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -281,17 +305,36 @@ fn index_project_with_id(
 
         stats.files_scanned += 1;
 
+        // Compute mtime:size fingerprint — cheap, no file read needed.
+        // metadata() is a stat() call, ~microseconds per file.
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let size = metadata.len();
+        let cheap_fp = format!("{mtime}:{size}");
+
+        // O(1) hashmap lookup — skip file entirely if unchanged
+        if let Some(stored) = stored_fingerprints.get(&rel_str) {
+            if *stored == cheap_fp {
+                stats.files_skipped += 1;
+                continue;
+            }
+        }
+
+        // Only read file content when we know it changed
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        if !needs_reindex(conn, project_id, &rel_str, &content) {
-            stats.files_skipped += 1;
-            continue;
-        }
-
-        files_to_index.push((rel_str, content, language.to_string()));
+        files_to_index.push((rel_str, content, language.to_string(), cheap_fp));
     }
 
     if !files_to_index.is_empty() {
@@ -307,10 +350,9 @@ fn index_project_with_id(
              DROP TRIGGER IF EXISTS symbols_fts_update;"
         )?;
 
-        for (rel_str, content, language) in &files_to_index {
-            let fingerprint = file_fingerprint(content);
+        for (rel_str, content, language, cheap_fp) in &files_to_index {
             let extracted = extract::extract_all(content, language, rel_str);
-            match index_file_in_tx(&tx, project_id, rel_str, &fingerprint, language, &extracted) {
+            match index_file_in_tx(&tx, project_id, rel_str, cheap_fp, language, &extracted) {
                 Ok(n) => {
                     stats.files_indexed += 1;
                     stats.symbols_indexed += n;
@@ -369,17 +411,19 @@ fn index_project_with_id(
         stats.files_scanned, stats.files_indexed, stats.symbols_indexed, stats.errors
     );
 
-    // Embed symbols into vector index for brain search
-    match brain::embed_project(conn, project_id) {
-        Ok(n) => {
-            stats.embedded_symbols = Some(n);
-            info!("Brain: embedded {n} symbols");
-        }
-        Err(e) => {
-            if verbose {
-                eprintln!("  ⚠ Embedding failed (non-fatal): {e}");
+    // Embed symbols into vector index for brain search — only when files changed
+    if stats.files_indexed > 0 {
+        match brain::embed_project(conn, project_id) {
+            Ok(n) => {
+                stats.embedded_symbols = Some(n);
+                info!("Brain: embedded {n} symbols");
             }
-            tracing::warn!("Embedding failed: {e}");
+            Err(e) => {
+                if verbose {
+                    eprintln!("  ⚠ Embedding failed (non-fatal): {e}");
+                }
+                tracing::warn!("Embedding failed: {e}");
+            }
         }
     }
 
