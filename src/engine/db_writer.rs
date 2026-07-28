@@ -118,6 +118,64 @@ pub fn save_review_to_db(record: &ReviewRecord<'_>) -> Option<i64> {
     Some(review_id)
 }
 
+/// Auto-resolve findings from prior reviews that no longer appear.
+///
+/// After saving a new review, any `open` findings in the same project whose
+/// fingerprint is *not* in the current review's findings are marked `resolved`
+/// with an `auto_resolved` event. Findings that *do* reappear are left `open`.
+pub fn resolve_stale_findings(project_root: &str, current_fingerprints: &[String]) -> usize {
+    let Ok(conn) = open_db() else { return 0 };
+    let Ok(project_id) = schema::get_or_create_project(&conn, project_root) else { return 0 };
+
+    // Fetch (id, fingerprint) for all open findings in this project.
+    let mut stmt = match conn.prepare(
+        "SELECT f.id, f.fingerprint FROM findings f
+         JOIN reviews r ON f.review_id = r.id
+         WHERE r.project_id = ?1
+           AND f.status = 'open'
+           AND f.fingerprint IS NOT NULL",
+    ) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut rows = match stmt.query(rusqlite::params![project_id]) {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+
+    let mut stale_ids: Vec<i64> = Vec::new();
+    while let Some(row) = rows.next().unwrap_or(None) {
+        let id: i64 = row.get(0).unwrap_or(0);
+        let fp: String = row.get(1).unwrap_or_default();
+        if !current_fingerprints.contains(&fp) {
+            stale_ids.push(id);
+        }
+    }
+
+    let mut resolved = 0;
+    let mut stmt_update = conn
+        .prepare("UPDATE findings SET status = 'resolved' WHERE id = ?1")
+        .ok();
+    let mut stmt_event = conn
+        .prepare(
+            "INSERT INTO finding_events (finding_id, event_type, note)
+             VALUES (?1, 'auto_resolved', 'No longer found in latest review')",
+        )
+        .ok();
+
+    for id in &stale_ids {
+        if let (Some(u), Some(e)) = (stmt_update.as_mut(), stmt_event.as_mut()) {
+            if u.execute(rusqlite::params![id]).is_ok()
+                && e.execute(rusqlite::params![id]).is_ok()
+            {
+                resolved += 1;
+            }
+        }
+    }
+
+    resolved
+}
+
 /// Open the global `cora.db` and ensure migrations are up to date.
 fn open_db() -> anyhow::Result<Connection> {
     crate::data_dir::ensure_data_dir()?;
@@ -130,6 +188,12 @@ fn open_db() -> anyhow::Result<Connection> {
 }
 
 /// Compute a fingerprint for dedup/auto-resolve: `file:line:title_slug`.
+/// Public wrapper so callers (review.rs, scan.rs) can compute fingerprints
+/// for the current review before calling `resolve_stale_findings`.
+pub fn compute_fingerprint_pub(issue: &ReviewIssue) -> String {
+    compute_fingerprint(issue)
+}
+
 fn compute_fingerprint(issue: &ReviewIssue) -> String {
     let line = issue.line.unwrap_or(0);
     let title_slug = issue.title.to_lowercase().replace(' ', "_");
@@ -154,7 +218,6 @@ fn calculate_score(issues: &[ReviewIssue]) -> f64 {
     score.max(0.0)
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests {
     use super::*;

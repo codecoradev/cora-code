@@ -285,6 +285,17 @@ pub async fn execute_scan(
         if db_writer::save_review_to_db(&record).is_none() {
             debug!("Failed to save scan to cora.db");
         }
+
+        // Auto-resolve findings that no longer appear in this scan.
+        let fps: Vec<String> = response
+            .issues
+            .iter()
+            .map(|i| db_writer::compute_fingerprint_pub(i))
+            .collect();
+        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
+        if resolved > 0 {
+            debug!(resolved, "auto-resolved stale findings");
+        }
     }
 
     if response.should_block && config.hook.mode == "block" {

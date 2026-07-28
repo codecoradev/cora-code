@@ -333,6 +333,17 @@ pub async fn execute_review(
         if db_writer::save_review_to_db(&record).is_none() {
             debug!("Failed to save review to cora.db");
         }
+
+        // Auto-resolve findings that no longer appear in this review.
+        let fps: Vec<String> = filtered_response
+            .issues
+            .iter()
+            .map(|i| db_writer::compute_fingerprint_pub(i))
+            .collect();
+        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
+        if resolved > 0 {
+            debug!(resolved, "auto-resolved stale findings");
+        }
     }
     let exit_code = if gate_result
         .as_ref()
@@ -702,6 +713,17 @@ async fn execute_chunked_review(
         };
         if db_writer::save_review_to_db(&record).is_none() {
             debug!("Failed to save review to cora.db");
+        }
+
+        // Auto-resolve findings that no longer appear in this review.
+        let fps: Vec<String> = filtered_response
+            .issues
+            .iter()
+            .map(|i| db_writer::compute_fingerprint_pub(i))
+            .collect();
+        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
+        if resolved > 0 {
+            debug!(resolved, "auto-resolved stale findings");
         }
     }
     let exit_code = compute_exit_code(

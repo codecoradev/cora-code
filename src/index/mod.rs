@@ -26,7 +26,7 @@ pub use symbols::{SearchResult, SymbolKind, SymbolQuery};
 
 /// Open or create the **global** symbol index database.
 ///
-/// All projects share a single SQLite database at `~/.codecora/cora-code/graph.db`.
+/// All projects share a single SQLite database at `~/.codecora/cora-code/cora.db`.
 /// Project isolation is handled via the `project_id` foreign key.
 pub fn open_global_index() -> anyhow::Result<Connection> {
     crate::data_dir::ensure_data_dir()?;
