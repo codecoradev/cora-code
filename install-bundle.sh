@@ -14,24 +14,34 @@ REPO_NAME="cora-code"
 BINARY_NAME="cora"
 INSTALL_DIR="$HOME/.local/bin"
 
-# Detect platform
+# Detect platform → Rust target triple + archive extension
 detect_platform() {
     OS="$(uname -s)"
     ARCH="$(uname -m)"
 
-    case "$OS" in
-        Linux*)  OS="linux" ;;
-        Darwin*) OS="macos" ;;
-        *)       echo "Unsupported OS: $OS"; exit 1 ;;
-    esac
-
+    # Normalize arch
     case "$ARCH" in
-        x86_64|amd64) ARCH="x86_64" ;;
+        x86_64|amd64)  ARCH="x86_64" ;;
         aarch64|arm64) ARCH="aarch64" ;;
         *)             echo "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
 
-    PLATFORM="${OS}-${ARCH}"
+    # Map OS + arch → Rust target triple
+    case "$OS" in
+        Linux*)   TARGET="${ARCH}-unknown-linux-gnu"; EXT="tar.gz" ;;
+        Darwin*)  TARGET="${ARCH}-apple-darwin";     EXT="tar.gz" ;;
+        *)        echo "Unsupported OS: $OS"; exit 1 ;;
+    esac
+
+    # Windows override (MSYS2 / Git Bash)
+    case "${MSYSTEM:-}${MINGW:-}" in
+        *MSYS*|*MINGW*)
+            TARGET="${ARCH}-pc-windows-msvc"
+            EXT="zip"
+            ;;
+    esac
+
+    PLATFORM="$TARGET"
 }
 
 # Get latest release tag from GitHub
@@ -67,11 +77,24 @@ install_binary() {
     # Create install directory
     mkdir -p "$INSTALL_DIR"
 
-    # Download URL
-    URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/${BINARY_NAME}-${PLATFORM}"
+    # Download URL — matches release asset naming: cora-{target}-v{version}.{ext}
+    ARCHIVE_NAME="${BINARY_NAME}-${PLATFORM}-${VERSION}.${EXT}"
+    URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${VERSION}/${ARCHIVE_NAME}"
+
+    TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "${TMPDIR}"' EXIT
 
     echo "Downloading ${BINARY_NAME} ${VERSION}..."
-    curl -fsSL "$URL" -o "${INSTALL_DIR}/${BINARY_NAME}"
+    curl -fsSL "$URL" -o "${TMPDIR}/${ARCHIVE_NAME}"
+
+    # Extract archive
+    case "$EXT" in
+        tar.gz) tar xzf "${TMPDIR}/${ARCHIVE_NAME}" -C "${TMPDIR}" ;;
+        zip)    unzip -qo "${TMPDIR}/${ARCHIVE_NAME}" -d "${TMPDIR}" ;;
+    esac
+
+    # Install binary
+    mv "${TMPDIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 
     # Make executable
     chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
