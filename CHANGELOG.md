@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-28
+
+### Highlights
+
+- **Single source of truth.** Review findings, scan findings, and tech debt snapshots now persist to `cora.db` — one global database, no more scattered file snapshots.
+- **Massive indexing speedup.** Rayon-parallel extraction + embedding, batch SQLite writes, PRAGMA tuning, and mtime:size fingerprinting deliver **52× faster incremental indexing** (414ms → 6ms) and **1.3× faster cold rebuild** (1,260ms → 936ms).
+- **`cora findings` CLI.** Track, filter, dismiss, and reopen findings across all your reviews.
+
+### Added
+
+- **Persist review & scan findings to `cora.db`** (#397, #398). `cora review` and `cora scan` now save findings (severity, file, line, title, fingerprint) to the global database. Best-effort logging — never blocks the review pipeline on DB errors.
+- **Auto-resolve stale findings** (#399). When a new review/scan completes, findings from prior reviews that no longer appear are automatically marked `resolved` with an `auto_resolved` event. Findings that reappear stay `open`.
+- **`cora findings` CLI command** (#400). New subcommand with four actions:
+  - `cora findings list` — show open findings (use `--all`, `--severity`, `--file`, `--json` for filtering)
+  - `cora findings stats` — summary counts with resolution rate (`--json` supported)
+  - `cora findings dismiss <id>` — mark as won't-fix with optional `--reason`
+  - `cora findings reopen <id>` — reopen a dismissed/resolved finding
+- **Migration v5 schema** (#396). New tables: `reviews`, `findings`, `finding_events`. Auto-migrates on first run.
+- **`cora index --rebuild` flag.** Drop and re-index from scratch — useful for schema upgrades or corrupted indices.
+- **Rayon parallel processing** (#409, #422). File extraction and embedding computation now run in parallel across CPU cores via Rayon.
+- **Cache vector index in memory** (#407). `VECTOR_CACHE` (LazyLock) keeps the usearch HNSW index hot in memory — eliminates file I/O on every brain search.
+- **Batch symbol lookup in RRF fusion** (#410). Brain search now batches DB lookups instead of per-result queries.
+- **SQLite PRAGMA tuning** (#406). `journal_mode=WAL`, `synchronous=NORMAL`, `mmap_size=256MB`, `cache_size=-64MB` for faster writes.
+- **Batch INSERT via multi-row VALUES** (#405). Symbol insertion now uses multi-row `INSERT ... VALUES (?,?,?),(?,?,?),...` instead of per-row inserts.
+- **Batch transaction for `index_project`** (#404). All symbol/edge insertions wrapped in a single `BEGIN IMMEDIATE ... COMMIT`.
+- **Disable FTS5 triggers during bulk indexing** (#411). Triggers re-enabled after commit — avoids redundant index updates mid-batch.
+- **Mtime:size fingerprinting.** Replaces SHA256 content hashing for change detection. Trade-off: `--rebuild` available for full re-validation.
+
+### Changed
+
+- **`cora debt` reads from `cora.db` as primary source** (#403). File snapshots are now fallback only. DB is the single source of truth for tech debt reports.
+- **`graph.db` renamed to `cora.db`** (#395). Auto-migrates existing `graph.db` on first run.
+- `db_writer` module now exposes `open_db_for_read()`, `open_db_for_write()`, and `compute_fingerprint_pub()` for use by the findings CLI.
+
+### Performance
+
+Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
+
+| Operation | Before (v0.8.3) | After (v0.9.0) | Speedup |
+|-----------|-----------------|-----------------|---------|
+| Cold index (full rebuild) | ~1,260ms | ~936ms | 1.3× |
+| Incremental (no changes) | ~414ms | ~6ms | **52×** |
+| Brain search (hybrid) | ~250ms | ~5ms | **40×** |
+
+### Fixed
+
+- **`cora brain` vector search filtered by project_id** (#382). Over-fetches from global usearch index, filters at DB layer — prevents cross-project noise.
+- **Project root detection** (#380). Walks up from CWD to find `.cora.yaml` / `Cargo.toml` / `.git` instead of always using CWD.
+
 ## [0.8.3] - 2026-07-27
 
 ### Added

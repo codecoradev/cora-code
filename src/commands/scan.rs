@@ -5,6 +5,7 @@ use colored::Colorize;
 use tracing::debug;
 
 use crate::config::schema::Config;
+use crate::engine::db_writer;
 use crate::engine::scanner::{batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
 use crate::formatters::{OutputFormat, formatter_for};
@@ -96,7 +97,7 @@ pub async fn execute_scan(
         });
         let skipped = before_count - files.len();
         if skipped > 0 {
-            println!(
+            eprintln!(
                 "  {} skipped (unchanged since last scan)",
                 skipped.to_string().dimmed()
             );
@@ -104,11 +105,11 @@ pub async fn execute_scan(
     }
 
     if files.is_empty() {
-        println!("{}", "No files to scan.".yellow());
+        eprintln!("{}", "No files to scan.".yellow());
         return Ok(0);
     }
 
-    println!("🔍 {} files to review…", files.len().to_string().cyan());
+    eprintln!("🔍 {} files to review…", files.len().to_string().cyan());
 
     // 2. Calculate total lines
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
@@ -139,7 +140,7 @@ pub async fn execute_scan(
             String::new()
         };
 
-        println!("  Reviewing{batch_label}…");
+        eprintln!("  Reviewing{batch_label}…");
 
         match crate::engine::llm::scan_files(
             llm_config,
@@ -249,6 +250,52 @@ pub async fn execute_scan(
         }
         cache.save()?;
         debug!(cached = files.len(), "saved scan cache");
+    }
+
+    // 7. Save scan findings to cora.db (best-effort)
+    {
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
+        let branch = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let record = db_writer::ReviewRecord {
+            command: "scan",
+            project_root: &cwd,
+            commit_hash: commit.as_deref(),
+            branch: branch.as_deref(),
+            summary: &response.summary,
+            gate_status: "disabled",
+            files_scanned: response.files_scanned,
+            lines_scanned: response.lines_scanned,
+            should_block: response.should_block,
+            tokens: response.tokens_used.as_ref(),
+            issues: &response.issues,
+        };
+        if db_writer::save_review_to_db(&record).is_none() {
+            debug!("Failed to save scan to cora.db");
+        }
+
+        // Auto-resolve findings that no longer appear in this scan.
+        let fps: Vec<String> = response
+            .issues
+            .iter()
+            .map(db_writer::compute_fingerprint_pub)
+            .collect();
+        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
+        if resolved > 0 {
+            debug!(resolved, "auto-resolved stale findings");
+        }
     }
 
     if response.should_block && config.hook.mode == "block" {

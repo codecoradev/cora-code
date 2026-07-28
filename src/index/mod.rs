@@ -16,7 +16,9 @@ pub mod vector;
 use std::collections::HashMap;
 use std::path::Path;
 
+use rayon::prelude::*;
 use rusqlite::Connection;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
@@ -26,14 +28,21 @@ pub use symbols::{SearchResult, SymbolKind, SymbolQuery};
 
 /// Open or create the **global** symbol index database.
 ///
-/// All projects share a single SQLite database at `~/.codecora/cora-code/graph.db`.
+/// All projects share a single SQLite database at `~/.codecora/cora-code/cora.db`.
 /// Project isolation is handled via the `project_id` foreign key.
 pub fn open_global_index() -> anyhow::Result<Connection> {
     crate::data_dir::ensure_data_dir()?;
     let db_path = crate::data_dir::graph_db_path();
 
     let conn = Connection::open(&db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;\
+         PRAGMA foreign_keys=ON;\
+         PRAGMA synchronous=NORMAL;\
+         PRAGMA cache_size=-65536;\
+         PRAGMA mmap_size=268435456;\
+         PRAGMA temp_store=MEMORY;",
+    )?;
     schema::run_migrations(&conn)?;
 
     debug!("Opened global index at {}", db_path.display());
@@ -85,12 +94,9 @@ pub fn resolve_project_id(conn: &Connection) -> anyhow::Result<(i64, std::path::
     Ok((project_id, root))
 }
 
+#[cfg(test)]
 /// Index a single file: extract symbols and store in the database.
-///
-/// `project_id` is written to every row so data is scoped per-project
-/// in the global database.
-///
-/// Returns the number of symbols indexed.
+/// Test-only — production uses `index_project_with_id` with batch fingerprinting.
 pub fn index_file(
     conn: &Connection,
     project_id: i64,
@@ -99,10 +105,36 @@ pub fn index_file(
     language: &str,
 ) -> anyhow::Result<usize> {
     let fingerprint = file_fingerprint(content);
-    let symbols = extract::extract_symbols(content, language, file_path);
+    let extracted = extract::extract_all(content, language, file_path);
 
     let tx = conn.unchecked_transaction()?;
+    let count = index_file_in_tx(
+        &tx,
+        project_id,
+        file_path,
+        &fingerprint,
+        language,
+        &extracted,
+    )?;
+    tx.commit()?;
 
+    debug!(
+        "Indexed {file_path}: {count} symbols, {} call edges ({language})",
+        extracted.calls.len()
+    );
+    Ok(count)
+}
+
+/// Write extracted data for a single file within an existing transaction.
+/// Does NOT commit — caller is responsible for `tx.commit()`.
+fn index_file_in_tx(
+    tx: &rusqlite::Transaction,
+    project_id: i64,
+    file_path: &str,
+    fingerprint: &str,
+    language: &str,
+    extracted: &extract::ExtractedAll,
+) -> anyhow::Result<usize> {
     // Delete existing symbols for this file within this project
     tx.execute(
         "DELETE FROM symbols WHERE file = ?1 AND project_id = ?2",
@@ -123,18 +155,20 @@ pub fn index_file(
             file_path,
             fingerprint,
             language,
-            symbols.len() as i64,
+            extracted.symbols.len() as i64,
             project_id
         ],
     )?;
 
-    // Insert symbols
-    let mut count = 0;
-    for sym in &symbols {
-        tx.execute(
+    // Batch INSERT symbols using prepared statement
+    let count = extracted.symbols.len();
+    if !extracted.symbols.is_empty() {
+        let mut stmt = tx.prepare(
             "INSERT INTO symbols (name, kind, file, line, signature, language, project_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
+        )?;
+        for sym in &extracted.symbols {
+            stmt.execute(rusqlite::params![
                 sym.name,
                 sym.kind.as_str(),
                 sym.file,
@@ -142,58 +176,72 @@ pub fn index_file(
                 sym.signature,
                 language,
                 project_id,
-            ],
-        )?;
-        count += 1;
-    }
-
-    // Extract and store call graph edges
-    graph::clear_edges_for_file(&tx, file_path, project_id)?;
-    let call_sites = extract::extract_calls(content, language, file_path);
-    for site in &call_sites {
-        tx.execute(
-            "INSERT INTO call_graph (caller, callee, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![site.caller, site.callee, site.file, site.line as i64, project_id],
-        )?;
-    }
-
-    #[cfg(feature = "tree-sitter")]
-    {
-        graph::clear_kg_edges_for_file(&tx, file_path, project_id)?;
-        let kg_edges = extract::extract_edges(content, language, file_path);
-        for e in &kg_edges {
-            tx.execute(
-                "INSERT INTO edges (source, kind, target, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![e.source, e.kind.as_str(), e.target, e.file, e.line as i64, project_id],
-            )?;
+            ])?;
         }
     }
 
-    tx.commit()?;
+    // Clear and insert call graph edges
+    tx.execute(
+        "DELETE FROM call_graph WHERE file = ?1 AND project_id = ?2",
+        rusqlite::params![file_path, project_id],
+    )?;
+    if !extracted.calls.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)"
+        )?;
+        for site in &extracted.calls {
+            stmt.execute(rusqlite::params![
+                site.caller,
+                site.callee,
+                site.file,
+                site.line as i64,
+                project_id,
+            ])?;
+        }
+    }
 
-    debug!(
-        "Indexed {file_path}: {count} symbols, {} call edges ({language})",
-        call_sites.len()
-    );
+    // Clear and insert knowledge graph edges (tree-sitter only)
+    #[cfg(feature = "tree-sitter")]
+    {
+        tx.execute(
+            "DELETE FROM edges WHERE file = ?1 AND project_id = ?2",
+            rusqlite::params![file_path, project_id],
+        )?;
+        if !extracted.kg_edges.is_empty() {
+            let mut stmt = tx.prepare(
+                "INSERT INTO edges (source, kind, target, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+            )?;
+            for e in &extracted.kg_edges {
+                stmt.execute(rusqlite::params![
+                    e.source,
+                    e.kind.as_str(),
+                    e.target,
+                    e.file,
+                    e.line as i64,
+                    project_id,
+                ])?;
+            }
+        }
+    }
+
     Ok(count)
 }
 
-/// Check if a file needs re-indexing based on content hash.
-pub fn needs_reindex(conn: &Connection, project_id: i64, file_path: &str, content: &str) -> bool {
-    let fingerprint = file_fingerprint(content);
-
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT fingerprint FROM files WHERE path = ?1 AND project_id = ?2",
-            rusqlite::params![file_path, project_id],
-            |row| row.get(0),
-        )
-        .ok();
-
-    match stored {
-        Some(fp) => fp != fingerprint,
-        None => true,
-    }
+/// Load all file fingerprints for a project in a single query.
+/// Returns `HashMap<file_path, fingerprint>` — O(1) lookup per file
+/// instead of N individual DB roundtrips.
+fn load_all_fingerprints(
+    conn: &Connection,
+    project_id: i64,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare("SELECT path, fingerprint FROM files WHERE project_id = ?1")?;
+    let map: HashMap<String, String> = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(map)
 }
 
 /// Index a project directory, respecting .gitignore.
@@ -212,6 +260,12 @@ fn index_project_with_id(
     verbose: bool,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
+
+    // Collect files to index
+    let mut files_to_index: Vec<(String, String, String, String)> = Vec::new(); // (rel_str, content, language, cheap_fp)
+
+    // Batch-load all fingerprints in ONE query — eliminates N per-file DB roundtrips.
+    let stored_fingerprints = load_all_fingerprints(conn, project_id).unwrap_or_default();
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
@@ -236,26 +290,121 @@ fn index_project_with_id(
 
         stats.files_scanned += 1;
 
+        // Compute mtime:size fingerprint — cheap, no file read needed.
+        // metadata() is a stat() call, ~microseconds per file.
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let size = metadata.len();
+        let cheap_fp = format!("{mtime}:{size}");
+
+        // O(1) hashmap lookup — skip file entirely if unchanged
+        if let Some(stored) = stored_fingerprints.get(&rel_str) {
+            if *stored == cheap_fp {
+                stats.files_skipped += 1;
+                continue;
+            }
+        }
+
+        // Only read file content when we know it changed
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => continue,
         };
 
-        if !needs_reindex(conn, project_id, &rel_str, &content) {
-            stats.files_skipped += 1;
-            continue;
-        }
+        files_to_index.push((rel_str, content, language.to_string(), cheap_fp));
+    }
 
-        stats.files_indexed += 1;
-        match index_file(conn, project_id, &rel_str, &content, language) {
-            Ok(n) => stats.symbols_indexed += n,
-            Err(e) => {
-                stats.errors += 1;
-                if verbose {
-                    eprintln!("  ⚠ Failed to index {rel_str}: {e}");
+    if !files_to_index.is_empty() {
+        // ── Phase 1: Parallel extraction (CPU-bound tree-sitter + regex) ───
+        // Rayon par_iter distributes file parsing across all CPU cores.
+        // extract_all is CPU-bound (~4ms/file) and fully thread-safe.
+        let t_extract = std::time::Instant::now();
+        let extracted_files: Vec<(String, extract::ExtractedAll, String, String)> = files_to_index
+            .par_iter()
+            .map(|(rel_str, content, language, cheap_fp)| {
+                let extracted = extract::extract_all(content, language, rel_str);
+                (
+                    rel_str.clone(),
+                    extracted,
+                    language.clone(),
+                    cheap_fp.clone(),
+                )
+            })
+            .collect();
+        let extract_ms = t_extract.elapsed().as_millis();
+
+        // ── Phase 2: Serial SQLite writes (single transaction) ─────────
+        let t_db = std::time::Instant::now();
+        let tx = conn.unchecked_transaction()?;
+
+        // Disable FTS5 triggers during bulk insert to avoid 3x write amplification.
+        tx.execute_batch(
+            "DROP TRIGGER IF EXISTS symbols_fts_insert;\
+             DROP TRIGGER IF EXISTS symbols_fts_delete;\
+             DROP TRIGGER IF EXISTS symbols_fts_update;",
+        )?;
+
+        for (rel_str, extracted, language, cheap_fp) in &extracted_files {
+            match index_file_in_tx(&tx, project_id, rel_str, cheap_fp, language, extracted) {
+                Ok(n) => {
+                    stats.files_indexed += 1;
+                    stats.symbols_indexed += n;
+                }
+                Err(e) => {
+                    stats.errors += 1;
+                    if verbose {
+                        eprintln!("  ⚠ Failed to index {rel_str}: {e}");
+                    }
                 }
             }
         }
+
+        // Rebuild FTS5 index from the content table in one shot.
+        // 'rebuild' tells FTS5 to discard its data and re-read from the
+        // external content table (symbols) — much cheaper than per-row triggers.
+        tx.execute("INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')", [])?;
+
+        // Recreate FTS5 triggers for incremental updates after bulk load
+        tx.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS symbols_fts_insert
+             AFTER INSERT ON symbols
+             BEGIN
+                 INSERT INTO symbols_fts(rowid, name, signature)
+                 VALUES (new.id, new.name, new.signature);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS symbols_fts_delete
+             AFTER DELETE ON symbols
+             BEGIN
+                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature)
+                 VALUES ('delete', old.id, old.name, old.signature);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS symbols_fts_update
+             AFTER UPDATE ON symbols
+             BEGIN
+                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature)
+                 VALUES ('delete', old.id, old.name, old.signature);
+                 INSERT INTO symbols_fts(rowid, name, signature)
+                 VALUES (new.id, new.name, new.signature);
+             END;",
+        )?;
+
+        tx.commit()?;
+        tracing::debug!(
+            "extract={}ms (rayon), db={}ms, files={}",
+            extract_ms,
+            t_db.elapsed().as_millis(),
+            files_to_index.len()
+        );
     }
 
     // Update project's last_indexed timestamp
@@ -269,17 +418,19 @@ fn index_project_with_id(
         stats.files_scanned, stats.files_indexed, stats.symbols_indexed, stats.errors
     );
 
-    // Embed symbols into vector index for brain search
-    match brain::embed_project(conn, project_id) {
-        Ok(n) => {
-            stats.embedded_symbols = Some(n);
-            info!("Brain: embedded {n} symbols");
-        }
-        Err(e) => {
-            if verbose {
-                eprintln!("  ⚠ Embedding failed (non-fatal): {e}");
+    // Embed symbols into vector index for brain search — only when files changed
+    if stats.files_indexed > 0 {
+        match brain::embed_project(conn, project_id) {
+            Ok(n) => {
+                stats.embedded_symbols = Some(n);
+                info!("Brain: embedded {n} symbols");
             }
-            tracing::warn!("Embedding failed: {e}");
+            Err(e) => {
+                if verbose {
+                    eprintln!("  ⚠ Embedding failed (non-fatal): {e}");
+                }
+                tracing::warn!("Embedding failed: {e}");
+            }
         }
     }
 
@@ -391,7 +542,8 @@ pub fn prune_deleted(conn: &Connection, project_id: i64, root: &Path) -> anyhow:
     Ok(deleted)
 }
 
-/// Compute a SHA-256 fingerprint for file content.
+#[cfg(test)]
+/// Compute a SHA-256 fingerprint for file content (test-only).
 fn file_fingerprint(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -468,25 +620,6 @@ impl Cache {
 "#;
         let count = index_file(&conn, project_id, "src/cache.rs", code, "rs").unwrap();
         assert!(count > 0, "Should extract symbols from Rust code");
-    }
-
-    #[test]
-    fn test_needs_reindex() {
-        let conn = mem_conn();
-        let project_id = test_project(&conn);
-        let code = "fn hello() {}";
-
-        // First time → needs reindex
-        assert!(needs_reindex(&conn, project_id, "test.rs", code));
-
-        // Index it
-        index_file(&conn, project_id, "test.rs", code, "rs").unwrap();
-
-        // Same content → no reindex needed
-        assert!(!needs_reindex(&conn, project_id, "test.rs", code));
-
-        // Changed content → needs reindex
-        assert!(needs_reindex(&conn, project_id, "test.rs", "fn world() {}"));
     }
 
     #[test]
