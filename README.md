@@ -181,6 +181,7 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora scan` | Scan files for issues |
 | `cora commit` | Review + generate commit message + commit |
 | `cora debt` | Show tech debt report from review history |
+| `cora findings` | Track, dismiss, and reopen review/scan findings |
 
 ### Code Intelligence
 
@@ -207,6 +208,19 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora hook install` | Install pre-commit hook |
 
 See **[CLI Reference →](https://codecora.dev/cli-reference.html)** for all flags and examples.
+
+## Performance
+
+Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64, single-thread baseline → Rayon parallel).
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| Cold index (full rebuild) | **~936ms** | Walk + parse + embed + HNSW insert (Rayon parallel) |
+| Incremental (no changes) | **~6ms** | mtime:size fingerprint — skips unchanged files |
+| Brain search (hybrid) | **~5ms** | FTS5 + vector KNN + graph BFS → RRF fusion |
+| Binary size | **10.4 MB** | Single static binary, zero runtime dependencies |
+
+> Measurements are indicative, not contractual. Your numbers will vary with codebase size, CPU cores, and disk I/O.
 
 ## Environment Variables
 
