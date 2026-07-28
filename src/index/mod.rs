@@ -327,14 +327,18 @@ fn index_project_with_id(
         // Rayon par_iter distributes file parsing across all CPU cores.
         // extract_all is CPU-bound (~4ms/file) and fully thread-safe.
         let t_extract = std::time::Instant::now();
-        let extracted_files: Vec<(String, extract::ExtractedAll, String, String)> =
-            files_to_index
-                .par_iter()
-                .map(|(rel_str, content, language, cheap_fp)| {
-                    let extracted = extract::extract_all(content, language, rel_str);
-                    (rel_str.clone(), extracted, language.clone(), cheap_fp.clone())
-                })
-                .collect();
+        let extracted_files: Vec<(String, extract::ExtractedAll, String, String)> = files_to_index
+            .par_iter()
+            .map(|(rel_str, content, language, cheap_fp)| {
+                let extracted = extract::extract_all(content, language, rel_str);
+                (
+                    rel_str.clone(),
+                    extracted,
+                    language.clone(),
+                    cheap_fp.clone(),
+                )
+            })
+            .collect();
         let extract_ms = t_extract.elapsed().as_millis();
 
         // ── Phase 2: Serial SQLite writes (single transaction) ─────────
@@ -349,7 +353,7 @@ fn index_project_with_id(
         )?;
 
         for (rel_str, extracted, language, cheap_fp) in &extracted_files {
-            match index_file_in_tx(&tx, project_id, rel_str, &cheap_fp, &language, &extracted) {
+            match index_file_in_tx(&tx, project_id, rel_str, cheap_fp, language, extracted) {
                 Ok(n) => {
                     stats.files_indexed += 1;
                     stats.symbols_indexed += n;
@@ -397,7 +401,9 @@ fn index_project_with_id(
         tx.commit()?;
         tracing::debug!(
             "extract={}ms (rayon), db={}ms, files={}",
-            extract_ms, t_db.elapsed().as_millis(), files_to_index.len()
+            extract_ms,
+            t_db.elapsed().as_millis(),
+            files_to_index.len()
         );
     }
 

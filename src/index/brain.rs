@@ -102,8 +102,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     let mut count = 0;
     let mut new_ids: HashSet<i64> = HashSet::with_capacity(embedded.len());
     for (sym_id, vec) in &embedded {
-        vi.insert(*sym_id, vec)
-            .context("insert symbol embedding")?;
+        vi.insert(*sym_id, vec).context("insert symbol embedding")?;
         new_ids.insert(*sym_id);
         count += 1;
     }
@@ -111,7 +110,9 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
 
     tracing::debug!(
         "embed_compute={}ms, usearch_insert={}ms, symbols={}",
-        compute_ms, insert_ms, count
+        compute_ms,
+        insert_ms,
+        count
     );
 
     if vi.is_dirty() {
