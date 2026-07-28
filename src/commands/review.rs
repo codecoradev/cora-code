@@ -338,7 +338,7 @@ pub async fn execute_review(
         let fps: Vec<String> = filtered_response
             .issues
             .iter()
-            .map(|i| db_writer::compute_fingerprint_pub(i))
+            .map(db_writer::compute_fingerprint_pub)
             .collect();
         let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
         if resolved > 0 {
@@ -719,7 +719,7 @@ async fn execute_chunked_review(
         let fps: Vec<String> = filtered_response
             .issues
             .iter()
-            .map(|i| db_writer::compute_fingerprint_pub(i))
+            .map(db_writer::compute_fingerprint_pub)
             .collect();
         let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
         if resolved > 0 {

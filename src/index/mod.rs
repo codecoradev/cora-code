@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rusqlite::Connection;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
@@ -39,7 +40,7 @@ pub fn open_global_index() -> anyhow::Result<Connection> {
          PRAGMA synchronous=NORMAL;\
          PRAGMA cache_size=-65536;\
          PRAGMA mmap_size=268435456;\
-         PRAGMA temp_store=MEMORY;"
+         PRAGMA temp_store=MEMORY;",
     )?;
     schema::run_migrations(&conn)?;
 
@@ -92,12 +93,9 @@ pub fn resolve_project_id(conn: &Connection) -> anyhow::Result<(i64, std::path::
     Ok((project_id, root))
 }
 
+#[cfg(test)]
 /// Index a single file: extract symbols and store in the database.
-///
-/// `project_id` is written to every row so data is scoped per-project
-/// in the global database.
-///
-/// Returns the number of symbols indexed.
+/// Test-only — production uses `index_project_with_id` with batch fingerprinting.
 pub fn index_file(
     conn: &Connection,
     project_id: i64,
@@ -109,7 +107,14 @@ pub fn index_file(
     let extracted = extract::extract_all(content, language, file_path);
 
     let tx = conn.unchecked_transaction()?;
-    let count = index_file_in_tx(&tx, project_id, file_path, &fingerprint, language, &extracted)?;
+    let count = index_file_in_tx(
+        &tx,
+        project_id,
+        file_path,
+        &fingerprint,
+        language,
+        &extracted,
+    )?;
     tx.commit()?;
 
     debug!(
@@ -159,7 +164,7 @@ fn index_file_in_tx(
     if !extracted.symbols.is_empty() {
         let mut stmt = tx.prepare(
             "INSERT INTO symbols (name, kind, file, line, signature, language, project_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for sym in &extracted.symbols {
             stmt.execute(rusqlite::params![
@@ -221,24 +226,6 @@ fn index_file_in_tx(
     Ok(count)
 }
 
-/// Check if a file needs re-indexing based on content hash.
-pub fn needs_reindex(conn: &Connection, project_id: i64, file_path: &str, content: &str) -> bool {
-    let fingerprint = file_fingerprint(content);
-
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT fingerprint FROM files WHERE path = ?1 AND project_id = ?2",
-            rusqlite::params![file_path, project_id],
-            |row| row.get(0),
-        )
-        .ok();
-
-    match stored {
-        Some(fp) => fp != fingerprint,
-        None => true,
-    }
-}
-
 /// Load all file fingerprints for a project in a single query.
 /// Returns `HashMap<file_path, fingerprint>` — O(1) lookup per file
 /// instead of N individual DB roundtrips.
@@ -246,9 +233,7 @@ fn load_all_fingerprints(
     conn: &Connection,
     project_id: i64,
 ) -> anyhow::Result<HashMap<String, String>> {
-    let mut stmt = conn.prepare(
-        "SELECT path, fingerprint FROM files WHERE project_id = ?1",
-    )?;
+    let mut stmt = conn.prepare("SELECT path, fingerprint FROM files WHERE project_id = ?1")?;
     let map: HashMap<String, String> = stmt
         .query_map([project_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -279,8 +264,7 @@ fn index_project_with_id(
     let mut files_to_index: Vec<(String, String, String, String)> = Vec::new(); // (rel_str, content, language, cheap_fp)
 
     // Batch-load all fingerprints in ONE query — eliminates N per-file DB roundtrips.
-    let stored_fingerprints = load_all_fingerprints(conn, project_id)
-        .unwrap_or_default();
+    let stored_fingerprints = load_all_fingerprints(conn, project_id).unwrap_or_default();
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(true)
@@ -347,7 +331,7 @@ fn index_project_with_id(
         tx.execute_batch(
             "DROP TRIGGER IF EXISTS symbols_fts_insert;\
              DROP TRIGGER IF EXISTS symbols_fts_delete;\
-             DROP TRIGGER IF EXISTS symbols_fts_update;"
+             DROP TRIGGER IF EXISTS symbols_fts_update;",
         )?;
 
         for (rel_str, content, language, cheap_fp) in &files_to_index {
@@ -394,7 +378,7 @@ fn index_project_with_id(
                  VALUES ('delete', old.id, old.name, old.signature);
                  INSERT INTO symbols_fts(rowid, name, signature)
                  VALUES (new.id, new.name, new.signature);
-             END;"
+             END;",
         )?;
 
         tx.commit()?;
@@ -535,7 +519,8 @@ pub fn prune_deleted(conn: &Connection, project_id: i64, root: &Path) -> anyhow:
     Ok(deleted)
 }
 
-/// Compute a SHA-256 fingerprint for file content.
+#[cfg(test)]
+/// Compute a SHA-256 fingerprint for file content (test-only).
 fn file_fingerprint(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
@@ -612,25 +597,6 @@ impl Cache {
 "#;
         let count = index_file(&conn, project_id, "src/cache.rs", code, "rs").unwrap();
         assert!(count > 0, "Should extract symbols from Rust code");
-    }
-
-    #[test]
-    fn test_needs_reindex() {
-        let conn = mem_conn();
-        let project_id = test_project(&conn);
-        let code = "fn hello() {}";
-
-        // First time → needs reindex
-        assert!(needs_reindex(&conn, project_id, "test.rs", code));
-
-        // Index it
-        index_file(&conn, project_id, "test.rs", code, "rs").unwrap();
-
-        // Same content → no reindex needed
-        assert!(!needs_reindex(&conn, project_id, "test.rs", code));
-
-        // Changed content → needs reindex
-        assert!(needs_reindex(&conn, project_id, "test.rs", "fn world() {}"));
     }
 
     #[test]

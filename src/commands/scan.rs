@@ -97,7 +97,7 @@ pub async fn execute_scan(
         });
         let skipped = before_count - files.len();
         if skipped > 0 {
-            println!(
+            eprintln!(
                 "  {} skipped (unchanged since last scan)",
                 skipped.to_string().dimmed()
             );
@@ -105,11 +105,11 @@ pub async fn execute_scan(
     }
 
     if files.is_empty() {
-        println!("{}", "No files to scan.".yellow());
+        eprintln!("{}", "No files to scan.".yellow());
         return Ok(0);
     }
 
-    println!("🔍 {} files to review…", files.len().to_string().cyan());
+    eprintln!("🔍 {} files to review…", files.len().to_string().cyan());
 
     // 2. Calculate total lines
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
@@ -140,7 +140,7 @@ pub async fn execute_scan(
             String::new()
         };
 
-        println!("  Reviewing{batch_label}…");
+        eprintln!("  Reviewing{batch_label}…");
 
         match crate::engine::llm::scan_files(
             llm_config,
@@ -290,7 +290,7 @@ pub async fn execute_scan(
         let fps: Vec<String> = response
             .issues
             .iter()
-            .map(|i| db_writer::compute_fingerprint_pub(i))
+            .map(db_writer::compute_fingerprint_pub)
             .collect();
         let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
         if resolved > 0 {

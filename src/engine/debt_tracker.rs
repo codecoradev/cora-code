@@ -484,6 +484,147 @@ pub fn aggregate(snapshots: &[DebtSnapshot]) -> DebtReport {
     }
 }
 
+// ─── DB-backed snapshot loading ───
+
+/// Load review snapshots from `cora.db` for the given project root.
+///
+/// This is the preferred data source (SoT). Falls back gracefully if the DB
+/// doesn't exist or has no reviews.
+///
+/// Converts the DB's 0-100 score to the 0-10 scale used by `DebtSnapshot`.
+pub fn load_snapshots_from_db(project_root: &str) -> Vec<DebtSnapshot> {
+    let Some(conn) = crate::engine::db_writer::open_db_for_read() else {
+        return Vec::new();
+    };
+
+    let canonical = match std::path::Path::new(project_root).canonicalize() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => project_root.to_string(),
+    };
+
+    // Get project ID
+    let project_id: i64 = match conn.query_row(
+        "SELECT id FROM projects WHERE root_path = ?1",
+        rusqlite::params![canonical],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => return Vec::new(),
+    };
+
+    // Load all reviews for this project, ordered by created_at
+    let mut stmt = match conn.prepare(
+        "SELECT id, commit_hash, branch, files_scanned, lines_scanned,
+                score, gate_status, created_at
+         FROM reviews WHERE project_id = ?1 ORDER BY created_at ASC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut rows = match stmt.query(rusqlite::params![project_id]) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut snapshots = Vec::new();
+    while let Some(row) = rows.next().unwrap_or(None) {
+        let review_id: i64 = row.get(0).unwrap_or(0);
+        let commit: Option<String> = row.get(1).unwrap_or(None);
+        let branch: Option<String> = row.get(2).unwrap_or(None);
+        let files_scanned: i64 = row.get(3).unwrap_or(0);
+        let lines_scanned: i64 = row.get(4).unwrap_or(0);
+        let db_score: f64 = row.get(5).unwrap_or(100.0);
+        let gate_status: String = row.get(6).unwrap_or_else(|_| "disabled".to_string());
+        let created_at: String = row.get(7).unwrap_or_default();
+
+        // Parse timestamp
+        let timestamp = DateTime::parse_from_rfc3339(&created_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&created_at, "%Y-%m-%d %H:%M:%S")
+                    .map(|ndt| ndt.and_utc())
+            })
+            .unwrap_or_else(|_| Utc::now());
+
+        // Load findings for this review
+        let findings = load_findings_for_review(&conn, review_id);
+        let categories = load_categories_for_review(&conn, review_id);
+
+        // Convert DB score (0-100) to DebtSnapshot scale (0-10)
+        let quality_score = db_score / 10.0;
+
+        snapshots.push(DebtSnapshot {
+            timestamp,
+            commit,
+            branch,
+            files_reviewed: files_scanned as usize,
+            lines_reviewed: if lines_scanned > 0 {
+                Some(lines_scanned as usize)
+            } else {
+                None
+            },
+            findings,
+            categories,
+            quality_score,
+            gate_status,
+            duration_ms: None, // not stored in DB
+        });
+    }
+
+    snapshots
+}
+
+/// Load severity → count map for findings of a specific review.
+fn load_findings_for_review(conn: &rusqlite::Connection, review_id: i64) -> HashMap<String, usize> {
+    let mut findings: HashMap<String, usize> = HashMap::new();
+    let mut stmt = match conn.prepare(
+        "SELECT severity, COUNT(*) as cnt FROM findings
+         WHERE review_id = ?1 AND status = 'open'
+         GROUP BY severity",
+    ) {
+        Ok(s) => s,
+        Err(_) => return findings,
+    };
+    let mut rows = match stmt.query(rusqlite::params![review_id]) {
+        Ok(r) => r,
+        Err(_) => return findings,
+    };
+    while let Some(row) = rows.next().unwrap_or(None) {
+        let severity: String = row.get::<_, String>(0).unwrap_or_default().to_lowercase();
+        let count: usize = row.get::<_, i64>(1).unwrap_or(0) as usize;
+        *findings.entry(severity).or_insert(0) += count;
+    }
+    findings
+}
+
+/// Load category → count map for findings of a specific review.
+fn load_categories_for_review(
+    conn: &rusqlite::Connection,
+    review_id: i64,
+) -> HashMap<String, usize> {
+    let mut categories: HashMap<String, usize> = HashMap::new();
+    let mut stmt = match conn.prepare(
+        "SELECT issue_type, COUNT(*) as cnt FROM findings
+         WHERE review_id = ?1 AND status = 'open' AND issue_type IS NOT NULL
+         GROUP BY issue_type",
+    ) {
+        Ok(s) => s,
+        Err(_) => return categories,
+    };
+    let mut rows = match stmt.query(rusqlite::params![review_id]) {
+        Ok(r) => r,
+        Err(_) => return categories,
+    };
+    while let Some(row) = rows.next().unwrap_or(None) {
+        let issue_type: String = row.get::<_, String>(0).unwrap_or_default();
+        let count: usize = row.get::<_, i64>(1).unwrap_or(0) as usize;
+        let cat = normalize_category(&issue_type);
+        *categories.entry(cat.to_string()).or_insert(0) += count;
+    }
+    categories
+}
+
 // ─── Debt config ───
 
 /// Debt tracking configuration — parsed from `.cora.yaml` under `debt`.

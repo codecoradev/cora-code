@@ -192,9 +192,9 @@ fn list_findings(
             "  #{} {} {} {}{} [{}]",
             r.id.to_string().dimmed(),
             sev,
-            format!("{}", r.file_path).blue(),
+            r.file_path.to_string().blue(),
             line_info.dimmed(),
-            format!(" | {}", r.title),
+            format_args!(" | {}", r.title),
             status_tag,
         );
     }
@@ -282,9 +282,7 @@ fn dismiss(conn: &rusqlite::Connection, id: i64, reason: &Option<String>) -> Res
         rusqlite::params![id],
     )?;
 
-    let note = reason
-        .as_deref()
-        .unwrap_or("Manually dismissed via CLI");
+    let note = reason.as_deref().unwrap_or("Manually dismissed via CLI");
     conn.execute(
         "INSERT INTO finding_events (finding_id, event_type, note) VALUES (?1, 'dismissed', ?2)",
         rusqlite::params![id, note],

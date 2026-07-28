@@ -571,6 +571,7 @@ async fn main() -> Result<()> {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(log_level)
         .with_target(false)
+        .with_writer(std::io::stderr) // logs/warns must go to stderr, not stdout
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("cora=warn")),
@@ -1389,9 +1390,7 @@ async fn main() -> Result<()> {
             mcp::server::run_server()?;
             0
         }
-        Command::Findings { action } => {
-            commands::findings::execute_findings(&action)?
-        }
+        Command::Findings { action } => commands::findings::execute_findings(&action)?,
         Command::Debt {
             json,
             trend,

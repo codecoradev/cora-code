@@ -3,11 +3,10 @@
 //! Uses the v5 schema tables: `reviews`, `findings`, `finding_events`.
 //! All operations are best-effort (non-fatal on error) to never block a review.
 
-
 use rusqlite::Connection;
 
-use crate::engine::types::{ReviewIssue, TokenUsage};
 use crate::engine::Severity;
+use crate::engine::types::{ReviewIssue, TokenUsage};
 use crate::index::schema;
 
 /// Input data for saving a review/scan run to the database.
@@ -48,7 +47,13 @@ pub fn save_review_to_db(record: &ReviewRecord<'_>) -> Option<i64> {
     // Insert the review row.
     let (input_tokens, output_tokens, cost_usd) = record
         .tokens
-        .map(|t| (t.input_tokens as i64, t.output_tokens as i64, t.estimated_cost_usd))
+        .map(|t| {
+            (
+                t.input_tokens as i64,
+                t.output_tokens as i64,
+                t.estimated_cost_usd,
+            )
+        })
         .unwrap_or((0, 0, 0.0));
 
     conn.execute(
@@ -110,9 +115,7 @@ pub fn save_review_to_db(record: &ReviewRecord<'_>) -> Option<i64> {
             .ok()?;
 
         let finding_id = conn.last_insert_rowid();
-        stmt_events
-            .execute(rusqlite::params![finding_id])
-            .ok()?;
+        stmt_events.execute(rusqlite::params![finding_id]).ok()?;
     }
 
     Some(review_id)
@@ -125,7 +128,9 @@ pub fn save_review_to_db(record: &ReviewRecord<'_>) -> Option<i64> {
 /// with an `auto_resolved` event. Findings that *do* reappear are left `open`.
 pub fn resolve_stale_findings(project_root: &str, current_fingerprints: &[String]) -> usize {
     let Ok(conn) = open_db() else { return 0 };
-    let Ok(project_id) = schema::get_or_create_project(&conn, project_root) else { return 0 };
+    let Ok(project_id) = schema::get_or_create_project(&conn, project_root) else {
+        return 0;
+    };
 
     // Fetch (id, fingerprint) for all open findings in this project.
     let mut stmt = match conn.prepare(
@@ -165,8 +170,7 @@ pub fn resolve_stale_findings(project_root: &str, current_fingerprints: &[String
 
     for id in &stale_ids {
         if let (Some(u), Some(e)) = (stmt_update.as_mut(), stmt_event.as_mut()) {
-            if u.execute(rusqlite::params![id]).is_ok()
-                && e.execute(rusqlite::params![id]).is_ok()
+            if u.execute(rusqlite::params![id]).is_ok() && e.execute(rusqlite::params![id]).is_ok()
             {
                 resolved += 1;
             }

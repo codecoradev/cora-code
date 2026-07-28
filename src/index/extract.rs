@@ -734,6 +734,7 @@ fn is_builtin(name: &str) -> bool {
 /// All extracted data from a single file (symbols + calls + kg edges).
 /// Used by bulk indexing to parse tree-sitter only once.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct ExtractedAll {
     pub symbols: Vec<ExtractedDef>,
     pub calls: Vec<CallSite>,
@@ -746,7 +747,8 @@ pub type KgEdge = crate::index::ast::AstEdge;
 
 /// A knowledge-graph edge stub when tree-sitter is disabled (never used).
 #[cfg(not(feature = "tree-sitter"))]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct KgEdge {
     pub source: String,
     pub kind: String,

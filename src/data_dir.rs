@@ -88,7 +88,8 @@ mod tests {
     fn test_graph_db_path() {
         let path = graph_db_path();
         assert!(
-            path.ends_with(".codecora/cora-code/cora.db") || path.ends_with(".codecora/cora-code/graph.db"),
+            path.ends_with(".codecora/cora-code/cora.db")
+                || path.ends_with(".codecora/cora-code/graph.db"),
             "graph_db_path should end with cora.db (or graph.db on migration failure), got: {path:?}"
         );
     }

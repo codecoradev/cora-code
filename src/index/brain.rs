@@ -101,7 +101,10 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     }
 
     // Cache project → symbol IDs for fast search-time filtering
-    PROJECT_ID_CACHE.write().unwrap().insert(project_id, new_ids);
+    PROJECT_ID_CACHE
+        .write()
+        .unwrap()
+        .insert(project_id, new_ids);
 
     conn.execute(
         "UPDATE projects SET embedding_tier = 'static', embedding_dims = ?1, \
@@ -221,7 +224,10 @@ fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) 
                 .map(|rows| rows.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default();
             let ids: HashSet<i64> = rows.into_iter().collect();
-            PROJECT_ID_CACHE.write().unwrap().insert(project_id, ids.clone());
+            PROJECT_ID_CACHE
+                .write()
+                .unwrap()
+                .insert(project_id, ids.clone());
             ids
         }
     };
@@ -283,10 +289,7 @@ fn graph_proximity_search(
 
 /// Fetch multiple symbol rows in a single `WHERE id IN (...)` query.
 /// Replaces the N+1 `get_symbol_by_id` pattern.
-fn batch_get_symbols(
-    conn: &Connection,
-    ranked: &[(i64, (f32, Vec<String>))],
-) -> Vec<BrainResult> {
+fn batch_get_symbols(conn: &Connection, ranked: &[(i64, (f32, Vec<String>))]) -> Vec<BrainResult> {
     if ranked.is_empty() {
         return Vec::new();
     }
@@ -299,8 +302,10 @@ fn batch_get_symbols(
     );
 
     let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
-    let params: Vec<&dyn rusqlite::types::ToSql> =
-        ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
