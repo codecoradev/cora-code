@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 /// Current schema version.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 
 /// Run database migrations (creates tables if not exist).
 pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
@@ -33,6 +33,9 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
     if current < 4 {
         migrate_v4(conn)?;
+    }
+    if current < 5 {
+        migrate_v5(conn)?;
     }
 
     Ok(())
@@ -128,7 +131,7 @@ fn migrate_v1(conn: &Connection) -> anyhow::Result<()> {
 /// Migration v2: Multi-project support.
 ///
 /// Adds `projects` table and `project_id` column to `symbols`, `files`,
-/// and `call_graph`. The global DB at `~/.codecora/cora-code/graph.db`
+/// and `call_graph`. The global DB at `~/.codecora/cora-code/cora.db`
 /// stores data for all indexed projects, keyed by absolute path.
 fn migrate_v2(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
@@ -208,6 +211,77 @@ fn migrate_v4(conn: &Connection) -> anyhow::Result<()> {
     )?;
 
     conn.execute("INSERT INTO schema_version (version) VALUES (4)", [])?;
+
+    Ok(())
+}
+
+/// Migration v5: Review history — reviews, findings, finding_events.
+///
+/// Enables persistent storage of review/scan results in the same `cora.db`.
+/// This replaces the legacy JSON snapshot files in `.cora/history/`.
+fn migrate_v5(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "
+        -- One row per review/scan run
+        CREATE TABLE IF NOT EXISTS reviews (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id      INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            command         TEXT NOT NULL DEFAULT 'review',
+            commit_hash     TEXT,
+            branch          TEXT,
+            summary         TEXT NOT NULL DEFAULT '',
+            score           INTEGER NOT NULL DEFAULT 0,
+            gate_status     TEXT NOT NULL DEFAULT 'disabled',
+            files_scanned   INTEGER NOT NULL DEFAULT 0,
+            lines_scanned   INTEGER NOT NULL DEFAULT 0,
+            should_block    INTEGER NOT NULL DEFAULT 0,
+            input_tokens    INTEGER NOT NULL DEFAULT 0,
+            output_tokens   INTEGER NOT NULL DEFAULT 0,
+            cost_usd        REAL NOT NULL DEFAULT 0.0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id);
+        CREATE INDEX IF NOT EXISTS idx_reviews_created ON reviews(created_at);
+        CREATE INDEX IF NOT EXISTS idx_reviews_command ON reviews(command);
+
+        -- Individual findings (issues) from each review/scan
+        CREATE TABLE IF NOT EXISTS findings (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_id       INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+            file_path       TEXT NOT NULL,
+            line_number     INTEGER,
+            severity        TEXT NOT NULL DEFAULT 'info',
+            issue_type      TEXT,
+            title           TEXT NOT NULL DEFAULT '',
+            body            TEXT NOT NULL DEFAULT '',
+            suggested_fix   TEXT,
+            status          TEXT NOT NULL DEFAULT 'open',
+            fingerprint     TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_findings_review ON findings(review_id);
+        CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
+        CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
+        CREATE INDEX IF NOT EXISTS idx_findings_file ON findings(file_path);
+        CREATE INDEX IF NOT EXISTS idx_findings_fingerprint ON findings(fingerprint);
+
+        -- Audit trail for finding status changes
+        CREATE TABLE IF NOT EXISTS finding_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            finding_id      INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+            event_type      TEXT NOT NULL,  -- 'opened', 'auto_resolved', 'dismissed', 'reopened'
+            note            TEXT,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_fevents_finding ON finding_events(finding_id);
+        CREATE INDEX IF NOT EXISTS idx_fevents_type ON finding_events(event_type);
+        ",
+    )?;
+
+    conn.execute("INSERT INTO schema_version (version) VALUES (5)", [])?;
 
     Ok(())
 }
@@ -466,5 +540,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_v5_review_tables_exist() {
+        let conn = mem_conn();
+
+        // Check reviews table
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reviews", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Check findings table
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM findings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Check finding_events table
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM finding_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        // Verify schema version is 5
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn test_v5_insert_review_and_findings() {
+        let conn = mem_conn();
+        let pid = get_or_create_project(&conn, "/test/proj").unwrap();
+
+        // Insert a review
+        conn.execute(
+            "INSERT INTO reviews (project_id, command, commit_hash, branch, summary, score, files_scanned, lines_scanned)
+             VALUES (?1, 'review', 'abc123', 'main', '3 issues found', 75, 5, 200)",
+            rusqlite::params![pid],
+        )
+        .unwrap();
+        let review_id: i64 = conn.last_insert_rowid();
+
+        // Insert findings
+        conn.execute(
+            "INSERT INTO findings (review_id, file_path, line_number, severity, title, body, fingerprint)
+             VALUES (?1, 'src/main.rs', 42, 'critical', 'SQL injection', 'Unsanitized input', 'main.rs:42:sql_injection')",
+            rusqlite::params![review_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO findings (review_id, file_path, line_number, severity, title, body, fingerprint)
+             VALUES (?1, 'src/lib.rs', 10, 'minor', 'Unused import', 'Import not used', 'lib.rs:10:unused_import')",
+            rusqlite::params![review_id],
+        )
+        .unwrap();
+
+        // Query back
+        let finding_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?1",
+                rusqlite::params![review_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(finding_count, 2);
+
+        // Insert an event
+        let finding_id: i64 = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO finding_events (finding_id, event_type, note) VALUES (?1, 'opened', NULL)",
+            rusqlite::params![finding_id],
+        )
+        .unwrap();
+
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM finding_events WHERE finding_id = ?1",
+                rusqlite::params![finding_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
     }
 }

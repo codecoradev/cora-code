@@ -5,6 +5,7 @@ use tracing::debug;
 use crate::config::schema::Config;
 use crate::engine::Severity;
 use crate::engine::chunker;
+use crate::engine::db_writer;
 use crate::engine::quality_gate;
 use crate::engine::types::ReviewResponse;
 use crate::formatters::{OutputFormat, formatter_for};
@@ -303,7 +304,36 @@ pub async fn execute_review(
         crate::engine::debt_tracker::save_snapshot(&snapshot, config.debt.history_dir.as_deref());
     }
 
-    // 9. Return exit code
+    // 8c. Save review findings to cora.db (best-effort)
+    {
+        let (commit, branch) = get_git_context();
+        let cmd = if opts.ci { "review --ci" } else { "review" };
+        let gate_status = match gate_result.as_ref().map(|g| g.status) {
+            Some(quality_gate::GateStatus::Pass) => "passed",
+            Some(quality_gate::GateStatus::Fail) => "failed",
+            None => "disabled",
+        };
+        let tokens = response.tokens_used.as_ref();
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let record = db_writer::ReviewRecord {
+            command: cmd,
+            project_root: &cwd,
+            commit_hash: commit.as_deref(),
+            branch: branch.as_deref(),
+            summary: &filtered_response.summary,
+            gate_status,
+            files_scanned: 0,
+            lines_scanned: 0,
+            should_block: filtered_response.should_block,
+            tokens,
+            issues: &filtered_response.issues,
+        };
+        if db_writer::save_review_to_db(&record).is_none() {
+            debug!("Failed to save review to cora.db");
+        }
+    }
     let exit_code = if gate_result
         .as_ref()
         .is_some_and(|g| g.status == quality_gate::GateStatus::Fail)
@@ -644,7 +674,36 @@ async fn execute_chunked_review(
         crate::engine::debt_tracker::save_snapshot(&snapshot, config.debt.history_dir.as_deref());
     }
 
-    // 9. Return exit code
+    // 8c. Save review findings to cora.db (best-effort)
+    {
+        let (commit, branch) = get_git_context();
+        let cmd = if opts.ci { "review --ci" } else { "review" };
+        let gate_status = match gate_result.as_ref().map(|g| g.status) {
+            Some(quality_gate::GateStatus::Pass) => "passed",
+            Some(quality_gate::GateStatus::Fail) => "failed",
+            None => "disabled",
+        };
+        let tokens = merged_response.tokens_used.as_ref();
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let record = db_writer::ReviewRecord {
+            command: cmd,
+            project_root: &cwd,
+            commit_hash: commit.as_deref(),
+            branch: branch.as_deref(),
+            summary: &filtered_response.summary,
+            gate_status,
+            files_scanned: 0,
+            lines_scanned: 0,
+            should_block: filtered_response.should_block,
+            tokens,
+            issues: &filtered_response.issues,
+        };
+        if db_writer::save_review_to_db(&record).is_none() {
+            debug!("Failed to save review to cora.db");
+        }
+    }
     let exit_code = compute_exit_code(
         gate_result.as_ref().map(|g| g.status),
         opts.ci,

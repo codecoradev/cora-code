@@ -5,6 +5,7 @@ use colored::Colorize;
 use tracing::debug;
 
 use crate::config::schema::Config;
+use crate::engine::db_writer;
 use crate::engine::scanner::{batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
 use crate::formatters::{OutputFormat, formatter_for};
@@ -249,6 +250,41 @@ pub async fn execute_scan(
         }
         cache.save()?;
         debug!(cached = files.len(), "saved scan cache");
+    }
+
+    // 7. Save scan findings to cora.db (best-effort)
+    {
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
+        let branch = std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let record = db_writer::ReviewRecord {
+            command: "scan",
+            project_root: &cwd,
+            commit_hash: commit.as_deref(),
+            branch: branch.as_deref(),
+            summary: &response.summary,
+            gate_status: "disabled",
+            files_scanned: response.files_scanned,
+            lines_scanned: response.lines_scanned,
+            should_block: response.should_block,
+            tokens: response.tokens_used.as_ref(),
+            issues: &response.issues,
+        };
+        if db_writer::save_review_to_db(&record).is_none() {
+            debug!("Failed to save scan to cora.db");
+        }
     }
 
     if response.should_block && config.hook.mode == "block" {

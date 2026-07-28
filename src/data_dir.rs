@@ -40,8 +40,25 @@ pub fn cora_data_dir() -> PathBuf {
 }
 
 /// Returns the path to the global graph database.
+///
+/// Defaults to `cora.db`. If `cora.db` does not exist but `graph.db` does,
+/// automatically renames `graph.db` → `cora.db` (backward-compatible migration).
 pub fn graph_db_path() -> PathBuf {
-    cora_data_dir().join("graph.db")
+    let dir = cora_data_dir();
+    let new_db = dir.join("cora.db");
+
+    if !new_db.exists() {
+        let old_db = dir.join("graph.db");
+        if old_db.exists() {
+            if let Err(e) = std::fs::rename(&old_db, &new_db) {
+                eprintln!("warning: failed to migrate graph.db → cora.db: {e}");
+                // Fall back to graph.db on rename failure
+                return old_db;
+            }
+        }
+    }
+
+    new_db
 }
 
 /// Ensure the cora-code data directory exists.
@@ -70,7 +87,10 @@ mod tests {
     #[test]
     fn test_graph_db_path() {
         let path = graph_db_path();
-        assert!(path.ends_with(".codecora/cora-code/graph.db"));
+        assert!(
+            path.ends_with(".codecora/cora-code/cora.db") || path.ends_with(".codecora/cora-code/graph.db"),
+            "graph_db_path should end with cora.db (or graph.db on migration failure), got: {path:?}"
+        );
     }
 
     #[test]
