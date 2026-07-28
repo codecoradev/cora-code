@@ -8,10 +8,23 @@ use crate::index::symbols::SymbolQuery;
 use crate::index::vector::{CodeVectorIndex, DEFAULT_DIMS, cosine_distance_to_similarity};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, RwLock};
 
 /// RRF constant (standard value from Cormack et al. 2009).
 const RRF_K: f32 = 60.0;
+
+// ── Process-lifetime caches ─────────────────────────────────────────────
+
+/// Cached vector index — loaded once from disk, reused for all searches.
+/// Write-locked during embed_project (indexing), read-locked during search.
+static VECTOR_CACHE: LazyLock<RwLock<Option<CodeVectorIndex>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+/// Cached project → symbol ID sets, used to filter vector results without
+/// a full DB scan per query. Invalidated when a project is re-indexed.
+static PROJECT_ID_CACHE: LazyLock<RwLock<HashMap<i64, HashSet<i64>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// A brain search result with provenance information.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -36,11 +49,25 @@ fn vector_index_path() -> std::path::PathBuf {
 /// Embed all symbols for a project into the vector index.
 ///
 /// Reads symbols from SQLite, embeds via static token method,
-/// stores in usearch. Call after `index_project`.
+/// stores in usearch. Updates the in-memory cache.
+/// Call after `index_project`.
 pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     let vi_path = vector_index_path();
-    let mut vi =
-        CodeVectorIndex::load_or_create(&vi_path, DEFAULT_DIMS).context("load vector index")?;
+
+    // Acquire write lock — block searches while embedding.
+    // This is fine because embedding only happens during `cora index`,
+    // never during `cora brain_search`.
+    let mut cache = VECTOR_CACHE.write().unwrap();
+
+    // Load or create the vector index (reuses cache if available)
+    let vi = if let Some(ref mut cached) = *cache {
+        cached
+    } else {
+        let vi =
+            CodeVectorIndex::load_or_create(&vi_path, DEFAULT_DIMS).context("load vector index")?;
+        *cache = Some(vi);
+        cache.as_mut().unwrap()
+    };
 
     let mut stmt =
         conn.prepare("SELECT id, name, kind, signature FROM symbols WHERE project_id = ?1")?;
@@ -52,6 +79,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         .collect();
 
     let mut count = 0;
+    let mut new_ids: HashSet<i64> = HashSet::with_capacity(rows.len());
     for (sym_id, name, _kind, signature) in &rows {
         let text = if signature.is_empty() || signature == name {
             name.clone()
@@ -64,12 +92,16 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
 
         vi.insert(*sym_id, &vec)
             .context("insert symbol embedding")?;
+        new_ids.insert(*sym_id);
         count += 1;
     }
 
     if vi.is_dirty() {
         vi.save().context("save vector index")?;
     }
+
+    // Cache project → symbol IDs for fast search-time filtering
+    PROJECT_ID_CACHE.write().unwrap().insert(project_id, new_ids);
 
     conn.execute(
         "UPDATE projects SET embedding_tier = 'static', embedding_dims = ?1, \
@@ -127,25 +159,8 @@ pub fn brain_search(
     });
     ranked.truncate(limit);
 
-    let results: Vec<BrainResult> = ranked
-        .into_iter()
-        .filter_map(|(id, (score, mut signals))| {
-            get_symbol_by_id(conn, id).ok().map(|sym| {
-                signals.sort();
-                signals.dedup();
-                BrainResult {
-                    symbol_id: id,
-                    name: sym.0,
-                    kind: sym.1,
-                    file: sym.2,
-                    line: sym.3,
-                    signature: sym.4,
-                    score,
-                    signals,
-                }
-            })
-        })
-        .collect();
+    // Batch fetch all symbol rows in a single query (was N+1 individual queries)
+    let results = batch_get_symbols(conn, &ranked);
 
     Ok(results)
 }
@@ -169,23 +184,14 @@ fn fts5_search(conn: &Connection, project_id: i64, query: &str, limit: usize) ->
 }
 
 /// usearch vector search → (symbol_id, cosine_similarity) pairs, filtered to project.
-/// Over-fetches from global vector index then filters by project_id via DB lookup.
+/// Uses cached vector index and cached project ID set — no disk I/O per query.
 fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) -> Vec<(i64, f32)> {
-    let vi_path = vector_index_path();
-    if !vi_path.exists() {
-        return Vec::new();
-    }
-    let vi = match CodeVectorIndex::load_or_create(&vi_path, DEFAULT_DIMS) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("vector index load error: {e}");
-            return Vec::new();
-        }
+    // Read-lock the cached vector index — no disk load
+    let cache = VECTOR_CACHE.read().unwrap();
+    let vi = match cache.as_ref() {
+        Some(v) if !v.is_empty() => v,
+        _ => return Vec::new(),
     };
-
-    if vi.is_empty() {
-        return Vec::new();
-    }
 
     let embedding = embed_code(query);
     let vec: Vec<f32> = embedding.as_slice().iter().map(|&v| v as f32).collect();
@@ -194,17 +200,30 @@ fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) 
     let over_fetch = (limit * 5).max(50);
     let raw = vi.search(&vec, over_fetch);
 
-    // Build a set of symbol IDs belonging to this project.
-    let project_ids: std::collections::HashSet<i64> = {
-        let mut stmt = conn
-            .prepare("SELECT id FROM symbols WHERE project_id = ?1")
-            .unwrap();
-        let rows: Vec<i64> = stmt
-            .query_map([project_id], |r| r.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect();
-        rows.into_iter().collect()
+    // Use cached project ID set — avoids full DB scan per query.
+    // Falls back to DB query only on cache miss (first search after process start).
+    let project_ids = {
+        let cache = PROJECT_ID_CACHE.read().unwrap();
+        cache.get(&project_id).cloned()
+    };
+
+    let project_ids = match project_ids {
+        Some(ids) => ids,
+        None => {
+            // Cache miss — load from DB and cache for future queries
+            let mut stmt = match conn.prepare("SELECT id FROM symbols WHERE project_id = ?1") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let rows: Vec<i64> = stmt
+                .query_map([project_id], |r| r.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default();
+            let ids: HashSet<i64> = rows.into_iter().collect();
+            PROJECT_ID_CACHE.write().unwrap().insert(project_id, ids.clone());
+            ids
+        }
     };
 
     raw.into_iter()
@@ -262,20 +281,74 @@ fn graph_proximity_search(
     ids
 }
 
-/// Fetch symbol row by ID → (name, kind, file, line, signature).
-fn get_symbol_by_id(conn: &Connection, id: i64) -> Result<(String, String, String, i64, String)> {
-    conn.query_row(
-        "SELECT name, kind, file, line, signature FROM symbols WHERE id = ?1",
-        rusqlite::params![id],
-        |row| {
+/// Fetch multiple symbol rows in a single `WHERE id IN (...)` query.
+/// Replaces the N+1 `get_symbol_by_id` pattern.
+fn batch_get_symbols(
+    conn: &Connection,
+    ranked: &[(i64, (f32, Vec<String>))],
+) -> Vec<BrainResult> {
+    if ranked.is_empty() {
+        return Vec::new();
+    }
+
+    // Build placeholder string: ?, ?, ?, ...
+    let placeholders = ranked.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT id, name, kind, file, line, signature \
+         FROM symbols WHERE id IN ({placeholders})"
+    );
+
+    let ids: Vec<i64> = ranked.iter().map(|(id, _)| *id).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("batch_get_symbols prepare error: {e}");
+            return Vec::new();
+        }
+    };
+
+    // Build a lookup map: symbol_id → (score, signals)
+    let mut score_map: HashMap<i64, (f32, Vec<String>)> = HashMap::with_capacity(ranked.len());
+    for (id, (score, signals)) in ranked {
+        score_map.insert(*id, (*score, signals.clone()));
+    }
+
+    let results: Vec<BrainResult> = stmt
+        .query_map(params.as_slice(), |row| {
             Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
             ))
-        },
-    )
-    .map_err(Into::into)
+        })
+        .ok()
+        .map(|rows| {
+            rows.filter_map(|r| r.ok())
+                .filter_map(|(id, name, kind, file, line, signature)| {
+                    score_map.remove(&id).map(|(score, mut signals)| {
+                        signals.sort();
+                        signals.dedup();
+                        BrainResult {
+                            symbol_id: id,
+                            name,
+                            kind,
+                            file,
+                            line,
+                            signature,
+                            score,
+                            signals,
+                        }
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    results
 }
