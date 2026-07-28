@@ -14,6 +14,7 @@ exclude = [
     "docs/",
     ".github/",
     "tests/",
+    "bench/",
     "target/",
 ]
 
