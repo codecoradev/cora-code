@@ -45,6 +45,9 @@ dirs = "6"
 glob = "0.3"
 ignore = "0.4"
 
+# Parallelism (cold-rebuild file parsing)
+rayon = "1"
+
 # Error handling
 anyhow = "1"
 which = "7"

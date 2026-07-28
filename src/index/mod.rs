@@ -16,6 +16,7 @@ pub mod vector;
 use std::collections::HashMap;
 use std::path::Path;
 
+use rayon::prelude::*;
 use rusqlite::Connection;
 #[cfg(test)]
 use sha2::{Digest, Sha256};
@@ -322,21 +323,33 @@ fn index_project_with_id(
     }
 
     if !files_to_index.is_empty() {
-        // Single transaction for ALL files — eliminates per-file fsync
+        // ── Phase 1: Parallel extraction (CPU-bound tree-sitter + regex) ───
+        // Rayon par_iter distributes file parsing across all CPU cores.
+        // extract_all is CPU-bound (~4ms/file) and fully thread-safe.
+        let t_extract = std::time::Instant::now();
+        let extracted_files: Vec<(String, extract::ExtractedAll, String, String)> =
+            files_to_index
+                .par_iter()
+                .map(|(rel_str, content, language, cheap_fp)| {
+                    let extracted = extract::extract_all(content, language, rel_str);
+                    (rel_str.clone(), extracted, language.clone(), cheap_fp.clone())
+                })
+                .collect();
+        let extract_ms = t_extract.elapsed().as_millis();
+
+        // ── Phase 2: Serial SQLite writes (single transaction) ─────────
+        let t_db = std::time::Instant::now();
         let tx = conn.unchecked_transaction()?;
 
         // Disable FTS5 triggers during bulk insert to avoid 3x write amplification.
-        // For a content-sync FTS5 table (content='symbols'), the correct bulk-load
-        // sequence is: drop triggers → insert rows → 'rebuild' command → recreate triggers.
         tx.execute_batch(
             "DROP TRIGGER IF EXISTS symbols_fts_insert;\
              DROP TRIGGER IF EXISTS symbols_fts_delete;\
              DROP TRIGGER IF EXISTS symbols_fts_update;",
         )?;
 
-        for (rel_str, content, language, cheap_fp) in &files_to_index {
-            let extracted = extract::extract_all(content, language, rel_str);
-            match index_file_in_tx(&tx, project_id, rel_str, cheap_fp, language, &extracted) {
+        for (rel_str, extracted, language, cheap_fp) in &extracted_files {
+            match index_file_in_tx(&tx, project_id, rel_str, &cheap_fp, &language, &extracted) {
                 Ok(n) => {
                     stats.files_indexed += 1;
                     stats.symbols_indexed += n;
@@ -382,6 +395,10 @@ fn index_project_with_id(
         )?;
 
         tx.commit()?;
+        tracing::debug!(
+            "extract={}ms (rayon), db={}ms, files={}",
+            extract_ms, t_db.elapsed().as_millis(), files_to_index.len()
+        );
     }
 
     // Update project's last_indexed timestamp

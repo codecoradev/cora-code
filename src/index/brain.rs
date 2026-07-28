@@ -7,6 +7,7 @@ use crate::embed::tokens::embed_code;
 use crate::index::symbols::SymbolQuery;
 use crate::index::vector::{CodeVectorIndex, DEFAULT_DIMS, cosine_distance_to_similarity};
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, RwLock};
@@ -78,23 +79,40 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         .filter_map(|r| r.ok())
         .collect();
 
+    // ── Parallel embedding computation (Rayon) ─────────────────────────
+    // embed_code is pure + CPU-bound. usearch insert is serial.
+    let t_compute = std::time::Instant::now();
+    let embedded: Vec<(i64, Vec<f32>)> = rows
+        .par_iter()
+        .map(|(sym_id, name, _kind, signature)| {
+            let text = if signature.is_empty() || signature == name {
+                name.clone()
+            } else {
+                format!("{name} {signature}")
+            };
+            let embedding = embed_code(&text);
+            let vec: Vec<f32> = embedding.as_slice().iter().map(|&v| v as f32).collect();
+            (*sym_id, vec)
+        })
+        .collect();
+    let compute_ms = t_compute.elapsed().as_millis();
+
+    // ── Serial usearch insert ────────────────────────────────────────
+    let t_insert = std::time::Instant::now();
     let mut count = 0;
-    let mut new_ids: HashSet<i64> = HashSet::with_capacity(rows.len());
-    for (sym_id, name, _kind, signature) in &rows {
-        let text = if signature.is_empty() || signature == name {
-            name.clone()
-        } else {
-            format!("{name} {signature}")
-        };
-
-        let embedding = embed_code(&text);
-        let vec: Vec<f32> = embedding.as_slice().iter().map(|&v| v as f32).collect();
-
-        vi.insert(*sym_id, &vec)
+    let mut new_ids: HashSet<i64> = HashSet::with_capacity(embedded.len());
+    for (sym_id, vec) in &embedded {
+        vi.insert(*sym_id, vec)
             .context("insert symbol embedding")?;
         new_ids.insert(*sym_id);
         count += 1;
     }
+    let insert_ms = t_insert.elapsed().as_millis();
+
+    tracing::debug!(
+        "embed_compute={}ms, usearch_insert={}ms, symbols={}",
+        compute_ms, insert_ms, count
+    );
 
     if vi.is_dirty() {
         vi.save().context("save vector index")?;
