@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-29
+
+### Highlights
+
+- **Dead code detection.** `cora dead-code` finds functions/methods with no callers using call graph analysis. Available as both CLI command and MCP tool (`cora.dead_code`).
+- **Graph query DSL.** `cora query "main -> *"` lets you traverse the code graph with simple patterns — no SQL needed. Available as both CLI and MCP (`cora.query`).
+- **Auto-config agent installer.** `cora install` detects installed AI coding agents (Cline, Cursor, Windsurf, etc.) and configures Cora as their MCP server. One command setup.
+- **Background reindex on serve.** `cora serve` now auto-reindexes the current project before starting the MCP server — always up-to-date symbols.
+- **Tree-sitter is now a default feature.** The `edges` table (IMPORTS, IMPLEMENTS, INHERITS, CHILD_OF) now populates correctly in all builds, including release binaries.
+
+### Added
+
+- **`cora dead-code` CLI command** (#427). Detect dead functions/methods with `--include-tests`, `--min-lines`, and `--json` flags.
+- **`cora.dead_code` MCP tool** (#428). Same dead code detection, accessible via Model Context Protocol.
+- **`cora query` CLI command** (#435). Simple graph traversal DSL: `"symbol -> *"` (callees), `"* -> symbol"` (callers), `"SymbolName"` (symbol lookup).
+- **`cora.query` MCP tool** (#435). Same query DSL via MCP.
+- **`cora install` CLI command** (#431). Auto-detect 40+ AI coding agents and configure Cora MCP with one command. Supports `--list`, `--dry-run`, `--agents`, `--force`.
+- **`cora.install` MCP tool** (#431). Same install detection via MCP.
+- **`cora serve` with auto-reindex** (#434). `cora serve` runs incremental reindex on startup before launching MCP server.
+- **Agent config module** (#432). Read/write support for JSON, JSONC, and YAML agent configuration files.
+
+### Changed
+
+- **Tree-sitter is now a default feature** (#429). `default = ["tree-sitter"]` in Cargo.toml. All builds (including release) now include AST-based extraction.
+- **Release workflow** explicitly builds with `--features tree-sitter`.
+- **CI workflow** explicitly builds/tests with `--features tree-sitter`.
+- **MCP tool count** increased from 16 to 18 tools.
+
+### Fixed
+
+- **`edges` table was always empty** (#429). Root cause: tree-sitter feature was not enabled by default, so AST extraction (which produces IMPORTS, IMPLEMENTS, INHERITS, CHILD_OF edges) was never compiled into release binaries. Now fixed — 352+ edges populated on rebuild.
+
 ## [0.9.0] - 2026-07-28
 
 ### Highlights

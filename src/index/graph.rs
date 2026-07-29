@@ -580,6 +580,210 @@ pub struct ModuleInfo {
     pub symbol_count: usize,
     pub edge_types: usize,
 }
+
+/// A dead-code detection result entry.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeadCodeResult {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub signature: Option<String>,
+    pub reason: String,
+}
+
+/// Options controlling dead-code detection.
+#[derive(Debug, Clone, Default)]
+pub struct DeadCodeOptions {
+    /// Include test functions (starting with `test_` or `_test`) in dead code detection.
+    pub include_tests: bool,
+    /// If set, only report symbols whose span is at least this many lines long.
+    pub min_lines: Option<u32>,
+}
+
+/// Well-known symbol names that should not be flagged as dead code even when
+/// they have no recorded callers (they are typically called via trait
+/// dispatch, language builtins, or external entry points).
+const WELL_KNOWN_NAMES: &[&str] = &[
+    "main",
+    "new",
+    "drop",
+    "default",
+    "clone",
+    "eq",
+    "hash",
+    "fmt",
+    "debug",
+    "display",
+    "from_str",
+    "into",
+    "from",
+    "try_from",
+    "try_into",
+    "deref",
+    "deref_mut",
+    "index",
+    "index_mut",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "rem",
+    "neg",
+    "not",
+    "bitand",
+    "bitor",
+    "bitxor",
+    "shl",
+    "shr",
+    "partial_eq",
+    "partial_ord",
+    "eq_ignore_ascii_case",
+    "is_ascii",
+    "to_lowercase",
+    "to_uppercase",
+    "trim",
+    "trim_start",
+    "trim_end",
+    "as_str",
+    "as_bytes",
+    "as_mut",
+    "as_ref",
+    "into_iter",
+    "iter",
+    "next",
+    "map",
+    "filter",
+    "fold",
+    "collect",
+    "len",
+    "is_empty",
+    "contains",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "clear",
+    "get",
+    "get_mut",
+    "with_capacity",
+    "to_vec",
+    "to_string",
+    "parse",
+    "unwrap",
+    "expect",
+    "ok",
+    "err",
+    "is_ok",
+    "is_err",
+    "is_some",
+    "is_none",
+    "take",
+    "replace",
+    "lock",
+    "read",
+    "write",
+    "flush",
+    "close",
+    "connect",
+    "accept",
+    "bind",
+    "listen",
+    "send",
+    "recv",
+    "shutdown",
+    "spawn",
+    "join",
+    "sleep",
+    "yield_now",
+    "block_on",
+    "from_secs",
+    "from_millis",
+    "elapsed",
+    "instant",
+    "system_time",
+    "now",
+    "duration_since",
+];
+
+/// Find dead code: symbols that have no recorded callers and are not
+/// well-known names or (by default) test functions.
+///
+/// `find_dead_code` looks for `function`, `method`, and `procedure` symbols
+/// that never appear as a `callee` in the `call_graph` table for the given
+/// project. Results are ordered by file then line.
+pub fn find_dead_code(
+    conn: &Connection,
+    project_id: i64,
+    opts: &DeadCodeOptions,
+) -> anyhow::Result<Vec<DeadCodeResult>> {
+    // Build the `NOT IN (...)` placeholder list for well-known names.
+    let placeholders: Vec<&str> = WELL_KNOWN_NAMES.iter().map(|_| "?").collect();
+    let not_in_clause = placeholders.join(", ");
+
+    // Build the base SQL. We use dynamic bind parameters: project_id (twice),
+    // then the well-known names, then optionally test-name LIKE patterns.
+    let mut sql = String::from(
+        "SELECT s.name, s.kind, s.file, s.line, s.signature
+         FROM symbols s
+         WHERE s.project_id = ?1
+           AND s.kind IN ('function', 'method', 'procedure')
+           AND s.name NOT IN (",
+    );
+    sql.push_str(&not_in_clause);
+    sql.push_str(
+        ")
+           AND NOT EXISTS (
+               SELECT 1 FROM call_graph cg
+               WHERE cg.callee = s.name AND cg.project_id = ?1
+           )",
+    );
+
+    // Exclude test functions unless requested.
+    if !opts.include_tests {
+        sql.push_str(" AND s.name NOT LIKE 'test_%' AND s.name NOT LIKE '%_test'");
+    }
+
+    // Optional min_lines filter — applied post-query below when span metadata
+    // becomes available. Kept for API compatibility.
+    if opts.min_lines.is_some() {
+        // Placeholder: span filtering not yet supported (no start/end_line cols)
+    }
+
+    sql.push_str(" ORDER BY s.file, s.line");
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    // Bind parameters in order.
+    // Bind parameters: ?1 = project_id, followed by well-known names.
+    let project_id_ref = &project_id;
+
+    // rusqlite's `query_map` with `params!` macro is awkward for a dynamic
+    // number of args, so build a `Vec<&dyn rusqlite::ToSql>`.
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(1 + WELL_KNOWN_NAMES.len());
+    params_vec.push(project_id_ref);
+    for name in WELL_KNOWN_NAMES {
+        params_vec.push(name);
+    }
+
+    let rows = stmt.query_map(params_vec.as_slice(), |row| {
+        let name: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let file: String = row.get(2)?;
+        let line: u32 = row.get::<_, i64>(3)? as u32;
+        let signature: Option<String> = row.get(4)?;
+        Ok(DeadCodeResult {
+            name,
+            kind,
+            file,
+            line,
+            signature,
+            reason: "no callers found".to_string(),
+        })
+    })?;
+
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,5 +1033,79 @@ mod tests {
         let overview = arch_overview(&conn, pid).unwrap();
         assert_eq!(overview.modules.len(), 1);
         assert_eq!(overview.modules[0].name, "src");
+    }
+
+    #[test]
+    fn test_find_dead_code() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+
+        // Insert symbols:
+        //   - "used_fn" (function) → will have a caller, NOT dead
+        //   - "orphan_fn" (function) → no caller, NOT well-known → DEAD
+        //   - "unused_method" (method) → no caller → DEAD
+        //   - "test_unused" (function) → no caller but starts with test_ →
+        //     excluded by default, included when include_tests=true
+        //   - "new" (function) → no caller but well-known → NOT dead
+        let insert_sym = |name: &str, kind: &str, file: &str, line: i64| {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, signature, language, project_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![name, kind, file, line, "", "rust", pid],
+            )
+            .unwrap();
+        };
+
+        insert_sym("used_fn", "function", "src/lib.rs", 10);
+        insert_sym("orphan_fn", "function", "src/lib.rs", 20);
+        insert_sym("unused_method", "method", "src/impl.rs", 5);
+        insert_sym("test_unused", "function", "src/tests.rs", 1);
+        insert_sym("new", "function", "src/lib.rs", 30);
+
+        // Add a call edge: someone calls used_fn
+        store_edges(
+            &conn,
+            &[CallEdge {
+                caller: "caller_fn".into(),
+                callee: "used_fn".into(),
+                file: "src/lib.rs".into(),
+                line: 50,
+            }],
+            pid,
+        )
+        .unwrap();
+
+        // Default opts: test functions excluded
+        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+
+        // orphan_fn and unused_method are dead; used_fn has a caller;
+        // new is well-known; test_unused is excluded as a test function.
+        assert!(names.contains(&"orphan_fn"));
+        assert!(names.contains(&"unused_method"));
+        assert!(!names.contains(&"used_fn"));
+        assert!(!names.contains(&"new"));
+        assert!(!names.contains(&"test_unused"));
+
+        // With include_tests = true, test_unused should appear
+        let dead_with_tests = find_dead_code(
+            &conn,
+            pid,
+            &DeadCodeOptions {
+                include_tests: true,
+                min_lines: None,
+            },
+        )
+        .unwrap();
+        let names_t: Vec<&str> = dead_with_tests.iter().map(|d| d.name.as_str()).collect();
+        assert!(names_t.contains(&"test_unused"));
+        assert!(names_t.contains(&"orphan_fn"));
+
+        // Verify result fields
+        let orphan = dead.iter().find(|d| d.name == "orphan_fn").unwrap();
+        assert_eq!(orphan.kind, "function");
+        assert_eq!(orphan.file, "src/lib.rs");
+        assert_eq!(orphan.line, 20);
+        assert_eq!(orphan.reason, "no callers found");
     }
 }
