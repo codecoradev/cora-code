@@ -468,6 +468,39 @@ enum Command {
         #[clap(long)]
         estimate: bool,
     },
+    /// Auto-detect and configure AI coding agents for Cora MCP
+    Install {
+        /// List detected agents without installing
+        #[clap(long)]
+        list: bool,
+        /// Specific agents to install (comma-separated, e.g. "cline,cursor")
+        #[clap(long)]
+        agents: Option<String>,
+        /// Dry run — show what would be changed
+        #[clap(long)]
+        dry_run: bool,
+        /// Overwrite existing cora entry
+        #[clap(long)]
+        force: bool,
+        /// Install ALL detected agents (non-interactive)
+        #[clap(long, short)]
+        yes: bool,
+    },
+
+    /// Query the code graph with simple patterns (e.g. "main -> *", "* -> authenticate")
+    Query {
+        /// Graph query pattern (e.g. "main -> *", "* -> main", "MyStruct")
+        query: String,
+        /// Maximum results
+        #[clap(long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[clap(long)]
+        json: bool,
+    },
+
+    /// Start MCP server with auto-reindex on startup
+    Serve,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1408,6 +1441,23 @@ async fn main() -> Result<()> {
                 estimate,
             };
             debt::execute_debt(&opts)?
+        }
+        Command::Install {
+            list, agents, dry_run, force, yes,
+        } => {
+            let opts = commands::install::InstallOptions { list, agents, dry_run, force, yes };
+            let output = commands::install::execute_install(&opts)?;
+            println!("{output}");
+            0
+        }
+        Command::Query { query, limit, json } => {
+            let output = commands::query::execute_query_cli(&query, json, limit)?;
+            println!("{output}");
+            0
+        }
+        Command::Serve => {
+            commands::serve::execute_serve()?;
+            0
         }
     };
 

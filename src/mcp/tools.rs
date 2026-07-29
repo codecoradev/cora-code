@@ -194,6 +194,20 @@ pub fn list_tools() -> Vec<Tool> {
                 "required": ["query"]
             }),
         },
+        // ─── Agent Install ───
+        Tool {
+            name: "cora.install".to_string(),
+            description: "Detect installed AI coding agents and configure Cora as an MCP server. List detected agents or install configuration.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "list": { "type": "boolean", "description": "List detected agents without installing" },
+                    "agents": { "type": "string", "description": "Specific agents to install (comma-separated)" },
+                    "dry_run": { "type": "boolean", "description": "Show what would be changed without writing" }
+                },
+                "required": []
+            }),
+        },
     ]
 }
 
@@ -221,6 +235,8 @@ pub fn handle_tool_call(name: &str, params: &serde_json::Value) -> ToolResult {
         "cora.get_memory" => handle_get_memory(params),
         // Brain Mode (Phase 3)
         "cora.brain_search" => handle_brain_search(params),
+        // Agent Install
+        "cora.install" => handle_install(params),
         _ => ToolResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -929,6 +945,30 @@ fn handle_brain_search(params: &serde_json::Value) -> ToolResult {
     }
 }
 
+// ─── Agent Install Handler ───
+
+fn handle_install(params: &serde_json::Value) -> ToolResult {
+    let list = params.get("list").and_then(|v| v.as_bool()).unwrap_or(false);
+    let agents = params
+        .get("agents")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let opts = crate::commands::install::InstallOptions {
+        list,
+        agents,
+        dry_run,
+        force: false,
+        yes: true, // MCP is non-interactive
+    };
+
+    match crate::commands::install::execute_install(&opts) {
+        Ok(msg) => ToolResult::text(msg),
+        Err(e) => ToolResult::error(format!("Install failed: {e:#}")),
+    }
+}
+
 /// Load project config safely (no API keys exposed).
 fn load_project_config() -> anyhow::Result<crate::config::schema::Config> {
     let mut config = crate::config::schema::Config::default();
@@ -1109,7 +1149,7 @@ mod tests {
     #[test]
     fn total_tool_count() {
         let tools = list_tools();
-        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) = 15
-        assert_eq!(tools.len(), 15);
+        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) = 16
+        assert_eq!(tools.len(), 16);
     }
 }
