@@ -487,6 +487,19 @@ enum Command {
         yes: bool,
     },
 
+    /// Detect dead code — functions/methods with no callers
+    DeadCode {
+        /// Include test functions (test_*, _test) in results
+        #[clap(long)]
+        include_tests: bool,
+        /// Minimum lines of code (filter out tiny functions)
+        #[clap(long)]
+        min_lines: Option<u32>,
+        /// Output as JSON
+        #[clap(long)]
+        json: bool,
+    },
+
     /// Query the code graph with simple patterns (e.g. "main -> *", "* -> authenticate")
     Query {
         /// Graph query pattern (e.g. "main -> *", "* -> main", "MyStruct")
@@ -1448,6 +1461,37 @@ async fn main() -> Result<()> {
             let opts = commands::install::InstallOptions { list, agents, dry_run, force, yes };
             let output = commands::install::execute_install(&opts)?;
             println!("{output}");
+            0
+        }
+        Command::DeadCode {
+            include_tests, min_lines, json,
+        } => {
+            let conn = index::open_global_index()?;
+            let cwd = std::env::current_dir().with_context(|| "failed to get cwd")?;
+            let project_id = index::schema::get_or_create_project(&conn, cwd.to_str().with_context(|| "invalid UTF-8 in cwd path")?)?;
+            let opts = index::graph::DeadCodeOptions {
+                include_tests,
+                min_lines,
+            };
+            let results = index::graph::find_dead_code(&conn, project_id, &opts)?;
+            if json {
+                let out = serde_json::to_string_pretty(&results)?;
+                println!("{out}");
+            } else if results.is_empty() {
+                println!("✅ No dead code found.");
+            } else {
+                println!("☠ Found {} potentially dead symbol(s):\n", results.len());
+                for r in &results {
+                    println!(
+                        "  {} {}:{} — {} {}",
+                        r.name.dimmed(),
+                        r.file.cyan(),
+                        r.line.to_string().dimmed(),
+                        r.kind.yellow(),
+                        format!("({})", r.reason).dimmed()
+                    );
+                }
+            }
             0
         }
         Command::Query { query, limit, json } => {

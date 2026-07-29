@@ -208,6 +208,32 @@ pub fn list_tools() -> Vec<Tool> {
                 "required": []
             }),
         },
+        // ─── Dead Code Detection ───
+        Tool {
+            name: "cora.dead_code".to_string(),
+            description: "Find potentially dead code — functions/methods with no callers in the codebase.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "include_tests": { "type": "boolean", "description": "Include test functions in results" },
+                    "min_lines": { "type": "integer", "description": "Minimum lines of code to report" }
+                },
+                "required": []
+            }),
+        },
+        // ─── Graph Query DSL ───
+        Tool {
+            name: "cora.query".to_string(),
+            description: "Query the code graph with simple patterns (e.g. 'main -> *', '* -> authenticate', 'MyStruct'). Returns matching symbols and edges.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Graph query pattern (e.g. 'main -> *', '* -> main')" },
+                    "limit": { "type": "integer", "description": "Max results (default: 50)" }
+                },
+                "required": ["query"]
+            }),
+        },
     ]
 }
 
@@ -237,6 +263,10 @@ pub fn handle_tool_call(name: &str, params: &serde_json::Value) -> ToolResult {
         "cora.brain_search" => handle_brain_search(params),
         // Agent Install
         "cora.install" => handle_install(params),
+        // Dead Code Detection
+        "cora.dead_code" => handle_dead_code(params),
+        // Graph Query DSL
+        "cora.query" => handle_query(params),
         _ => ToolResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -969,6 +999,69 @@ fn handle_install(params: &serde_json::Value) -> ToolResult {
     }
 }
 
+// ─── Dead Code Detection Handler ───
+
+fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
+    let (conn, project_id) = match open_index_db() {
+        Ok((c, pid)) => (c, pid),
+        Err(e) => return ToolResult::error(e.to_string()),
+    };
+
+    let include_tests = params
+        .get("include_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let min_lines = params
+        .get("min_lines")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    let opts = crate::index::graph::DeadCodeOptions {
+        include_tests,
+        min_lines,
+    };
+
+    match crate::index::graph::find_dead_code(&conn, project_id, &opts) {
+        Ok(results) => {
+            if results.is_empty() {
+                return ToolResult::text("No dead code found.");
+            }
+            let json: Vec<serde_json::Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "name": r.name,
+                        "kind": r.kind,
+                        "file": r.file,
+                        "line": r.line,
+                        "reason": r.reason,
+                    })
+                })
+                .collect();
+            ToolResult::text(serde_json::to_string_pretty(&json).unwrap_or_default())
+        }
+        Err(e) => ToolResult::error(format!("Dead code detection failed: {e}")),
+    }
+}
+
+// ─── Graph Query DSL Handler ───
+
+fn handle_query(params: &serde_json::Value) -> ToolResult {
+    let query = match params.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q,
+        None => return ToolResult::error("Missing required parameter: query"),
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize;
+
+    match crate::commands::query::execute_query_cli(query, true, limit) {
+        Ok(output) => ToolResult::text(output),
+        Err(e) => ToolResult::error(format!("Query failed: {e:#}")),
+    }
+}
+
 /// Load project config safely (no API keys exposed).
 fn load_project_config() -> anyhow::Result<crate::config::schema::Config> {
     let mut config = crate::config::schema::Config::default();
@@ -1149,7 +1242,7 @@ mod tests {
     #[test]
     fn total_tool_count() {
         let tools = list_tools();
-        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) = 16
-        assert_eq!(tools.len(), 16);
+        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) + dead_code (1) + query (1) = 18
+        assert_eq!(tools.len(), 18);
     }
 }

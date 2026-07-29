@@ -8,7 +8,7 @@ pub fn execute_serve() -> anyhow::Result<()> {
         crate::index::resolve_project_root(&project_root).unwrap_or(project_root.clone());
 
     let conn = crate::index::open_global_index()?;
-    let project_id = crate::index::ensure_project(&conn, &project_root)?;
+    let _project_id = crate::index::ensure_project(&conn, &project_root)?;
 
     let stats = crate::index::index_project(&conn, &project_root, false)?;
 
