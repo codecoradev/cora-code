@@ -1105,12 +1105,12 @@ fn extract_lang_attr(line: &str) -> String {
         let after = &line[lang_pos + 5..];
         // Skip optional whitespace
         let after = after.trim_start();
-        if after.starts_with('"') {
-            let end = after[1..].find('"').map(|p| p + 1).unwrap_or(after.len());
-            return after[1..end].to_string();
-        } else if after.starts_with('\'') {
-            let end = after[1..].find('\'').map(|p| p + 1).unwrap_or(after.len());
-            return after[1..end].to_string();
+        if let Some(inner) = after.strip_prefix('"') {
+            let end = inner.find('"').map(|p| p + 1).unwrap_or(inner.len());
+            return inner[..end].to_string();
+        } else if let Some(inner) = after.strip_prefix('\'') {
+            let end = inner.find('\'').map(|p| p + 1).unwrap_or(inner.len());
+            return inner[..end].to_string();
         }
     }
     String::new()
@@ -1664,11 +1664,9 @@ fn extract_csharp(
                                         && base
                                             .chars()
                                             .nth(1)
-                                            .map_or(false, |c| c.is_ascii_uppercase())
+                                            .is_some_and(|c| c.is_ascii_uppercase())
                                     {
                                         EdgeKind::Implements
-                                    } else if kind == SymbolKind::Interface {
-                                        EdgeKind::Inherits
                                     } else {
                                         EdgeKind::Inherits
                                     };

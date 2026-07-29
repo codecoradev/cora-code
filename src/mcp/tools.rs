@@ -978,12 +978,18 @@ fn handle_brain_search(params: &serde_json::Value) -> ToolResult {
 // ─── Agent Install Handler ───
 
 fn handle_install(params: &serde_json::Value) -> ToolResult {
-    let list = params.get("list").and_then(|v| v.as_bool()).unwrap_or(false);
+    let list = params
+        .get("list")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let agents = params
         .get("agents")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let dry_run = params.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false);
+    let dry_run = params
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let opts = crate::commands::install::InstallOptions {
         list,
@@ -1051,10 +1057,7 @@ fn handle_query(params: &serde_json::Value) -> ToolResult {
         Some(q) => q,
         None => return ToolResult::error("Missing required parameter: query"),
     };
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize;
+    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
 
     match crate::commands::query::execute_query_cli(query, true, limit) {
         Ok(output) => ToolResult::text(output),

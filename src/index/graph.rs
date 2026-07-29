@@ -593,39 +593,117 @@ pub struct DeadCodeResult {
 }
 
 /// Options controlling dead-code detection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeadCodeOptions {
-    /// If true, do not filter out test functions (names starting with `test_`
-    /// or containing `_test`).
+    /// Include test functions (starting with `test_` or `_test`) in dead code detection.
     pub include_tests: bool,
     /// If set, only report symbols whose span is at least this many lines long.
     pub min_lines: Option<u32>,
-}
-
-impl Default for DeadCodeOptions {
-    fn default() -> Self {
-        Self {
-            include_tests: false,
-            min_lines: None,
-        }
-    }
 }
 
 /// Well-known symbol names that should not be flagged as dead code even when
 /// they have no recorded callers (they are typically called via trait
 /// dispatch, language builtins, or external entry points).
 const WELL_KNOWN_NAMES: &[&str] = &[
-    "main", "new", "drop", "default", "clone", "eq", "hash", "fmt", "debug", "display", "from_str",
-    "into", "from", "try_from", "try_into", "deref", "deref_mut", "index", "index_mut", "add",
-    "sub", "mul", "div", "rem", "neg", "not", "bitand", "bitor", "bitxor", "shl", "shr",
-    "partial_eq", "partial_ord", "eq_ignore_ascii_case", "is_ascii", "to_lowercase", "to_uppercase",
-    "trim", "trim_start", "trim_end", "as_str", "as_bytes", "as_mut", "as_ref", "into_iter", "iter",
-    "next", "map", "filter", "fold", "collect", "len", "is_empty", "contains", "push", "pop",
-    "insert", "remove", "clear", "get", "get_mut", "with_capacity", "to_vec", "to_string", "parse",
-    "unwrap", "expect", "ok", "err", "is_ok", "is_err", "is_some", "is_none", "take", "replace",
-    "lock", "read", "write", "flush", "close", "connect", "accept", "bind", "listen", "send", "recv",
-    "shutdown", "spawn", "join", "sleep", "yield_now", "block_on", "from_secs", "from_millis",
-    "elapsed", "instant", "system_time", "now", "duration_since",
+    "main",
+    "new",
+    "drop",
+    "default",
+    "clone",
+    "eq",
+    "hash",
+    "fmt",
+    "debug",
+    "display",
+    "from_str",
+    "into",
+    "from",
+    "try_from",
+    "try_into",
+    "deref",
+    "deref_mut",
+    "index",
+    "index_mut",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "rem",
+    "neg",
+    "not",
+    "bitand",
+    "bitor",
+    "bitxor",
+    "shl",
+    "shr",
+    "partial_eq",
+    "partial_ord",
+    "eq_ignore_ascii_case",
+    "is_ascii",
+    "to_lowercase",
+    "to_uppercase",
+    "trim",
+    "trim_start",
+    "trim_end",
+    "as_str",
+    "as_bytes",
+    "as_mut",
+    "as_ref",
+    "into_iter",
+    "iter",
+    "next",
+    "map",
+    "filter",
+    "fold",
+    "collect",
+    "len",
+    "is_empty",
+    "contains",
+    "push",
+    "pop",
+    "insert",
+    "remove",
+    "clear",
+    "get",
+    "get_mut",
+    "with_capacity",
+    "to_vec",
+    "to_string",
+    "parse",
+    "unwrap",
+    "expect",
+    "ok",
+    "err",
+    "is_ok",
+    "is_err",
+    "is_some",
+    "is_none",
+    "take",
+    "replace",
+    "lock",
+    "read",
+    "write",
+    "flush",
+    "close",
+    "connect",
+    "accept",
+    "bind",
+    "listen",
+    "send",
+    "recv",
+    "shutdown",
+    "spawn",
+    "join",
+    "sleep",
+    "yield_now",
+    "block_on",
+    "from_secs",
+    "from_millis",
+    "elapsed",
+    "instant",
+    "system_time",
+    "now",
+    "duration_since",
 ];
 
 /// Find dead code: symbols that have no recorded callers and are not
@@ -653,11 +731,13 @@ pub fn find_dead_code(
            AND s.name NOT IN (",
     );
     sql.push_str(&not_in_clause);
-    sql.push_str(")
+    sql.push_str(
+        ")
            AND NOT EXISTS (
                SELECT 1 FROM call_graph cg
                WHERE cg.callee = s.name AND cg.project_id = ?1
-           )");
+           )",
+    );
 
     // Exclude test functions unless requested.
     if !opts.include_tests {

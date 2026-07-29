@@ -18,7 +18,10 @@ pub fn execute_serve() -> anyhow::Result<()> {
             stats.files_indexed, stats.symbols_indexed, stats.files_skipped
         );
     } else {
-        eprintln!("  Index up to date ({} files scanned, {} skipped)", stats.files_scanned, stats.files_skipped);
+        eprintln!(
+            "  Index up to date ({} files scanned, {} skipped)",
+            stats.files_scanned, stats.files_skipped
+        );
     }
 
     // 2. Start MCP server (same as `cora mcp`)

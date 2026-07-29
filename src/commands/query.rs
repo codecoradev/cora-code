@@ -115,8 +115,7 @@ fn execute_outgoing(
         Ok(rows.filter_map(|r| r.ok()).collect())
     } else if pattern.target == "*" {
         // Find all callees of source symbol
-        let callees =
-            crate::index::graph::find_callees(conn, project_id, &pattern.source, limit)?;
+        let callees = crate::index::graph::find_callees(conn, project_id, &pattern.source, limit)?;
         Ok(callees
             .iter()
             .map(|c| {
@@ -130,8 +129,7 @@ fn execute_outgoing(
             .collect())
     } else {
         // Find specific callee — filter results
-        let callees =
-            crate::index::graph::find_callees(conn, project_id, &pattern.source, limit)?;
+        let callees = crate::index::graph::find_callees(conn, project_id, &pattern.source, limit)?;
         Ok(callees
             .iter()
             .filter(|c| c.callee == pattern.target)
@@ -175,8 +173,7 @@ fn execute_incoming(
         Ok(rows.filter_map(|r| r.ok()).collect())
     } else if pattern.target == "*" {
         // Find all callers of source symbol
-        let callers =
-            crate::index::graph::find_callers(conn, project_id, &pattern.source, limit)?;
+        let callers = crate::index::graph::find_callers(conn, project_id, &pattern.source, limit)?;
         Ok(callers
             .iter()
             .map(|c| {
@@ -190,8 +187,7 @@ fn execute_incoming(
             .collect())
     } else {
         // Find specific caller — filter results
-        let callers =
-            crate::index::graph::find_callers(conn, project_id, &pattern.source, limit)?;
+        let callers = crate::index::graph::find_callers(conn, project_id, &pattern.source, limit)?;
         Ok(callers
             .iter()
             .filter(|c| c.caller == pattern.target)
@@ -229,17 +225,14 @@ pub fn execute_query_cli(
 }
 
 /// Format query results as human-readable text.
-fn format_results(
-    pattern: &QueryPattern,
-    results: &serde_json::Value,
-) -> anyhow::Result<String> {
-    let arr = results
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+fn format_results(pattern: &QueryPattern, results: &serde_json::Value) -> anyhow::Result<String> {
+    let arr = results.as_array().cloned().unwrap_or_default();
 
     if arr.is_empty() {
-        return Ok(format!("No results found for pattern: {}", describe_pattern(pattern)));
+        return Ok(format!(
+            "No results found for pattern: {}",
+            describe_pattern(pattern)
+        ));
     }
 
     let mut lines = Vec::new();

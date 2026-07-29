@@ -1456,19 +1456,34 @@ async fn main() -> Result<()> {
             debt::execute_debt(&opts)?
         }
         Command::Install {
-            list, agents, dry_run, force, yes,
+            list,
+            agents,
+            dry_run,
+            force,
+            yes,
         } => {
-            let opts = commands::install::InstallOptions { list, agents, dry_run, force, yes };
+            let opts = commands::install::InstallOptions {
+                list,
+                agents,
+                dry_run,
+                force,
+                yes,
+            };
             let output = commands::install::execute_install(&opts)?;
             println!("{output}");
             0
         }
         Command::DeadCode {
-            include_tests, min_lines, json,
+            include_tests,
+            min_lines,
+            json,
         } => {
             let conn = index::open_global_index()?;
             let cwd = std::env::current_dir().with_context(|| "failed to get cwd")?;
-            let project_id = index::schema::get_or_create_project(&conn, cwd.to_str().with_context(|| "invalid UTF-8 in cwd path")?)?;
+            let project_id = index::schema::get_or_create_project(
+                &conn,
+                cwd.to_str().with_context(|| "invalid UTF-8 in cwd path")?,
+            )?;
             let opts = index::graph::DeadCodeOptions {
                 include_tests,
                 min_lines,

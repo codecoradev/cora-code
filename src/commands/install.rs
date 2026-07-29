@@ -12,6 +12,7 @@ use std::path::PathBuf;
 enum ConfigFormat {
     Json,
     Jsonc,
+    #[allow(dead_code)]
     Yaml,
 }
 
@@ -34,6 +35,7 @@ pub struct InstallOptions {
     /// Overwrite existing cora entry.
     pub force: bool,
     /// Non-interactive mode.
+    #[allow(dead_code)]
     pub yes: bool,
 }
 
@@ -122,8 +124,8 @@ fn strip_jsonc_comments(input: &str) -> String {
 
 /// Merge the cora MCP server entry into a JSON/JSONC config file.
 fn merge_json_config(path: &std::path::Path, force: bool, dry_run: bool) -> Result<String> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     // For JSONC, strip comments before parsing
     let clean = strip_jsonc_comments(&raw);
@@ -166,12 +168,14 @@ fn merge_json_config(path: &std::path::Path, force: bool, dry_run: bool) -> Resu
     } else {
         let output = if is_jsonc {
             // Write back as JSONC with a header comment
-            format!("// Modified by cora install\n{}", serde_json::to_string_pretty(&config)?)
+            format!(
+                "// Modified by cora install\n{}",
+                serde_json::to_string_pretty(&config)?
+            )
         } else {
             serde_json::to_string_pretty(&config)?
         };
-        fs::write(path, &output)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        fs::write(path, &output).with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(format!(
             "  {} {} — cora MCP server entry added",
             "✓ ".green(),
@@ -182,8 +186,8 @@ fn merge_json_config(path: &std::path::Path, force: bool, dry_run: bool) -> Resu
 
 /// Merge the cora MCP server entry into a YAML config file.
 fn merge_yaml_config(path: &std::path::Path, force: bool, dry_run: bool) -> Result<String> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     let mut config: serde_yaml_ng::Value =
         serde_yaml_ng::from_str(&raw).context("Failed to parse YAML config")?;
@@ -226,8 +230,7 @@ fn merge_yaml_config(path: &std::path::Path, force: bool, dry_run: bool) -> Resu
         ))
     } else {
         let output = serde_yaml_ng::to_string(&config)?;
-        fs::write(path, output)
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+        fs::write(path, output).with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(format!(
             "  {} {} — cora MCP server entry added",
             "✓ ".green(),
@@ -270,7 +273,11 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
         if let Some(ref agent_list) = opts.agents {
             return Ok(format!(
                 "None of the specified agents found: {agent_list}\nDetected agents: {}",
-                all_agents.iter().map(|a| a.name).collect::<Vec<_>>().join(", ")
+                all_agents
+                    .iter()
+                    .map(|a| a.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         unreachable!();
@@ -278,9 +285,7 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
 
     // --list mode
     if opts.list {
-        let mut lines = vec![
-            format!("Detected {} AI coding agent(s):\n", agents.len()),
-        ];
+        let mut lines = vec![format!("Detected {} AI coding agent(s):\n", agents.len())];
         for agent in &agents {
             lines.push(format!(
                 "  {} {}  {}",
