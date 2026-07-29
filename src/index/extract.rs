@@ -505,6 +505,7 @@ fn extract_svelte(content: &str, file: &str, out: &mut Vec<ExtractedDef>) {
 ///
 /// When the `tree-sitter` feature is enabled, uses AST-based extraction for
 /// supported languages. Falls back to regex-based scope tracking for others.
+#[allow(dead_code)]
 pub fn extract_calls(content: &str, language: &str, file_path: &str) -> Vec<CallSite> {
     #[cfg(feature = "tree-sitter")]
     {
