@@ -300,6 +300,99 @@ pub fn scan_breaking_changes(
     findings
 }
 
+/// Scan a full project for index-based findings (unused imports + dead code).
+/// Designed for `cora scan` which operates on file paths, not diffs.
+/// Returns findings for any file in the project that has an index DB.
+pub fn scan_project_index(
+    root: &std::path::Path,
+    _files: &[crate::engine::scanner::FileEntry],
+    max_findings: usize,
+) -> Vec<crate::engine::ReviewIssue> {
+    use crate::engine::ReviewIssue;
+
+    let mut findings = Vec::new();
+
+    let conn = match crate::index::open_global_index() {
+        Ok(c) => c,
+        Err(_) => {
+            debug!("no global index available — skipping project index scan");
+            return findings;
+        }
+    };
+
+    let project_id = match crate::index::ensure_project(&conn, root) {
+        Ok(id) => id,
+        Err(_) => {
+            debug!("failed to get project_id — skipping project index scan");
+            return findings;
+        }
+    };
+
+    // Scan for unused imports across all files in the scan set
+    let mut seen_files = std::collections::HashSet::new();
+    for entry in _files {
+        if seen_files.insert(entry.path.clone()) {
+            match graph::find_unused_imports(&conn, &entry.path, project_id) {
+                Ok(unused) => {
+                    for u in &unused {
+                        findings.push(ReviewIssue {
+                            file: u.file.clone(),
+                            line: Some(u.line),
+                            severity: crate::engine::Severity::Minor,
+                            issue_type: Some("index".into()),
+                            title: format!("[index-unused-import] Unused import: {}", u.target),
+                            body: format!(
+                                "Import `{}` is never used in this file. \
+                                 Consider removing it to keep imports clean.",
+                                u.target
+                            ),
+                            suggested_fix: None,
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!("unused import scan failed for {}: {}", entry.path, e);
+                }
+            }
+        }
+        if findings.len() >= max_findings {
+            break;
+        }
+    }
+
+    if findings.len() >= max_findings {
+        return findings;
+    }
+
+    // Scan for dead code in the indexed project
+    let opts = graph::DeadCodeOptions::default();
+    match graph::find_dead_code(&conn, project_id, &opts) {
+        Ok(dead) => {
+            for func in dead.into_iter().take(max_findings - findings.len()) {
+                findings.push(ReviewIssue {
+                    file: func.file.clone(),
+                    line: Some(func.line),
+                    severity: crate::engine::Severity::Info,
+                    issue_type: Some("index".into()),
+                    title: format!("[index-dead-code] Potentially dead code: {}", func.name),
+                    body: format!(
+                        "Function `{}` ({}) has no callers in the \
+                         project. Verify it's not called via reflection, \
+                         trait dispatch, or external entry points.",
+                        func.name, func.kind
+                    ),
+                    suggested_fix: None,
+                });
+            }
+        }
+        Err(e) => {
+            debug!("dead code scan failed: {}", e);
+        }
+    }
+
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

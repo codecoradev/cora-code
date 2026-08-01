@@ -308,15 +308,24 @@ async fn review_diff_inner(
             if !rule_findings.is_empty()
                 || !secrets_findings.is_empty()
                 || !security_findings.is_empty()
+                || !index_unused_findings.is_empty()
+                || !index_dead_findings.is_empty()
+                || !index_breaking_findings.is_empty()
             {
                 let n_rules = rule_findings.len();
                 let n_secrets = secrets_findings.len();
                 let n_security = security_findings.len();
+                let n_index_unused = index_unused_findings.len();
+                let n_index_dead = index_dead_findings.len();
+                let n_index_breaking = index_breaking_findings.len();
                 debug!(
                     error = %e,
                     rule_findings = n_rules,
                     secrets_findings = n_secrets,
                     security_findings = n_security,
+                    index_unused = n_index_unused,
+                    index_dead = n_index_dead,
+                    index_breaking = n_index_breaking,
                     "LLM call failed, returning deterministic findings only"
                 );
                 let mut all_deterministic =
@@ -325,10 +334,22 @@ async fn review_diff_inner(
                     crate::engine::rules::merge_rule_findings(all_deterministic, secrets_findings);
                 all_deterministic =
                     crate::engine::rules::merge_rule_findings(all_deterministic, security_findings);
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_unused_findings,
+                );
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_dead_findings,
+                );
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_breaking_findings,
+                );
                 let mut fallback = ReviewResponse {
                     issues: all_deterministic,
                     summary: format!(
-                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security findings."
+                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security + {n_index_unused} unused imports + {n_index_dead} dead code + {n_index_breaking} breaking changes."
                     ),
                     tokens_used: None,
                     should_block: false,
