@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0]
+
+### Highlights
+
+- **Index-powered unused import detection.** `cora review` now flags unused imports using symbol graph analysis — not regex guessing. Detects imports that are never referenced in the file, across Rust, TypeScript, Go, and Python.
+- **Dead code in review.** Changed files with dead functions/methods (zero callers) are now flagged automatically during review, not just via standalone `cora dead-code`.
+- **Breaking change detection.** When a public symbol is removed or modified, review flags it with a list of affected callers — prevents silent breaking API changes.
+- **HTTP route detection.** Route handlers (Axum, Actix, Express, Go net/http) are now tracked as first-class graph edges (`ROUTE`), enabling `cora query` to trace routes to handlers.
+- **Brain enrichment (Tier 1).** Review pipeline now leverages symbol index for caller resolution, impact analysis, affected tests, and semantic search. Zero regression without index — falls back to regex-based resolution.
+
+### Added
+
+- **Unused import scanner** — `find_unused_imports()` in graph module, wired into review pipeline. Flags unused imports with file:line and imported symbol name.
+- **Dead code scanner** — `find_dead_code_in_file()` in graph module. Detects unreachable symbols in changed files during review.
+- **Breaking change scanner** — Detects removed public symbols and cross-references callers from index.
+- **`EdgeKind::Route`** — New edge type for HTTP route → handler relationships.
+- **Route extraction** — Axum `#[get("/path")]`, Actix `#[route("/path")]`, Express `app.get()`, Go `http.HandleFunc()`.
+
+### Changed
+
+- **Caller resolution** — Index-aware `resolve_callers()` uses graph query first, regex fallback only when no index.
+- **Pre-commit hook** — Auto-runs `cora index --quiet` before review for persistent local index.
+- **Context enrichment** — Impact analysis, affected tests, and brain search injected into LLM review prompt.
+- **Ruby AST extraction** — Fixed `body_statement` wrapper bug in class/module method extraction.
+
+### Technical
+
+- **Resolved `test_extract_ruby`** — tree-sitter Ruby method extraction now correctly handles `body_statement` intermediate nodes.
+- **CI 10/10 green** — All checks pass including format, clippy, test, build, security audit.
+
 ## [0.10.0] - 2026-07-29
 
 ### Highlights

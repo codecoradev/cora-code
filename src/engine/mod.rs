@@ -5,6 +5,7 @@ pub mod context;
 pub mod db_writer;
 pub mod debt_tracker;
 pub mod diff_parser;
+pub mod index_scanner;
 pub mod language_analyzer;
 pub mod llm;
 pub mod markdown;

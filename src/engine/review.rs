@@ -141,47 +141,59 @@ async fn review_diff_inner(
         config.rules_config.max_findings,
     );
 
+    // Run index-powered scans (requires symbol graph — graceful no-op without index)
+    let index_unused_findings = crate::engine::index_scanner::scan_unused_imports(
+        &diff_chunks,
+        std::env::current_dir().unwrap_or_default().as_path(),
+        config.rules_config.max_findings,
+    );
+    let index_dead_findings = crate::engine::index_scanner::scan_dead_code_in_review(
+        &diff_chunks,
+        std::env::current_dir().unwrap_or_default().as_path(),
+        config.rules_config.max_findings,
+    );
+    let index_breaking_findings = crate::engine::index_scanner::scan_breaking_changes(
+        &diff_chunks,
+        std::env::current_dir().unwrap_or_default().as_path(),
+        config.rules_config.max_findings,
+    );
+
     let rule_context = crate::engine::rules::format_rule_context(&rule_findings);
     let secrets_context = crate::engine::rules::format_rule_context(&secrets_findings);
     let security_context = crate::engine::rules::format_rule_context(&security_findings);
+    let index_unused_context = crate::engine::rules::format_rule_context(&index_unused_findings);
+    let index_dead_context = crate::engine::rules::format_rule_context(&index_dead_findings);
+    let index_breaking_context =
+        crate::engine::rules::format_rule_context(&index_breaking_findings);
     // Keep a clone for merging after LLM (rule_findings may be consumed in error fallback)
     let rule_findings_clone = rule_findings.clone();
     let secrets_findings_clone = secrets_findings.clone();
     let security_findings_clone = security_findings.clone();
+    let index_unused_findings_clone = index_unused_findings.clone();
+    let index_dead_findings_clone = index_dead_findings.clone();
+    let index_breaking_findings_clone = index_breaking_findings.clone();
 
-    // Combine static analysis + rule engine + secrets + security findings for LLM prompt
-    let combined_context = match (
-        static_context.as_deref(),
+    // Combine all context sections for LLM prompt (static analysis + all scanner findings)
+    let mut context_parts: Vec<String> = Vec::new();
+    if let Some(sa) = static_context.as_deref() {
+        context_parts.push(sa.to_string());
+    }
+    for ctx in [
         rule_context.as_str(),
         secrets_context.as_str(),
         security_context.as_str(),
-    ) {
-        (Some(sa), rc, sc, sec) if !rc.is_empty() && !sc.is_empty() && !sec.is_empty() => {
-            Some(format!("{sa}\n\n{rc}\n\n{sc}\n\n{sec}"))
+        index_unused_context.as_str(),
+        index_dead_context.as_str(),
+        index_breaking_context.as_str(),
+    ] {
+        if !ctx.is_empty() {
+            context_parts.push(ctx.to_string());
         }
-        (Some(sa), rc, sc, _) if !rc.is_empty() && !sc.is_empty() => {
-            Some(format!("{sa}\n\n{rc}\n\n{sc}"))
-        }
-        (Some(sa), rc, _, sec) if !rc.is_empty() && !sec.is_empty() => {
-            Some(format!("{sa}\n\n{rc}\n\n{sec}"))
-        }
-        (Some(sa), _, sc, sec) if !sc.is_empty() && !sec.is_empty() => {
-            Some(format!("{sa}\n\n{sc}\n\n{sec}"))
-        }
-        (Some(sa), rc, _, _) if !rc.is_empty() => Some(format!("{sa}\n\n{rc}")),
-        (Some(sa), _, sc, _) if !sc.is_empty() => Some(format!("{sa}\n\n{sc}")),
-        (Some(sa), _, _, sec) if !sec.is_empty() => Some(format!("{sa}\n\n{sec}")),
-        (Some(sa), _, _, _) => Some(sa.to_string()),
-        (_, rc, sc, sec) if !rc.is_empty() && !sc.is_empty() && !sec.is_empty() => {
-            Some(format!("{rc}\n\n{sc}\n\n{sec}"))
-        }
-        (_, rc, sc, _) if !rc.is_empty() && !sc.is_empty() => Some(format!("{rc}\n\n{sc}")),
-        (_, rc, _, sec) if !rc.is_empty() && !sec.is_empty() => Some(format!("{rc}\n\n{sec}")),
-        (_, _, sc, sec) if !sc.is_empty() && !sec.is_empty() => Some(format!("{sc}\n\n{sec}")),
-        (_, rc, _, _) if !rc.is_empty() => Some(rc.to_string()),
-        (_, _, sc, _) if !sc.is_empty() => Some(sc.to_string()),
-        (_, _, _, sec) if !sec.is_empty() => Some(sec.to_string()),
-        _ => None,
+    }
+    let combined_context = if context_parts.is_empty() {
+        None
+    } else {
+        Some(context_parts.join("\n\n"))
     };
 
     // Build context chain (cross-file dependency extraction)
@@ -296,15 +308,24 @@ async fn review_diff_inner(
             if !rule_findings.is_empty()
                 || !secrets_findings.is_empty()
                 || !security_findings.is_empty()
+                || !index_unused_findings.is_empty()
+                || !index_dead_findings.is_empty()
+                || !index_breaking_findings.is_empty()
             {
                 let n_rules = rule_findings.len();
                 let n_secrets = secrets_findings.len();
                 let n_security = security_findings.len();
+                let n_index_unused = index_unused_findings.len();
+                let n_index_dead = index_dead_findings.len();
+                let n_index_breaking = index_breaking_findings.len();
                 debug!(
                     error = %e,
                     rule_findings = n_rules,
                     secrets_findings = n_secrets,
                     security_findings = n_security,
+                    index_unused = n_index_unused,
+                    index_dead = n_index_dead,
+                    index_breaking = n_index_breaking,
                     "LLM call failed, returning deterministic findings only"
                 );
                 let mut all_deterministic =
@@ -313,10 +334,22 @@ async fn review_diff_inner(
                     crate::engine::rules::merge_rule_findings(all_deterministic, secrets_findings);
                 all_deterministic =
                     crate::engine::rules::merge_rule_findings(all_deterministic, security_findings);
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_unused_findings,
+                );
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_dead_findings,
+                );
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_breaking_findings,
+                );
                 let mut fallback = ReviewResponse {
                     issues: all_deterministic,
                     summary: format!(
-                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security findings."
+                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security + {n_index_unused} unused imports + {n_index_dead} dead code + {n_index_breaking} breaking changes."
                     ),
                     tokens_used: None,
                     should_block: false,
@@ -334,7 +367,7 @@ async fn review_diff_inner(
         }
     };
 
-    // Merge rule findings + secrets findings + security findings with LLM issues
+    // Merge rule findings + secrets findings + security findings + index findings with LLM issues
     if !rule_findings_clone.is_empty() {
         response.issues =
             crate::engine::rules::merge_rule_findings(response.issues, rule_findings_clone);
@@ -346,6 +379,20 @@ async fn review_diff_inner(
     if !security_findings_clone.is_empty() {
         response.issues =
             crate::engine::rules::merge_rule_findings(response.issues, security_findings_clone);
+    }
+    if !index_unused_findings_clone.is_empty() {
+        response.issues =
+            crate::engine::rules::merge_rule_findings(response.issues, index_unused_findings_clone);
+    }
+    if !index_dead_findings_clone.is_empty() {
+        response.issues =
+            crate::engine::rules::merge_rule_findings(response.issues, index_dead_findings_clone);
+    }
+    if !index_breaking_findings_clone.is_empty() {
+        response.issues = crate::engine::rules::merge_rule_findings(
+            response.issues,
+            index_breaking_findings_clone,
+        );
     }
 
     // Filter out issues with invalid file paths (hallucination guard)
