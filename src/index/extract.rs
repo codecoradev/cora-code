@@ -627,12 +627,12 @@ pub fn detect_routes(
         "rs" => &[
             // axum: .route("/path", get(handler_fn))
             (
-                r#"(?:\w+\.)?route\(\s*"([^"]+)"\s*,\s*(?:\w+::)?(\w+)\((\w+)"#,
+                r#"(?:\w+\.)?route\(\s*"([^"]+)"\s*,\s*(?:\w+::)?(\w+)\(([\w:]+)"#,
                 "route_method_handler",
             ),
             // actix-web: .route("/path", web::get().to(handler))
             (
-                r#"\.route\(\s*"([^"]+)"\s*,\s*\w+::(\w+)\(\)\.to\((\w+)"#,
+                r#"\.route\(\s*"([^"]+)"\s*,\s*\w+::(\w+)\(\)\.to\(([\w:]+)"#,
                 "route_method_to_handler",
             ),
         ],
@@ -658,7 +658,7 @@ pub fn detect_routes(
         _ => &[],
     };
 
-    for (pattern, _label) in patterns {
+    for (pattern, label) in patterns {
         let re = Regex::new(pattern).unwrap();
         for cap in re.captures_iter(content) {
             let full_match = cap.get(0).unwrap();
@@ -667,21 +667,41 @@ pub fn detect_routes(
                 .count()
                 .saturating_add(1);
 
-            // Build the route target string: METHOD /path
-            let path = &cap[1];
-            let method = extract_http_method(pattern, &cap, language);
+            // Resolve (path, method, handler) per pattern label. Each framework's
+            // regex captures groups in a different order, so dispatch on the label.
+            // axum/actix capture the method fn in group 2 (e.g. `get`, `post`);
+            // go/express capture only path + handler.
+            let (path, method, handler): (String, String, Option<String>) = match *label {
+                "route_method_handler" | "route_method_to_handler" => (
+                    cap[1].to_string(),
+                    cap[2].to_ascii_uppercase(),
+                    // Handler may be a fully-qualified path like
+                    // `routes::health::health_check` — keep only the final segment
+                    // so it matches the indexed function symbol.
+                    Some(cap[3].rsplit("::").next().unwrap_or(&cap[3]).to_string()),
+                ),
+                "handle_func" | "router_method" | "express_route" => {
+                    (cap[1].to_string(), String::new(), Some(cap[2].to_string()))
+                }
+                "flask_decorator" | "fastapi_decorator" => {
+                    (cap[1].to_string(), String::new(), None)
+                }
+                _ => (
+                    cap.get(1)
+                        .map(|m| m.as_str().to_string())
+                        .unwrap_or_default(),
+                    String::new(),
+                    cap.get(2).map(|m| m.as_str().to_string()),
+                ),
+            };
+
+            // Build the route target string: "METHOD /path" (or just "/path")
             let target = if method.is_empty() {
-                path.to_string()
+                path
             } else {
                 format!("{} {}", method, path)
             };
-
-            // Handler name — try capture groups 2 and 3 (some patterns have 2, some 3)
-            let handler = cap.get(2).or_else(|| cap.get(3)).map(|m| m.as_str());
-            let source = match handler {
-                Some(h) => h.to_string(),
-                None => format!("route_line_{}", line_no),
-            };
+            let source = handler.unwrap_or_else(|| format!("route_line_{}", line_no));
 
             edges.push(AstEdge {
                 source,
@@ -694,37 +714,6 @@ pub fn detect_routes(
     }
 
     edges
-}
-
-/// Extract HTTP method from a route pattern match.
-fn extract_http_method(pattern: &str, cap: &regex::Captures<'_>, language: &str) -> &'static str {
-    // For patterns that capture the HTTP method explicitly (group 2 before handler)
-    if pattern.contains("method_to_handler") {
-        return match cap.get(2).map(|m| m.as_str().to_uppercase()).as_deref() {
-            Some("GET") => "GET",
-            Some("POST") => "POST",
-            Some("PUT") => "PUT",
-            Some("DELETE") => "DELETE",
-            Some("PATCH") => "PATCH",
-            _ => "",
-        };
-    }
-
-    // For framework-specific patterns, infer from handler name
-    if language == "python" {
-        // FastAPI: @app.get(), @app.post(), etc.
-        if let Some(method) = cap.get(1) {
-            // Can't extract method from the decorator itself in this pattern
-            let _ = method;
-        }
-        // Infer from the route function name pattern
-        let handler = cap.get(2).or_else(|| cap.get(3)).map(|m| m.as_str());
-        if let Some(_h) = handler {
-            return "";
-        }
-    }
-
-    ""
 }
 
 /// Detect function entry from a line (returns function name).
@@ -1321,6 +1310,94 @@ enum Status { active, inactive }"#;
         assert!(names.contains(&"login"), "login method");
         assert!(names.contains(&"fetchData"), "fetchData function");
         assert!(names.contains(&"Status"), "Status enum");
+    }
+
+    #[test]
+    fn test_detect_routes_axum_fully_qualified_handler() {
+        // Real-world axum: handlers are often fully-qualified module paths like
+        // `routes::health::health_check`. The handler symbol we store must be the
+        // final segment (`health_check`) so it matches the indexed function.
+        let content = r#"
+            .route("/api/health", get(routes::health::health_check))
+            .route("/api/progress", post(routes::progress::submit_progress))
+        "#;
+        let edges = detect_routes(content, "rs", "src/lib.rs");
+        assert_eq!(edges.len(), 2);
+        let by_handler: std::collections::HashMap<&str, &str> =
+            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        assert_eq!(by_handler.get("health_check"), Some(&"GET /api/health"));
+        assert_eq!(by_handler.get("submit_progress"), Some(&"POST /api/progress"));
+        // Module prefixes must NOT leak into the handler name.
+        assert!(!by_handler.contains_key("routes"));
+        assert!(!by_handler.contains_key("health"));
+        assert!(!by_handler.contains_key("progress"));
+    }
+
+    #[test]
+    fn test_detect_routes_axum_handler_and_method() {
+        // Axum: .route("/path", get(handler))  — handler is group 3, method group 2.
+        // Verifies the bug fix where `get` (the method fn) was wrongly used as the
+        // handler name, and the method was dropped from the target.
+        let content = r#"
+            .route("/api/health", get(health_check))
+            .route("/api/auth/login", post(login))
+            .route("/api/users/:id", get(get_user))
+        "#;
+        let edges = detect_routes(content, "rs", "src/lib.rs");
+        assert_eq!(edges.len(), 3, "expected 3 axum routes");
+
+        // Each edge: source = handler, target = "METHOD /path"
+        let by_handler: std::collections::HashMap<&str, &str> =
+            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        assert_eq!(by_handler.get("health_check"), Some(&"GET /api/health"));
+        assert_eq!(by_handler.get("login"), Some(&"POST /api/auth/login"));
+        assert_eq!(by_handler.get("get_user"), Some(&"GET /api/users/:id"));
+
+        // The method fn name `get`/`post` must NOT appear as a handler.
+        assert!(!by_handler.contains_key("get"));
+        assert!(!by_handler.contains_key("post"));
+    }
+
+    #[test]
+    fn test_detect_routes_actix() {
+        let content =
+            r#".route("/api/items", web::get().to(list_items)).route("/api/items", web::post().to(create_item))"#;
+        let edges = detect_routes(content, "rs", "src/routes.rs");
+        assert_eq!(edges.len(), 2);
+        let by_handler: std::collections::HashMap<&str, &str> =
+            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        assert_eq!(by_handler.get("list_items"), Some(&"GET /api/items"));
+        assert_eq!(by_handler.get("create_item"), Some(&"POST /api/items"));
+    }
+
+    #[test]
+    fn test_detect_routes_express() {
+        let content = r#"
+            app.get('/api/health', healthHandler);
+            router.post('/api/login', loginHandler);
+        "#;
+        let edges = detect_routes(content, "ts", "src/server.ts");
+        // express pattern captures method + path + handler (3 groups) but current
+        // resolution maps express_route to (path, "", handler) — method empty.
+        assert_eq!(edges.len(), 2);
+        let by_handler: std::collections::HashMap<&str, &str> =
+            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        assert_eq!(by_handler.get("healthHandler"), Some(&"/api/health"));
+        assert_eq!(by_handler.get("loginHandler"), Some(&"/api/login"));
+    }
+
+    #[test]
+    fn test_detect_routes_no_routes() {
+        let content = "fn main() { do_stuff() }\n";
+        let edges = detect_routes(content, "rs", "src/main.rs");
+        assert!(edges.is_empty(), "plain code should yield no routes");
+    }
+
+    #[test]
+    fn test_detect_routes_unknown_language() {
+        let content = "app.get('/x', h)";
+        let edges = detect_routes(content, "ruby", "src/app.rb");
+        assert!(edges.is_empty());
     }
 
     #[test]
