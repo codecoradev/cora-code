@@ -121,6 +121,7 @@ pub async fn execute_scan(
         &root_abs,
         &files,
         config.rules_config.max_findings,
+        &config.rules_config.index_skip_files,
     );
     if !index_findings.is_empty() {
         eprintln!(
