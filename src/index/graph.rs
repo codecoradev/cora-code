@@ -784,6 +784,161 @@ pub fn find_dead_code(
 
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
+
+/// Result of unused import analysis for a single file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnusedImportResult {
+    /// The imported symbol or module name.
+    pub target: String,
+    /// The source (importing) symbol — usually the file module or import statement.
+    pub source: String,
+    /// File containing the unused import.
+    pub file: String,
+    /// Line number of the import statement.
+    pub line: u32,
+}
+
+/// Find unused imports in a specific file using the edges table.
+///
+/// For each IMPORTS edge in the file, checks if the imported symbol is
+/// referenced anywhere else (as a callee in call_graph, or as source/target
+/// in non-IMPORTS edges). If not referenced → unused import.
+pub fn find_unused_imports(
+    conn: &Connection,
+    file: &str,
+    project_id: i64,
+) -> anyhow::Result<Vec<UnusedImportResult>> {
+    // 1. Get all IMPORTS edges for this file
+    let mut imports_stmt = conn.prepare(
+        "SELECT source, target, line FROM edges
+         WHERE file = ?1 AND kind = 'IMPORTS' AND project_id = ?2",
+    )?;
+
+    let imports: Vec<(String, String, u32)> = imports_stmt
+        .query_map(rusqlite::params![file, project_id], |row| {
+            let source: String = row.get(0)?;
+            let target: String = row.get(1)?;
+            let line: u32 = row.get::<_, i64>(2)? as u32;
+            Ok((source, target, line))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if imports.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut unused = Vec::new();
+
+    for (source, target, line) in &imports {
+        // Check if the imported target is used in this file:
+        // - As callee in call_graph
+        // - As source or target in non-IMPORTS edges within this file
+        let is_used = conn.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT 1 FROM call_graph cg
+                WHERE cg.callee = ?1 AND cg.file = ?2 AND cg.project_id = ?3
+                UNION
+                SELECT 1 FROM edges e
+                WHERE e.target = ?1 AND e.file = ?2 AND e.kind != 'IMPORTS' AND e.project_id = ?3
+            )",
+            rusqlite::params![target, file, project_id],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+
+        if !is_used {
+            // Additional check: is the target referenced as a symbol in any
+            // edge from this file (could be a type used in signatures, etc.)
+            let is_referenced = conn.query_row(
+                "SELECT COUNT(*) FROM edges e
+                 WHERE (e.source = ?1 OR e.target = ?1)
+                   AND e.file = ?2
+                   AND e.project_id = ?3
+                   AND e.kind != 'IMPORTS'",
+                rusqlite::params![target, file, project_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+
+            if is_referenced == 0 {
+                unused.push(UnusedImportResult {
+                    target: target.clone(),
+                    source: source.clone(),
+                    file: file.to_string(),
+                    line: *line,
+                });
+            }
+        }
+    }
+
+    Ok(unused)
+}
+
+/// Find dead code (symbols with no callers) within a specific file.
+///
+/// Unlike the standalone `find_dead_code` which scans the whole project,
+/// this function is scoped to changed files for use in review context.
+pub fn find_dead_code_in_file(
+    conn: &Connection,
+    file: &str,
+    project_id: i64,
+    include_tests: bool,
+) -> anyhow::Result<Vec<DeadCodeResult>> {
+    let mut sql = String::from(
+        "SELECT s.name, s.kind, s.file, s.line, s.signature
+         FROM symbols s
+         WHERE s.file = ?1
+           AND s.project_id = ?2
+           AND s.kind IN ('function', 'method', 'procedure')
+           AND s.name NOT IN (",
+    );
+
+    let placeholders: Vec<&str> = WELL_KNOWN_NAMES.iter().map(|_| "?").collect();
+    sql.push_str(&placeholders.join(", "));
+    sql.push_str(
+        ")
+           AND NOT EXISTS (
+               SELECT 1 FROM call_graph cg
+               WHERE cg.callee = s.name AND cg.project_id = ?2
+           )",
+    );
+
+    if !include_tests {
+        sql.push_str(" AND s.name NOT LIKE 'test_%' AND s.name NOT LIKE '%_test'");
+    }
+
+    sql.push_str(" ORDER BY s.line");
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+        Vec::with_capacity(2 + WELL_KNOWN_NAMES.len());
+    params_vec.push(Box::new(file.to_string()));
+    params_vec.push(Box::new(project_id));
+    for name in WELL_KNOWN_NAMES {
+        params_vec.push(Box::new(*name));
+    }
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
+
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        let name: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let file: String = row.get(2)?;
+        let line: u32 = row.get::<_, i64>(3)? as u32;
+        let signature: Option<String> = row.get(4)?;
+        Ok(DeadCodeResult {
+            name,
+            kind,
+            file,
+            line,
+            signature,
+            reason: "no callers found".to_string(),
+        })
+    })?;
+
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

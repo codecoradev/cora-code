@@ -53,6 +53,7 @@ pub enum EdgeKind {
     Implements,
     Inherits,
     ChildOf,
+    Route,
 }
 
 impl EdgeKind {
@@ -63,6 +64,7 @@ impl EdgeKind {
             Self::Implements => "IMPLEMENTS",
             Self::Inherits => "INHERITS",
             Self::ChildOf => "CHILD_OF",
+            Self::Route => "ROUTE",
         }
     }
 }
