@@ -1027,9 +1027,9 @@ end
 "#;
         let symbols = extract_symbols(code, "rb", "app.rb");
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"ApplicationController"));
-        assert!(names.contains(&"authenticate_user"));
-        assert!(names.contains(&"Auth"));
+        assert!(names.contains(&"ApplicationController"), "missing ApplicationController, got: {names:?}");
+        assert!(names.contains(&"authenticate_user"), "missing authenticate_user, got: {names:?}");
+        assert!(names.contains(&"Auth"), "missing Auth, got: {names:?}");
     }
 
     #[test]
