@@ -729,6 +729,72 @@ fn resolve_callers(
         return Vec::new();
     }
 
+    // ── Index-based caller resolution (preferred) ───────────────────────
+    if let Ok(conn) = crate::index::open_global_index() {
+        if let Ok(project_id) = crate::index::ensure_project(&conn, project_root) {
+            let mut entries = Vec::new();
+            for def in defs {
+                if def.name.len() < 2 {
+                    continue;
+                }
+                match crate::index::graph::find_callers(&conn, project_id, &def.name, 20) {
+                    Ok(callers) => {
+                        for caller in callers {
+                            // Skip callers in the defining file itself
+                            if caller.file == def.file {
+                                continue;
+                            }
+                            let rel = caller.file.clone();
+                            if is_ignored(&rel, ignore_patterns) {
+                                continue;
+                            }
+                            let label = match def.kind {
+                                DefinitionKind::Function => {
+                                    format!("caller of fn {}", def.name)
+                                }
+                                DefinitionKind::Type => {
+                                    format!("usage of {}", def.name)
+                                }
+                            };
+                            entries.push(ContextEntry {
+                                file: rel,
+                                line_start: caller.line.saturating_sub(1).max(1),
+                                line_end: caller.line + 1,
+                                label,
+                                priority: ContextPriority::CallerSite,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        debug!(symbol = %def.name, error = %e, "index caller lookup failed");
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                debug!(
+                    callers_found = entries.len(),
+                    source = "index",
+                    "resolved callers"
+                );
+                return entries;
+            }
+            // Index found but no callers — fall through to regex scan
+            debug!("index caller lookup returned empty, falling back to regex");
+        }
+    }
+
+    // ── Regex-based fallback (original behavior) ───────────────────────
+    debug!("using regex-based caller resolution");
+    resolve_callers_regex(defs, project_root, ignore_patterns)
+}
+
+/// Regex-based caller resolution — scans project files for symbol references.
+/// Used as fallback when no symbol index is available.
+fn resolve_callers_regex(
+    defs: &[DefinedSymbol],
+    project_root: &Path,
+    ignore_patterns: &[String],
+) -> Vec<ContextEntry> {
     // Precompile a matcher per definition. Skip names that are too short/noisy.
     let matchers: Vec<(&DefinedSymbol, Regex)> = defs
         .iter()
@@ -819,7 +885,9 @@ fn resolve_callers(
 
     debug!(
         callers_found = entries.len(),
-        files_scanned, "resolved callers"
+        files_scanned,
+        source = "regex",
+        "resolved callers"
     );
     entries
 }
@@ -1151,6 +1219,8 @@ mod tests {
             follow_depth: 1,
             include_tests: false,
             include_callers: false,
+            use_brain: false,
+            impact_depth: 2,
         };
 
         let symbols = vec![ExtractedSymbol {
@@ -1175,6 +1245,8 @@ mod tests {
             follow_depth: 1,
             include_tests: false,
             include_callers: false,
+            use_brain: false,
+            impact_depth: 2,
         };
 
         let symbols = vec![ExtractedSymbol {

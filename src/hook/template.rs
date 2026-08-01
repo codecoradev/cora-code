@@ -1,6 +1,7 @@
 /// Pre-commit hook template content.
 ///
-/// The hook runs `cora review --staged --format compact` and checks the exit
+/// The hook runs `cora index --quiet` (incremental, ~0.014s) then
+/// `cora review --staged --format compact` and checks the exit
 /// code: 0 = ok (allow commit), 1 = error (allow commit), 2 = blocked (deny commit).
 pub const HOOK_TEMPLATE: &str = r#"#!/usr/bin/env bash
 # cora pre-commit hook — installed by `cora hook install`
@@ -13,7 +14,10 @@ CORA_BIN="${CORA_BIN:-cora}"
 
 echo "🔍 Running cora code review..."
 
-# Run cora review on staged changes
+# Update the symbol index (incremental — fast, non-blocking)
+"$CORA_BIN" index 2>/dev/null || true
+
+# Run cora review on staged changes (uses index for brain enrichment)
 if "$CORA_BIN" review --staged --format compact 2>/dev/null; then
     echo "✅ cora review passed."
     exit 0
