@@ -11,6 +11,7 @@ pub mod profile;
 pub mod providers;
 pub mod query;
 pub mod review;
+pub mod routes;
 pub mod scan;
 pub mod serve;
 pub mod upload;

@@ -512,6 +512,19 @@ enum Command {
         json: bool,
     },
 
+    /// List detected HTTP routes (Axum, Actix, Express, FastAPI, Flask, Go)
+    Routes {
+        /// Filter by HTTP method (e.g. GET, POST). Case-insensitive.
+        #[clap(long)]
+        method: Option<String>,
+        /// Filter by path prefix (e.g. /api)
+        #[clap(long)]
+        prefix: Option<String>,
+        /// Output as JSON
+        #[clap(long)]
+        json: bool,
+    },
+
     /// Start MCP server with auto-reindex on startup
     Serve,
 }
@@ -1511,6 +1524,16 @@ async fn main() -> Result<()> {
         }
         Command::Query { query, limit, json } => {
             let output = commands::query::execute_query_cli(&query, json, limit)?;
+            println!("{output}");
+            0
+        }
+        Command::Routes {
+            method,
+            prefix,
+            json,
+        } => {
+            let output =
+                commands::routes::execute_routes_cli(method.as_deref(), prefix.as_deref(), json)?;
             println!("{output}");
             0
         }
