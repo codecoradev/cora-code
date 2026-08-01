@@ -1323,10 +1323,15 @@ enum Status { active, inactive }"#;
         "#;
         let edges = detect_routes(content, "rs", "src/lib.rs");
         assert_eq!(edges.len(), 2);
-        let by_handler: std::collections::HashMap<&str, &str> =
-            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        let by_handler: std::collections::HashMap<&str, &str> = edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
         assert_eq!(by_handler.get("health_check"), Some(&"GET /api/health"));
-        assert_eq!(by_handler.get("submit_progress"), Some(&"POST /api/progress"));
+        assert_eq!(
+            by_handler.get("submit_progress"),
+            Some(&"POST /api/progress")
+        );
         // Module prefixes must NOT leak into the handler name.
         assert!(!by_handler.contains_key("routes"));
         assert!(!by_handler.contains_key("health"));
@@ -1347,8 +1352,10 @@ enum Status { active, inactive }"#;
         assert_eq!(edges.len(), 3, "expected 3 axum routes");
 
         // Each edge: source = handler, target = "METHOD /path"
-        let by_handler: std::collections::HashMap<&str, &str> =
-            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        let by_handler: std::collections::HashMap<&str, &str> = edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
         assert_eq!(by_handler.get("health_check"), Some(&"GET /api/health"));
         assert_eq!(by_handler.get("login"), Some(&"POST /api/auth/login"));
         assert_eq!(by_handler.get("get_user"), Some(&"GET /api/users/:id"));
@@ -1360,12 +1367,13 @@ enum Status { active, inactive }"#;
 
     #[test]
     fn test_detect_routes_actix() {
-        let content =
-            r#".route("/api/items", web::get().to(list_items)).route("/api/items", web::post().to(create_item))"#;
+        let content = r#".route("/api/items", web::get().to(list_items)).route("/api/items", web::post().to(create_item))"#;
         let edges = detect_routes(content, "rs", "src/routes.rs");
         assert_eq!(edges.len(), 2);
-        let by_handler: std::collections::HashMap<&str, &str> =
-            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        let by_handler: std::collections::HashMap<&str, &str> = edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
         assert_eq!(by_handler.get("list_items"), Some(&"GET /api/items"));
         assert_eq!(by_handler.get("create_item"), Some(&"POST /api/items"));
     }
@@ -1380,8 +1388,10 @@ enum Status { active, inactive }"#;
         // express pattern captures method + path + handler (3 groups) but current
         // resolution maps express_route to (path, "", handler) — method empty.
         assert_eq!(edges.len(), 2);
-        let by_handler: std::collections::HashMap<&str, &str> =
-            edges.iter().map(|e| (e.source.as_str(), e.target.as_str())).collect();
+        let by_handler: std::collections::HashMap<&str, &str> = edges
+            .iter()
+            .map(|e| (e.source.as_str(), e.target.as_str()))
+            .collect();
         assert_eq!(by_handler.get("healthHandler"), Some(&"/api/health"));
         assert_eq!(by_handler.get("loginHandler"), Some(&"/api/login"));
     }
