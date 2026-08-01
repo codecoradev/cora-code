@@ -5,6 +5,45 @@ All notable changes to cora-code are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1]
+
+### Fixed
+
+- **Index scanner false positives on entry-point files.** Added `index_skip_files` glob patterns to `RulesConfig`. Common bundler config files (`vite.config.ts`, `webpack.config.*`) and app entry points (`src/main.ts`, `src/index.tsx`) are now skipped by default — reducing noise from imports used by bundlers, not code.
+- **`cora scan` now includes index findings.** Fixed bug where `cora scan` did not wire index scanners — the scan command now runs `scan_project_index()` to produce deterministic findings alongside LLM analysis.
+- **Error fallback preserves index findings.** When LLM review fails, the fallback path now includes all index-based findings instead of silently dropping them.
+
+### Added
+
+- **`index_skip_files` config field** — New field in `RulesConfig` and `.cora.yaml` `rules_engine` section. Supports glob patterns (`*.config.ts`, `vite.config.*`, `**/main.ts`). Configurable per-project.
+- **`should_skip_file()` helper** — Glob matching utility for index scanner file filtering.
+- **8 new unit tests** — Tests for `should_skip_file()` covering exact match, wildcard suffix/prefix, `**/` patterns, and default skip list validation.
+
+## [0.11.0]
+
+### Highlights
+
+- **Index-powered unused import detection.** `cora review` now flags unused imports using symbol graph analysis — not regex guessing. Detects imports that are never referenced in the file, across Rust, TypeScript, Go, and Python.
+- **Dead code in review.** Changed files with dead functions/methods (zero callers) are now flagged automatically during review, not just via standalone `cora dead-code`.
+- **Breaking change detection.** When a public symbol is removed or modified, review flags it with a list of affected callers — prevents silent breaking API changes.
+- **HTTP route detection.** Route handlers (Axum, Actix, Express, Go net/http) are now tracked as first-class graph edges (`ROUTE`), enabling `cora query` to trace routes to handlers.
+- **Brain enrichment (Tier 1).** Review pipeline now leverages symbol index for caller resolution, impact analysis, affected tests, and semantic search. Zero regression without index — falls back to regex-based resolution.
+
+### Added
+
+- **Unused import scanner** — `find_unused_imports()` in graph module, wired into review pipeline. Flags unused imports with file:line and imported symbol name.
+- **Dead code scanner** — `find_dead_code_in_file()` in graph module. Detects unreachable symbols in changed files during review.
+- **Breaking change scanner** — Detects removed public symbols and cross-references callers from index.
+- **`EdgeKind::Route`** — New edge type for HTTP route → handler relationships.
+- **Route extraction** — Axum `#[get("/path")]`, Actix `#[route("/path")]`, Express `app.get()`, Go `http.HandleFunc()`.
+
+### Changed
+
+- **Caller resolution** — Index-aware `resolve_callers()` uses graph query first, regex fallback only when no index.
+- **Pre-commit hook** — Auto-runs `cora index --quiet` before review for persistent local index.
+- **Context enrichment** — Impact analysis, affected tests, and brain search injected into LLM review prompt.
+- **Ruby AST extraction** — Fixed `body_statement` wrapper bug in class/module method extraction.
+
 ## [0.8.3] - 2026-07-27
 
 ### Added — Code Intelligence
