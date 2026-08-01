@@ -41,6 +41,22 @@ pub struct ContextConfig {
     /// breaking signature/type changes can be flagged. Default: true.
     #[serde(default = "default_true")]
     pub include_callers: bool,
+
+    /// When `true` (default), enrich the review prompt with code intelligence
+    /// from the symbol index: impact analysis (blast radius via call graph),
+    /// affected test detection, and semantic pattern search (brain).
+    /// Only active when an index exists (`cora index` has been run).
+    /// Set to `false` to disable brain enrichment even if an index is available.
+    #[serde(default = "default_true")]
+    pub use_brain: bool,
+
+    /// Depth for impact analysis blast-radius traversal.
+    /// Depth 1 = direct callers only.
+    /// Depth 2 = callers of callers (recommended).
+    /// Depth 3+ = deep blast radius (higher token cost).
+    /// Default: 2.
+    #[serde(default = "default_impact_depth")]
+    pub impact_depth: u32,
 }
 
 fn default_true() -> bool {
@@ -55,6 +71,10 @@ fn default_follow_depth() -> u32 {
     1
 }
 
+fn default_impact_depth() -> u32 {
+    2
+}
+
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +83,8 @@ impl Default for ContextConfig {
             follow_depth: 1,
             include_tests: true,
             include_callers: true,
+            use_brain: true,
+            impact_depth: 2,
         }
     }
 }
