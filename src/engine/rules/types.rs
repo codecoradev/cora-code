@@ -12,6 +12,40 @@ pub struct RulesConfig {
     pub max_findings: usize,
     /// User-defined custom rules, merged with built-in rules.
     pub custom_rules: Vec<CustomRule>,
+    /// Glob patterns for files to skip in index-based scanners.
+    /// Reduces false positives on bundler entry-points, config files, etc.
+    /// Supports simple glob (* and **) — not full regex.
+    /// Matches against the file path relative to the project root.
+    #[serde(default = "default_index_skip_files")]
+    pub index_skip_files: Vec<String>,
+}
+
+/// Default skip patterns for index scanners — common false-positive sources.
+pub(crate) fn default_index_skip_files() -> Vec<String> {
+    vec![
+        // Bundler/framework config files
+        "*.config.ts".into(),
+        "*.config.js".into(),
+        "*.config.mjs".into(),
+        "*.config.cjs".into(),
+        // Build tool entry files
+        "webpack.config.*".into(),
+        "vite.config.*".into(),
+        "rollup.config.*".into(),
+        "next.config.*".into(),
+        "nuxt.config.*".into(),
+        // App entry points (imports used by bundler, not code refs)
+        "src/main.ts".into(),
+        "src/main.tsx".into(),
+        "src/main.js".into(),
+        "src/main.jsx".into(),
+        "src/index.ts".into(),
+        "src/index.tsx".into(),
+        "src/index.js".into(),
+        "src/index.jsx".into(),
+        "src/app.ts".into(),
+        "src/app.tsx".into(),
+    ]
 }
 
 impl Default for RulesConfig {
@@ -20,6 +54,7 @@ impl Default for RulesConfig {
             enabled: true,
             max_findings: 5,
             custom_rules: Vec::new(),
+            index_skip_files: default_index_skip_files(),
         }
     }
 }

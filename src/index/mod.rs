@@ -116,6 +116,7 @@ pub fn index_file(
         language,
         &extracted,
     )?;
+
     tx.commit()?;
 
     debug!(
@@ -330,7 +331,11 @@ fn index_project_with_id(
         let extracted_files: Vec<(String, extract::ExtractedAll, String, String)> = files_to_index
             .par_iter()
             .map(|(rel_str, content, language, cheap_fp)| {
-                let extracted = extract::extract_all(content, language, rel_str);
+                let mut extracted = extract::extract_all(content, language, rel_str);
+                // Detect HTTP route edges and append to kg_edges
+                extracted
+                    .kg_edges
+                    .extend(extract::detect_routes(content, language, rel_str));
                 (
                     rel_str.clone(),
                     extracted,

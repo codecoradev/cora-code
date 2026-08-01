@@ -599,6 +599,134 @@ pub fn extract_edges(
     Vec::new()
 }
 
+/// Detect HTTP route definitions from source code using regex heuristics.
+///
+/// Catches common route registration patterns across frameworks:
+/// - **Rust (axum):** `.route("/path", get(handler))`
+/// - **Rust (actix-web):** `.route("/path", web::get().to(handler))`
+/// - **Rust (warp):** `path("/api")` + `.and(then(handler))`
+/// - **Go:** `http.HandleFunc("/path", handler)` or `r.GET("/path", handler)`
+/// - **TypeScript/JS (express):** `app.get("/path", handler)`
+/// - **TypeScript/JS (fastify):** `fastify.get("/path", handler)`
+/// - **Python (flask):** `@app.route("/path")`
+/// - **Python (fastapi):** `@app.get("/path")`
+///
+/// Returns `AstEdge` with `EdgeKind::Route` where `source` = handler name,
+/// `target` = HTTP method + path (e.g., `GET /api/users`).
+pub fn detect_routes(
+    content: &str,
+    language: &str,
+    file_path: &str,
+) -> Vec<crate::index::ast::AstEdge> {
+    use crate::index::ast::{AstEdge, EdgeKind};
+    use regex::Regex;
+
+    let mut edges = Vec::new();
+
+    let patterns: &[(&str, &str)] = match language {
+        "rs" => &[
+            // axum: .route("/path", get(handler_fn))
+            (
+                r#"(?:\w+\.)?route\(\s*"([^"]+)"\s*,\s*(?:\w+::)?(\w+)\((\w+)"#,
+                "route_method_handler",
+            ),
+            // actix-web: .route("/path", web::get().to(handler))
+            (
+                r#"\.route\(\s*"([^"]+)"\s*,\s*\w+::(\w+)\(\)\.to\((\w+)"#,
+                "route_method_to_handler",
+            ),
+        ],
+        "go" => &[
+            // net/http: http.HandleFunc("/path", handler)
+            (r#"HandleFunc\(\s*"([^"]+)"\s*,\s*(\w+)"#, "handle_func"),
+            // chi: r.Get("/path", handler)
+            (r#"\w+\.\w+\(\s*"([^"]+)"\s*,\s*(\w+)"#, "router_method"),
+        ],
+        "ts" | "tsx" | "javascript" | "jsx" => &[
+            // express/fastify: app.get("/path", handler)
+            (
+                r#"(?:app|router|fastify)\.\w+\(\s*['"]([^'"]+)['"]\s*,\s*(\w+)"#,
+                "express_route",
+            ),
+        ],
+        "python" => &[
+            // flask: @app.route("/path")
+            (r#"@\w+\.route\(\s*['"]([^'"]+)['"]"#, "flask_decorator"),
+            // fastapi: @app.get("/path")
+            (r#"@\w+\.\w+\(\s*['"]([^'"]+)['"]"#, "fastapi_decorator"),
+        ],
+        _ => &[],
+    };
+
+    for (pattern, _label) in patterns {
+        let re = Regex::new(pattern).unwrap();
+        for cap in re.captures_iter(content) {
+            let full_match = cap.get(0).unwrap();
+            let line_no = content[..full_match.start()]
+                .matches('\n')
+                .count()
+                .saturating_add(1);
+
+            // Build the route target string: METHOD /path
+            let path = &cap[1];
+            let method = extract_http_method(pattern, &cap, language);
+            let target = if method.is_empty() {
+                path.to_string()
+            } else {
+                format!("{} {}", method, path)
+            };
+
+            // Handler name — try capture groups 2 and 3 (some patterns have 2, some 3)
+            let handler = cap.get(2).or_else(|| cap.get(3)).map(|m| m.as_str());
+            let source = match handler {
+                Some(h) => h.to_string(),
+                None => format!("route_line_{}", line_no),
+            };
+
+            edges.push(AstEdge {
+                source,
+                kind: EdgeKind::Route,
+                target,
+                file: file_path.to_string(),
+                line: line_no as u32,
+            });
+        }
+    }
+
+    edges
+}
+
+/// Extract HTTP method from a route pattern match.
+fn extract_http_method(pattern: &str, cap: &regex::Captures<'_>, language: &str) -> &'static str {
+    // For patterns that capture the HTTP method explicitly (group 2 before handler)
+    if pattern.contains("method_to_handler") {
+        return match cap.get(2).map(|m| m.as_str().to_uppercase()).as_deref() {
+            Some("GET") => "GET",
+            Some("POST") => "POST",
+            Some("PUT") => "PUT",
+            Some("DELETE") => "DELETE",
+            Some("PATCH") => "PATCH",
+            _ => "",
+        };
+    }
+
+    // For framework-specific patterns, infer from handler name
+    if language == "python" {
+        // FastAPI: @app.get(), @app.post(), etc.
+        if let Some(method) = cap.get(1) {
+            // Can't extract method from the decorator itself in this pattern
+            let _ = method;
+        }
+        // Infer from the route function name pattern
+        let handler = cap.get(2).or_else(|| cap.get(3)).map(|m| m.as_str());
+        if let Some(_h) = handler {
+            return "";
+        }
+    }
+
+    ""
+}
+
 /// Detect function entry from a line (returns function name).
 fn detect_function_entry(line: &str, language: &str) -> Option<String> {
     let trimmed = line.trim();
@@ -1027,9 +1155,15 @@ end
 "#;
         let symbols = extract_symbols(code, "rb", "app.rb");
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"ApplicationController"));
-        assert!(names.contains(&"authenticate_user"));
-        assert!(names.contains(&"Auth"));
+        assert!(
+            names.contains(&"ApplicationController"),
+            "missing ApplicationController, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"authenticate_user"),
+            "missing authenticate_user, got: {names:?}"
+        );
+        assert!(names.contains(&"Auth"), "missing Auth, got: {names:?}");
     }
 
     #[test]

@@ -114,6 +114,22 @@ pub async fn execute_scan(
     // 2. Calculate total lines
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
 
+    // 2b. Run index-powered deterministic scans (unused imports, dead code)
+    // These work even without LLM and add findings to the final report.
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let index_findings = crate::engine::index_scanner::scan_project_index(
+        &root_abs,
+        &files,
+        config.rules_config.max_findings,
+        &config.rules_config.index_skip_files,
+    );
+    if !index_findings.is_empty() {
+        eprintln!(
+            "  {} index-based findings (unused imports, dead code)",
+            index_findings.len().to_string().cyan()
+        );
+    }
+
     // 3. Batch files
     let max_files_per_batch = if opts.batch_files > 0 {
         opts.batch_files
@@ -213,6 +229,7 @@ pub async fn execute_scan(
     }
 
     // 5. Build response and format
+    all_issues.extend(index_findings);
     let issue_count = all_issues.len();
     let min_severity = config.hook.min_severity_level();
     // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above

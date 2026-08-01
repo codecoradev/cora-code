@@ -53,6 +53,7 @@ pub enum EdgeKind {
     Implements,
     Inherits,
     ChildOf,
+    Route,
 }
 
 impl EdgeKind {
@@ -63,6 +64,7 @@ impl EdgeKind {
             Self::Implements => "IMPLEMENTS",
             Self::Inherits => "INHERITS",
             Self::ChildOf => "CHILD_OF",
+            Self::Route => "ROUTE",
         }
     }
 }
@@ -1805,6 +1807,72 @@ fn extract_csharp(
 
 // ─── Ruby ──────────────────────────────────────────────────────────
 
+/// Walk a Ruby class/module node to extract method definitions.
+/// Handles the tree-sitter-ruby `body_statement` wrapper that sits
+/// between the class/module node and its method children.
+fn extract_methods_from_ruby_node(
+    parent: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    parent_name: &str,
+    nodes: &mut Vec<AstNode>,
+) {
+    let mut mc = parent.walk();
+    if mc.goto_first_child() {
+        loop {
+            let kind = mc.node().kind();
+            if kind == "method" {
+                let mname = if let Some(n) = mc.node().child_by_field_name("name") {
+                    node_text(&n, source)
+                } else {
+                    String::new()
+                };
+                if !mname.is_empty() {
+                    nodes.push(AstNode {
+                        name: mname,
+                        kind: SymbolKind::Method,
+                        file: file_path.to_string(),
+                        line: (mc.node().start_position().row + 1) as u32,
+                        signature: signature_for_node(&mc.node(), source),
+                        parent: Some(parent_name.to_string()),
+                    });
+                }
+            } else if kind == "body_statement" || kind == "singleton_class" {
+                // tree-sitter-ruby wraps class/module contents in body_statement;
+                // recurse one level to find methods inside.
+                let mut inner = mc.node().walk();
+                if inner.goto_first_child() {
+                    loop {
+                        if inner.node().kind() == "method" {
+                            let mname = if let Some(n) = inner.node().child_by_field_name("name") {
+                                node_text(&n, source)
+                            } else {
+                                String::new()
+                            };
+                            if !mname.is_empty() {
+                                nodes.push(AstNode {
+                                    name: mname,
+                                    kind: SymbolKind::Method,
+                                    file: file_path.to_string(),
+                                    line: (inner.node().start_position().row + 1) as u32,
+                                    signature: signature_for_node(&inner.node(), source),
+                                    parent: Some(parent_name.to_string()),
+                                });
+                            }
+                        }
+                        if !inner.goto_next_sibling() {
+                            break;
+                        }
+                    }
+                }
+            }
+            if !mc.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
 fn extract_ruby(
     root: &tree_sitter::Node,
     source: &str,
@@ -1818,7 +1886,7 @@ fn extract_ruby(
         node: &tree_sitter::Node,
         source: &str,
         file_path: &str,
-        nodes: &mut Vec<AstNode>,
+        mut nodes: &mut Vec<AstNode>,
         edges: &mut Vec<AstEdge>,
     ) {
         match node.kind() {
@@ -1868,32 +1936,27 @@ fn extract_ruby(
                         signature: signature_for_node(node, source),
                         parent: None,
                     });
-                    // Methods inside class
-                    let mut mc = node.walk();
-                    if mc.goto_first_child() {
-                        loop {
-                            if mc.node().kind() == "method" {
-                                let mname = if let Some(n) = mc.node().child_by_field_name("name") {
-                                    node_text(&n, source)
-                                } else {
-                                    String::new()
-                                };
-                                if !mname.is_empty() {
-                                    nodes.push(AstNode {
-                                        name: mname,
-                                        kind: SymbolKind::Method,
-                                        file: file_path.to_string(),
-                                        line: (mc.node().start_position().row + 1) as u32,
-                                        signature: signature_for_node(&mc.node(), source),
-                                        parent: Some(name.clone()),
-                                    });
-                                }
-                            }
-                            if !mc.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
+                    // Methods inside class (tree-sitter-ruby wraps them in body_statement)
+                    extract_methods_from_ruby_node(node, source, file_path, &name, nodes);
+                }
+            }
+            "module" => {
+                let name = if let Some(n) = node.child_by_field_name("name") {
+                    node_text(&n, source)
+                } else {
+                    String::new()
+                };
+                if !name.is_empty() {
+                    nodes.push(AstNode {
+                        name: name.clone(),
+                        kind: SymbolKind::Module,
+                        file: file_path.to_string(),
+                        line: (node.start_position().row + 1) as u32,
+                        signature: signature_for_node(node, source),
+                        parent: None,
+                    });
+                    // Methods inside module (same body_statement wrapping)
+                    extract_methods_from_ruby_node(node, source, file_path, &name, nodes);
                 }
             }
             "method" => {

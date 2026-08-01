@@ -199,6 +199,7 @@ mod tests {
             enabled: true,
             max_findings: 10,
             custom_rules: Vec::new(),
+            index_skip_files: super::types::default_index_skip_files(),
         }
     }
 

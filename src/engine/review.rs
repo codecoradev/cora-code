@@ -141,47 +141,63 @@ async fn review_diff_inner(
         config.rules_config.max_findings,
     );
 
+    // Run index-powered scans (requires symbol graph — graceful no-op without index)
+    let skip_patterns = &config.rules_config.index_skip_files;
+    let index_unused_findings = crate::engine::index_scanner::scan_unused_imports(
+        &diff_chunks,
+        std::env::current_dir().unwrap_or_default().as_path(),
+        config.rules_config.max_findings,
+        skip_patterns,
+    );
+    let index_dead_findings = crate::engine::index_scanner::scan_dead_code_in_review(
+        &diff_chunks,
+        std::env::current_dir().unwrap_or_default().as_path(),
+        config.rules_config.max_findings,
+        skip_patterns,
+    );
+    let index_breaking_findings = crate::engine::index_scanner::scan_breaking_changes(
+        &diff_chunks,
+        std::env::current_dir().unwrap_or_default().as_path(),
+        config.rules_config.max_findings,
+        skip_patterns,
+    );
+
     let rule_context = crate::engine::rules::format_rule_context(&rule_findings);
     let secrets_context = crate::engine::rules::format_rule_context(&secrets_findings);
     let security_context = crate::engine::rules::format_rule_context(&security_findings);
+    let index_unused_context = crate::engine::rules::format_rule_context(&index_unused_findings);
+    let index_dead_context = crate::engine::rules::format_rule_context(&index_dead_findings);
+    let index_breaking_context =
+        crate::engine::rules::format_rule_context(&index_breaking_findings);
     // Keep a clone for merging after LLM (rule_findings may be consumed in error fallback)
     let rule_findings_clone = rule_findings.clone();
     let secrets_findings_clone = secrets_findings.clone();
     let security_findings_clone = security_findings.clone();
+    let index_unused_findings_clone = index_unused_findings.clone();
+    let index_dead_findings_clone = index_dead_findings.clone();
+    let index_breaking_findings_clone = index_breaking_findings.clone();
 
-    // Combine static analysis + rule engine + secrets + security findings for LLM prompt
-    let combined_context = match (
-        static_context.as_deref(),
+    // Combine all context sections for LLM prompt (static analysis + all scanner findings)
+    let mut context_parts: Vec<String> = Vec::new();
+    if let Some(sa) = static_context.as_deref() {
+        context_parts.push(sa.to_string());
+    }
+    for ctx in [
         rule_context.as_str(),
         secrets_context.as_str(),
         security_context.as_str(),
-    ) {
-        (Some(sa), rc, sc, sec) if !rc.is_empty() && !sc.is_empty() && !sec.is_empty() => {
-            Some(format!("{sa}\n\n{rc}\n\n{sc}\n\n{sec}"))
+        index_unused_context.as_str(),
+        index_dead_context.as_str(),
+        index_breaking_context.as_str(),
+    ] {
+        if !ctx.is_empty() {
+            context_parts.push(ctx.to_string());
         }
-        (Some(sa), rc, sc, _) if !rc.is_empty() && !sc.is_empty() => {
-            Some(format!("{sa}\n\n{rc}\n\n{sc}"))
-        }
-        (Some(sa), rc, _, sec) if !rc.is_empty() && !sec.is_empty() => {
-            Some(format!("{sa}\n\n{rc}\n\n{sec}"))
-        }
-        (Some(sa), _, sc, sec) if !sc.is_empty() && !sec.is_empty() => {
-            Some(format!("{sa}\n\n{sc}\n\n{sec}"))
-        }
-        (Some(sa), rc, _, _) if !rc.is_empty() => Some(format!("{sa}\n\n{rc}")),
-        (Some(sa), _, sc, _) if !sc.is_empty() => Some(format!("{sa}\n\n{sc}")),
-        (Some(sa), _, _, sec) if !sec.is_empty() => Some(format!("{sa}\n\n{sec}")),
-        (Some(sa), _, _, _) => Some(sa.to_string()),
-        (_, rc, sc, sec) if !rc.is_empty() && !sc.is_empty() && !sec.is_empty() => {
-            Some(format!("{rc}\n\n{sc}\n\n{sec}"))
-        }
-        (_, rc, sc, _) if !rc.is_empty() && !sc.is_empty() => Some(format!("{rc}\n\n{sc}")),
-        (_, rc, _, sec) if !rc.is_empty() && !sec.is_empty() => Some(format!("{rc}\n\n{sec}")),
-        (_, _, sc, sec) if !sc.is_empty() && !sec.is_empty() => Some(format!("{sc}\n\n{sec}")),
-        (_, rc, _, _) if !rc.is_empty() => Some(rc.to_string()),
-        (_, _, sc, _) if !sc.is_empty() => Some(sc.to_string()),
-        (_, _, _, sec) if !sec.is_empty() => Some(sec.to_string()),
-        _ => None,
+    }
+    let combined_context = if context_parts.is_empty() {
+        None
+    } else {
+        Some(context_parts.join("\n\n"))
     };
 
     // Build context chain (cross-file dependency extraction)
@@ -236,6 +252,33 @@ async fn review_diff_inner(
         (Some(mem), Some(ctx)) => Some(format!("{mem}\n\n{ctx}")),
         (Some(mem), None) => Some(mem.to_string()),
         (None, ctx) => ctx,
+    };
+
+    // ── Brain enrichment phase (Tier 1) ──────────────────────────────────
+    // When use_brain is enabled and an index exists, enrich the review prompt
+    // with impact analysis, affected tests, and semantic pattern search.
+    let final_context = if config.context_chain.use_brain {
+        match build_brain_context(
+            &diff_chunks,
+            config.context_chain.impact_depth,
+            std::env::current_dir().unwrap_or_default().as_path(),
+        ) {
+            Some(brain_ctx) if !brain_ctx.is_empty() => {
+                debug!(
+                    brain_context_len = brain_ctx.len(),
+                    "brain enrichment applied"
+                );
+                match final_context {
+                    Some(ctx) => Some(format!(
+                        "{ctx}\n\n## Code Intelligence (Brain)\n{brain_ctx}"
+                    )),
+                    None => Some(format!("## Code Intelligence (Brain)\n{brain_ctx}")),
+                }
+            }
+            _ => final_context,
+        }
+    } else {
+        final_context
     }; // but preserve deterministic rule findings even on LLM failure
     let llm_result: Result<ReviewResponse, CoraError> = if stream {
         llm::review_diff_stream(
@@ -269,15 +312,24 @@ async fn review_diff_inner(
             if !rule_findings.is_empty()
                 || !secrets_findings.is_empty()
                 || !security_findings.is_empty()
+                || !index_unused_findings.is_empty()
+                || !index_dead_findings.is_empty()
+                || !index_breaking_findings.is_empty()
             {
                 let n_rules = rule_findings.len();
                 let n_secrets = secrets_findings.len();
                 let n_security = security_findings.len();
+                let n_index_unused = index_unused_findings.len();
+                let n_index_dead = index_dead_findings.len();
+                let n_index_breaking = index_breaking_findings.len();
                 debug!(
                     error = %e,
                     rule_findings = n_rules,
                     secrets_findings = n_secrets,
                     security_findings = n_security,
+                    index_unused = n_index_unused,
+                    index_dead = n_index_dead,
+                    index_breaking = n_index_breaking,
                     "LLM call failed, returning deterministic findings only"
                 );
                 let mut all_deterministic =
@@ -286,10 +338,22 @@ async fn review_diff_inner(
                     crate::engine::rules::merge_rule_findings(all_deterministic, secrets_findings);
                 all_deterministic =
                     crate::engine::rules::merge_rule_findings(all_deterministic, security_findings);
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_unused_findings,
+                );
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_dead_findings,
+                );
+                all_deterministic = crate::engine::rules::merge_rule_findings(
+                    all_deterministic,
+                    index_breaking_findings,
+                );
                 let mut fallback = ReviewResponse {
                     issues: all_deterministic,
                     summary: format!(
-                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security findings."
+                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security + {n_index_unused} unused imports + {n_index_dead} dead code + {n_index_breaking} breaking changes."
                     ),
                     tokens_used: None,
                     should_block: false,
@@ -307,7 +371,7 @@ async fn review_diff_inner(
         }
     };
 
-    // Merge rule findings + secrets findings + security findings with LLM issues
+    // Merge rule findings + secrets findings + security findings + index findings with LLM issues
     if !rule_findings_clone.is_empty() {
         response.issues =
             crate::engine::rules::merge_rule_findings(response.issues, rule_findings_clone);
@@ -319,6 +383,20 @@ async fn review_diff_inner(
     if !security_findings_clone.is_empty() {
         response.issues =
             crate::engine::rules::merge_rule_findings(response.issues, security_findings_clone);
+    }
+    if !index_unused_findings_clone.is_empty() {
+        response.issues =
+            crate::engine::rules::merge_rule_findings(response.issues, index_unused_findings_clone);
+    }
+    if !index_dead_findings_clone.is_empty() {
+        response.issues =
+            crate::engine::rules::merge_rule_findings(response.issues, index_dead_findings_clone);
+    }
+    if !index_breaking_findings_clone.is_empty() {
+        response.issues = crate::engine::rules::merge_rule_findings(
+            response.issues,
+            index_breaking_findings_clone,
+        );
     }
 
     // Filter out issues with invalid file paths (hallucination guard)
@@ -578,6 +656,151 @@ fn apply_ignore_rules(mut issues: Vec<ReviewIssue>, ignore_rules: &[String]) -> 
 /// Uses exact match only — the LLM should report paths exactly as they appear in the diff.
 fn is_valid_file_path(issue_file: &str, valid_files: &[String]) -> bool {
     valid_files.iter().any(|f| f == issue_file)
+}
+
+/// Build brain-enriched context from the symbol index.
+///
+/// Queries the index for:
+/// 1. **Impact analysis** — blast radius of changed symbols (who depends on them)
+/// 2. **Affected tests** — test files that exercise the changed code
+/// 3. **Brain search** — semantically related patterns across the codebase
+///
+/// Returns `None` if no index is available or no results found.
+fn build_brain_context(
+    diff_chunks: &[crate::engine::diff_parser::FileChunk],
+    impact_depth: u32,
+    project_root: &std::path::Path,
+) -> Option<String> {
+    // Try to open the global symbol index
+    let conn = crate::index::open_global_index().ok()?;
+    let project_id = crate::index::ensure_project(&conn, project_root).ok()?;
+
+    // Extract defined symbols from the diff
+    let defs = crate::engine::context::extraction::extract_definitions_from_diff(diff_chunks);
+    if defs.is_empty() {
+        return None;
+    }
+
+    let mut sections = Vec::new();
+
+    // ── 1. Impact Analysis ─────────────────────────────────────────────
+    let mut impact_lines: Vec<String> = Vec::new();
+    for def in &defs {
+        if def.name.len() < 2 {
+            continue;
+        }
+        if let Ok(nodes) =
+            crate::index::graph::impact_analysis(&conn, project_id, &def.name, impact_depth)
+        {
+            if !nodes.is_empty() {
+                impact_lines.push(format!(
+                    "- `{}`: {} downstream caller(s)",
+                    def.name,
+                    nodes.len()
+                ));
+                // Show top callers (deduplicated by file)
+                let mut seen_files = std::collections::HashSet::new();
+                for node in nodes.iter().take(5) {
+                    if seen_files.insert(node.file.clone()) {
+                        impact_lines.push(format!(
+                            "  - depth {}: {} ({}:{})",
+                            node.depth, node.symbol, node.file, node.line
+                        ));
+                    }
+                }
+                if nodes.len() > 5 {
+                    impact_lines.push(format!("  - ... and {} more", nodes.len() - 5));
+                }
+            }
+        }
+    }
+    if !impact_lines.is_empty() {
+        sections.push(format!(
+            "### Impact Analysis (Blast Radius)\n{}",
+            impact_lines.join("\n")
+        ));
+    }
+
+    // ── 2. Affected Tests ───────────────────────────────────────────────
+    let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in &defs {
+        if def.name.len() < 2 {
+            continue;
+        }
+        // Walk impact nodes, collect files containing "test" or "spec"
+        if let Ok(nodes) = crate::index::graph::impact_analysis(
+            &conn, project_id, &def.name, 1, // depth 1 is enough for test detection
+        ) {
+            for node in &nodes {
+                let lower = node.file.to_lowercase();
+                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
+                    test_files.insert(node.file.clone());
+                }
+            }
+        }
+        // Also search FTS5 for test symbols matching this function name
+        if let Ok(results) =
+            crate::index::brain::brain_search(&conn, project_id, &format!("test {}", def.name), 3)
+        {
+            for r in results {
+                let lower = r.file.to_lowercase();
+                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
+                    test_files.insert(r.file);
+                }
+            }
+        }
+    }
+    if !test_files.is_empty() {
+        let mut test_list: Vec<_> = test_files.into_iter().collect();
+        test_list.sort();
+        sections.push(format!(
+            "### Potentially Affected Tests\n{}",
+            test_list
+                .iter()
+                .map(|f| format!("- `{f}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    // ── 3. Semantic Pattern Search ───────────────────────────────────────
+    let mut brain_lines: Vec<String> = Vec::new();
+    let mut seen_brain: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in defs.iter().take(5) {
+        // limit to 5 symbols to avoid excessive token cost
+        if def.name.len() < 2 {
+            continue;
+        }
+        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &def.name, 3) {
+            for r in results {
+                // Skip results from the same file as the definition
+                if r.file == def.file {
+                    continue;
+                }
+                if seen_brain.insert(format!("{}:{}", r.file, r.line)) {
+                    brain_lines.push(format!(
+                        "- `{}` in {}:{} (signals: {})",
+                        r.name,
+                        r.file,
+                        r.line,
+                        r.signals.join("+")
+                    ));
+                }
+            }
+        }
+    }
+    if !brain_lines.is_empty() {
+        sections.push(format!(
+            "### Related Patterns (Semantic Search)\n{}",
+            brain_lines.join("\n")
+        ));
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
 }
 
 #[cfg(test)]
