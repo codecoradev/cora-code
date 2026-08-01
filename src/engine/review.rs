@@ -248,9 +248,14 @@ async fn review_diff_inner(
             std::env::current_dir().unwrap_or_default().as_path(),
         ) {
             Some(brain_ctx) if !brain_ctx.is_empty() => {
-                debug!(brain_context_len = brain_ctx.len(), "brain enrichment applied");
+                debug!(
+                    brain_context_len = brain_ctx.len(),
+                    "brain enrichment applied"
+                );
                 match final_context {
-                    Some(ctx) => Some(format!("{ctx}\n\n## Code Intelligence (Brain)\n{brain_ctx}")),
+                    Some(ctx) => Some(format!(
+                        "{ctx}\n\n## Code Intelligence (Brain)\n{brain_ctx}"
+                    )),
                     None => Some(format!("## Code Intelligence (Brain)\n{brain_ctx}")),
                 }
             }
@@ -600,6 +605,151 @@ fn apply_ignore_rules(mut issues: Vec<ReviewIssue>, ignore_rules: &[String]) -> 
 /// Uses exact match only — the LLM should report paths exactly as they appear in the diff.
 fn is_valid_file_path(issue_file: &str, valid_files: &[String]) -> bool {
     valid_files.iter().any(|f| f == issue_file)
+}
+
+/// Build brain-enriched context from the symbol index.
+///
+/// Queries the index for:
+/// 1. **Impact analysis** — blast radius of changed symbols (who depends on them)
+/// 2. **Affected tests** — test files that exercise the changed code
+/// 3. **Brain search** — semantically related patterns across the codebase
+///
+/// Returns `None` if no index is available or no results found.
+fn build_brain_context(
+    diff_chunks: &[crate::engine::diff_parser::FileChunk],
+    impact_depth: u32,
+    project_root: &std::path::Path,
+) -> Option<String> {
+    // Try to open the global symbol index
+    let conn = crate::index::open_global_index().ok()?;
+    let project_id = crate::index::ensure_project(&conn, project_root).ok()?;
+
+    // Extract defined symbols from the diff
+    let defs = crate::engine::context::extraction::extract_definitions_from_diff(diff_chunks);
+    if defs.is_empty() {
+        return None;
+    }
+
+    let mut sections = Vec::new();
+
+    // ── 1. Impact Analysis ─────────────────────────────────────────────
+    let mut impact_lines: Vec<String> = Vec::new();
+    for def in &defs {
+        if def.name.len() < 2 {
+            continue;
+        }
+        if let Ok(nodes) =
+            crate::index::graph::impact_analysis(&conn, project_id, &def.name, impact_depth)
+        {
+            if !nodes.is_empty() {
+                impact_lines.push(format!(
+                    "- `{}`: {} downstream caller(s)",
+                    def.name,
+                    nodes.len()
+                ));
+                // Show top callers (deduplicated by file)
+                let mut seen_files = std::collections::HashSet::new();
+                for node in nodes.iter().take(5) {
+                    if seen_files.insert(node.file.clone()) {
+                        impact_lines.push(format!(
+                            "  - depth {}: {} ({}:{})",
+                            node.depth, node.symbol, node.file, node.line
+                        ));
+                    }
+                }
+                if nodes.len() > 5 {
+                    impact_lines.push(format!("  - ... and {} more", nodes.len() - 5));
+                }
+            }
+        }
+    }
+    if !impact_lines.is_empty() {
+        sections.push(format!(
+            "### Impact Analysis (Blast Radius)\n{}",
+            impact_lines.join("\n")
+        ));
+    }
+
+    // ── 2. Affected Tests ───────────────────────────────────────────────
+    let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in &defs {
+        if def.name.len() < 2 {
+            continue;
+        }
+        // Walk impact nodes, collect files containing "test" or "spec"
+        if let Ok(nodes) = crate::index::graph::impact_analysis(
+            &conn, project_id, &def.name, 1, // depth 1 is enough for test detection
+        ) {
+            for node in &nodes {
+                let lower = node.file.to_lowercase();
+                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
+                    test_files.insert(node.file.clone());
+                }
+            }
+        }
+        // Also search FTS5 for test symbols matching this function name
+        if let Ok(results) =
+            crate::index::brain::brain_search(&conn, project_id, &format!("test {}", def.name), 3)
+        {
+            for r in results {
+                let lower = r.file.to_lowercase();
+                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
+                    test_files.insert(r.file);
+                }
+            }
+        }
+    }
+    if !test_files.is_empty() {
+        let mut test_list: Vec<_> = test_files.into_iter().collect();
+        test_list.sort();
+        sections.push(format!(
+            "### Potentially Affected Tests\n{}",
+            test_list
+                .iter()
+                .map(|f| format!("- `{f}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+
+    // ── 3. Semantic Pattern Search ───────────────────────────────────────
+    let mut brain_lines: Vec<String> = Vec::new();
+    let mut seen_brain: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for def in defs.iter().take(5) {
+        // limit to 5 symbols to avoid excessive token cost
+        if def.name.len() < 2 {
+            continue;
+        }
+        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &def.name, 3) {
+            for r in results {
+                // Skip results from the same file as the definition
+                if r.file == def.file {
+                    continue;
+                }
+                if seen_brain.insert(format!("{}:{}", r.file, r.line)) {
+                    brain_lines.push(format!(
+                        "- `{}` in {}:{} (signals: {})",
+                        r.name,
+                        r.file,
+                        r.line,
+                        r.signals.join("+")
+                    ));
+                }
+            }
+        }
+    }
+    if !brain_lines.is_empty() {
+        sections.push(format!(
+            "### Related Patterns (Semantic Search)\n{}",
+            brain_lines.join("\n")
+        ));
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
 }
 
 #[cfg(test)]
@@ -1053,166 +1203,5 @@ mod tests {
 
         let result = apply_markdown_code_block_filter(issues, &[]);
         assert_eq!(result.len(), 1);
-    }
-}
-
-/// Build brain-enriched context from the symbol index.
-///
-/// Queries the index for:
-/// 1. **Impact analysis** — blast radius of changed symbols (who depends on them)
-/// 2. **Affected tests** — test files that exercise the changed code
-/// 3. **Brain search** — semantically related patterns across the codebase
-///
-/// Returns `None` if no index is available or no results found.
-fn build_brain_context(
-    diff_chunks: &[crate::engine::diff_parser::FileChunk],
-    impact_depth: u32,
-    project_root: &std::path::Path,
-) -> Option<String> {
-    // Try to open the global symbol index
-    let conn = crate::index::open_global_index().ok()?;
-    let project_id = crate::index::ensure_project(&conn, project_root).ok()?;
-
-    // Extract defined symbols from the diff
-    let defs =
-        crate::engine::context::extraction::extract_definitions_from_diff(diff_chunks);
-    if defs.is_empty() {
-        return None;
-    }
-
-    let mut sections = Vec::new();
-
-    // ── 1. Impact Analysis ─────────────────────────────────────────────
-    let mut impact_lines: Vec<String> = Vec::new();
-    for def in &defs {
-        if def.name.len() < 2 {
-            continue;
-        }
-        if let Ok(nodes) = crate::index::graph::impact_analysis(
-            &conn,
-            project_id,
-            &def.name,
-            impact_depth,
-        ) {
-            if !nodes.is_empty() {
-                impact_lines.push(format!(
-                    "- `{}`: {} downstream caller(s)",
-                    def.name,
-                    nodes.len()
-                ));
-                // Show top callers (deduplicated by file)
-                let mut seen_files = std::collections::HashSet::new();
-                for node in nodes.iter().take(5) {
-                    if seen_files.insert(node.file.clone()) {
-                        impact_lines.push(format!(
-                            "  - depth {}: {} ({}:{})",
-                            node.depth, node.symbol, node.file, node.line
-                        ));
-                    }
-                }
-                if nodes.len() > 5 {
-                    impact_lines.push(format!(
-                        "  - ... and {} more",
-                        nodes.len() - 5
-                    ));
-                }
-            }
-        }
-    }
-    if !impact_lines.is_empty() {
-        sections.push(format!(
-            "### Impact Analysis (Blast Radius)\n{}",
-            impact_lines.join("\n")
-        ));
-    }
-
-    // ── 2. Affected Tests ───────────────────────────────────────────────
-    let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for def in &defs {
-        if def.name.len() < 2 {
-            continue;
-        }
-        // Walk impact nodes, collect files containing "test" or "spec"
-        if let Ok(nodes) = crate::index::graph::impact_analysis(
-            &conn,
-            project_id,
-            &def.name,
-            1, // depth 1 is enough for test detection
-        ) {
-            for node in &nodes {
-                let lower = node.file.to_lowercase();
-                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
-                    test_files.insert(node.file.clone());
-                }
-            }
-        }
-        // Also search FTS5 for test symbols matching this function name
-        if let Ok(results) = crate::index::brain::brain_search(
-            &conn,
-            project_id,
-            &format!("test {}", def.name),
-            3,
-        ) {
-            for r in results {
-                let lower = r.file.to_lowercase();
-                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
-                    test_files.insert(r.file);
-                }
-            }
-        }
-    }
-    if !test_files.is_empty() {
-        let mut test_list: Vec<_> = test_files.into_iter().collect();
-        test_list.sort();
-        sections.push(format!(
-            "### Potentially Affected Tests\n{}",
-            test_list
-                .iter()
-                .map(|f| format!("- `{f}`"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-
-    // ── 3. Semantic Pattern Search ───────────────────────────────────────
-    // For each defined symbol, search for related patterns (max 2 per symbol)
-    let mut brain_lines: Vec<String> = Vec::new();
-    let mut seen_brain: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for def in defs.iter().take(5) {
-        // limit to 5 symbols to avoid excessive token cost
-        if def.name.len() < 2 {
-            continue;
-        }
-        if let Ok(results) =
-            crate::index::brain::brain_search(&conn, project_id, &def.name, 3)
-        {
-            for r in results {
-                // Skip results from the same file as the definition
-                if r.file == def.file {
-                    continue;
-                }
-                if seen_brain.insert(format!("{}:{}", r.file, r.line)) {
-                    brain_lines.push(format!(
-                        "- `{}` in {}:{} (signals: {})",
-                        r.name,
-                        r.file,
-                        r.line,
-                        r.signals.join("+")
-                    ));
-                }
-            }
-        }
-    }
-    if !brain_lines.is_empty() {
-        sections.push(format!(
-            "### Related Patterns (Semantic Search)\n{}",
-            brain_lines.join("\n")
-        ));
-    }
-
-    if sections.is_empty() {
-        None
-    } else {
-        Some(sections.join("\n\n"))
     }
 }
