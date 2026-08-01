@@ -445,6 +445,8 @@ pub struct RulesSection {
     pub max_findings: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom: Vec<crate::engine::rules::types::CustomRule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_skip_files: Vec<String>,
 }
 
 /// File bundling configuration section for `.cora.yaml`.
@@ -588,6 +590,9 @@ impl CoraFile {
             config.rules_config.max_findings = re.max_findings;
             if !re.custom.is_empty() {
                 config.rules_config.custom_rules = re.custom.clone();
+            }
+            if !re.index_skip_files.is_empty() {
+                config.rules_config.index_skip_files = re.index_skip_files.clone();
             }
         }
         if let Some(b) = &self.bundling {

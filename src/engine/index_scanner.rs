@@ -12,6 +12,56 @@ use crate::engine::diff_parser::{DiffLineType, FileChunk};
 use crate::engine::rules::types::RuleFinding;
 use crate::index::graph;
 
+/// Check if a file path matches any of the skip patterns.
+/// Uses simple glob matching (* and **) against both the full path and the basename.
+/// Pattern "src/main.ts" matches exactly, "*.config.ts" matches any filename ending in .config.ts.
+pub fn should_skip_file(file_path: &str, skip_patterns: &[String]) -> bool {
+    if skip_patterns.is_empty() {
+        return false;
+    }
+
+    let basename = std::path::Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    for pattern in skip_patterns {
+        // Exact match (e.g. "src/main.ts")
+        if file_path == pattern {
+            return true;
+        }
+        // Basename exact match
+        if basename == *pattern {
+            return true;
+        }
+        // Simple glob: pattern contains *
+        if pattern.contains('*') {
+            // Convert simple glob to a basic match:
+            // "*.config.ts" → check if basename ends with ".config.ts"
+            // "vite.config.*" → check if basename starts with "vite.config."
+            if pattern.starts_with("*.") {
+                let suffix = &pattern[1..]; // ".config.ts"
+                if basename.ends_with(suffix) {
+                    return true;
+                }
+            } else if pattern.ends_with(".*") {
+                let prefix = &pattern[..pattern.len() - 2]; // "vite.config"
+                if basename.starts_with(prefix) {
+                    return true;
+                }
+            }
+            // "**/something" → match basename
+            if let Some(rest) = pattern.strip_prefix("**/") {
+                if basename == rest || file_path.ends_with(&format!("/{}", rest)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 /// Scan for unused imports across all changed files using the symbol index.
 ///
 /// For each file with IMPORTS edges, checks if each imported symbol is actually
@@ -22,6 +72,7 @@ pub fn scan_unused_imports(
     chunks: &[FileChunk],
     project_root: &std::path::Path,
     max_findings: usize,
+    skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
     let conn = match crate::index::open_global_index() {
         Ok(c) => c,
@@ -52,6 +103,11 @@ pub fn scan_unused_imports(
 
         // Skip deleted files (no new_path) and unknown
         if chunk.new_path.is_none() {
+            continue;
+        }
+
+        // Skip files matching skip patterns
+        if should_skip_file(file, skip_patterns) {
             continue;
         }
 
@@ -110,6 +166,7 @@ pub fn scan_dead_code_in_review(
     chunks: &[FileChunk],
     project_root: &std::path::Path,
     max_findings: usize,
+    skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
     let conn = match crate::index::open_global_index() {
         Ok(c) => c,
@@ -138,6 +195,10 @@ pub fn scan_dead_code_in_review(
             .unwrap_or("unknown");
 
         if chunk.new_path.is_none() {
+            continue;
+        }
+
+        if should_skip_file(file, skip_patterns) {
             continue;
         }
 
@@ -188,6 +249,7 @@ pub fn scan_breaking_changes(
     chunks: &[FileChunk],
     project_root: &std::path::Path,
     max_findings: usize,
+    skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
     let conn = match crate::index::open_global_index() {
         Ok(c) => c,
@@ -232,6 +294,10 @@ pub fn scan_breaking_changes(
             .as_deref()
             .or(chunk.old_path.as_deref())
             .unwrap_or("unknown");
+
+        if should_skip_file(file, skip_patterns) {
+            continue;
+        }
 
         for hunk in &chunk.chunks {
             for line in &hunk.lines {
@@ -305,8 +371,9 @@ pub fn scan_breaking_changes(
 /// Returns findings for any file in the project that has an index DB.
 pub fn scan_project_index(
     root: &std::path::Path,
-    _files: &[crate::engine::scanner::FileEntry],
+    files: &[crate::engine::scanner::FileEntry],
     max_findings: usize,
+    skip_patterns: &[String],
 ) -> Vec<crate::engine::ReviewIssue> {
     use crate::engine::ReviewIssue;
 
@@ -330,7 +397,10 @@ pub fn scan_project_index(
 
     // Scan for unused imports across all files in the scan set
     let mut seen_files = std::collections::HashSet::new();
-    for entry in _files {
+    for entry in files {
+        if should_skip_file(&entry.path, skip_patterns) {
+            continue;
+        }
         if seen_files.insert(entry.path.clone()) {
             match graph::find_unused_imports(&conn, &entry.path, project_id) {
                 Ok(unused) => {
@@ -435,7 +505,7 @@ mod tests {
     fn scan_unused_imports_no_index_graceful() {
         // No index available — should return empty, not panic
         let chunks = vec![make_chunk("src/main.rs", "+use std::collections::HashMap;")];
-        let findings = scan_unused_imports(&chunks, std::path::Path::new("/nonexistent"), 10);
+        let findings = scan_unused_imports(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
         assert!(
             findings.is_empty(),
             "should gracefully return empty without index"
@@ -445,7 +515,8 @@ mod tests {
     #[test]
     fn scan_dead_code_no_index_graceful() {
         let chunks = vec![make_chunk("src/main.rs", "+fn foo() {}")];
-        let findings = scan_dead_code_in_review(&chunks, std::path::Path::new("/nonexistent"), 10);
+        let findings =
+            scan_dead_code_in_review(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
         assert!(
             findings.is_empty(),
             "should gracefully return empty without index"
@@ -455,7 +526,8 @@ mod tests {
     #[test]
     fn scan_breaking_changes_no_index_graceful() {
         let chunks = vec![make_chunk("src/main.rs", "-pub fn important_api() {}")];
-        let findings = scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10);
+        let findings =
+            scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
         assert!(
             findings.is_empty(),
             "should gracefully return empty without index"
@@ -469,7 +541,77 @@ mod tests {
             "-pub fn important_api() {}\n+pub fn new_api() {}",
         )];
         // No index, so no callers detected — but the pattern should still compile
-        let findings = scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10);
+        let findings =
+            scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
         assert!(findings.is_empty(), "no index means no caller data");
+    }
+
+    // --- should_skip_file tests ---
+
+    #[test]
+    fn skip_empty_patterns() {
+        assert!(!should_skip_file("src/main.ts", &[]));
+        assert!(!should_skip_file("vitest.config.ts", &[]));
+    }
+
+    #[test]
+    fn skip_exact_match() {
+        let patterns = vec!["src/main.ts".into(), "src/index.ts".into()];
+        assert!(should_skip_file("src/main.ts", &patterns));
+        assert!(!should_skip_file("src/app.ts", &patterns));
+    }
+
+    #[test]
+    fn skip_wildcard_suffix() {
+        let patterns = vec!["*.config.ts".into()];
+        assert!(should_skip_file("vitest.config.ts", &patterns));
+        assert!(should_skip_file("vite.config.ts", &patterns));
+        assert!(should_skip_file("webpack.config.ts", &patterns));
+        assert!(!should_skip_file("src/app.ts", &patterns));
+        assert!(!should_skip_file("config.ts", &patterns)); // basename = "config.ts", doesn't end with ".config.ts"
+    }
+
+    #[test]
+    fn skip_wildcard_prefix() {
+        let patterns = vec!["vite.config.*".into()];
+        assert!(should_skip_file("vite.config.ts", &patterns));
+        assert!(should_skip_file("vite.config.js", &patterns));
+        assert!(!should_skip_file("webpack.config.ts", &patterns));
+    }
+
+    #[test]
+    fn skip_doublestar_prefix() {
+        let patterns = vec!["**/main.ts".into()];
+        assert!(should_skip_file("src/main.ts", &patterns));
+        assert!(should_skip_file("main.ts", &patterns));
+        assert!(!should_skip_file("src/app.ts", &patterns));
+    }
+
+    #[test]
+    fn skip_basename_exact() {
+        // "src/main.ts" pattern — basename match works too
+        let patterns = vec!["main.ts".into()];
+        assert!(should_skip_file("src/main.ts", &patterns));
+        assert!(should_skip_file("main.ts", &patterns));
+        assert!(!should_skip_file("src/app.ts", &patterns));
+    }
+
+    #[test]
+    fn skip_default_list_blocks_common_entry_points() {
+        use crate::engine::rules::types::default_index_skip_files;
+        let defaults = default_index_skip_files();
+
+        // These should all be skipped
+        assert!(should_skip_file("vitest.config.ts", &defaults));
+        assert!(should_skip_file("vite.config.js", &defaults));
+        assert!(should_skip_file("webpack.config.ts", &defaults));
+        assert!(should_skip_file("src/main.ts", &defaults));
+        assert!(should_skip_file("src/index.tsx", &defaults));
+        assert!(should_skip_file("src/app.tsx", &defaults));
+
+        // These should NOT be skipped
+        assert!(!should_skip_file("src/lib.rs", &defaults));
+        assert!(!should_skip_file("src/utils.ts", &defaults));
+        assert!(!should_skip_file("src/components/Button.tsx", &defaults));
     }
 }

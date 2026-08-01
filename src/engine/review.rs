@@ -142,20 +142,24 @@ async fn review_diff_inner(
     );
 
     // Run index-powered scans (requires symbol graph — graceful no-op without index)
+    let skip_patterns = &config.rules_config.index_skip_files;
     let index_unused_findings = crate::engine::index_scanner::scan_unused_imports(
         &diff_chunks,
         std::env::current_dir().unwrap_or_default().as_path(),
         config.rules_config.max_findings,
+        skip_patterns,
     );
     let index_dead_findings = crate::engine::index_scanner::scan_dead_code_in_review(
         &diff_chunks,
         std::env::current_dir().unwrap_or_default().as_path(),
         config.rules_config.max_findings,
+        skip_patterns,
     );
     let index_breaking_findings = crate::engine::index_scanner::scan_breaking_changes(
         &diff_chunks,
         std::env::current_dir().unwrap_or_default().as_path(),
         config.rules_config.max_findings,
+        skip_patterns,
     );
 
     let rule_context = crate::engine::rules::format_rule_context(&rule_findings);

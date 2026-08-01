@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1]
+
+### Fixed
+
+- **Index scanner false positives on entry-point files.** Added `index_skip_files` glob patterns to `RulesConfig`. Common bundler config files (`vite.config.ts`, `webpack.config.*`) and app entry points (`src/main.ts`, `src/index.tsx`) are now skipped by default — reducing noise from imports used by bundlers, not code.
+- **`cora scan` now includes index findings.** Fixed bug where `cora scan` did not wire index scanners (unused imports, dead code) — the scan command now runs `scan_project_index()` to produce deterministic findings alongside LLM analysis.
+- **Error fallback preserves index findings.** When LLM review fails, the fallback path now includes all index-based findings instead of silently dropping them.
+
+### Added
+
+- **`index_skip_files` config field** — New field in `RulesConfig` and `.cora.yaml` `rules_engine` section. Supports simple glob patterns (`*.config.ts`, `vite.config.*`, `**/main.ts`). Configurable per-project.
+- **`should_skip_file()` helper** — Glob matching utility for index scanner file filtering.
+- **8 new unit tests** — Tests for `should_skip_file()` covering exact match, wildcard suffix/prefix, `**/` patterns, and default skip list validation.
+
 ## [0.11.0]
 
 ### Highlights
