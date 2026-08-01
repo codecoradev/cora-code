@@ -381,6 +381,43 @@ rules:
 
 Rules run during the deterministic pre-scan phase (no LLM needed).
 
+### Index Scanner Configuration
+
+Control how index-based scanners (unused imports, dead code, breaking changes) behave — including file skip patterns to reduce false positives on bundler entry points and config files.
+
+```yaml
+rules_engine:
+  enabled: true
+  max_findings: 50
+  index_skip_files:
+    - "*.config.ts"
+    - "vite.config.*"
+    - "webpack.config.*"
+    - "tailwind.config.*"
+    - "next.config.*"
+    - "src/main.ts"
+    - "src/index.tsx"
+    - "src/app.tsx"
+    - "build.rs"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `true` | Enable/disable the rule engine |
+| `max_findings` | `int` | `50` | Max findings per scan |
+| `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
+
+Default `index_skip_files` patterns (bundled with cora):
+
+- `*.config.ts`, `*.config.js`, `*.config.mjs` — bundler/build config files
+- `vite.config.*`, `next.config.*`, `tailwind.config.*` — framework config files
+- `src/main.ts`, `src/index.tsx`, `src/app.tsx`, `src/main.rs`, `src/lib.rs` — app entry points
+- `build.rs` — Rust build scripts
+
+> **Why skip these?** Entry-point files and bundler configs often import symbols that are consumed by the bundler/compiler, not by other source code. Index scanners detect these as "unused" because there are no code-level references. Skipping them eliminates the most common source of false positives.
+
+Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`), wildcard prefix (`vite.*`), and any-directory (`**/main.ts`).
+
 ## Tech Debt Tracker
 
 cora tracks review history and calculates tech debt metrics over time.
