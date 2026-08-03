@@ -691,6 +691,7 @@ pub async fn scan_files(
     rules: &[String],
     response_format: &str,
     system_prompt_override: Option<&str>,
+    brain_context: Option<&str>,
 ) -> std::result::Result<(Vec<ReviewIssue>, Option<String>, Option<TokenUsage>), CoraError> {
     let spinner = create_spinner("Scanning files…");
 
@@ -709,6 +710,15 @@ pub async fn scan_files(
                 .collect::<Vec<_>>()
                 .join("\n")
         ));
+    }
+    // Inject brain/code-intel context when available (impact analysis,
+    // related patterns, affected tests from the symbol index).
+    if let Some(ctx) = brain_context {
+        if !ctx.is_empty() {
+            user_prompt.push_str("## Code Intelligence (Brain)\n");
+            user_prompt.push_str(ctx);
+            user_prompt.push_str("\n\n");
+        }
     }
     user_prompt.push_str("Files to review:\n\n");
     user_prompt.push_str(files_content);

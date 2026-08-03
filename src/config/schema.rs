@@ -53,6 +53,9 @@ pub struct Config {
     pub debt: crate::engine::debt_tracker::DebtConfig,
     /// Active quality profile (resolved from .cora.yaml).
     pub profile: Option<crate::engine::profiles::Profile>,
+    /// Analysis configuration — dead-code detection, entry-point patterns.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub analysis: AnalysisConfig,
 }
 
 /// Provider configuration.
@@ -137,6 +140,7 @@ impl Default for Config {
             bundling: BundlingConfig::default(),
             debt: crate::engine::debt_tracker::DebtConfig::default(),
             profile: None,
+            analysis: AnalysisConfig::default(),
         }
     }
 }
@@ -300,6 +304,8 @@ pub struct CoraFile {
     pub debt: Option<crate::engine::debt_tracker::DebtConfig>,
     #[serde(default)]
     pub profile: Option<crate::engine::profiles::ProfileRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis: Option<AnalysisConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -396,6 +402,16 @@ pub struct StaticAnalysisConfig {
     /// If set, this file's content is injected instead of running auto_clippy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clippy_output_file: Option<String>,
+}
+
+/// Analysis configuration — controls dead-code detection and symbol search.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct AnalysisConfig {
+    /// Custom entry-point method patterns to exclude from dead-code detection.
+    /// Supports glob-like patterns: `prefix*`, `*suffix`, `*substring*`.
+    /// Example: `["*Handler", "resolve_*", "*Middleware"]`
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub entry_point_patterns: Vec<String>,
 }
 
 fn is_default<T: Default + PartialEq>(val: &T) -> bool {
@@ -633,6 +649,15 @@ impl CoraFile {
                         "invalid profile in config: {e}"
                     )));
                 }
+            }
+        }
+        // Merge analysis config
+        if let Some(analysis) = &self.analysis {
+            if !analysis.entry_point_patterns.is_empty() {
+                config
+                    .analysis
+                    .entry_point_patterns
+                    .clone_from(&analysis.entry_point_patterns);
             }
         }
         Ok(())

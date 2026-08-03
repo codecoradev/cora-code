@@ -13,8 +13,14 @@ use crate::engine::rules::types::RuleFinding;
 use crate::index::graph;
 
 /// Check if a file path matches any of the skip patterns.
-/// Uses simple glob matching (* and **) against both the full path and the basename.
-/// Pattern "src/main.ts" matches exactly, "*.config.ts" matches any filename ending in .config.ts.
+/// Supports simple glob patterns:
+/// - Exact: `"src/main.ts"` → full path match
+/// - Suffix: `"*.config.ts"` → basename ends with `.config.ts`
+/// - Prefix: `"vite.config.*"` → basename starts with `vite.config.`
+/// - Any-dir name: `"**/something"` → basename or path suffix match
+/// - Any-dir wildcard: `"**/phaser/**"` → any path component equals `phaser`
+/// - Prefix-dir: `"src/engine/**"` → file under `src/engine/`
+/// - Double wildcard ext: `"**/*.test.ts"` → basename ends with `.test.ts`
 pub fn should_skip_file(file_path: &str, skip_patterns: &[String]) -> bool {
     if skip_patterns.is_empty() {
         return false;
@@ -34,27 +40,60 @@ pub fn should_skip_file(file_path: &str, skip_patterns: &[String]) -> bool {
         if basename == *pattern {
             return true;
         }
-        // Simple glob: pattern contains *
-        if pattern.contains('*') {
-            // Convert simple glob to a basic match:
-            // "*.config.ts" → check if basename ends with ".config.ts"
-            // "vite.config.*" → check if basename starts with "vite.config."
-            if pattern.starts_with("*.") {
-                let suffix = &pattern[1..]; // ".config.ts"
-                if basename.ends_with(suffix) {
-                    return true;
-                }
-            } else if pattern.ends_with(".*") {
-                let prefix = &pattern[..pattern.len() - 2]; // "vite.config"
-                if basename.starts_with(prefix) {
+        if !pattern.contains('*') {
+            continue;
+        }
+
+        // "**/*.ext" → suffix match on basename (any directory)
+        if let Some(rest) = pattern.strip_prefix("**/") {
+            if let Some(ext) = rest.strip_prefix("*.") {
+                if basename.ends_with(ext) {
                     return true;
                 }
             }
-            // "**/something" → match basename
-            if let Some(rest) = pattern.strip_prefix("**/") {
-                if basename == rest || file_path.ends_with(&format!("/{}", rest)) {
-                    return true;
-                }
+        }
+
+        // "*.ext" → suffix match on basename
+        if pattern.starts_with("*.") {
+            let suffix = &pattern[1..]; // ".config.ts"
+            if basename.ends_with(suffix) {
+                return true;
+            }
+        }
+
+        // "name.*" → prefix match on basename
+        if pattern.ends_with(".*") {
+            let prefix = &pattern[..pattern.len() - 2]; // "vite.config"
+            if basename.starts_with(prefix) {
+                return true;
+            }
+        }
+
+        // "**/name/**" → any path component equals "name"
+        if let Some(dir) = pattern
+            .strip_prefix("**/")
+            .and_then(|s| s.strip_suffix("/**"))
+        {
+            let components: Vec<&str> = file_path.split('/').collect();
+            if components.contains(&dir) {
+                return true;
+            }
+        }
+
+        // "dir/**" → file under dir/
+        if let Some(dir) = pattern.strip_suffix("/**") {
+            if file_path.starts_with(&format!("{dir}/")) || file_path == dir {
+                return true;
+            }
+        }
+
+        // "**/name" → match basename or path suffix
+        if let Some(rest) = pattern.strip_prefix("**/") {
+            if rest.contains('*') {
+                continue;
+            }
+            if basename == rest || file_path.ends_with(&format!("/{rest}")) {
+                return true;
             }
         }
     }
@@ -613,5 +652,68 @@ mod tests {
         assert!(!should_skip_file("src/lib.rs", &defaults));
         assert!(!should_skip_file("src/utils.ts", &defaults));
         assert!(!should_skip_file("src/components/Button.tsx", &defaults));
+    }
+
+    // --- New glob pattern tests (#453) ---
+
+    #[test]
+    fn skip_doublestar_dir_doublestar() {
+        // "**/phaser/**" → match any path containing "phaser" as a component
+        let patterns = vec!["**/phaser/**".into()];
+        assert!(should_skip_file(
+            "src/scenes/phaser/GameScene.ts",
+            &patterns
+        ));
+        assert!(should_skip_file("phaser/GameScene.ts", &patterns));
+        assert!(should_skip_file("src/phaser/utils.ts", &patterns));
+        assert!(!should_skip_file("src/utils/phaserHelper.ts", &patterns));
+        assert!(!should_skip_file("src/app.ts", &patterns));
+    }
+
+    #[test]
+    fn skip_prefix_dir_doublestar() {
+        // "src/engine/**" → files under src/engine/
+        let patterns = vec!["src/engine/**".into()];
+        assert!(should_skip_file("src/engine/physics.rs", &patterns));
+        assert!(should_skip_file("src/engine/core/mod.rs", &patterns));
+        assert!(!should_skip_file("src/app/engine.rs", &patterns));
+    }
+
+    #[test]
+    fn skip_doublestar_wildcard_ext() {
+        // "**/*.test.ts" → any .test.ts file anywhere
+        let patterns = vec!["**/*.test.ts".into()];
+        assert!(should_skip_file("src/utils/helpers.test.ts", &patterns));
+        assert!(should_skip_file("tests/integration.test.ts", &patterns));
+        assert!(!should_skip_file("src/utils/helpers.ts", &patterns));
+        assert!(!should_skip_file("src/utils/helpers.test.js", &patterns));
+    }
+
+    #[test]
+    fn skip_nested_doublestar_dir() {
+        // "**/node_modules/**" → match nested node_modules
+        let patterns = vec!["**/node_modules/**".into()];
+        assert!(should_skip_file("node_modules/lodash/index.js", &patterns));
+        assert!(should_skip_file(
+            "packages/app/node_modules/lodash/index.js",
+            &patterns
+        ));
+        assert!(!should_skip_file("src/node_modulesHelper.ts", &patterns));
+    }
+
+    #[test]
+    fn skip_multiple_patterns_any_match() {
+        let patterns = vec![
+            "**/phaser/**".into(),
+            "*.config.ts".into(),
+            "src/main.ts".into(),
+        ];
+        assert!(should_skip_file(
+            "src/scenes/phaser/GameScene.ts",
+            &patterns
+        ));
+        assert!(should_skip_file("vite.config.ts", &patterns));
+        assert!(should_skip_file("src/main.ts", &patterns));
+        assert!(!should_skip_file("src/lib.rs", &patterns));
     }
 }

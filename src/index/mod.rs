@@ -249,7 +249,64 @@ fn load_all_fingerprints(
 ///
 /// Returns summary stats.
 pub fn index_project(conn: &Connection, root: &Path, verbose: bool) -> anyhow::Result<IndexStats> {
+    index_project_with_skip(conn, root, verbose, None)
+}
+
+/// Index a project directory, with config hash invalidation.
+///
+/// If `skip_patterns` is provided, the config hash is compared against
+/// the stored hash in the DB. If they differ, all fingerprints are
+/// cleared, forcing a full re-index.
+pub fn index_project_with_skip(
+    conn: &Connection,
+    root: &Path,
+    verbose: bool,
+    skip_patterns: Option<&[String]>,
+) -> anyhow::Result<IndexStats> {
     let project_id = ensure_project(conn, root)?;
+
+    // Config hash invalidation: if skip_patterns changed, clear fingerprints
+    if let Some(patterns) = skip_patterns {
+        let new_hash = schema::compute_index_config_hash(patterns);
+        let stored_hash: Option<String> = conn
+            .query_row(
+                "SELECT index_config_hash FROM projects WHERE id = ?1",
+                rusqlite::params![project_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        if stored_hash.as_deref() != Some(&new_hash) {
+            if verbose {
+                eprintln!("  ↻ Config changed — invalidating fingerprints for full re-index");
+            }
+            // Clear all fingerprints for this project to force re-index
+            conn.execute(
+                "DELETE FROM files WHERE project_id = ?1",
+                rusqlite::params![project_id],
+            )?;
+            // Also clear symbols/edges so they're rebuilt from scratch
+            conn.execute(
+                "DELETE FROM symbols WHERE project_id = ?1",
+                rusqlite::params![project_id],
+            )?;
+            conn.execute(
+                "DELETE FROM edges WHERE project_id = ?1",
+                rusqlite::params![project_id],
+            )?;
+            conn.execute(
+                "DELETE FROM call_graph WHERE project_id = ?1",
+                rusqlite::params![project_id],
+            )?;
+            // Store the new config hash
+            conn.execute(
+                "UPDATE projects SET index_config_hash = ?1 WHERE id = ?2",
+                rusqlite::params![new_hash, project_id],
+            )?;
+        }
+    }
+
     index_project_with_id(conn, project_id, root, verbose)
 }
 
@@ -382,24 +439,24 @@ fn index_project_with_id(
             "CREATE TRIGGER IF NOT EXISTS symbols_fts_insert
              AFTER INSERT ON symbols
              BEGIN
-                 INSERT INTO symbols_fts(rowid, name, signature)
-                 VALUES (new.id, new.name, new.signature);
+                 INSERT INTO symbols_fts(rowid, name, signature, file)
+                 VALUES (new.id, new.name, new.signature, new.file);
              END;
 
              CREATE TRIGGER IF NOT EXISTS symbols_fts_delete
              AFTER DELETE ON symbols
              BEGIN
-                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature)
-                 VALUES ('delete', old.id, old.name, old.signature);
+                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, file)
+                 VALUES ('delete', old.id, old.name, old.signature, old.file);
              END;
 
              CREATE TRIGGER IF NOT EXISTS symbols_fts_update
              AFTER UPDATE ON symbols
              BEGIN
-                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature)
-                 VALUES ('delete', old.id, old.name, old.signature);
-                 INSERT INTO symbols_fts(rowid, name, signature)
-                 VALUES (new.id, new.name, new.signature);
+                 INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, file)
+                 VALUES ('delete', old.id, old.name, old.signature, old.file);
+                 INSERT INTO symbols_fts(rowid, name, signature, file)
+                 VALUES (new.id, new.name, new.signature, new.file);
              END;",
         )?;
 

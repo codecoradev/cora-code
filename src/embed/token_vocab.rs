@@ -1,6 +1,3 @@
-//! Pre-trained token vocabulary — reserved for Phase 5 (Voyage-4-Nano ONNX).
-#![allow(dead_code)]
-
 //! Pre-trained token vocabulary from nomic-embed-code.
 //!
 //! Provides real 768-dimensional code embeddings distilled from
@@ -146,6 +143,16 @@ pub fn embed_pretrained(tokens: &HashMap<String, u32>) -> PretrainedEmbedding {
     }
 
     PretrainedEmbedding { vec }
+}
+
+/// Convenience function: tokenize → embed using pretrained vocabulary in one step.
+///
+/// Returns an f32 vector (768 dimensions, L2-normalised) ready for usearch.
+/// This is the pretrained counterpart of [`crate::embed::tokens::embed_code`].
+pub fn embed_code_pretrained(code: &str) -> Vec<f32> {
+    let tokens = crate::embed::tokens::tokenize_code(code);
+    let emb = embed_pretrained(&tokens);
+    emb.into_vec()
 }
 
 /// Compute cosine similarity between two [`PretrainedEmbedding`]s.

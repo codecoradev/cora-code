@@ -57,6 +57,13 @@ pub struct ContextConfig {
     /// Default: 2.
     #[serde(default = "default_impact_depth")]
     pub impact_depth: u32,
+
+    /// When `true` (default), prefer the symbol index (FTS5 + call graph)
+    /// over regex-based file scanning for outbound symbol resolution.
+    /// This produces more accurate results but requires `cora index` to have
+    /// been run.  Falls back to regex automatically when the index is unavailable.
+    #[serde(default = "default_true")]
+    pub prefer_index: bool,
 }
 
 fn default_true() -> bool {
@@ -85,6 +92,7 @@ impl Default for ContextConfig {
             include_callers: true,
             use_brain: true,
             impact_depth: 2,
+            prefer_index: true,
         }
     }
 }
