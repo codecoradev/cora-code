@@ -76,6 +76,31 @@ pub fn build_context_chain(
     project_root: &Path,
     ignore_patterns: &[String],
 ) -> ContextChain {
+    // Open the index bridge for the project root.
+    let bridge = crate::engine::index_bridge::IndexBridge::open(project_root);
+    build_context_chain_with_bridge(
+        symbols,
+        defs,
+        config,
+        project_root,
+        ignore_patterns,
+        &bridge,
+    )
+}
+
+/// Build the full context chain with an explicit [`IndexBridge`].
+///
+/// This is the internal implementation that both the public `build_context_chain`
+/// (which opens a bridge automatically) and callers that already hold a bridge
+/// can use.
+pub fn build_context_chain_with_bridge(
+    symbols: &[ExtractedSymbol],
+    defs: &[DefinedSymbol],
+    config: &ContextConfig,
+    project_root: &Path,
+    ignore_patterns: &[String],
+    bridge: &crate::engine::index_bridge::IndexBridge,
+) -> ContextChain {
     if !config.enabled || (symbols.is_empty() && defs.is_empty()) {
         return ContextChain::default();
     }
@@ -84,9 +109,41 @@ pub fn build_context_chain(
         symbols_extracted: symbols.len(),
         ..Default::default()
     };
-
     // Phase 1: Resolve outbound symbols to file locations (what changed code calls)
-    let mut entries = resolve_symbols(symbols, config, project_root, ignore_patterns, &mut stats);
+    // When prefer_index is true, try index first, then fall back to regex
+    // for any symbols not found in the index (new files, stale index, etc.).
+    let mut entries = if config.prefer_index && bridge.is_available() {
+        let (index_entries, unresolved) =
+            resolve_via_index(symbols, bridge, project_root, ignore_patterns, &mut stats);
+        debug!(
+            index_resolved = index_entries.len(),
+            unresolved = unresolved.len(),
+            source = "index",
+            "resolved symbols via index"
+        );
+        // Fall back to regex for symbols the index couldn't resolve
+        if !unresolved.is_empty() {
+            debug!(
+                count = unresolved.len(),
+                "falling back to regex for unresolved symbols"
+            );
+            let mut fallback = resolve_symbols(
+                &unresolved,
+                config,
+                project_root,
+                ignore_patterns,
+                &mut stats,
+            );
+            index_entries
+                .into_iter()
+                .chain(fallback.drain(..))
+                .collect()
+        } else {
+            index_entries
+        }
+    } else {
+        resolve_symbols(symbols, config, project_root, ignore_patterns, &mut stats)
+    };
 
     // Phase 2: Add test file mappings
     if config.include_tests {
@@ -94,7 +151,13 @@ pub fn build_context_chain(
     }
 
     // Phase 3: Resolve inbound callers (blast radius — who calls changed code)
-    entries.extend(resolve_callers(defs, config, project_root, ignore_patterns));
+    entries.extend(resolve_callers_with_bridge(
+        defs,
+        config,
+        project_root,
+        ignore_patterns,
+        bridge,
+    ));
 
     // Sort by priority (FunctionDef first, CallerSite last)
     entries.sort_by_key(|e| e.priority);
@@ -163,6 +226,131 @@ pub fn build_context_chain(
     );
 
     ContextChain { text, stats }
+}
+
+/// Resolve extracted symbols using the symbol index (FTS5 search).
+///
+/// Resolve extracted symbols to file locations using the symbol index.
+///
+/// Returns `(resolved_entries, unresolved_symbols)`. Symbols not found in
+/// the index (new files, unsupported languages, stale index) are returned as
+/// `unresolved_symbols` so the caller can fall back to regex-based resolution.
+fn resolve_via_index(
+    symbols: &[ExtractedSymbol],
+    bridge: &crate::engine::index_bridge::IndexBridge,
+    project_root: &Path,
+    ignore_patterns: &[String],
+    stats: &mut ContextStats,
+) -> (Vec<ContextEntry>, Vec<ExtractedSymbol>) {
+    let mut entries = Vec::new();
+    let mut seen_files: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    let mut resolved_indices = Vec::new(); // track which input symbols got resolved
+
+    for (sym_idx, sym) in symbols.iter().enumerate() {
+        let query_text = match &sym.kind {
+            SymbolKind::FunctionCall(name) => name.clone(),
+            SymbolKind::TypeRef(name) => name.clone(),
+            SymbolKind::Import(path) => {
+                // For imports, try to match the last segment as a module name
+                path.rsplit("::").next().unwrap_or(path).to_string()
+            }
+        };
+
+        if query_text.len() < 2 {
+            continue;
+        }
+
+        let results = bridge.search_symbols(&query_text, 5);
+        let mut sym_resolved = false;
+        for result in results {
+            let sym_file = &result.symbol.file;
+
+            // Skip entries for the same file the symbol came from
+            if sym_file == &sym.file {
+                continue;
+            }
+
+            // Check ignore patterns
+            if is_ignored(sym_file, ignore_patterns) {
+                continue;
+            }
+
+            // Verify the resolved file exists
+            let full_path = match safe_join(project_root, sym_file) {
+                Some(p) => p,
+                None => continue,
+            };
+            if !full_path.exists() {
+                continue;
+            }
+
+            sym_resolved = true;
+
+            // Determine priority from the symbol kind
+            let kind_str = result.symbol.kind.as_str();
+            let (priority, label) = match &sym.kind {
+                SymbolKind::FunctionCall(_) => {
+                    let prio = if kind_str == "function" || kind_str == "method" {
+                        ContextPriority::FunctionDef
+                    } else {
+                        ContextPriority::TypeDef
+                    };
+                    (prio, format!("fn {}", result.symbol.name))
+                }
+                SymbolKind::TypeRef(_) => (
+                    ContextPriority::TypeDef,
+                    format!("type {}", result.symbol.name),
+                ),
+                SymbolKind::Import(_) => (
+                    ContextPriority::TypeDef,
+                    format!("module {}", result.symbol.name),
+                ),
+            };
+
+            let line_start = result.symbol.line;
+            let line_end = (line_start + MAX_FN_LINES as u32).min(
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    content.lines().count() as u32
+                } else {
+                    line_start
+                },
+            );
+
+            // Merge overlapping ranges for the same file
+            let file_ranges = seen_files.entry(sym_file.clone()).or_default();
+            let overlaps = file_ranges
+                .iter()
+                .any(|(s, e)| line_start <= *e && line_end >= *s);
+
+            if !overlaps {
+                file_ranges.push((line_start, line_end));
+                entries.push(ContextEntry {
+                    file: sym_file.clone(),
+                    line_start,
+                    line_end,
+                    label,
+                    priority,
+                });
+            }
+        }
+
+        if sym_resolved {
+            resolved_indices.push(sym_idx);
+        }
+    }
+
+    stats.symbols_resolved = entries.len();
+
+    // Collect unresolved symbols (those not found in the index)
+    let resolved_set: std::collections::HashSet<usize> = resolved_indices.into_iter().collect();
+    let unresolved: Vec<ExtractedSymbol> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !resolved_set.contains(i))
+        .map(|(_, s)| s.clone())
+        .collect();
+
+    (entries, unresolved)
 }
 
 /// Resolve extracted symbols to concrete file locations and line ranges.
@@ -719,68 +907,78 @@ fn find_go_package_file(dir: &Path, import_path: &str) -> Option<ContextEntry> {
 /// never scanned, and is bounded by [`MAX_CALLER_FILES_SCAN`] files and
 /// [`MAX_CALLERS_PER_SYMBOL`] call-sites per symbol. Caller slices are tiny
 /// (the call line + 1 line of context) to stay token-economical.
+#[allow(dead_code)]
 fn resolve_callers(
     defs: &[DefinedSymbol],
     config: &ContextConfig,
     project_root: &Path,
     ignore_patterns: &[String],
 ) -> Vec<ContextEntry> {
+    // Open a fresh bridge for backward compatibility with callers that don't
+    // pass one explicitly.
+    let bridge = crate::engine::index_bridge::IndexBridge::open(project_root);
+    resolve_callers_with_bridge(defs, config, project_root, ignore_patterns, &bridge)
+}
+
+/// Resolve callers using an existing [`IndexBridge`].
+///
+/// When the bridge is available, uses the call-graph index for precise
+/// caller resolution.  Falls back to regex-based file scanning otherwise.
+fn resolve_callers_with_bridge(
+    defs: &[DefinedSymbol],
+    config: &ContextConfig,
+    project_root: &Path,
+    ignore_patterns: &[String],
+    bridge: &crate::engine::index_bridge::IndexBridge,
+) -> Vec<ContextEntry> {
     if !config.include_callers || defs.is_empty() {
         return Vec::new();
     }
 
     // ── Index-based caller resolution (preferred) ───────────────────────
-    if let Ok(conn) = crate::index::open_global_index() {
-        if let Ok(project_id) = crate::index::ensure_project(&conn, project_root) {
-            let mut entries = Vec::new();
-            for def in defs {
-                if def.name.len() < 2 {
+    if bridge.is_available() {
+        let mut entries = Vec::new();
+        for def in defs {
+            if def.name.len() < 2 {
+                continue;
+            }
+            let callers = bridge.find_callers(&def.name, 20);
+            for caller in callers {
+                // Skip callers in the defining file itself
+                if caller.file == def.file {
                     continue;
                 }
-                match crate::index::graph::find_callers(&conn, project_id, &def.name, 20) {
-                    Ok(callers) => {
-                        for caller in callers {
-                            // Skip callers in the defining file itself
-                            if caller.file == def.file {
-                                continue;
-                            }
-                            let rel = caller.file.clone();
-                            if is_ignored(&rel, ignore_patterns) {
-                                continue;
-                            }
-                            let label = match def.kind {
-                                DefinitionKind::Function => {
-                                    format!("caller of fn {}", def.name)
-                                }
-                                DefinitionKind::Type => {
-                                    format!("usage of {}", def.name)
-                                }
-                            };
-                            entries.push(ContextEntry {
-                                file: rel,
-                                line_start: caller.line.saturating_sub(1).max(1),
-                                line_end: caller.line + 1,
-                                label,
-                                priority: ContextPriority::CallerSite,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        debug!(symbol = %def.name, error = %e, "index caller lookup failed");
-                    }
+                let rel = caller.file.clone();
+                if is_ignored(&rel, ignore_patterns) {
+                    continue;
                 }
+                let label = match def.kind {
+                    DefinitionKind::Function => {
+                        format!("caller of fn {}", def.name)
+                    }
+                    DefinitionKind::Type => {
+                        format!("usage of {}", def.name)
+                    }
+                };
+                entries.push(ContextEntry {
+                    file: rel,
+                    line_start: caller.line.saturating_sub(1).max(1),
+                    line_end: caller.line + 1,
+                    label,
+                    priority: ContextPriority::CallerSite,
+                });
             }
-            if !entries.is_empty() {
-                debug!(
-                    callers_found = entries.len(),
-                    source = "index",
-                    "resolved callers"
-                );
-                return entries;
-            }
-            // Index found but no callers — fall through to regex scan
-            debug!("index caller lookup returned empty, falling back to regex");
         }
+        if !entries.is_empty() {
+            debug!(
+                callers_found = entries.len(),
+                source = "index",
+                "resolved callers via bridge"
+            );
+            return entries;
+        }
+        // Index found but no callers — fall through to regex scan
+        debug!("index caller lookup returned empty, falling back to regex");
     }
 
     // ── Regex-based fallback (original behavior) ───────────────────────
@@ -1221,6 +1419,7 @@ mod tests {
             include_callers: false,
             use_brain: false,
             impact_depth: 2,
+            prefer_index: true,
         };
 
         let symbols = vec![ExtractedSymbol {
@@ -1247,6 +1446,7 @@ mod tests {
             include_callers: false,
             use_brain: false,
             impact_depth: 2,
+            prefer_index: true,
         };
 
         let symbols = vec![ExtractedSymbol {

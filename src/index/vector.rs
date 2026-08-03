@@ -16,8 +16,18 @@ use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
 
 const USEARCH_EXT: &str = "usearch";
 
-/// Default embedding dimensions (nomic-embed-code static, 768d).
-pub const DEFAULT_DIMS: usize = 256;
+/// Hashing-trick embedding dimensions (zero-dependency fallback).
+pub const FALLBACK_DIMS: usize = 256;
+
+/// Default embedding dimensions for the vector index.
+///
+/// When compiled with `pretrained-embed`, uses nomic-embed-code 768-dim vectors.
+/// Otherwise falls back to the hashing-trick 256-dim vectors.
+#[cfg(feature = "pretrained-embed")]
+pub const DEFAULT_DIMS: usize = 768;
+
+#[cfg(not(feature = "pretrained-embed"))]
+pub const DEFAULT_DIMS: usize = FALLBACK_DIMS;
 
 /// Persistent HNSW vector index for code symbol embeddings.
 ///
