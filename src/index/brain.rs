@@ -12,7 +12,7 @@
 
 use crate::embed::{active_dims, active_provider_name, embed_code_dispatch};
 use crate::index::symbols::SymbolQuery;
-use crate::index::vector::{cosine_distance_to_similarity, CodeVectorIndex};
+use crate::index::vector::{CodeVectorIndex, cosine_distance_to_similarity};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -266,8 +266,8 @@ pub fn brain_search(
 
     let mut ranked: Vec<_> = fused.into_iter().collect();
     ranked.sort_by(|a, b| {
-        b.1 .0
-            .partial_cmp(&a.1 .0)
+        b.1.0
+            .partial_cmp(&a.1.0)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked.truncate(limit);

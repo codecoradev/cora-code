@@ -83,11 +83,7 @@ impl IndexBridge {
     ///
     /// Returns up to `limit` [`crate::index::symbols::SearchResult`] entries.
     /// Returns an empty vec if the bridge is unavailable.
-    pub fn search_symbols(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Vec<crate::index::SearchResult> {
+    pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<crate::index::SearchResult> {
         let conn = match self.conn.as_ref() {
             Some(c) => c,
             None => return Vec::new(),
@@ -130,11 +126,7 @@ impl IndexBridge {
     /// Returns up to `limit` [`crate::index::brain::BrainResult`] entries.
     /// Returns an empty vec if the bridge is unavailable.
     #[allow(dead_code)]
-    pub fn brain_search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Vec<crate::index::brain::BrainResult> {
+    pub fn brain_search(&self, query: &str, limit: usize) -> Vec<crate::index::brain::BrainResult> {
         let conn = match self.conn.as_ref() {
             Some(c) => c,
             None => return Vec::new(),

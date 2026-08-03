@@ -870,15 +870,10 @@ pub(crate) fn build_scan_brain_context(
     // Reuse the same symbols — no additional brain_search calls needed.
     let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &unique_symbols {
-        if let Ok(nodes) =
-            crate::index::graph::impact_analysis(&conn, project_id, &r.name, 1)
-        {
+        if let Ok(nodes) = crate::index::graph::impact_analysis(&conn, project_id, &r.name, 1) {
             for node in &nodes {
                 let lower = node.file.to_lowercase();
-                if lower.contains("test")
-                    || lower.contains("spec")
-                    || lower.contains("_test")
-                {
+                if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {
                     test_files.insert(node.file.clone());
                 }
             }

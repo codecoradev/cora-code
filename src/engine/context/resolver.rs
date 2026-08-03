@@ -78,7 +78,14 @@ pub fn build_context_chain(
 ) -> ContextChain {
     // Open the index bridge for the project root.
     let bridge = crate::engine::index_bridge::IndexBridge::open(project_root);
-    build_context_chain_with_bridge(symbols, defs, config, project_root, ignore_patterns, &bridge)
+    build_context_chain_with_bridge(
+        symbols,
+        defs,
+        config,
+        project_root,
+        ignore_patterns,
+        &bridge,
+    )
 }
 
 /// Build the full context chain with an explicit [`IndexBridge`].
@@ -116,9 +123,21 @@ pub fn build_context_chain_with_bridge(
         );
         // Fall back to regex for symbols the index couldn't resolve
         if !unresolved.is_empty() {
-            debug!(count = unresolved.len(), "falling back to regex for unresolved symbols");
-            let mut fallback = resolve_symbols(&unresolved, config, project_root, ignore_patterns, &mut stats);
-            index_entries.into_iter().chain(fallback.drain(..)).collect()
+            debug!(
+                count = unresolved.len(),
+                "falling back to regex for unresolved symbols"
+            );
+            let mut fallback = resolve_symbols(
+                &unresolved,
+                config,
+                project_root,
+                ignore_patterns,
+                &mut stats,
+            );
+            index_entries
+                .into_iter()
+                .chain(fallback.drain(..))
+                .collect()
         } else {
             index_entries
         }
@@ -132,7 +151,13 @@ pub fn build_context_chain_with_bridge(
     }
 
     // Phase 3: Resolve inbound callers (blast radius — who calls changed code)
-    entries.extend(resolve_callers_with_bridge(defs, config, project_root, ignore_patterns, bridge));
+    entries.extend(resolve_callers_with_bridge(
+        defs,
+        config,
+        project_root,
+        ignore_patterns,
+        bridge,
+    ));
 
     // Sort by priority (FunctionDef first, CallerSite last)
     entries.sort_by_key(|e| e.priority);

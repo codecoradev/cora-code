@@ -25,7 +25,7 @@ pub use tokens::EMBEDDING_DIM;
 
 // Re-export pretrained constants when feature is enabled.
 #[cfg(feature = "pretrained-embed")]
-pub use token_vocab::{embed_code_pretrained, PRETRAINED_DIM};
+pub use token_vocab::{PRETRAINED_DIM, embed_code_pretrained};
 
 /// Returns the embedding dimensionality used by the active backend.
 ///
@@ -80,6 +80,10 @@ pub fn embed_code_dispatch(code: &str) -> Vec<f32> {
 }
 
 /// Whether the pretrained embedding backend is available (compile-time).
+#[expect(
+    dead_code,
+    reason = "used by Phase 3+ features; embed module not yet wired at call sites"
+)]
 pub const fn has_pretrained() -> bool {
     cfg!(feature = "pretrained-embed")
 }
