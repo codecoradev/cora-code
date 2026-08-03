@@ -17,13 +17,13 @@ jobs:
           echo "Checking branch: $HEAD_REF"
 
           # Allowed prefixes (kebab-case)
-          ALLOWED="^(feat|fix|docs|chore|perf|security|refactor|test|build|ci)/"
+          ALLOWED="^(feat|fix|docs|chore|perf|security|refactor|test|build|ci|release)/"
 
           if echo "$HEAD_REF" | grep -qE "$ALLOWED"; then
             echo "✅ Branch name follows convention"
           else
-            echo "::error::Branch name must start with one of: feat/, fix/, docs/, chore/, perf/, security/, refactor/, test/, build/, ci/"
-            echo "Example: fix/fts5-camelcase, feat/mcp-find-callers"
+            echo "::error::Branch name must start with one of: feat/, fix/, docs/, chore/, perf/, security/, refactor/, test/, build/, ci/, release/"
+            echo "Example: fix/fts5-camelcase, feat/mcp-find-callers, release/v0.12.0"
             echo "Current: $HEAD_REF"
             exit 1
           fi
@@ -67,7 +67,7 @@ jobs:
     name: Conventional Commits
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Check PR title format
@@ -77,16 +77,16 @@ jobs:
           echo "Checking PR title: $PR_TITLE"
 
           # Conventional Commits: type(scope): description
-          # Types: feat, fix, docs, chore, perf, refactor, test, build, ci, security
-          PATTERN="^(feat|fix|docs|chore|perf|refactor|test|build|ci|security)(\(.+\))?!?: .+"
+          # Types: feat, fix, docs, chore, perf, refactor, test, build, ci, security, release
+          PATTERN="^(feat|fix|docs|chore|perf|refactor|test|build|ci|security|release)(\\(.+\\))?!?: .+"
 
           if echo "$PR_TITLE" | grep -qE "$PATTERN"; then
             echo "✅ PR title follows Conventional Commits"
           else
             echo "::error::PR title must follow Conventional Commits format"
             echo "Expected: type(scope): short description"
-            echo "Example: fix(review): handle empty diff"
-            echo "Types: feat, fix, docs, chore, perf, refactor, test, build, ci, security"
+            echo "Example: fix(review): handle empty diff, release: v0.12.0"
+            echo "Types: feat, fix, docs, chore, perf, refactor, test, build, ci, security, release"
             echo "Current: $PR_TITLE"
             exit 1
           fi
