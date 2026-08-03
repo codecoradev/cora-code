@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0]
+
+### Fixed
+
+- **FTS5 returning 0 results for camelCase queries (#451).** Added `file` column to FTS5 virtual table (schema v6), `split_camel_case()` identifier decomposition, and OR query expansion. Searches like `findUser` now correctly match via `find OR user`.
+- **Dead-code false positives on framework entry points (#452).** Added `FRAMEWORK_ENTRY_PREFIXES` with SQL LIKE pattern matching for common framework handlers (`handle_*`, `on_*`, `route_*`, etc.) — these are no longer flagged as dead code.
+- **Symbol-level suppression markers (#452).** Symbols containing `// cora: keep` in their body are excluded from dead-code detection.
+- **Sticky skip files on config change (#453).** Added `index_config_hash` column to projects table — when `.cora.yaml` changes, previously skipped files are re-evaluated instead of permanently skipped.
+
+### Added
+
+- **`entry_point_patterns` config field** — New field in `AnalysisConfig` and `.cora.yaml` `analysis` section. Custom list of glob patterns for framework-specific entry points beyond built-in defaults.
+- **Schema migration v6** — Auto-migration: adds `index_config_hash` to projects, drops and recreates FTS5 with `file` column, rebuilds search index.
+- **`index_project_with_skip()`** — Indexing now respects `index_skip_files` from config, skipping non-code files during symbol extraction.
+- **`split_camel_case()`** — Decomposes `camelCaseIdentifiers` into individual tokens for FTS5 search (`camelCase` → `camel OR case`).
+- **Enhanced `sanitize_fts_query()`** — Handles quoted phrases, trims whitespace, and escapes special FTS5 characters.
+- **31 new unit tests** — Tests for camelCase splitting, FTS5 query expansion, glob matching, suppression markers, framework prefix detection, schema migration v6, and config hash invalidation.
+
+### Changed
+
+- **`should_skip_file()` rewritten** — Simplified glob matching with early exit for non-glob patterns, explicit `**/name` branch handling.
+- **Governance documentation** — Added CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, PR template, issue templates (bug report + feature request), and PR checks workflow (branch naming, conventional commits, PR description validation).
+
 ## [0.11.1]
 
 ### Fixed
