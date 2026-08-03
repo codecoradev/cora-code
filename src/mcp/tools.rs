@@ -1025,6 +1025,7 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
     let opts = crate::index::graph::DeadCodeOptions {
         include_tests,
         min_lines,
+        entry_point_patterns: vec![],
     };
 
     match crate::index::graph::find_dead_code(&conn, project_id, &opts) {

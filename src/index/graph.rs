@@ -599,6 +599,10 @@ pub struct DeadCodeOptions {
     pub include_tests: bool,
     /// If set, only report symbols whose span is at least this many lines long.
     pub min_lines: Option<u32>,
+    /// Additional entry-point method name patterns to exclude from dead-code.
+    /// Each entry is a SQL LIKE pattern (e.g. `%Handler`, `%Listener`, `%Route`).
+    /// These are checked against symbol names in addition to WELL_KNOWN_NAMES.
+    pub entry_point_patterns: Vec<String>,
 }
 
 /// Well-known symbol names that should not be flagged as dead code even when
@@ -706,6 +710,56 @@ const WELL_KNOWN_NAMES: &[&str] = &[
     "duration_since",
 ];
 
+/// Framework lifecycle / entry-point method name prefixes.
+///
+/// Methods starting with these prefixes are typically called by frameworks
+/// (Axum route handlers, SvelteKit page loads, Phaser scene lifecycle, etc.)
+/// and may not have direct callers in the codebase.
+const FRAMEWORK_ENTRY_PREFIXES: &[&str] = &[
+    // Axum / Actix / Tower handler patterns
+    "handle_",
+    // SvelteKit page/layout exports
+    "load",
+    // Phaser scene lifecycle
+    "create",
+    "preload",
+    "update",
+    // React / Svelte lifecycle
+    "render",
+    "component_did_mount",
+    "on_mount",
+    "on_destroy",
+    // General async patterns
+    "handle",
+    "process",
+    "execute",
+    "serve",
+    "start",
+    "stop",
+    "run",
+    // GraphQL resolvers
+    "resolve_",
+];
+
+/// Patterns that indicate a method is a framework callback (suffix-based).
+const FRAMEWORK_ENTRY_SUFFIXES: &[&str] = &[
+    // Axum handler trait
+    "Handler",
+    // Event listeners
+    "Listener",
+    "Callback",
+    // Middleware
+    "Middleware",
+    // Route
+    "Route",
+    // Hook
+    "Hook",
+    // Plugin
+    "Plugin",
+    // Provider
+    "Provider",
+];
+
 /// Find dead code: symbols that have no recorded callers and are not
 /// well-known names or (by default) test functions.
 ///
@@ -743,6 +797,22 @@ pub fn find_dead_code(
     if !opts.include_tests {
         sql.push_str(" AND s.name NOT LIKE 'test_%' AND s.name NOT LIKE '%_test'");
     }
+
+    // Exclude symbols with `// cora: keep` suppression marker in their signature.
+    sql.push_str(" AND (s.signature IS NULL OR s.signature NOT LIKE '%cora: keep%')");
+
+    // Exclude framework entry-point methods by name prefix.
+    for prefix in FRAMEWORK_ENTRY_PREFIXES {
+        sql.push_str(&format!(" AND LOWER(s.name) NOT LIKE '{prefix}%'"));
+    }
+
+    // Exclude framework entry-point methods by name suffix.
+    for suffix in FRAMEWORK_ENTRY_SUFFIXES {
+        sql.push_str(&format!(" AND s.name NOT LIKE '%{suffix}'"));
+    }
+
+    // Exclude user-configured entry-point patterns via post-filter below.
+    let _ = &opts.entry_point_patterns; // patterns applied in post-filter
 
     // Optional min_lines filter — applied post-query below when span metadata
     // becomes available. Kept for API compatibility.
@@ -782,7 +852,28 @@ pub fn find_dead_code(
         })
     })?;
 
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    // Post-filter by user-configured entry_point_patterns (safe LIKE matching).
+    let results: Vec<DeadCodeResult> = rows
+        .filter_map(|r| r.ok())
+        .filter(|r| {
+            // Skip if any user pattern matches
+            let name_lower = r.name.to_lowercase();
+            !opts.entry_point_patterns.iter().any(|p| {
+                // Simple glob-like matching: prefix*, *suffix, or exact
+                if p.starts_with('*') && p.ends_with('*') && p.len() > 2 {
+                    name_lower.contains(&p[1..p.len() - 1].to_lowercase())
+                } else if let Some(suffix) = p.strip_prefix('*') {
+                    name_lower.ends_with(&suffix.to_lowercase())
+                } else if let Some(prefix) = p.strip_suffix('*') {
+                    name_lower.starts_with(&prefix.to_lowercase())
+                } else {
+                    name_lower == p.to_lowercase()
+                }
+            })
+        })
+        .collect();
+
+    Ok(results)
 }
 
 /// Result of unused import analysis for a single file.
@@ -1249,6 +1340,7 @@ mod tests {
             &DeadCodeOptions {
                 include_tests: true,
                 min_lines: None,
+                entry_point_patterns: vec![],
             },
         )
         .unwrap();

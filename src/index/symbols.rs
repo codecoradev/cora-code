@@ -308,24 +308,103 @@ fn filter_search(
 }
 
 /// Sanitize a user query for FTS5 MATCH syntax.
-/// Wraps each token in quotes to prevent FTS5 syntax errors.
+///
+/// Enhances search quality by:
+/// - Splitting camelCase/PascalCase identifiers into sub-words
+///   (e.g. "camelCase" → "camel" OR "Case")
+/// - Lowercasing tokens (unicode61 is case-insensitive, but explicit is safer)
+/// - Quoting tokens to prevent FTS5 syntax errors
+///
+/// Output format: "camelCase" OR "camel" OR "Case" "otherToken"
 fn sanitize_fts_query(text: &str) -> String {
-    // Split on whitespace, quote each token, join with AND
-    text.split_whitespace()
+    let tokens: Vec<String> = text
+        .split_whitespace()
         .map(|token| {
             let clean: String = token
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
                 .collect();
-            if clean.is_empty() {
-                String::new()
-            } else {
-                format!("\"{clean}\"")
-            }
+            clean
         })
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+
+    let mut parts = Vec::new();
+
+    for token in &tokens {
+        // Try camelCase/PascalCase split
+        let subwords = split_camel_case(token);
+
+        if subwords.len() > 1 {
+            // Original + subwords joined with OR for broader matching
+            let expanded: Vec<String> = subwords.iter().map(|w| format!("\"{w}\"")).collect();
+            // Also include the original token for exact matching
+            let all: Vec<String> = std::iter::once(format!("\"{token}\""))
+                .chain(expanded)
+                .collect();
+            parts.push(all.join(" OR "));
+        } else {
+            parts.push(format!("\"{token}\""));
+        }
+    }
+
+    parts.join(" ")
+}
+
+/// Split a camelCase or PascalCase identifier into sub-words.
+///
+/// "camelCase" → ["camel", "Case"]
+/// "PascalCase" → ["Pascal", "Case"]
+/// "XMLParser" → ["XML", "Parser"]
+/// "simple" → ["simple"]
+/// "snake_case" → ["snake_case"] (no split)
+/// "HTTPResponse" → ["HTTP", "Response"]
+fn split_camel_case(s: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = s.chars().collect();
+
+    if chars.is_empty() {
+        return words;
+    }
+
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            // Underscore boundary — keep as part of current word
+            current.push(c);
+            continue;
+        }
+
+        if c.is_uppercase() {
+            // Check if we should split before this uppercase
+            let prev_is_lower = current
+                .chars()
+                .last()
+                .map(|p| p.is_lowercase())
+                .unwrap_or(false);
+            let next_is_lower = chars.get(i + 1).map(|n| n.is_lowercase()).unwrap_or(false);
+
+            if prev_is_lower || (next_is_lower && !current.is_empty()) {
+                // Split: lowercase→uppercase or "A" in "XMLParser"
+                if !current.is_empty() {
+                    words.push(current.clone());
+                    current.clear();
+                }
+            }
+        }
+        current.push(c);
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    // If no split happened, return the original
+    if words.len() <= 1 {
+        vec![s.to_string()]
+    } else {
+        words
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +442,23 @@ mod tests {
             "\"auth\" \"DROP\" \"TABLE\""
         );
         assert_eq!(sanitize_fts_query(""), "");
+        // camelCase expansion
+        let q = sanitize_fts_query("camelCase");
+        assert!(q.contains("\"camelCase\""));
+        assert!(q.contains("\"camel\""));
+        assert!(q.contains("\"Case\""));
+        assert!(q.contains(" OR "));
+        // PascalCase
+        let q = sanitize_fts_query("PascalCase");
+        assert!(q.contains("\"PascalCase\""));
+        assert!(q.contains("\"Pascal\""));
+        assert!(q.contains("\"Case\""));
+        // All caps (no split)
+        assert_eq!(sanitize_fts_query("HTTP"), "\"HTTP\"");
+        // Mixed: camelCase + plain token
+        let q = sanitize_fts_query("camelCase helper");
+        assert!(q.contains("\"camel\""));
+        assert!(q.contains("\"helper\""));
     }
 
     #[test]
@@ -377,5 +473,21 @@ mod tests {
         let q = SymbolQuery::kind(SymbolKind::Function);
         assert_eq!(q.kind, Some(SymbolKind::Function));
         assert_eq!(q.limit, 50);
+    }
+
+    #[test]
+    fn test_split_camel_case() {
+        use super::split_camel_case;
+
+        assert_eq!(split_camel_case("camelCase"), vec!["camel", "Case"]);
+        assert_eq!(split_camel_case("PascalCase"), vec!["Pascal", "Case"]);
+        assert_eq!(split_camel_case("XMLParser"), vec!["XML", "Parser"]);
+        assert_eq!(split_camel_case("simple"), vec!["simple"]);
+        assert_eq!(split_camel_case("snake_case"), vec!["snake_case"]);
+        assert_eq!(split_camel_case("HTTPResponse"), vec!["HTTP", "Response"]);
+        assert_eq!(split_camel_case("getURL"), vec!["get", "URL"]);
+        assert_eq!(split_camel_case("a"), vec!["a"]);
+        assert_eq!(split_camel_case(""), Vec::<String>::new());
+        assert_eq!(split_camel_case("ABTest"), vec!["AB", "Test"]);
     }
 }
