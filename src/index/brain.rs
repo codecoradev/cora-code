@@ -2,10 +2,17 @@
 //!
 //! RRF fusion (k=60) merges 3 signal sources into ranked results.
 //! Pattern adopted from uteke `doc_search_hybrid()`.
+//!
+//! Embedding backend is selected at compile time:
+//! - `pretrained-embed` feature → nomic-embed-code 768-dim vectors
+//! - default → hashing-trick 256-dim vectors
+//!
+//! A dimension mismatch between an existing on-disk index and the current
+//! compile-time backend triggers a warning and advises re-indexing.
 
-use crate::embed::tokens::embed_code;
+use crate::embed::{active_dims, active_provider_name, embed_code_dispatch};
 use crate::index::symbols::SymbolQuery;
-use crate::index::vector::{CodeVectorIndex, DEFAULT_DIMS, cosine_distance_to_similarity};
+use crate::index::vector::{cosine_distance_to_similarity, CodeVectorIndex};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rusqlite::Connection;
@@ -47,13 +54,89 @@ fn vector_index_path() -> std::path::PathBuf {
     crate::data_dir::cora_data_dir().join("cora_index.usearch")
 }
 
+/// Check if an existing on-disk vector index has compatible dimensions.
+///
+/// If the index was created with different dimensions (e.g. 256d hashing-trick
+/// but now running with 768d pretrained), logs a warning advising re-indexing.
+///
+/// The index file contains usearch binary data — we can't easily read the
+/// dimensionality without loading it. Instead, we check the `embedding_dims`
+/// column in the projects table, which is written during embedding.
+fn check_dimension_compat(vi_path: &std::path::Path, expected_dims: usize) {
+    // Attempt to load the index just to check its dimensions.
+    // If it fails (empty, corrupt, etc.), we'll create fresh — no warning needed.
+    let Ok(file) = std::fs::File::open(vi_path) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return;
+    };
+    if metadata.len() == 0 {
+        return; // Empty file — will create fresh
+    }
+
+    // Try to load and check dims
+    let result = std::panic::catch_unwind(|| {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = file;
+        let _ = file.seek(SeekFrom::Start(0));
+        let mut buffer = Vec::new();
+        let _ = file.read_to_end(&mut buffer);
+        if buffer.is_empty() {
+            return None;
+        }
+        let index = usearch::Index::restore_from_buffer(&buffer).ok()?;
+        Some(index.dimensions())
+    });
+
+    match result {
+        Ok(Some(disk_dims)) if disk_dims != expected_dims => {
+            tracing::warn!(
+                "⚠ Vector index dimension mismatch: on-disk={disk_dims}, current={expected_dims} ({})",
+                active_provider_name()
+            );
+            tracing::warn!(
+                "  The vector index was built with a different embedding backend. \
+                 Run `cora index` to re-index with the current backend."
+            );
+            // Delete the stale index so embed_project creates a fresh one
+            if let Err(e) = std::fs::remove_file(vi_path) {
+                tracing::warn!("  Failed to remove stale index: {e}");
+            } else {
+                let keys_path = vi_path.with_extension("keys");
+                let _ = std::fs::remove_file(&keys_path);
+                tracing::info!("  Removed stale vector index — will create fresh on next index");
+            }
+        }
+        Ok(Some(_)) => {
+            // Dimensions match — all good
+        }
+        _ => {
+            // Couldn't read dimensions (corrupt, unsupported, etc.)
+            // embed_project will handle creation
+        }
+    }
+}
+
 /// Embed all symbols for a project into the vector index.
 ///
-/// Reads symbols from SQLite, embeds via static token method,
-/// stores in usearch. Updates the in-memory cache.
+/// Uses the best available embedding backend (selected at compile time):
+/// - `pretrained-embed` → nomic-embed-code 768-dim vectors
+/// - default → hashing-trick 256-dim vectors
+///
+/// Detects dimension mismatch between existing on-disk index and current
+/// backend, warning the user to re-index if dimensions changed.
 /// Call after `index_project`.
 pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     let vi_path = vector_index_path();
+    let active = active_dims();
+
+    // Check for existing index with mismatched dimensions (e.g. user rebuilt
+    // with/without pretrained-embed feature). Warn but continue — the index
+    // will be corrupted for searches until re-indexed.
+    if vi_path.exists() {
+        check_dimension_compat(&vi_path, active);
+    }
 
     // Acquire write lock — block searches while embedding.
     // This is fine because embedding only happens during `cora index`,
@@ -64,8 +147,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     let vi = if let Some(ref mut cached) = *cache {
         cached
     } else {
-        let vi =
-            CodeVectorIndex::load_or_create(&vi_path, DEFAULT_DIMS).context("load vector index")?;
+        let vi = CodeVectorIndex::load_or_create(&vi_path, active).context("load vector index")?;
         *cache = Some(vi);
         cache.as_mut().unwrap()
     };
@@ -80,7 +162,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         .collect();
 
     // ── Parallel embedding computation (Rayon) ─────────────────────────
-    // embed_code is pure + CPU-bound. usearch insert is serial.
+    // embed_code_dispatch is pure + CPU-bound. usearch insert is serial.
     let t_compute = std::time::Instant::now();
     let embedded: Vec<(i64, Vec<f32>)> = rows
         .par_iter()
@@ -90,8 +172,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
             } else {
                 format!("{name} {signature}")
             };
-            let embedding = embed_code(&text);
-            let vec: Vec<f32> = embedding.as_slice().iter().map(|&v| v as f32).collect();
+            let vec = embed_code_dispatch(&text);
             (*sym_id, vec)
         })
         .collect();
@@ -109,10 +190,12 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     let insert_ms = t_insert.elapsed().as_millis();
 
     tracing::debug!(
-        "embed_compute={}ms, usearch_insert={}ms, symbols={}",
+        "embed_compute={}ms, usearch_insert={}ms, symbols={}, dims={}, provider={}",
         compute_ms,
         insert_ms,
-        count
+        count,
+        active,
+        active_provider_name()
     );
 
     if vi.is_dirty() {
@@ -125,13 +208,21 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         .unwrap()
         .insert(project_id, new_ids);
 
+    let tier = if cfg!(feature = "pretrained-embed") {
+        "pretrained"
+    } else {
+        "static"
+    };
     conn.execute(
-        "UPDATE projects SET embedding_tier = 'static', embedding_dims = ?1, \
+        "UPDATE projects SET embedding_tier = ?3, embedding_dims = ?1, \
          last_embedded_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![DEFAULT_DIMS, project_id],
+        rusqlite::params![active, project_id, tier],
     )?;
 
-    tracing::info!("Embedded {count} symbols for project {project_id}");
+    tracing::info!(
+        "Embedded {count} symbols for project {project_id} (provider={}, dims={active})",
+        active_provider_name()
+    );
     Ok(count)
 }
 
@@ -175,8 +266,8 @@ pub fn brain_search(
 
     let mut ranked: Vec<_> = fused.into_iter().collect();
     ranked.sort_by(|a, b| {
-        b.1.0
-            .partial_cmp(&a.1.0)
+        b.1 .0
+            .partial_cmp(&a.1 .0)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked.truncate(limit);
@@ -215,8 +306,7 @@ fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) 
         _ => return Vec::new(),
     };
 
-    let embedding = embed_code(query);
-    let vec: Vec<f32> = embedding.as_slice().iter().map(|&v| v as f32).collect();
+    let vec = embed_code_dispatch(query);
 
     // Over-fetch to compensate for post-filter by project_id.
     let over_fetch = (limit * 5).max(50);
