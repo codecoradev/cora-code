@@ -1,0 +1,29 @@
+# Cora Code — local dev / single-host deploy via Docker Compose.
+#
+# Pulls prebuilt image from the self-hosted Zot registry.
+# For local builds: docker compose up --build
+#
+# Usage:
+#   docker compose pull && docker compose run --rm cora --version
+#   docker compose run --rm -e CORA_API_KEY=sk-xxx cora review --staged
+#   docker compose run --rm cora mcp serve
+#
+# Volumes:
+#   ./data:/data          — persistent storage (cora index DB, config)
+#   .:/workspace          — mount repo for code review (development)
+
+services:
+  cora:
+    image: registry.azfirazka.com/cora:${CORA_TAG:-develop}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cora
+    working_dir: /workspace
+    volumes:
+      - ./data:/data
+      - .:/workspace
+    environment:
+      - CORA_HOME=/data
+    # Default: show version (override via docker compose run)
+    command: ["--version"]

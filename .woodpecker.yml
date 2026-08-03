@@ -1,0 +1,72 @@
+# Woodpecker CI for Cora Code.
+#
+# Pipeline:
+#   1. Rust check / fmt / clippy / test — every push + PR.
+#   2. On push to develop OR a tag → build Docker image and push to Zot.
+#
+# Image tags (via auto_tag):
+#   - push to develop → :develop + :sha-<short>
+#   - tag v1.2.3      → :vX.Y.Z + :latest
+#
+# Required Woodpecker secrets (set in ci.ajianaz.dev → repo settings):
+#   ZOT_USER — registry account with push permission
+#   ZOT_PASS — registry password / token
+#
+# Required server config (Woodpecker admin, one-time):
+#   woodpeckerci/plugin-docker-buildx:5 must be in WOODPECKER_PLUGINS_PRIVILEGED
+#   (Docker-in-Docker needs privileged mode to run buildx).
+#
+# Pull from the registry (on the deploy host):
+#   docker pull registry.azfirazka.com/cora:develop
+
+steps:
+  # ── Rust checks ──────────────────────────────────────────────────────
+  check:
+    image: rust:1.85-bookworm
+    commands:
+      - cargo check --all-targets --features tree-sitter
+    when:
+      event: [push, pull_request]
+
+  fmt:
+    image: rust:1.85-bookworm
+    commands:
+      - rustup component add rustfmt
+      - cargo fmt --all -- --check
+    when:
+      event: [push, pull_request]
+
+  clippy:
+    image: rust:1.85-bookworm
+    commands:
+      - rustup component add clippy
+      - cargo clippy --all-targets --features tree-sitter -- -D warnings
+    when:
+      event: [push, pull_request]
+
+  test:
+    image: rust:1.85-bookworm
+    commands:
+      - cargo test --features tree-sitter
+    when:
+      event: [push, pull_request]
+
+  # ── Docker build & push to Zot ──────────────────────────────────────
+  docker:
+    image: woodpeckerci/plugin-docker-buildx:5
+    settings:
+      repo: registry.azfirazka.com/cora
+      registry: registry.azfirazka.com
+      username:
+        from_secret: ZOT_USER
+      password:
+        from_secret: ZOT_PASS
+      dockerfile: Dockerfile
+      no_cache: true
+      auto_tag: true
+      auto_tag_suffix: sha-${CI_COMMIT_SHA:0:7}
+      privileged: true
+    when:
+      - branch: develop
+        event: push
+      - event: tag

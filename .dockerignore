@@ -1,0 +1,47 @@
+# Build artifacts
+/target/
+debug/
+**/*.d
+**/*.rlib
+**/*.dll
+**/*.dylib
+**/*.so
+
+# Git
+.git/
+.gitignore
+
+# Docs (VitePress — not needed in image)
+docs/
+
+# Vendored
+vendored/
+
+# Tests & benchmarks
+tests/
+bench/
+
+# CI/CD
+.github/
+.woodpecker.yml
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
