@@ -40,6 +40,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/target/release/cora /usr/local/bin/cora
 
+# Create non-root user for running cora.
+RUN groupadd --gid 1000 cora && \
+    useradd --uid 1000 --gid cora --create-home --shell /bin/sh cora
+
+USER cora
+
 # Default workdir for review targets.
 WORKDIR /workspace
 
