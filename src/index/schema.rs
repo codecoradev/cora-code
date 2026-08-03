@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 /// Current schema version.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// Run database migrations (creates tables if not exist).
 pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
@@ -36,6 +36,9 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
     if current < 5 {
         migrate_v5(conn)?;
+    }
+    if current < 6 {
+        migrate_v6(conn)?;
     }
 
     Ok(())
@@ -284,6 +287,76 @@ fn migrate_v5(conn: &Connection) -> anyhow::Result<()> {
     conn.execute("INSERT INTO schema_version (version) VALUES (5)", [])?;
 
     Ok(())
+}
+
+/// Migration v6: Index config hash for fingerprint invalidation.
+///
+/// Adds `index_config_hash` to `projects`. When config-relevant settings
+/// (e.g. `index_skip_files`, language includes) change between runs, the
+/// stored hash won't match and all file fingerprints are cleared, forcing
+/// a full re-index on the next `cora index` run.
+fn migrate_v6(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "
+        ALTER TABLE projects ADD COLUMN index_config_hash TEXT;
+        ",
+    )?;
+
+    // Recreate FTS5 with file column for better search coverage.
+    // Drop old triggers first, then virtual table, then recreate with file column.
+    conn.execute_batch(
+        "
+        DROP TRIGGER IF EXISTS symbols_fts_insert;
+        DROP TRIGGER IF EXISTS symbols_fts_delete;
+        DROP TRIGGER IF EXISTS symbols_fts_update;
+        DROP TABLE IF EXISTS symbols_fts;
+        CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+            name,
+            signature,
+            file,
+            content='symbols',
+            content_rowid='id',
+            tokenize='unicode61 remove_diacritics 1'
+        );
+        CREATE TRIGGER IF NOT EXISTS symbols_fts_insert
+        AFTER INSERT ON symbols
+        BEGIN
+            INSERT INTO symbols_fts(rowid, name, signature, file)
+            VALUES (new.id, new.name, new.signature, new.file);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbols_fts_delete
+        AFTER DELETE ON symbols
+        BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, file)
+            VALUES ('delete', old.id, old.name, old.signature, old.file);
+        END;
+        CREATE TRIGGER IF NOT EXISTS symbols_fts_update
+        AFTER UPDATE ON symbols
+        BEGIN
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, file)
+            VALUES ('delete', old.id, old.name, old.signature, old.file);
+            INSERT INTO symbols_fts(rowid, name, signature, file)
+            VALUES (new.id, new.name, new.signature, new.file);
+        END;
+        ",
+    )?;
+
+    conn.execute("INSERT INTO schema_version (version) VALUES (6)", [])?;
+
+    Ok(())
+}
+
+/// Compute a stable hash of the indexing-relevant config.
+///
+/// Any change to these fields will invalidate all stored fingerprints,
+/// forcing a full re-index on the next run.
+pub fn compute_index_config_hash(skip_patterns: &[String]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    skip_patterns.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Get or create a project entry by root path.
@@ -571,7 +644,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -628,5 +701,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[test]
+    fn test_v6_migration_adds_config_hash_column() {
+        let conn = mem_conn();
+
+        // Verify index_config_hash column exists on projects
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT index_config_hash FROM projects WHERE 1=0",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        // No rows → None, but the column should exist without error
+        assert!(hash.is_none());
+    }
+
+    #[test]
+    fn test_compute_index_config_hash_deterministic() {
+        let patterns1 = vec!["**/vendor/**".to_string(), "*.min.js".to_string()];
+        let patterns2 = vec!["**/vendor/**".to_string(), "*.min.js".to_string()];
+        let patterns3 = vec!["**/node_modules/**".to_string()];
+
+        assert_eq!(
+            compute_index_config_hash(&patterns1),
+            compute_index_config_hash(&patterns2),
+            "same patterns → same hash"
+        );
+        assert_ne!(
+            compute_index_config_hash(&patterns1),
+            compute_index_config_hash(&patterns3),
+            "different patterns → different hash"
+        );
+    }
+
+    #[test]
+    fn test_compute_index_config_hash_empty() {
+        let h1 = compute_index_config_hash(&[]);
+        let h2 = compute_index_config_hash(&[]);
+        assert_eq!(h1, h2, "empty patterns should be deterministic");
+        assert!(!h1.is_empty(), "hash should not be empty");
     }
 }

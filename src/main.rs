@@ -720,9 +720,19 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
+                // Load config for config-hash invalidation
+                let skip_patterns =
+                    crate::config::loader::load_config(None, None, None, None, None, false)
+                        .ok()
+                        .map(|c| c.rules_config.index_skip_files);
+
                 eprintln!("{}", "🔍 Indexing project...".cyan());
-                let stats =
-                    index::index_project(&conn, &project_root, verbose || cli.global.verbose)?;
+                let stats = index::index_project_with_skip(
+                    &conn,
+                    &project_root,
+                    verbose || cli.global.verbose,
+                    skip_patterns.as_deref(),
+                )?;
                 eprintln!(
                     "{}",
                     format!(
@@ -1497,9 +1507,16 @@ async fn main() -> Result<()> {
                 &conn,
                 cwd.to_str().with_context(|| "invalid UTF-8 in cwd path")?,
             )?;
+
+            // Load config for entry_point_patterns
+            let config = crate::config::loader::load_config(None, None, None, None, None, false)
+                .unwrap_or_default();
+            let entry_point_patterns = config.analysis.entry_point_patterns.clone();
+
             let opts = index::graph::DeadCodeOptions {
                 include_tests,
                 min_lines,
+                entry_point_patterns,
             };
             let results = index::graph::find_dead_code(&conn, project_id, &opts)?;
             if json {
