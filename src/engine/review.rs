@@ -824,31 +824,38 @@ pub(crate) fn build_scan_brain_context(
     let mut sections = Vec::new();
     let file_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
 
-    // ── 1. Impact Analysis ───────────────────────────────────────────
-    let mut impact_lines: Vec<String> = Vec::new();
+    // ── Single-pass: collect all symbols from scanned files ────────
+    // Query brain_search once per file (capped at 10), then reuse the
+    // collected symbols for both impact analysis and affected-tests lookup.
+    let mut all_symbols: Vec<crate::index::brain::BrainResult> = Vec::new();
     for file_path in file_paths.iter().take(10) {
-        // Query index for symbols defined in this file
         let query = format!("file:\"{file_path}\"");
         if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &query, 5) {
-            for r in &results {
-                if r.name.len() < 2 {
-                    continue;
-                }
-                if let Ok(nodes) =
-                    crate::index::graph::impact_analysis(&conn, project_id, &r.name, impact_depth)
-                {
-                    if nodes.len() > 2 {
-                        if !impact_lines.iter().any(|l| l.contains(&r.name)) {
-                            impact_lines.push(format!(
-                                "- `{}` ({}:{}): {} downstream caller(s)",
-                                r.name,
-                                r.file,
-                                r.line,
-                                nodes.len()
-                            ));
-                        }
-                    }
-                }
+            all_symbols.extend(results.into_iter().filter(|r| r.name.len() >= 2));
+        }
+    }
+
+    // Deduplicate by name to avoid redundant impact_analysis calls
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let unique_symbols: Vec<_> = all_symbols
+        .into_iter()
+        .filter(|r| seen_names.insert(r.name.clone()))
+        .collect();
+
+    // ── 1. Impact Analysis ───────────────────────────────────────────
+    let mut impact_lines: Vec<String> = Vec::new();
+    for r in &unique_symbols {
+        if let Ok(nodes) =
+            crate::index::graph::impact_analysis(&conn, project_id, &r.name, impact_depth)
+        {
+            if nodes.len() > 2 {
+                impact_lines.push(format!(
+                    "- `{}` ({}:{}): {} downstream caller(s)",
+                    r.name,
+                    r.file,
+                    r.line,
+                    nodes.len()
+                ));
             }
         }
     }
@@ -860,26 +867,19 @@ pub(crate) fn build_scan_brain_context(
     }
 
     // ── 2. Affected Tests ────────────────────────────────────────────
+    // Reuse the same symbols — no additional brain_search calls needed.
     let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for file_path in file_paths.iter().take(10) {
-        let query = format!("file:\"{file_path}\"");
-        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &query, 5) {
-            for r in &results {
-                if r.name.len() < 2 {
-                    continue;
-                }
-                if let Ok(nodes) =
-                    crate::index::graph::impact_analysis(&conn, project_id, &r.name, 1)
+    for r in &unique_symbols {
+        if let Ok(nodes) =
+            crate::index::graph::impact_analysis(&conn, project_id, &r.name, 1)
+        {
+            for node in &nodes {
+                let lower = node.file.to_lowercase();
+                if lower.contains("test")
+                    || lower.contains("spec")
+                    || lower.contains("_test")
                 {
-                    for node in &nodes {
-                        let lower = node.file.to_lowercase();
-                        if lower.contains("test")
-                            || lower.contains("spec")
-                            || lower.contains("_test")
-                        {
-                            test_files.insert(node.file.clone());
-                        }
-                    }
+                    test_files.insert(node.file.clone());
                 }
             }
         }

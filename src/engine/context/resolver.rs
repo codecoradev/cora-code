@@ -102,16 +102,26 @@ pub fn build_context_chain_with_bridge(
         symbols_extracted: symbols.len(),
         ..Default::default()
     };
-
     // Phase 1: Resolve outbound symbols to file locations (what changed code calls)
+    // When prefer_index is true, try index first, then fall back to regex
+    // for any symbols not found in the index (new files, stale index, etc.).
     let mut entries = if config.prefer_index && bridge.is_available() {
-        let index_entries = resolve_via_index(symbols, bridge, project_root, ignore_patterns, &mut stats);
+        let (index_entries, unresolved) =
+            resolve_via_index(symbols, bridge, project_root, ignore_patterns, &mut stats);
         debug!(
             index_resolved = index_entries.len(),
+            unresolved = unresolved.len(),
             source = "index",
             "resolved symbols via index"
         );
-        index_entries
+        // Fall back to regex for symbols the index couldn't resolve
+        if !unresolved.is_empty() {
+            debug!(count = unresolved.len(), "falling back to regex for unresolved symbols");
+            let mut fallback = resolve_symbols(&unresolved, config, project_root, ignore_patterns, &mut stats);
+            index_entries.into_iter().chain(fallback.drain(..)).collect()
+        } else {
+            index_entries
+        }
     } else {
         resolve_symbols(symbols, config, project_root, ignore_patterns, &mut stats)
     };
@@ -195,33 +205,29 @@ pub fn build_context_chain_with_bridge(
 
 /// Resolve extracted symbols using the symbol index (FTS5 search).
 ///
-/// For each extracted symbol, queries the index for matching definitions and maps
-/// the results to [`ContextEntry`].  This is more accurate than regex-based
-/// file scanning because it leverages the pre-built symbol table.
+/// Resolve extracted symbols to file locations using the symbol index.
 ///
-/// Symbols not found in the index are silently skipped (the regex fallback
-/// in `build_context_chain_with_bridge` is only used when the entire index
-/// is unavailable, not per-symbol).
+/// Returns `(resolved_entries, unresolved_symbols)`. Symbols not found in
+/// the index (new files, unsupported languages, stale index) are returned as
+/// `unresolved_symbols` so the caller can fall back to regex-based resolution.
 fn resolve_via_index(
     symbols: &[ExtractedSymbol],
     bridge: &crate::engine::index_bridge::IndexBridge,
     project_root: &Path,
     ignore_patterns: &[String],
     stats: &mut ContextStats,
-) -> Vec<ContextEntry> {
+) -> (Vec<ContextEntry>, Vec<ExtractedSymbol>) {
     let mut entries = Vec::new();
     let mut seen_files: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    let mut resolved_indices = Vec::new(); // track which input symbols got resolved
 
-    for sym in symbols {
+    for (sym_idx, sym) in symbols.iter().enumerate() {
         let query_text = match &sym.kind {
             SymbolKind::FunctionCall(name) => name.clone(),
             SymbolKind::TypeRef(name) => name.clone(),
             SymbolKind::Import(path) => {
                 // For imports, try to match the last segment as a module name
-                path.rsplit("::")
-                    .next()
-                    .unwrap_or(path)
-                    .to_string()
+                path.rsplit("::").next().unwrap_or(path).to_string()
             }
         };
 
@@ -230,6 +236,7 @@ fn resolve_via_index(
         }
 
         let results = bridge.search_symbols(&query_text, 5);
+        let mut sym_resolved = false;
         for result in results {
             let sym_file = &result.symbol.file;
 
@@ -251,6 +258,8 @@ fn resolve_via_index(
             if !full_path.exists() {
                 continue;
             }
+
+            sym_resolved = true;
 
             // Determine priority from the symbol kind
             let kind_str = result.symbol.kind.as_str();
@@ -274,12 +283,13 @@ fn resolve_via_index(
             };
 
             let line_start = result.symbol.line;
-            let line_end = (line_start + MAX_FN_LINES as u32)
-                .min(if let Ok(content) = std::fs::read_to_string(&full_path) {
+            let line_end = (line_start + MAX_FN_LINES as u32).min(
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
                     content.lines().count() as u32
                 } else {
                     line_start
-                });
+                },
+            );
 
             // Merge overlapping ranges for the same file
             let file_ranges = seen_files.entry(sym_file.clone()).or_default();
@@ -298,10 +308,24 @@ fn resolve_via_index(
                 });
             }
         }
+
+        if sym_resolved {
+            resolved_indices.push(sym_idx);
+        }
     }
 
     stats.symbols_resolved = entries.len();
-    entries
+
+    // Collect unresolved symbols (those not found in the index)
+    let resolved_set: std::collections::HashSet<usize> = resolved_indices.into_iter().collect();
+    let unresolved: Vec<ExtractedSymbol> = symbols
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !resolved_set.contains(i))
+        .map(|(_, s)| s.clone())
+        .collect();
+
+    (entries, unresolved)
 }
 
 /// Resolve extracted symbols to concrete file locations and line ranges.
