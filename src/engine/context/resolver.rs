@@ -1370,6 +1370,7 @@ mod tests {
             include_callers: false,
             use_brain: false,
             impact_depth: 2,
+            prefer_index: true,
         };
 
         let symbols = vec![ExtractedSymbol {
@@ -1396,6 +1397,7 @@ mod tests {
             include_callers: false,
             use_brain: false,
             impact_depth: 2,
+            prefer_index: true,
         };
 
         let symbols = vec![ExtractedSymbol {

@@ -666,7 +666,7 @@ fn is_valid_file_path(issue_file: &str, valid_files: &[String]) -> bool {
 /// 3. **Brain search** — semantically related patterns across the codebase
 ///
 /// Returns `None` if no index is available or no results found.
-fn build_brain_context(
+pub(crate) fn build_brain_context(
     diff_chunks: &[crate::engine::diff_parser::FileChunk],
     impact_depth: u32,
     project_root: &std::path::Path,
@@ -793,6 +793,107 @@ fn build_brain_context(
         sections.push(format!(
             "### Related Patterns (Semantic Search)\n{}",
             brain_lines.join("\n")
+        ));
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
+/// Build brain context for `cora scan` from a list of files.
+///
+/// Unlike `build_brain_context` (which works on diff chunks), this variant
+/// extracts symbols from the scanned file list and queries the index for
+/// impact analysis, affected tests, and related patterns.
+///
+/// Returns `None` if no index is available or no results found.
+pub(crate) fn build_scan_brain_context(
+    files: &[crate::engine::scanner::FileEntry],
+    impact_depth: u32,
+    project_root: &std::path::Path,
+) -> Option<String> {
+    let conn = crate::index::open_global_index().ok()?;
+    let project_id = crate::index::ensure_project(&conn, project_root).ok()?;
+
+    // Extract function/type names from each file using simple heuristics.
+    // For scan we don't have tree-sitter AST — we use the index's FTS5
+    // to find symbols defined in these files.
+    let mut sections = Vec::new();
+    let file_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+
+    // ── 1. Impact Analysis ───────────────────────────────────────────
+    let mut impact_lines: Vec<String> = Vec::new();
+    for file_path in file_paths.iter().take(10) {
+        // Query index for symbols defined in this file
+        let query = format!("file:\"{file_path}\"");
+        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &query, 5) {
+            for r in &results {
+                if r.name.len() < 2 {
+                    continue;
+                }
+                if let Ok(nodes) =
+                    crate::index::graph::impact_analysis(&conn, project_id, &r.name, impact_depth)
+                {
+                    if nodes.len() > 2 {
+                        if !impact_lines.iter().any(|l| l.contains(&r.name)) {
+                            impact_lines.push(format!(
+                                "- `{}` ({}:{}): {} downstream caller(s)",
+                                r.name,
+                                r.file,
+                                r.line,
+                                nodes.len()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !impact_lines.is_empty() {
+        sections.push(format!(
+            "### High-Impact Symbols\n{}\n  Consider extra scrutiny for these high-call-count symbols.",
+            impact_lines.join("\n")
+        ));
+    }
+
+    // ── 2. Affected Tests ────────────────────────────────────────────
+    let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for file_path in file_paths.iter().take(10) {
+        let query = format!("file:\"{file_path}\"");
+        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &query, 5) {
+            for r in &results {
+                if r.name.len() < 2 {
+                    continue;
+                }
+                if let Ok(nodes) =
+                    crate::index::graph::impact_analysis(&conn, project_id, &r.name, 1)
+                {
+                    for node in &nodes {
+                        let lower = node.file.to_lowercase();
+                        if lower.contains("test")
+                            || lower.contains("spec")
+                            || lower.contains("_test")
+                        {
+                            test_files.insert(node.file.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !test_files.is_empty() {
+        let mut test_list: Vec<_> = test_files.into_iter().collect();
+        test_list.sort();
+        sections.push(format!(
+            "### Potentially Affected Tests\n{}",
+            test_list
+                .iter()
+                .map(|f| format!("- `{f}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
 

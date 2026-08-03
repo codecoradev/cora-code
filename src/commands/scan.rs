@@ -143,7 +143,20 @@ pub async fn execute_scan(
         "batched files"
     );
 
-    // 4. Process batches and collect issues
+    // 4. Build brain context once for the entire scan (if use_brain enabled).
+    //    Extracts defined symbols from the file list and queries the symbol
+    //    index for impact analysis, affected tests, and related patterns.
+    let brain_ctx = if config.context_chain.use_brain {
+        crate::engine::review::build_scan_brain_context(
+            &files,
+            config.context_chain.impact_depth,
+            &root_abs,
+        )
+    } else {
+        None
+    };
+
+    // 5. Process batches and collect issues
     let mut all_issues = Vec::new();
     let mut total_tokens: Option<TokenUsage> = None;
     let mut skipped_batches: Vec<(usize, Vec<String>, String)> = Vec::new();
@@ -165,6 +178,7 @@ pub async fn execute_scan(
             &config.rules,
             &config.response_format,
             None,
+            brain_ctx.as_deref(),
         )
         .await
         {
