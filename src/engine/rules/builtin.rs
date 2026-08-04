@@ -129,6 +129,7 @@ pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
     match rule_id {
         "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line),
         "sec-hardcoded-url" => is_false_positive_url(line),
+        "config/cors-wildcard" => is_false_positive_cors(line),
         _ => false,
     }
 }
@@ -239,6 +240,50 @@ fn is_false_positive_secret(line: &str) -> bool {
                 return true;
             }
         }
+    }
+
+    false
+}
+
+/// Check if a CORS wildcard match is a false positive.
+///
+/// Suppresses: negation contexts ("no wildcard", "do not use *"), comments
+/// documenting that wildcards are disallowed, and env var names that contain
+/// "cors" but are not wildcard assignments.
+fn is_false_positive_cors(line: &str) -> bool {
+    let lower = line.to_lowercase();
+
+    // Negation context — line says wildcards are NOT allowed.
+    // Examples: "no wildcard", "do not use *", "without wildcard"
+    let negation_markers = [
+        "no wildcard",
+        "no catch-all",
+        "no catch all",
+        "not.*wildcard",
+        "do not.*wildcard",
+        "do not.*\\*",
+        "without.*wildcard",
+        "never.*wildcard",
+        "disallow.*wildcard",
+        "prohibit.*wildcard",
+        "avoid.*wildcard",
+        "except.*wildcard",
+    ];
+    for marker in &negation_markers {
+        if let Ok(re) = regex::Regex::new(marker) {
+            if re.is_match(&lower) {
+                return true;
+            }
+        }
+    }
+
+    // Env var or config key names containing "cors" — these are identifiers,
+    // not wildcard assignments. e.g., TITEN_CORS_ORIGINS, CORS_ALLOWED_ORIGINS
+    if lower.contains("cors_origins")
+        || lower.contains("cors_allowed")
+        || lower.contains("cors_config")
+    {
+        return true;
     }
 
     false
@@ -434,6 +479,64 @@ mod tests {
         assert!(!post_match_filter(
             "sec-hardcoded-secret",
             "let password = supersecret12345"
+        ));
+    }
+
+    // ─── config/cors-wildcard false positive tests (issue #483) ───
+
+    #[test]
+    fn cors_negation_no_wildcard_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "// No wildcard — only explicit origins"
+        ));
+    }
+
+    #[test]
+    fn cors_negation_no_catch_all_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "// No catch-all origin pattern is permitted"
+        ));
+    }
+
+    #[test]
+    fn cors_negation_do_not_use_wildcard_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "# Do not use * in production"
+        ));
+    }
+
+    #[test]
+    fn cors_env_var_name_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "TITEN_CORS_ORIGINS=https://example.com"
+        ));
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "CORS_ALLOWED_ORIGINS=https://example.com"
+        ));
+    }
+
+    #[test]
+    fn cors_actual_wildcard_is_not_false_positive() {
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "Access-Control-Allow-Origin: *"
+        ));
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "let origin = \"*\";"
+        ));
+    }
+
+    #[test]
+    fn cors_unrelated_rule_not_affected() {
+        assert!(!post_match_filter(
+            "crypto/hardcoded-secret",
+            "No wildcard in this line"
         ));
     }
 }

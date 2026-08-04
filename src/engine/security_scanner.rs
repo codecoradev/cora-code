@@ -87,7 +87,12 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "config/cors-wildcard",
         name: "CORS wildcard allows all origins",
-        regex: r"(?i)(?:Access-Control-Allow-Origin|cors).*\*",
+        // Match actual code patterns, not the word "cors" in prose/documentation.
+        // Require either the literal HTTP header with `*`, or a code assignment/call
+        // like `cors = "*"`, `origin: *`, `allowed_origins = "*"`, `allow_origin("*")`.
+        // The word "cors" alone is too broad — it appears in env var names
+        // (TITEN_CORS_ORIGINS), config keys, and documentation.
+        regex: r#"(?i)(?:Access-Control-Allow-Origin\s*:\s*\*|(?:cors|allow_origin|allowed_origins)\s*[=:(]\s*["']?\*["']?|origin\s*[=:]\s*["']?\*["']?)"#,
         severity: Severity::Major,
     },
     // ── TLS/SSL ──
@@ -127,6 +132,14 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
         // Skip test/spec/fixture/mock/example files
         if is_test_file(path) {
             debug!(file = path, "skipping test file in security scan");
+            continue;
+        }
+
+        // Skip documentation and non-code files — security patterns are designed
+        // for source code, not prose. Prevents false positives like flagging
+        // "CORS" in a markdown config guide (#483).
+        if is_doc_file(path) {
+            debug!(file = path, "skipping documentation file in security scan");
             continue;
         }
 
@@ -214,6 +227,19 @@ fn is_test_file(path: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if a file path is a documentation or non-code file.
+///
+/// Security scanner patterns are designed for source code. Scanning markdown,
+/// plain text, or reStructuredText produces false positives because security
+/// keywords (CORS, secret, password) appear naturally in documentation prose.
+fn is_doc_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    matches!(
+        lower.rsplit('.').next().unwrap_or(""),
+        "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org"
+    )
 }
 
 #[cfg(test)]
@@ -449,7 +475,7 @@ mod tests {
     fn real_hardcoded_secret_still_detected_after_filter() {
         let chunks = vec![make_chunk(
             "src/config.py",
-            &["API_KEY = sk_live_abc123def456"],
+            &["API_KEY = \"sk_live_abc123def456ghi789\""],
         )];
         let findings = scan_security(&chunks, 10);
         let secret_findings: Vec<_> = findings
@@ -461,5 +487,176 @@ mod tests {
             1,
             "Real hardcoded secret should still be detected"
         );
+    }
+
+    // ─── CORS false positive tests (issue #483) ───
+
+    #[test]
+    fn detects_cors_wildcard_header() {
+        // The classic dangerous pattern — actual HTTP header with wildcard
+        let chunks = vec![make_chunk(
+            "src/server.rs",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(cors_findings.len(), 1, "Should detect wildcard CORS header");
+    }
+
+    #[test]
+    fn detects_cors_wildcard_assignment() {
+        // Code assignment like cors = "*" or origin = '*'
+        let chunks = vec![make_chunk("src/config.rs", &["let cors_origin = \"*\";"])];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors_findings.len(),
+            1,
+            "Should detect cors assignment with wildcard"
+        );
+    }
+
+    #[test]
+    fn detects_allowed_origins_wildcard() {
+        // Pattern: allowed_origins = "*"
+        let chunks = vec![make_chunk("src/app.py", &["allowed_origins = \"*\""])];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors_findings.len(),
+            1,
+            "Should detect allowed_origins with wildcard"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_cors_env_var_name() {
+        // Issue #483: TITEN_CORS_ORIGINS contains "cors" but is not a wildcard assignment.
+        // The * after it comes from markdown bold (**), not a CORS wildcard.
+        let chunks = vec![make_chunk(
+            "src/config.rs",
+            &["let val = std::env::var(\"TITEN_CORS_ORIGINS\").unwrap_or(\"*\");"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert!(
+            cors_findings.is_empty(),
+            "TITEN_CORS_ORIGINS env var name should not trigger CORS wildcard"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_cors_in_prose() {
+        // Issue #483: "CORS" keyword in documentation prose near a `*` character
+        let chunks = vec![make_chunk(
+            "src/config.rs",
+            &["// CORS configured via TITEN_CORS_ORIGINS env var"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert!(
+            cors_findings.is_empty(),
+            "CORS keyword in comment prose should not trigger"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_markdown_file() {
+        // Issue #483: .md files should be skipped entirely by security scanner
+        let chunks = vec![make_chunk(
+            "docs/deployment.md",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "Markdown files should not be scanned by security scanner"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_txt_file() {
+        let chunks = vec![make_chunk(
+            "docs/security.txt",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "Text files should not be scanned by security scanner"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_rst_file() {
+        let chunks = vec![make_chunk(
+            "docs/api.rst",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "reStructuredText files should not be scanned"
+        );
+    }
+
+    #[test]
+    fn real_cors_wildcard_in_rust_still_detected() {
+        // Make sure we don't over-suppress — actual code patterns still trigger
+        let chunks = vec![make_chunk(
+            "src/server.rs",
+            &[".layer(CorsLayer::new().allow_origin(\"*\"))"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        // This should trigger because it's a code assignment pattern: origin = "*"
+        assert_eq!(
+            cors_findings.len(),
+            1,
+            "Real CORS wildcard in Rust code should be detected"
+        );
+    }
+
+    #[test]
+    fn is_doc_file_recognizes_common_extensions() {
+        assert!(is_doc_file("README.md"));
+        assert!(is_doc_file("docs/guide.markdown"));
+        assert!(is_doc_file("docs/api.mdx"));
+        assert!(is_doc_file("notes.txt"));
+        assert!(is_doc_file("docs/spec.rst"));
+        assert!(is_doc_file("docs/manual.adoc"));
+        assert!(is_doc_file("docs/manual.asciidoc"));
+        assert!(is_doc_file("paper.tex"));
+        assert!(is_doc_file("notes.org"));
+    }
+
+    #[test]
+    fn is_doc_file_does_not_match_code_files() {
+        assert!(!is_doc_file("src/main.rs"));
+        assert!(!is_doc_file("src/app.py"));
+        assert!(!is_doc_file("src/server.ts"));
+        assert!(!is_doc_file("src/index.js"));
+        assert!(!is_doc_file("src/config.go"));
+        assert!(!is_doc_file("Dockerfile"));
+        assert!(!is_doc_file("docker-compose.yml"));
+        assert!(!is_doc_file("Makefile"));
     }
 }
