@@ -40,7 +40,7 @@ features:
     details: Index symbols across 15 languages. Call graph, trace, impact analysis. FTS5 + vector KNN + graph hybrid search.
   - icon: 🌳
     title: Tree-sitter
-    details: AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, Svelte.
+    details: "AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, Svelte."
   - icon: 🔌
     title: MCP Server
     details: 15 tools for AI coding agents — review, search, brain, debt, trace. Works with Claude, GPT, and other MCP clients.
