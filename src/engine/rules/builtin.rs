@@ -1,4 +1,7 @@
 /// Built-in rules for the rule engine.
+use regex::Regex;
+use std::sync::LazyLock;
+
 use crate::engine::Severity;
 use crate::engine::rules::types::CustomRule;
 
@@ -245,44 +248,84 @@ fn is_false_positive_secret(line: &str) -> bool {
     false
 }
 
+/// Negation markers that indicate a line is documenting that wildcards
+/// are disallowed. Matched against the comment-stripped, lowercased line.
+/// Plain strings use `contains`; patterns ending with `.*` use regex.
+const CORS_NEGATION_MARKERS: &[&str] = &[
+    "no wildcard",
+    "no catch-all",
+    "no catch all",
+    "not.*wildcard",
+    "do not.*wildcard",
+    "do not.*\\*",
+    "without.*wildcard",
+    "never.*wildcard",
+    "disallow.*wildcard",
+    "prohibit.*wildcard",
+    "avoid.*wildcard",
+    "except.*wildcard",
+];
+
+static CORS_NEGATION_RE: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    CORS_NEGATION_MARKERS
+        .iter()
+        .filter_map(|m| Regex::new(m).ok())
+        .collect()
+});
+
+/// Strip comment prefix from a line for negation checking.
+/// Handles: `//`, `#`, `--`, `/*`, `*` (block comment continuation).
+fn strip_comment_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for prefix in &["//", "#", "--", "/*", "*"] {
+        if let Some(stripped) = trimmed.strip_prefix(prefix) {
+            return stripped.trim_start();
+        }
+    }
+    trimmed
+}
+
 /// Check if a CORS wildcard match is a false positive.
 ///
-/// Suppresses: negation contexts ("no wildcard", "do not use *"), comments
-/// documenting that wildcards are disallowed, and env var names that contain
-/// "cors" but are not wildcard assignments.
+/// Suppresses: negation contexts ("no wildcard", "do not use *") only when
+/// the negation appears in a **comment prefix** (not mixed with code), and
+/// env var *read* patterns (`env::var("...")`, `getenv("...")`).
+///
+/// Does NOT suppress actual wildcard assignments like `CORS_CONFIG = "*"`
+/// or code that appears after a comment on the same line.
 fn is_false_positive_cors(line: &str) -> bool {
     let lower = line.to_lowercase();
 
-    // Negation context — line says wildcards are NOT allowed.
-    // Examples: "no wildcard", "do not use *", "without wildcard"
-    let negation_markers = [
-        "no wildcard",
-        "no catch-all",
-        "no catch all",
-        "not.*wildcard",
-        "do not.*wildcard",
-        "do not.*\\*",
-        "without.*wildcard",
-        "never.*wildcard",
-        "disallow.*wildcard",
-        "prohibit.*wildcard",
-        "avoid.*wildcard",
-        "except.*wildcard",
-    ];
-    for marker in &negation_markers {
-        if let Ok(re) = regex::Regex::new(marker) {
-            if re.is_match(&lower) {
-                return true;
+    // Negation context — but ONLY in comment prefix, not mixed with code.
+    // First strip the comment prefix, then check if the remaining text
+    // is purely a negation statement (no assignment/code after it).
+    let comment_body = strip_comment_prefix(line);
+    let comment_lower = comment_body.to_lowercase();
+
+    // Only apply negation filter if the original line was a comment
+    // AND the comment body does NOT contain code indicators (=, ", ', wildcard *)
+    // after the negation phrase. This prevents suppressing mixed lines like
+    // `// no wildcard for now, but origin = "*"` where real code follows the comment.
+    let is_comment = line.trim_start() != comment_body;
+    if is_comment {
+        // Check for code indicators in the comment body — if present, the line
+        // contains actual code after the comment, so negation should NOT suppress.
+        let has_code = comment_body.contains('=')
+            || comment_body.contains("fn ")
+            || comment_body.contains("let ")
+            || comment_body.contains("const ");
+        if !has_code {
+            for re in CORS_NEGATION_RE.iter() {
+                if re.is_match(&comment_lower) {
+                    return true;
+                }
             }
         }
     }
 
-    // Env var or config key names containing "cors" — these are identifiers,
-    // not wildcard assignments. e.g., TITEN_CORS_ORIGINS, CORS_ALLOWED_ORIGINS
-    if lower.contains("cors_origins")
-        || lower.contains("cors_allowed")
-        || lower.contains("cors_config")
-    {
+    // Env var READ patterns (not bare assignments).
+    // e.g., env::var("TITEN_CORS_ORIGINS"), getenv("CORS_CONFIG")
+    if lower.contains("env::var(") || lower.contains("getenv(") || lower.contains("os.environ") {
         return true;
     }
 
@@ -510,13 +553,44 @@ mod tests {
 
     #[test]
     fn cors_env_var_name_is_false_positive() {
+        // env::var() read pattern — should be suppressed
         assert!(post_match_filter(
             "config/cors-wildcard",
-            "TITEN_CORS_ORIGINS=https://example.com"
+            "let val = env::var(\"TITEN_CORS_ORIGINS\").unwrap();"
         ));
         assert!(post_match_filter(
             "config/cors-wildcard",
-            "CORS_ALLOWED_ORIGINS=https://example.com"
+            "let val = getenv(\"CORS_ALLOWED_ORIGINS\");"
+        ));
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "os.environ.get(\"CORS_ORIGINS\")"
+        ));
+    }
+
+    #[test]
+    fn cors_config_assignment_is_not_false_positive() {
+        // Issue #488: bare CORS_CONFIG = "*" is a REAL finding, not env var read
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "CORS_CONFIG = \"*\""
+        ));
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "cors_origins = \"*\""
+        ));
+    }
+
+    #[test]
+    fn cors_mixed_comment_code_not_suppressed() {
+        // Issue #488: code after a comment should NOT be suppressed by negation
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "// no wildcard for now, but origin = \"*\""
+        ));
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "# except for wildcard endpoints: cors = \"*\""
         ));
     }
 
