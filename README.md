@@ -144,7 +144,7 @@ cora config show --project # .cora.yaml
 | `~/.cora/config.yaml` | Global defaults (provider, model, etc.) |
 | `.cora.yaml` | Per-project overrides |
 
-See **[Configuration →](https://codecora.dev/configuration.html)** for full reference.
+See **[Configuration →](https://codecora.dev/cora/docs/configuration)** for full reference.
 
 ## CI/CD
 
@@ -169,7 +169,7 @@ Required secrets: `CORA_API_KEY`, `CORA_BASE_URL` (optional), `CORA_MODEL` (opti
 
 See [GitHub Marketplace](https://github.com/marketplace/actions/cora-ai-code-review) for full documentation.
 
-Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecora.dev/examples.html#_07-gitea-forgejo-ci)
+Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecora.dev/cora/docs/examples#_07-gitea-forgejo-ci)
 
 ## Commands
 
@@ -207,7 +207,7 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora mcp` | Start MCP server (15 tools) for AI coding agents |
 | `cora hook install` | Install pre-commit hook |
 
-See **[CLI Reference →](https://codecora.dev/cli-reference.html)** for all flags and examples.
+See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for all flags and examples.
 
 ## Performance
 
@@ -237,13 +237,13 @@ Provider-specific keys are auto-detected: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 
 | Page | Description |
 |------|-------------|
-| [Getting Started](https://codecora.dev/getting-started.html) | Install, auth, first review |
-| [Configuration](https://codecora.dev/configuration.html) | Config files, env vars, priority |
-| [CLI Reference](https://codecora.dev/cli-reference.html) | All commands and flags |
-| [Providers](https://codecora.dev/providers.html) | Supported LLM providers |
-| [Examples](https://codecora.dev/examples.html) | Common workflows & CI setup |
-| [Changelog](https://codecora.dev/changelog.html) | Release history |
-| [Roadmap](https://codecora.dev/roadmap.html) | Planned features |
+| [Getting Started](https://codecora.dev/cora/docs/getting-started) | Install, auth, first review |
+| [Configuration](https://codecora.dev/cora/docs/configuration) | Config files, env vars, priority |
+| [CLI Reference](https://codecora.dev/cora/docs/cli-reference) | All commands and flags |
+| [Providers](https://codecora.dev/cora/docs/providers) | Supported LLM providers |
+| [Examples](https://codecora.dev/cora/docs/examples) | Common workflows & CI setup |
+| [Changelog](https://codecora.dev/cora/docs/changelog) | Release history |
+| [Roadmap](https://codecora.dev/cora/docs/roadmap) | Planned features |
 
 ## Star History
 
