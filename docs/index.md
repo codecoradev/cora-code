@@ -43,7 +43,7 @@ features:
     details: "AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, Svelte."
   - icon: 🔌
     title: MCP Server
-    details: 15 tools for AI coding agents — review, search, brain, debt, trace. Works with Claude, GPT, and other MCP clients.
+    details: 18 tools for AI coding agents — review, search, brain, debt, trace, dead code, graph query. Works with Claude, Cursor, Windsurf, and other MCP clients.
   - icon: 📐
     title: Quality Profiles
     details: Strict, balanced, or lax presets. Configurable quality gate with pass/fail thresholds for CI enforcement.

@@ -49,6 +49,7 @@ provider:
 llm:
   temperature: 0
   max_tokens: 4096
+  max_tokens_param: auto       # auto | max_tokens | max_output_tokens | max_completion_tokens
   timeout: 120
   cache_ttl: 1440
 
@@ -56,6 +57,9 @@ review:
   system_prompt: "You are a senior code reviewer."
   # system_prompt_file: ./review-prompt.md
   response_format: json_object
+  static_analysis:
+    auto_clippy: false       # auto-run `cargo clippy` (Rust only)
+    clippy_output_file: ""   # or read clippy output from file
 
 focus: security, performance, bugs
 
@@ -63,11 +67,37 @@ hook:
   mode: warn
   min_severity: major
   max_diff_size: 51200
+  on_violation: warn           # warn | disallow (blocks commit if violations found)
 
 ignore:
   files:
     - "vendor/**"
-    - "*.min.js"
+    - "*.generated.ts"
+  rules: []                    # rule IDs to skip (e.g. ["no-unwrap", "sql-injection"])
+
+output:
+  format: pretty               # pretty | json | compact | sarif
+  color: true                  # ANSI colors in terminal output
+
+quality_gate:
+  enabled: true
+  thresholds:
+    max_critical: 0
+    max_security: 0
+
+bundling:
+  max_chars_per_group: 12000
+  max_files_per_group: 20
+  strategy: directory        # directory | language
+  coalesce_by_directory: true
+  coalesce_by_language: true
+
+analysis:
+  entry_point_patterns:
+    - "*Handler"
+    - "resolve_*"
+
+profile: clean-code        # security-first | performance | clean-code | beginner-friendly | minimal | rust-strict | typescript-strict | go-pragmatic
 ```
 
 ## Environment Variables
@@ -173,6 +203,9 @@ review:
     follow_depth: 1             # outbound resolution depth (1 = direct refs only)
     include_tests: true         # resolve test files via naming convention
     include_callers: true       # resolve callers of changed code (blast radius)
+    use_brain: true             # enrich prompt with symbol-index intelligence
+    impact_depth: 2             # blast-radius traversal depth (2 = callers of callers)
+    prefer_index: true          # prefer symbol index (FTS5 + call graph) over regex
 ```
 
 | Field | Default | Notes |
@@ -182,6 +215,9 @@ review:
 | `follow_depth` | `1` | Outbound recursion depth (`1` = direct references). |
 | `include_tests` | `true` | Map changed source to its test files. |
 | `include_callers` | `true` | Inbound caller resolution. Scans source files (gitignore-aware — `target/`, `node_modules/` are never scanned), bounded to ≤400 files and ≤3 call-sites per symbol. |
+| `use_brain` | `true` | Enrich prompt with symbol-index intelligence (impact analysis, affected tests, semantic search). Only active when `cora index` has been run. |
+| `impact_depth` | `2` | Blast-radius traversal depth (`1` = direct callers, `2` = callers of callers). |
+| `prefer_index` | `true` | Prefer symbol index (FTS5 + call graph) over regex scanning for outbound resolution. |
 
 ## Quality Gate
 
@@ -345,18 +381,25 @@ No configuration needed — language context is auto-detected from file extensio
 
 ## Quality Profiles
 
-cora includes built-in quality profiles for different review strictness:
+cora includes built-in quality profiles for different review focus:
 
 | Profile | Description |
 |---------|------------|
-| `strict` | All categories enabled, low tolerance for issues |
-| `balanced` | *(default)* Security + bugs + performance, moderate thresholds |
-| `lax` | Only critical issues, high tolerance |
+| `security-first` | Strict security focus — zero tolerance for vulnerabilities |
+| `performance` | Focus on speed, memory, and allocation patterns — best for hot-path code |
+| `clean-code` | *(default)* Broad quality — readability, naming, complexity — best for team projects |
+| `beginner-friendly` | Gentle review — focus on common mistakes and learning opportunities |
+| `minimal` | Only critical + security — best for quick PRs and hotfixes |
+| `rust-strict` | Rust-specific: unsafe, unwrap, panic, lifetime, error handling, idiomatic patterns |
+| `typescript-strict` | TypeScript-specific: any types, null safety, proper typing, async patterns |
+| `go-pragmatic` | Go-specific: error handling, goroutine safety, interface design, idiomatic Go |
+
+Run `cora profile list` to see all profiles. Cora auto-detects the best profile based on your project's primary language (Rust → `rust-strict`, Go → `go-pragmatic`, others → `clean-code`).
 
 Set in `.cora.yaml`:
 
 ```yaml
-profile: strict
+profile: security-first
 ```
 
 ## Custom Rule Engine
@@ -388,7 +431,7 @@ Control how index-based scanners (unused imports, dead code, breaking changes) b
 ```yaml
 rules_engine:
   enabled: true
-  max_findings: 50
+  max_findings: 5
   index_skip_files:
     - "*.config.ts"
     - "vite.config.*"
@@ -404,7 +447,7 @@ rules_engine:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
-| `max_findings` | `int` | `50` | Max findings per scan |
+| `max_findings` | `int` | `5` | Max findings per scan |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
 
 Default `index_skip_files` patterns (bundled with cora):
@@ -417,6 +460,87 @@ Default `index_skip_files` patterns (bundled with cora):
 > **Why skip these?** Entry-point files and bundler configs often import symbols that are consumed by the bundler/compiler, not by other source code. Index scanners detect these as "unused" because there are no code-level references. Skipping them eliminates the most common source of false positives.
 
 Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`), wildcard prefix (`vite.*`), and any-directory (`**/main.ts`).
+
+## Ignore Files
+
+Exclude files or directories from **all** cora operations — review, scan, and indexing. This is the broadest exclusion mechanism.
+
+```yaml
+ignore:
+  files:
+    - "vendor/**"
+    - "*.min.js"
+    - "**/generated/**"
+    - "*.lock"
+```
+
+| Pattern | Matches |
+|---------|---------|
+| `src/main.ts` | Exact path — only `src/main.ts` |
+| `*.config.ts` | Suffix wildcard — any file ending in `.config.ts` |
+| `vite.config.*` | Prefix wildcard — `vite.config.js`, `vite.config.ts` |
+| `**/main.ts` | Any-dir name — `src/main.ts`, `app/main.ts`, `a/b/main.ts` |
+| `**/phaser/**` | Any-dir wildcard — any path containing a `phaser/` directory |
+| `src/engine/**` | Prefix-dir — everything under `src/engine/` |
+| `**/*.test.ts` | Double wildcard ext — any `.test.ts` file anywhere |
+
+**Auto-skipped by default** (gitignore-aware): `node_modules/`, `target/`, `.git/`, `dist/`, `build/`.
+
+> **`ignore.files` vs `rules_engine.index_skip_files`:** `ignore.files` excludes files from **everything** (review, scan, index). `rules_engine.index_skip_files` excludes files from **index scanners only** (dead code, unused imports) — they're still reviewed by the LLM.
+
+## Static Analysis
+
+Run language-specific static analysis tools automatically during review and feed their output to the LLM for better findings.
+
+```yaml
+review:
+  static_analysis:
+    auto_clippy: false       # auto-run `cargo clippy` (Rust only)
+    clippy_output_file: ""   # or read clippy output from a file
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `auto_clippy` | `false` | Auto-run `cargo clippy --message-format=json` and inject warnings into review context (Rust projects only) |
+| `clippy_output_file` | `""` | Read clippy JSON output from a file instead of running clippy (useful for CI where clippy runs separately) |
+
+## Bundling
+
+Control how multiple files are grouped into LLM batches during `cora scan`. Cora automatically chunks large file sets into groups that fit within provider token limits.
+
+```yaml
+bundling:
+  max_chars_per_group: 60000  # max source characters per LLM batch
+  max_files_per_group: 20      # max files per batch
+  strategy: smart              # grouping strategy: smart | flat
+  coalesce_by_directory: true  # merge small batches from the same directory
+  coalesce_by_language: true   # merge small batches with the same language
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `max_chars_per_group` | `60000` | Soft limit on source characters per batch |
+| `max_files_per_group` | `20` | Max files per batch before splitting |
+| `strategy` | `smart` | Grouping strategy: `smart` (coalesce by directory + language within limits) or `flat` (first-fit by character count, legacy) |
+| `coalesce_by_directory` | `true` | Merge small batches from the same directory into one LLM call |
+| `coalesce_by_language` | `true` | Merge small batches with the same primary language |
+
+## Analysis
+
+Configure entry-point symbol patterns for architecture and call-graph analysis. Entry points are treated as roots when tracing execution paths and detecting dead code.
+
+```yaml
+analysis:
+  entry_point_patterns:
+    - "*Handler"
+    - "resolve_*"
+    - "*Middleware"
+    - "main"
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `entry_point_patterns` | `[]` | Glob patterns identifying entry-point symbols (used by `dead-code`, `trace`, and `arch` commands to avoid false positives on intentionally-unreachable functions) |
 
 ## Tech Debt Tracker
 
@@ -451,7 +575,8 @@ cora includes a built-in MCP (Model Context Protocol) server that exposes rules 
 ### Start the server
 
 ```bash
-cora mcp
+cora mcp      # Start MCP server
+cora serve    # Start MCP server + auto-reindex on startup (ensures fresh index)
 ```
 
 ### Available tools
@@ -463,6 +588,19 @@ cora mcp
 | `cora.get_quality_gate` | Get quality gate config and thresholds |
 | `cora.get_config` | Get effective project config (no secrets exposed) |
 | `cora.list_profiles` | List all quality profiles |
+| `cora.search_symbols` | Search the symbol index (requires `cora index`) |
+| `cora.find_callers` | Find all callers of a symbol (reverse call graph) |
+| `cora.find_impact` | Analyze blast radius of changing a symbol |
+| `cora.find_affected_tests` | Find test files affected by changed source files |
+| `cora.index_status` | Check if a symbol index exists and get statistics |
+| `cora.review_diff` | Review a git diff using cora's full pipeline (makes LLM call) |
+| `cora.get_debt` | Get tech debt report from review history |
+| `cora.get_project_info` | Get project context (repo, branch, cora version, index status) |
+| `cora.get_memory` | Recall project patterns from Uteke (requires `uteke` CLI) |
+| `cora.brain_search` | Hybrid code search: FTS5 + vector + graph → RRF fusion |
+| `cora.install` | Detect installed AI agents and configure cora as MCP server |
+| `cora.dead_code` | Find potentially dead code (functions with no callers) |
+| `cora.query` | Query the code graph with simple patterns (e.g. `main -> *`) |
 
 ### Configure in Claude Code
 
