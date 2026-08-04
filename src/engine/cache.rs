@@ -14,12 +14,15 @@ fn cache_dir() -> std::result::Result<PathBuf, CoraError> {
 }
 
 /// Compute SHA-256 hex digest of the diff content + config parameters.
-/// Includes model and temperature so config changes invalidate the cache.
+/// Includes model, provider, base_url, and temperature so config changes
+/// invalidate the cache (e.g., switching providers with the same model name).
 #[allow(clippy::format_collect)]
-fn cache_key(diff: &str, model: &str, temperature: f32) -> String {
+fn cache_key(diff: &str, model: &str, temperature: f32, provider: &str, base_url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(diff.as_bytes());
     hasher.update(model.as_bytes());
+    hasher.update(provider.as_bytes());
+    hasher.update(base_url.as_bytes());
     hasher.update(temperature.to_le_bytes());
     let result = hasher.finalize();
     result.iter().map(|b| format!("{b:02x}")).collect()
@@ -34,8 +37,10 @@ pub fn get_cached_review(
     model: &str,
     temperature: f32,
     ttl: u64,
+    provider: &str,
+    base_url: &str,
 ) -> Option<ReviewResponse> {
-    let hash = cache_key(diff, model, temperature);
+    let hash = cache_key(diff, model, temperature, provider, base_url);
     let dir = cache_dir().ok()?;
     let path = dir.join(format!("{hash}.json"));
 
@@ -78,11 +83,13 @@ pub fn save_cached_review(
     model: &str,
     temperature: f32,
     response: &ReviewResponse,
+    provider: &str,
+    base_url: &str,
 ) -> std::result::Result<(), CoraError> {
     let dir = cache_dir()?;
     std::fs::create_dir_all(&dir).map_err(CoraError::CacheIo)?;
 
-    let hash = cache_key(diff, model, temperature);
+    let hash = cache_key(diff, model, temperature, provider, base_url);
     let path = dir.join(format!("{hash}.json"));
 
     let now = SystemTime::now()
@@ -136,24 +143,54 @@ mod tests {
 
     #[test]
     fn cache_key_is_deterministic() {
-        let hash1 = cache_key("hello world", "gpt-4", 0.0);
-        let hash2 = cache_key("hello world", "gpt-4", 0.0);
+        let hash1 = cache_key(
+            "hello world",
+            "gpt-4",
+            0.0,
+            "openai",
+            "https://api.openai.com/v1",
+        );
+        let hash2 = cache_key(
+            "hello world",
+            "gpt-4",
+            0.0,
+            "openai",
+            "https://api.openai.com/v1",
+        );
         assert_eq!(hash1, hash2);
         assert_eq!(hash1.len(), 64); // SHA-256 hex = 64 chars
     }
 
     #[test]
     fn cache_key_differs_for_different_inputs() {
-        let hash1 = cache_key("hello world", "gpt-4", 0.0);
-        let hash2 = cache_key("hello earth", "gpt-4", 0.0);
+        let hash1 = cache_key(
+            "hello world",
+            "gpt-4",
+            0.0,
+            "openai",
+            "https://api.openai.com/v1",
+        );
+        let hash2 = cache_key(
+            "hello earth",
+            "gpt-4",
+            0.0,
+            "openai",
+            "https://api.openai.com/v1",
+        );
         assert_ne!(hash1, hash2);
     }
 
     #[test]
     fn cache_key_includes_model_and_temperature() {
-        let h1 = cache_key("diff", "gpt-4", 0.0);
-        let h2 = cache_key("diff", "gpt-3.5", 0.0);
-        let h3 = cache_key("diff", "gpt-4", 0.7);
+        let h1 = cache_key("diff", "gpt-4", 0.0, "openai", "https://api.openai.com/v1");
+        let h2 = cache_key(
+            "diff",
+            "gpt-3.5",
+            0.0,
+            "openai",
+            "https://api.openai.com/v1",
+        );
+        let h3 = cache_key("diff", "gpt-4", 0.7, "openai", "https://api.openai.com/v1");
         assert_ne!(h1, h2, "different models should differ");
         assert_ne!(h1, h3, "different temperatures should differ");
     }
@@ -161,7 +198,7 @@ mod tests {
     #[test]
     fn cache_key_len_is_64() {
         let diff = "diff --git a/file.txt b/file.txt\n+ hello";
-        let hash = cache_key(diff, "model", 0.0);
+        let hash = cache_key(diff, "model", 0.0, "openai", "https://api.openai.com/v1");
         assert_eq!(hash.len(), 64);
     }
 
@@ -169,9 +206,41 @@ mod tests {
     fn cache_miss_on_different_diff() {
         let diff1 = "diff --git a/a.txt b/a.txt\n+ hello";
         let diff2 = "diff --git a/b.txt b/b.txt\n+ world";
-        let hash1 = cache_key(diff1, "model", 0.0);
-        let hash2 = cache_key(diff2, "model", 0.0);
+        let hash1 = cache_key(diff1, "model", 0.0, "openai", "https://api.openai.com/v1");
+        let hash2 = cache_key(diff2, "model", 0.0, "openai", "https://api.openai.com/v1");
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_providers() {
+        let h1 = cache_key("diff", "gpt-4", 0.0, "openai", "https://api.openai.com/v1");
+        let h2 = cache_key(
+            "diff",
+            "gpt-4",
+            0.0,
+            "azure",
+            "https://my-azure.openai.azure.com",
+        );
+        assert_ne!(
+            h1, h2,
+            "different providers should produce different cache keys"
+        );
+    }
+
+    #[test]
+    fn cache_key_differs_for_different_base_urls() {
+        let h1 = cache_key("diff", "gpt-4", 0.0, "openai", "https://api.openai.com/v1");
+        let h2 = cache_key(
+            "diff",
+            "gpt-4",
+            0.0,
+            "openai",
+            "https://proxy.example.com/v1",
+        );
+        assert_ne!(
+            h1, h2,
+            "different base_urls should produce different cache keys"
+        );
     }
 
     #[test]
@@ -246,7 +315,7 @@ mod tests {
 
         // Manually set up a cache entry in the temp dir
         let diff = "test diff content";
-        let hash = cache_key(diff, "model", 0.0);
+        let hash = cache_key(diff, "model", 0.0, "openai", "https://api.openai.com/v1");
         let path = dir.join(format!("{hash}.json"));
 
         let response = make_response();
