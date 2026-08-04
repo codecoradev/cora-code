@@ -51,5 +51,5 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          preCommands: npx wrangler pages project create cora-code --production-branch=main || true
-          command: pages deploy docs/.vitepress/dist/ --project-name=cora-code --commit-dirty=true --branch=main
+          preCommands: npx wrangler pages project create cora-cli --production-branch=main || true
+          command: pages deploy docs/.vitepress/dist/ --project-name=cora-cli --commit-dirty=true --branch=main
