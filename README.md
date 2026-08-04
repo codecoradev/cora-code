@@ -32,7 +32,7 @@
 - 🧠 **Brain Mode** — hybrid semantic search (FTS5 + vector KNN + graph) with RRF fusion
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
-- 🔌 **MCP server** — 15 tools for AI coding agents (review, search, brain, debt, trace, ...)
+- 🔌 **MCP server** — 18 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
 - 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
 
@@ -195,6 +195,9 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora callers` | Find all callers of a symbol |
 | `cora impact` | Analyze blast radius of changing a symbol |
 | `cora affected` | Find tests impacted by changed files |
+| `cora dead-code` | Detect dead code — functions with zero callers |
+| `cora query` | Query the code graph (e.g. `"main -> *"`) |
+| `cora routes` | List detected HTTP routes (Axum, Actix, Express, FastAPI, Flask, Go) |
 
 ### Config & Setup
 
@@ -203,8 +206,12 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora init` | Create project config + hook |
 | `cora auth login` | Save API key |
 | `cora config show` | Show resolved config |
+| `cora config validate` | Validate configuration |
 | `cora providers` | List available LLM providers |
-| `cora mcp` | Start MCP server (15 tools) for AI coding agents |
+| `cora profile list` | List quality profiles (strict, balanced, lax) |
+| `cora mcp` | Start MCP server (18 tools) for AI coding agents |
+| `cora serve` | Start MCP server + auto-reindex on startup |
+| `cora install` | Auto-detect and configure AI coding agents |
 | `cora hook install` | Install pre-commit hook |
 
 See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for all flags and examples.
