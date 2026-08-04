@@ -11,7 +11,11 @@ use crate::config::schema::{CoraFile, HookSection, OutputSection, ProviderSectio
 /// `--global` shows only ~/.cora/config.yaml
 /// `--project` shows only .cora.yaml
 /// (default) shows the fully merged effective config
-pub fn execute_config_show(global_only: bool, project_only: bool) -> Result<()> {
+pub fn execute_config_show(
+    global_only: bool,
+    project_only: bool,
+    config_path: Option<&str>,
+) -> Result<()> {
     // Clap conflicts_with handles the --global + --project case,
     // but add a defensive check in case of programmatic invocation.
     if global_only {
@@ -20,12 +24,12 @@ pub fn execute_config_show(global_only: bool, project_only: bool) -> Result<()> 
     if project_only {
         return show_project_config();
     }
-    show_effective_config()
+    show_effective_config(config_path)
 }
 
 /// Show the fully merged effective config (default behavior).
-fn show_effective_config() -> Result<()> {
-    let config = loader::load_config(None, None, None, None, None, false)?;
+fn show_effective_config(config_path: Option<&str>) -> Result<()> {
+    let config = loader::load_config(config_path, None, None, None, None, false)?;
 
     // Resolve effective values (env vars can override config file)
     let eff_provider = std::env::var("CORA_PROVIDER")
@@ -438,20 +442,28 @@ pub fn execute_config_set(key: &str, value: &str, global: bool) -> Result<()> {
 /// Execute `cora config validate` — load config and report validity.
 ///
 /// Returns exit code: 0 if valid, 2 if issues found.
-pub fn execute_config_validate() -> Result<i32> {
+pub fn execute_config_validate(config_path: Option<&str>) -> Result<i32> {
     // 1. Load resolved config (same as other commands)
-    let config = loader::load_config(None, None, None, None, None, false)?;
+    let config = loader::load_config(config_path, None, None, None, None, false)?;
 
-    // 2. Find the raw config file to check which fields were explicitly set
-    let cora_file = loader::find_cora_file(&std::env::current_dir().unwrap_or_default())
-        .unwrap_or_else(|e| {
+    // 2. Find the raw config file to check which fields were explicitly set.
+    //    Prefer --config path, then fall back to auto-discovery.
+    let cora_file = if let Some(path) = config_path {
+        std::fs::read_to_string(path).ok().and_then(|content| {
+            CoraFile::from_str(&content)
+                .ok()
+                .map(|cf| (std::path::PathBuf::from(path), cf))
+        })
+    } else {
+        loader::find_cora_file(&std::env::current_dir().unwrap_or_default()).unwrap_or_else(|e| {
             eprintln!(
                 "{} Warning: could not search for config file: {}",
                 "⚠️".yellow(),
                 e
             );
             None
-        });
+        })
+    };
 
     // Also check global config for fields set there
     let global_cora = load_global_cora_file();
