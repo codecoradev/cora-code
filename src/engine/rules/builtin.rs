@@ -127,8 +127,8 @@ pub fn builtin_rules() -> Vec<CustomRule> {
 /// Returns `true` to suppress a finding that the regex matched but should be ignored.
 pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
     match rule_id {
+        "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line),
         "sec-hardcoded-url" => is_false_positive_url(line),
-        "crypto/hardcoded-secret" => is_false_positive_secret(line),
         _ => false,
     }
 }
@@ -403,7 +403,37 @@ mod tests {
         ));
         assert!(!post_match_filter(
             "crypto/hardcoded-secret",
-            "const API_KEY = \"sk-abc123def456gh\""
+            "const API_KEY = \"***\""
+        ));
+    }
+
+    // ─── sec-hardcoded-secret (builtin rule ID) false positive tests ───
+
+    #[test]
+    fn builtin_rule_id_secret_empty_string_is_false_positive() {
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "let formAppSecret = $state('');"
+        ));
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "let password = '';"
+        ));
+    }
+
+    #[test]
+    fn builtin_rule_id_secret_svelte_state_is_false_positive() {
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "let formPassword = $state('default12345678');"
+        ));
+    }
+
+    #[test]
+    fn builtin_rule_id_secret_actual_hardcoded_is_real_finding() {
+        assert!(!post_match_filter(
+            "sec-hardcoded-secret",
+            "let password = supersecret12345"
         ));
     }
 }

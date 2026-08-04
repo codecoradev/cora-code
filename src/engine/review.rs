@@ -106,6 +106,8 @@ async fn review_diff_inner(
             &llm_config.model,
             llm_config.temperature,
             config.cache_ttl,
+            &llm_config.provider,
+            &llm_config.base_url,
         ) {
             debug!("returning cached review response");
             return Ok(cached);
@@ -453,6 +455,8 @@ async fn review_diff_inner(
             &llm_config.model,
             llm_config.temperature,
             &response,
+            &llm_config.provider,
+            &llm_config.base_url,
         ) {
             debug!("failed to save review to cache: {}", e);
         }
