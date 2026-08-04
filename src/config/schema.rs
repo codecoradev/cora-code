@@ -528,9 +528,21 @@ impl CoraFile {
         }
         if let Some(ig) = &self.ignore {
             if let Some(v) = &ig.files {
-                config.ignore.files.clone_from(v);
+                // Merge user-specified ignore patterns with defaults.
+                // Previously this used clone_from, which OVERWROTE the default
+                // patterns (node_modules/**, target/**, dist/**, .git/**).
+                // When a user set any custom ignore file, all defaults were
+                // silently lost — causing build artifacts and dependencies to
+                // leak into review context, scan walks, and resolver output.
+                // Deduplicate to avoid redundant entries.
+                for f in v {
+                    if !config.ignore.files.contains(f) {
+                        config.ignore.files.push(f.clone());
+                    }
+                }
             }
             if let Some(v) = &ig.rules {
+                // ignore.rules defaults to empty, so clone is safe here.
                 config.ignore.rules.clone_from(v);
             }
         }
@@ -608,7 +620,16 @@ impl CoraFile {
                 config.rules_config.custom_rules = re.custom.clone();
             }
             if !re.index_skip_files.is_empty() {
-                config.rules_config.index_skip_files = re.index_skip_files.clone();
+                // Merge user-specified skip patterns with defaults.
+                // Previously this used clone, which OVERWROTE the default
+                // skip files (*.config.ts, *.config.js, etc.). When a user
+                // set any custom skip file, all defaults were silently lost,
+                // causing false positives on bundler/framework entry points.
+                for f in &re.index_skip_files {
+                    if !config.rules_config.index_skip_files.contains(f) {
+                        config.rules_config.index_skip_files.push(f.clone());
+                    }
+                }
             }
         }
         if let Some(b) = &self.bundling {
@@ -833,8 +854,91 @@ provider: zai
             ..Default::default()
         };
         cora.merge_into(&mut cfg).unwrap();
-        assert_eq!(cfg.ignore.files, vec!["vendor/**"]);
+        // User-specified ignore file should be present.
+        assert!(
+            cfg.ignore.files.contains(&"vendor/**".to_string()),
+            "user ignore file should be merged in"
+        );
+        // Default ignore files must be preserved (not overwritten).
+        assert!(
+            cfg.ignore.files.contains(&"node_modules/**".to_string()),
+            "default node_modules/** must be preserved"
+        );
+        assert!(
+            cfg.ignore.files.contains(&"target/**".to_string()),
+            "default target/** must be preserved"
+        );
+        assert!(
+            cfg.ignore.files.contains(&"dist/**".to_string()),
+            "default dist/** must be preserved"
+        );
+        assert!(
+            cfg.ignore.files.contains(&".git/**".to_string()),
+            "default .git/** must be preserved"
+        );
+        // ignore.rules defaults to empty, so clone is a full replacement.
         assert_eq!(cfg.ignore.rules, vec!["skip-rule-1"]);
+    }
+
+    #[test]
+    fn merge_ignore_files_dedup() {
+        // User lists a pattern that's already a default — should not duplicate.
+        let mut cfg = Config::default();
+        let cora = CoraFile {
+            ignore: Some(IgnoreSection {
+                files: Some(vec![
+                    "node_modules/**".to_string(), // already a default
+                    "my-vendor/**".to_string(),
+                ]),
+                rules: None,
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut cfg).unwrap();
+        let nm_count = cfg
+            .ignore
+            .files
+            .iter()
+            .filter(|f| *f == "node_modules/**")
+            .count();
+        assert_eq!(nm_count, 1, "duplicate entry should be deduplicated");
+    }
+
+    #[test]
+    fn merge_index_skip_files_preserves_defaults() {
+        let mut cfg = Config::default();
+        let cora = CoraFile {
+            rules_engine: Some(RulesSection {
+                enabled: true,
+                max_findings: 10,
+                custom: Vec::new(),
+                index_skip_files: vec!["my-generated/**".to_string()],
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut cfg).unwrap();
+        // User pattern should be present.
+        assert!(
+            cfg.rules_config
+                .index_skip_files
+                .contains(&"my-generated/**".to_string()),
+            "user skip pattern should be merged in"
+        );
+        // Default skip patterns must be preserved.
+        assert!(
+            cfg.rules_config
+                .index_skip_files
+                .iter()
+                .any(|f| f == "*.config.ts"),
+            "default *.config.ts must be preserved"
+        );
+        assert!(
+            cfg.rules_config
+                .index_skip_files
+                .iter()
+                .any(|f| f == "*.config.js"),
+            "default *.config.js must be preserved"
+        );
     }
 
     #[test]
