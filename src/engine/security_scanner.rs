@@ -87,12 +87,42 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "config/cors-wildcard",
         name: "CORS wildcard allows all origins",
-        // Match actual code patterns, not the word "cors" in prose/documentation.
-        // Require either the literal HTTP header with `*`, or a code assignment/call
-        // like `cors = "*"`, `origin: *`, `allowed_origins = "*"`, `allow_origin("*")`.
-        // The word "cors" alone is too broad — it appears in env var names
-        // (TITEN_CORS_ORIGINS), config keys, and documentation.
-        regex: r#"(?i)(?:Access-Control-Allow-Origin\s*:\s*\*|(?:cors|allow_origin|allowed_origins)\s*[=:(]\s*["']?\*["']?|origin\s*[=:]\s*["']?\*["']?)"#,
+        // Match real code patterns across frameworks — not the bare word "cors" in prose.
+        // Uses (?ix) for case-insensitive + extended (whitespace ignored, comments with #).
+        // Rust regex crate does NOT support lookahead (?!\w), so we use explicit
+        // trailing delimiters to prevent partial-word false positives.
+        regex: r#"(?ix)
+        (?:
+          # 1. HTTP response header (any spacing/quote style)
+          Access-Control-Allow-Origin \s* :? \s* ["']? \* ["']? (?: \s | ; | $ )
+        |
+          # 2. Generic keyword assignment with wildcard (covers quotes, brackets)
+          (?: cors | allow_origin | allowed_origins | allow_origins ) \s* [=:(\[] \s* ["'\[\{]{0,2} \* ["'\]\}]{0,2} (?: \s | ; | , | \) | \] | $ )
+        |
+          # 3. keyword origin assignment
+          origin \s* [:=] \s* ["']? \* ["']? (?: \s | ; | $ )
+        |
+          # 4. Django boolean flag
+          CORS_ALLOW_ALL_ORIGINS \s* = \s* True
+        |
+          # 5. Spring .allowedOrigins("*")
+          \. allowedOrigins \s* \( \s* ["'] \* ["'] \s* \)
+        |
+          # 6. .NET AllowAnyOrigin()
+          AllowAnyOrigin \s* \(
+        |
+          # 7. tower-http allow_origin(Any)
+          allow_origin \s* \( \s* Any \s* \)
+        |
+          # 8. Express cors({ origin: true })
+          cors \s* \( \s* \{ \s* origin \s* : \s* true
+        |
+          # 9. nginx add_header
+          add_header \s+ Access-Control-Allow-Origin \s+ \*
+        |
+          # 10. actix SetHeader
+          SetHeader \s* \( \s* ["'] Access-Control-Allow-Origin ["'] \s* , \s* ["'] \* ["']
+        )"#,
         severity: Severity::Major,
     },
     // ── TLS/SSL ──
@@ -236,8 +266,15 @@ fn is_test_file(path: &str) -> bool {
 /// keywords (CORS, secret, password) appear naturally in documentation prose.
 fn is_doc_file(path: &str) -> bool {
     let lower = path.to_lowercase();
+    // Ensure the path contains a dot before extracting extension.
+    // Without this, extensionless files like "org" or "tex" would
+    // be treated as documentation (rsplit returns the whole string).
+    let ext = match lower.rfind('.') {
+        Some(pos) => &lower[pos + 1..],
+        None => return false,
+    };
     matches!(
-        lower.rsplit('.').next().unwrap_or(""),
+        ext,
         "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org"
     )
 }
@@ -627,12 +664,144 @@ mod tests {
             .iter()
             .filter(|f| f.rule_id == "config/cors-wildcard")
             .collect();
-        // This should trigger because it's a code assignment pattern: origin = "*"
         assert_eq!(
             cors_findings.len(),
             1,
             "Real CORS wildcard in Rust code should be detected"
         );
+    }
+
+    // ─── Framework-specific CORS patterns (issue #488) ───
+
+    #[test]
+    fn detects_cors_wildcard_nginx_add_header() {
+        let chunks = vec![make_chunk(
+            "nginx.conf",
+            &["add_header Access-Control-Allow-Origin *;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "nginx add_header wildcard should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_django() {
+        let chunks = vec![make_chunk(
+            "settings.py",
+            &["CORS_ALLOW_ALL_ORIGINS = True"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "Django CORS_ALLOW_ALL_ORIGINS should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_spring_boot() {
+        let chunks = vec![make_chunk("WebConfig.java", &[".allowedOrigins(\"*\")"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "Spring .allowedOrigins(\"*\") should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_dotnet_allowany() {
+        let chunks = vec![make_chunk("Startup.cs", &[".AllowAnyOrigin()"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(cors.len(), 1, ".NET AllowAnyOrigin() should be detected");
+    }
+
+    #[test]
+    fn detects_cors_wildcard_tower_http_any() {
+        let chunks = vec![make_chunk("src/main.rs", &[".allow_origin(Any)"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "tower-http allow_origin(Any) should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_express_origin_true() {
+        let chunks = vec![make_chunk("app.js", &["cors({ origin: true })"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "Express cors({{ origin: true }}) should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_fastapi_list() {
+        let chunks = vec![make_chunk("main.py", &["allow_origins=[\"*\"]"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "FastAPI allow_origins=[\"*\"] should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_nginx_set_header_actix() {
+        let chunks = vec![make_chunk(
+            "src/server.rs",
+            &["SetHeader(\"Access-Control-Allow-Origin\", \"*\")"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(cors.len(), 1, "actix SetHeader wildcard should be detected");
+    }
+
+    #[test]
+    fn is_doc_file_does_not_match_extensionless() {
+        // Issue #489: extensionless files should not be treated as docs
+        assert!(!is_doc_file("org"));
+        assert!(!is_doc_file("tex"));
+        assert!(!is_doc_file("md"));
+        assert!(!is_doc_file("src/org"));
+        assert!(!is_doc_file("bin/tex"));
     }
 
     #[test]
