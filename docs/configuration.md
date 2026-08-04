@@ -49,6 +49,7 @@ provider:
 llm:
   temperature: 0
   max_tokens: 4096
+  max_tokens_param: auto       # auto | max_tokens | max_output_tokens | max_completion_tokens
   timeout: 120
   cache_ttl: 1440
 
@@ -66,11 +67,17 @@ hook:
   mode: warn
   min_severity: major
   max_diff_size: 51200
+  on_violation: warn           # warn | disallow (blocks commit if violations found)
 
 ignore:
   files:
     - "vendor/**"
-    - "*.min.js"
+    - "*.generated.ts"
+  rules: []                    # rule IDs to skip (e.g. ["no-unwrap", "sql-injection"])
+
+output:
+  format: pretty               # pretty | json | compact | sarif
+  color: true                  # ANSI colors in terminal output
 
 quality_gate:
   enabled: true
@@ -90,7 +97,7 @@ analysis:
     - "*Handler"
     - "resolve_*"
 
-profile: balanced            # strict | balanced | lax
+profile: clean-code        # security-first | performance | clean-code | beginner-friendly | minimal | rust-strict | typescript-strict | go-pragmatic
 ```
 
 ## Environment Variables
@@ -196,6 +203,9 @@ review:
     follow_depth: 1             # outbound resolution depth (1 = direct refs only)
     include_tests: true         # resolve test files via naming convention
     include_callers: true       # resolve callers of changed code (blast radius)
+    use_brain: true             # enrich prompt with symbol-index intelligence
+    impact_depth: 2             # blast-radius traversal depth (2 = callers of callers)
+    prefer_index: true          # prefer symbol index (FTS5 + call graph) over regex
 ```
 
 | Field | Default | Notes |
@@ -205,6 +215,9 @@ review:
 | `follow_depth` | `1` | Outbound recursion depth (`1` = direct references). |
 | `include_tests` | `true` | Map changed source to its test files. |
 | `include_callers` | `true` | Inbound caller resolution. Scans source files (gitignore-aware — `target/`, `node_modules/` are never scanned), bounded to ≤400 files and ≤3 call-sites per symbol. |
+| `use_brain` | `true` | Enrich prompt with symbol-index intelligence (impact analysis, affected tests, semantic search). Only active when `cora index` has been run. |
+| `impact_depth` | `2` | Blast-radius traversal depth (`1` = direct callers, `2` = callers of callers). |
+| `prefer_index` | `true` | Prefer symbol index (FTS5 + call graph) over regex scanning for outbound resolution. |
 
 ## Quality Gate
 
@@ -368,18 +381,25 @@ No configuration needed — language context is auto-detected from file extensio
 
 ## Quality Profiles
 
-cora includes built-in quality profiles for different review strictness:
+cora includes built-in quality profiles for different review focus:
 
 | Profile | Description |
 |---------|------------|
-| `strict` | All categories enabled, low tolerance for issues |
-| `balanced` | *(default)* Security + bugs + performance, moderate thresholds |
-| `lax` | Only critical issues, high tolerance |
+| `security-first` | Strict security focus — zero tolerance for vulnerabilities |
+| `performance` | Focus on speed, memory, and allocation patterns — best for hot-path code |
+| `clean-code` | *(default)* Broad quality — readability, naming, complexity — best for team projects |
+| `beginner-friendly` | Gentle review — focus on common mistakes and learning opportunities |
+| `minimal` | Only critical + security — best for quick PRs and hotfixes |
+| `rust-strict` | Rust-specific: unsafe, unwrap, panic, lifetime, error handling, idiomatic patterns |
+| `typescript-strict` | TypeScript-specific: any types, null safety, proper typing, async patterns |
+| `go-pragmatic` | Go-specific: error handling, goroutine safety, interface design, idiomatic Go |
+
+Run `cora profile list` to see all profiles. Cora auto-detects the best profile based on your project's primary language (Rust → `rust-strict`, Go → `go-pragmatic`, others → `clean-code`).
 
 Set in `.cora.yaml`:
 
 ```yaml
-profile: strict
+profile: security-first
 ```
 
 ## Custom Rule Engine
@@ -411,7 +431,7 @@ Control how index-based scanners (unused imports, dead code, breaking changes) b
 ```yaml
 rules_engine:
   enabled: true
-  max_findings: 50
+  max_findings: 5
   index_skip_files:
     - "*.config.ts"
     - "vite.config.*"
@@ -427,7 +447,7 @@ rules_engine:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
-| `max_findings` | `int` | `50` | Max findings per scan |
+| `max_findings` | `int` | `5` | Max findings per scan |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
 
 Default `index_skip_files` patterns (bundled with cora):
@@ -490,18 +510,18 @@ Control how multiple files are grouped into LLM batches during `cora scan`. Cora
 
 ```yaml
 bundling:
-  max_chars_per_group: 12000   # max source characters per LLM batch
+  max_chars_per_group: 60000  # max source characters per LLM batch
   max_files_per_group: 20      # max files per batch
-  strategy: directory          # grouping strategy: directory | language
+  strategy: smart              # grouping strategy: smart | flat
   coalesce_by_directory: true  # merge small batches from the same directory
   coalesce_by_language: true   # merge small batches with the same language
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `max_chars_per_group` | `12000` | Soft limit on source characters per batch |
+| `max_chars_per_group` | `60000` | Soft limit on source characters per batch |
 | `max_files_per_group` | `20` | Max files per batch before splitting |
-| `strategy` | `directory` | Grouping strategy: `directory` (proximity-based) or `language` (same-language files together) |
+| `strategy` | `smart` | Grouping strategy: `smart` (coalesce by directory + language within limits) or `flat` (first-fit by character count, legacy) |
 | `coalesce_by_directory` | `true` | Merge small batches from the same directory into one LLM call |
 | `coalesce_by_language` | `true` | Merge small batches with the same primary language |
 

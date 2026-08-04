@@ -110,7 +110,7 @@ FTS5 full-text search over symbol names and signatures.
 ```bash
 cora explore "authenticate"         # Search by name
 cora explore --kind function        # Filter by symbol kind
-cora explore --lang rust             # Filter by language
+cora explore --language rust        # Filter by language
 cora explore --limit 20              # Max results
 cora explore --json                 # JSON output
 ```
