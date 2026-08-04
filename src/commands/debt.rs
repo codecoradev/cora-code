@@ -25,11 +25,20 @@ pub struct DebtOptions {
     pub badge: bool,
     /// Show estimated debt fix time.
     pub estimate: bool,
+    /// Config file path (from --config global flag).
+    pub config_path: Option<String>,
 }
 
 /// Execute the `cora debt` subcommand.
 pub fn execute_debt(opts: &DebtOptions) -> Result<i32> {
-    let config = crate::config::loader::load_config(None, None, None, None, None, false)?;
+    let config = crate::config::loader::load_config(
+        opts.config_path.as_deref(),
+        None,
+        None,
+        None,
+        None,
+        false,
+    )?;
 
     if !config.debt.enabled {
         println!(
