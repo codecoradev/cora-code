@@ -71,21 +71,37 @@ pub fn ensure_data_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Ensure tests that mutate CODECORA_HOME don't run concurrently.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_codecora_home_returns_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(CODECORA_HOME_ENV);
+        }
         let path = codecora_home();
         assert!(path.ends_with(".codecora"));
     }
 
     #[test]
     fn test_product_data_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(CODECORA_HOME_ENV);
+        }
         let path = product_data_dir("cora-code");
         assert!(path.ends_with(".codecora/cora-code"));
     }
 
     #[test]
     fn test_graph_db_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(CODECORA_HOME_ENV);
+        }
         let path = graph_db_path();
         assert!(
             path.ends_with(".codecora/cora-code/cora.db")
@@ -96,6 +112,10 @@ mod tests {
 
     #[test]
     fn test_cora_data_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var(CODECORA_HOME_ENV);
+        }
         let path = cora_data_dir();
         assert!(path.ends_with(".codecora/cora-code"));
         // Should not have trailing slash
@@ -105,6 +125,7 @@ mod tests {
 
     #[test]
     fn test_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var(CODECORA_HOME_ENV, "/tmp/test-codecora");
         }

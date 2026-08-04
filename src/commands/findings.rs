@@ -120,27 +120,33 @@ fn list_findings(
         JOIN reviews r ON f.review_id = r.id",
     );
 
-    let mut wheres: Vec<String> = Vec::new();
+    // Build WHERE clause with parameterized placeholders to prevent SQL injection.
+    let mut wheres: Vec<&str> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
     if !all {
-        wheres.push("f.status = 'open'".to_string());
+        wheres.push("f.status = 'open'");
     }
     if let Some(s) = severity {
-        wheres.push(format!("f.severity = '{}'", s.to_uppercase()));
+        wheres.push("f.severity = ?");
+        params.push(Box::new(s.to_uppercase()));
     }
     if let Some(f) = file {
-        wheres.push(format!("f.file_path LIKE '%{}%'", f.replace('"', "'")));
+        wheres.push("f.file_path LIKE ?");
+        params.push(Box::new(format!("%{f}%")));
     }
 
     if !wheres.is_empty() {
         sql.push_str(" WHERE ");
         sql.push_str(&wheres.join(" AND "));
     }
-    sql.push_str(" ORDER BY f.id DESC");
-    sql.push_str(&format!(" LIMIT {}", limit));
+    sql.push_str(" ORDER BY f.id DESC LIMIT ?");
+    params.push(Box::new(limit as i64));
 
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<ListRow> = stmt
-        .query([])?
+        .query(param_refs.as_slice())?
         .mapped(|r| {
             Ok(ListRow {
                 id: r.get(0)?,
