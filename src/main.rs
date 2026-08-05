@@ -1511,6 +1511,7 @@ async fn main() -> Result<()> {
             filter,
         } => {
             let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
             let config_path = cli.global.config.as_deref();
             commands::watch::run_watch(
                 &project_root,

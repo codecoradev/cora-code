@@ -33,12 +33,7 @@ pub fn run_watch(
     filter: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    let db_path = project_root.join(".cora/index.db");
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let conn = rusqlite::Connection::open(&db_path)
-        .with_context(|| format!("Failed to open index database at {}", db_path.display()))?;
+    let conn = crate::index::open_global_index()?;
     // Load skip patterns from config
     let skip_patterns: Option<Vec<String>> =
         crate::config::loader::load_config(config_path, None, None, None, None, false)
@@ -131,7 +126,10 @@ fn detect_changes(
     glob_matcher: Option<&glob::Pattern>,
 ) -> Result<Vec<PathBuf>> {
     let mut changed = Vec::new();
-    let extensions: &[&str] = &["rs", "py", "js", "ts", "go", "java", "c", "cpp", "h", "rb"];
+    let extensions: &[&str] = &[
+        "rs", "py", "js", "ts", "go", "java", "c", "cpp", "h", "rb", "php", "scala", "cs", "kt",
+        "svelte", "jsx", "tsx",
+    ];
 
     let mut walker = |path: &Path| {
         // Skip files inside hidden directories (relative to project root)
