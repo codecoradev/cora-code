@@ -241,10 +241,16 @@ async fn generate_commit_message(
 
 /// Build the user prompt for commit message generation.
 fn build_commit_prompt(diff: &str) -> String {
-    // Truncate very long diffs for commit message generation
+    // Truncate very long diffs for commit message generation.
+    // Use floor_char_boundary to avoid panicking on multi-byte UTF-8
+    // (e.g. emoji or non-ASCII characters in code/comments).
     let max_chars = 8000;
     let truncated = if diff.len() > max_chars {
-        &diff[..max_chars]
+        let mut end = max_chars;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        &diff[..end]
     } else {
         diff
     };
@@ -344,9 +350,13 @@ fn parse_commit_message(raw: &str) -> Result<CommitMessage> {
         format!("chore: {subject}")
     };
 
-    // Enforce max length on subject
+    // Enforce max length on subject (char-boundary safe for UTF-8)
     let subject = if subject.len() > 72 {
-        format!("{}…", &subject[..69])
+        let mut end = 69;
+        while !subject.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &subject[..end])
     } else {
         subject
     };
@@ -533,6 +543,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_truncates_long_subject_with_multibyte() {
+        // Subject with emoji near the truncation boundary (byte 69).
+        // Without char-boundary checking, &subject[..69] would split the
+        // 4-byte emoji at positions 67–70 and panic.
+        let mut long = "x".repeat(67);
+        long.push_str("🎉rest_of_subject_here"); // emoji at bytes 67-70
+        let raw = format!(r#"{{"subject":"{long}","body":""}}"#);
+        // Must not panic:
+        let msg = parse_commit_message(&raw).unwrap();
+        assert!(msg.subject.contains('…'));
+    }
+
+    #[test]
     fn parse_invalid_json_fails() {
         let result = parse_commit_message("not json at all");
         assert!(result.is_err());
@@ -546,6 +569,23 @@ mod tests {
         let prompt = build_commit_prompt(diff);
         assert!(prompt.contains("foo.rs"));
         assert!(prompt.contains("conventional commit"));
+    }
+
+    #[test]
+    fn commit_prompt_truncates_multibyte_utf8_without_panic() {
+        // Fill 7998 ASCII bytes, then a 4-byte emoji, then more text.
+        // Without char-boundary checking, slicing at 8000 would land
+        // mid-codepoint and panic with "byte index is not a char boundary".
+        let mut diff = "a".repeat(7998);
+        diff.push('🎉'); // 4 bytes: positions 7998..8002
+        diff.push_str(&"b".repeat(200));
+
+        // This must not panic:
+        let prompt = build_commit_prompt(&diff);
+        assert!(prompt.contains("conventional commit"));
+        // Truncated output should not contain the partial emoji bytes
+        // (it ends before the emoji because the boundary floors to 7998).
+        assert!(!prompt.contains('🎉'));
     }
 
     // ─── diff_stats ───

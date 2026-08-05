@@ -120,9 +120,15 @@ fn check_dimension_compat(vi_path: &std::path::Path, expected_dims: usize) {
 
 /// Embed all symbols for a project into the vector index.
 ///
-/// Uses the best available embedding backend (selected at compile time):
-/// - `pretrained-embed` → nomic-embed-code 768-dim vectors
-/// - default → hashing-trick 256-dim vectors
+/// Uses the embedding backend selected at runtime via [`resolve_backend`]:
+/// - `"pretrained"` → nomic-embed-code 768-dim vectors
+/// - `"hashing"` → hashing-trick 256-dim vectors
+/// - `"auto"` → best available
+///
+/// **Incremental**: Only symbols whose `name + signature` fingerprint has
+/// changed since the last embed are re-embedded. This dramatically reduces
+/// embedding time when a single file is modified (e.g. 10 changed symbols
+/// out of 1100 total).
 ///
 /// Detects dimension mismatch between existing on-disk index and current
 /// backend, warning the user to re-index if dimensions changed.
@@ -152,27 +158,65 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         cache.as_mut().unwrap()
     };
 
-    let mut stmt =
-        conn.prepare("SELECT id, name, kind, signature FROM symbols WHERE project_id = ?1")?;
-    let rows: Vec<(i64, String, String, String)> = stmt
+    // ── Incremental: fetch stored fingerprints ──────────────────────
+    // Only re-embed symbols whose name+signature has changed.
+    let mut stmt = conn.prepare(
+        "SELECT id, name, kind, signature, embed_fingerprint \
+         FROM symbols WHERE project_id = ?1",
+    )?;
+    let rows: Vec<(i64, String, String, String, Option<String>)> = stmt
         .query_map(rusqlite::params![project_id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    // ── Parallel embedding computation (Rayon) ─────────────────────────
-    // embed_code_dispatch is pure + CPU-bound. usearch insert is serial.
-    let t_compute = std::time::Instant::now();
-    let embedded: Vec<(i64, Vec<f32>)> = rows
-        .par_iter()
-        .map(|(sym_id, name, _kind, signature)| {
+    // Compute current fingerprints and filter to only changed symbols
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let changed: Vec<(i64, String)> = rows
+        .iter()
+        .filter_map(|(sym_id, name, _kind, signature, stored_fp)| {
             let text = if signature.is_empty() || signature == name {
                 name.clone()
             } else {
                 format!("{name} {signature}")
             };
-            let vec = embed_code_dispatch(&text);
+            let mut hasher = DefaultHasher::new();
+            text.hash(&mut hasher);
+            let current_fp = format!("{:016x}", hasher.finish());
+
+            if stored_fp.as_deref() == Some(&current_fp) {
+                None // unchanged — skip
+            } else {
+                Some((*sym_id, text))
+            }
+        })
+        .collect();
+
+    let total_symbols = rows.len();
+    let skipped = total_symbols - changed.len();
+    if skipped > 0 {
+        tracing::info!(
+            "Incremental embed: {total_symbols} total, {skipped} unchanged (skipped), {} changed (re-embedding)",
+            changed.len()
+        );
+    }
+
+    // ── Parallel embedding computation (Rayon) ─────────────────────────
+    // embed_code_dispatch is pure + CPU-bound. usearch insert is serial.
+    let t_compute = std::time::Instant::now();
+    let embedded: Vec<(i64, Vec<f32>)> = changed
+        .par_iter()
+        .map(|(sym_id, text)| {
+            let vec = embed_code_dispatch(text);
             (*sym_id, vec)
         })
         .collect();
@@ -181,19 +225,24 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     // ── Serial usearch insert ────────────────────────────────────────
     let t_insert = std::time::Instant::now();
     let mut count = 0;
-    let mut new_ids: HashSet<i64> = HashSet::with_capacity(embedded.len());
+    let mut new_ids: HashSet<i64> = HashSet::with_capacity(rows.len());
+    // Populate new_ids with ALL symbol IDs for this project (for search filtering)
+    for (sym_id, _, _, _, _) in &rows {
+        new_ids.insert(*sym_id);
+    }
     for (sym_id, vec) in &embedded {
         vi.insert(*sym_id, vec).context("insert symbol embedding")?;
-        new_ids.insert(*sym_id);
         count += 1;
     }
     let insert_ms = t_insert.elapsed().as_millis();
 
     tracing::debug!(
-        "embed_compute={}ms, usearch_insert={}ms, symbols={}, dims={}, provider={}",
+        "embed_compute={}ms, usearch_insert={}ms, re-embedded={}, total={}, skipped={}, dims={}, provider={}",
         compute_ms,
         insert_ms,
         count,
+        total_symbols,
+        skipped,
         active,
         active_provider_name()
     );
@@ -202,26 +251,36 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         vi.save().context("save vector index")?;
     }
 
+    // ── Update fingerprints for embedded symbols ─────────────────────
+    let mut update_fp = conn.prepare("UPDATE symbols SET embed_fingerprint = ?2 WHERE id = ?1")?;
+    for (sym_id, text) in &changed {
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let fp = format!("{:016x}", hasher.finish());
+        update_fp.execute(rusqlite::params![sym_id, fp])?;
+    }
+
     // Cache project → symbol IDs for fast search-time filtering
     PROJECT_ID_CACHE
         .write()
         .unwrap()
         .insert(project_id, new_ids);
 
-    let tier = if cfg!(feature = "pretrained-embed") {
+    // Determine tier label
+    let provider = active_provider_name();
+    let tier = if provider.contains("pretrained") {
         "pretrained"
     } else {
         "static"
     };
     conn.execute(
         "UPDATE projects SET embedding_tier = ?3, embedding_dims = ?1, \
-         last_embedded_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![active, project_id, tier],
+         embedding_provider = ?4, last_embedded_at = datetime('now') WHERE id = ?2",
+        rusqlite::params![active, project_id, tier, provider],
     )?;
 
     tracing::info!(
-        "Embedded {count} symbols for project {project_id} (provider={}, dims={active})",
-        active_provider_name()
+        "Embedded {count}/{total_symbols} symbols for project {project_id} ({skipped} unchanged, provider={provider}, dims={active})",
     );
     Ok(count)
 }

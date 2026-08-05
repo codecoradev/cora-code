@@ -56,6 +56,9 @@ pub struct Config {
     /// Analysis configuration — dead-code detection, entry-point patterns.
     #[serde(default, skip_serializing_if = "is_default")]
     pub analysis: AnalysisConfig,
+    /// Brain Mode configuration — embedding backend selection.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub brain: BrainConfig,
 }
 
 /// Provider configuration.
@@ -141,6 +144,7 @@ impl Default for Config {
             debt: crate::engine::debt_tracker::DebtConfig::default(),
             profile: None,
             analysis: AnalysisConfig::default(),
+            brain: BrainConfig::default(),
         }
     }
 }
@@ -414,6 +418,62 @@ pub struct AnalysisConfig {
     pub entry_point_patterns: Vec<String>,
 }
 
+/// Brain Mode configuration — controls embedding backend for vector search.
+///
+/// By default (`auto`), cora selects the best available backend at runtime:
+/// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
+/// Users can force a specific backend via `.cora.yaml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BrainConfig {
+    /// Embedding backend selection.
+    ///
+    /// - `"auto"` (default) — best available: pretrained → hashing
+    /// - `"hashing"` — force 256d hashing trick (zero dependency)
+    /// - `"pretrained"` — force nomic 768d (requires `--features pretrained-embed`)
+    ///
+    /// Invalid values fall back to `"auto"` with a warning.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub embedding: BrainEmbeddingMode,
+}
+
+/// Embedding backend mode for Brain Mode.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BrainEmbeddingMode {
+    /// Best available backend (pretrained if compiled, else hashing).
+    #[default]
+    Auto,
+    /// Force 256d hashing trick (zero dependency).
+    Hashing,
+    /// Force nomic 768d pretrained (requires feature flag).
+    Pretrained,
+}
+
+impl std::fmt::Display for BrainEmbeddingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Hashing => write!(f, "hashing"),
+            Self::Pretrained => write!(f, "pretrained"),
+        }
+    }
+}
+
+impl std::str::FromStr for BrainEmbeddingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "hashing" => Ok(Self::Hashing),
+            "pretrained" => Ok(Self::Pretrained),
+            other => Err(format!(
+                "unknown brain.embedding value '{other}' — expected auto, hashing, or pretrained"
+            )),
+        }
+    }
+}
+
 fn is_default<T: Default + PartialEq>(val: &T) -> bool {
     *val == T::default()
 }
@@ -528,9 +588,21 @@ impl CoraFile {
         }
         if let Some(ig) = &self.ignore {
             if let Some(v) = &ig.files {
-                config.ignore.files.clone_from(v);
+                // Merge user-specified ignore patterns with defaults.
+                // Previously this used clone_from, which OVERWROTE the default
+                // patterns (node_modules/**, target/**, dist/**, .git/**).
+                // When a user set any custom ignore file, all defaults were
+                // silently lost — causing build artifacts and dependencies to
+                // leak into review context, scan walks, and resolver output.
+                // Deduplicate to avoid redundant entries.
+                for f in v {
+                    if !config.ignore.files.contains(f) {
+                        config.ignore.files.push(f.clone());
+                    }
+                }
             }
             if let Some(v) = &ig.rules {
+                // ignore.rules defaults to empty, so clone is safe here.
                 config.ignore.rules.clone_from(v);
             }
         }
@@ -608,7 +680,16 @@ impl CoraFile {
                 config.rules_config.custom_rules = re.custom.clone();
             }
             if !re.index_skip_files.is_empty() {
-                config.rules_config.index_skip_files = re.index_skip_files.clone();
+                // Merge user-specified skip patterns with defaults.
+                // Previously this used clone, which OVERWROTE the default
+                // skip files (*.config.ts, *.config.js, etc.). When a user
+                // set any custom skip file, all defaults were silently lost,
+                // causing false positives on bundler/framework entry points.
+                for f in &re.index_skip_files {
+                    if !config.rules_config.index_skip_files.contains(f) {
+                        config.rules_config.index_skip_files.push(f.clone());
+                    }
+                }
             }
         }
         if let Some(b) = &self.bundling {
@@ -833,8 +914,91 @@ provider: zai
             ..Default::default()
         };
         cora.merge_into(&mut cfg).unwrap();
-        assert_eq!(cfg.ignore.files, vec!["vendor/**"]);
+        // User-specified ignore file should be present.
+        assert!(
+            cfg.ignore.files.contains(&"vendor/**".to_string()),
+            "user ignore file should be merged in"
+        );
+        // Default ignore files must be preserved (not overwritten).
+        assert!(
+            cfg.ignore.files.contains(&"node_modules/**".to_string()),
+            "default node_modules/** must be preserved"
+        );
+        assert!(
+            cfg.ignore.files.contains(&"target/**".to_string()),
+            "default target/** must be preserved"
+        );
+        assert!(
+            cfg.ignore.files.contains(&"dist/**".to_string()),
+            "default dist/** must be preserved"
+        );
+        assert!(
+            cfg.ignore.files.contains(&".git/**".to_string()),
+            "default .git/** must be preserved"
+        );
+        // ignore.rules defaults to empty, so clone is a full replacement.
         assert_eq!(cfg.ignore.rules, vec!["skip-rule-1"]);
+    }
+
+    #[test]
+    fn merge_ignore_files_dedup() {
+        // User lists a pattern that's already a default — should not duplicate.
+        let mut cfg = Config::default();
+        let cora = CoraFile {
+            ignore: Some(IgnoreSection {
+                files: Some(vec![
+                    "node_modules/**".to_string(), // already a default
+                    "my-vendor/**".to_string(),
+                ]),
+                rules: None,
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut cfg).unwrap();
+        let nm_count = cfg
+            .ignore
+            .files
+            .iter()
+            .filter(|f| *f == "node_modules/**")
+            .count();
+        assert_eq!(nm_count, 1, "duplicate entry should be deduplicated");
+    }
+
+    #[test]
+    fn merge_index_skip_files_preserves_defaults() {
+        let mut cfg = Config::default();
+        let cora = CoraFile {
+            rules_engine: Some(RulesSection {
+                enabled: true,
+                max_findings: 10,
+                custom: Vec::new(),
+                index_skip_files: vec!["my-generated/**".to_string()],
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut cfg).unwrap();
+        // User pattern should be present.
+        assert!(
+            cfg.rules_config
+                .index_skip_files
+                .contains(&"my-generated/**".to_string()),
+            "user skip pattern should be merged in"
+        );
+        // Default skip patterns must be preserved.
+        assert!(
+            cfg.rules_config
+                .index_skip_files
+                .iter()
+                .any(|f| f == "*.config.ts"),
+            "default *.config.ts must be preserved"
+        );
+        assert!(
+            cfg.rules_config
+                .index_skip_files
+                .iter()
+                .any(|f| f == "*.config.js"),
+            "default *.config.js must be preserved"
+        );
     }
 
     #[test]

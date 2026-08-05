@@ -468,6 +468,18 @@ enum Command {
         #[clap(long)]
         estimate: bool,
     },
+    /// Watch for file changes and auto-reindex (standalone real-time watcher)
+    Watch {
+        /// Debounce window in milliseconds (default: 500)
+        #[clap(long, default_value = "500")]
+        debounce: u64,
+        /// Only trigger on git-tracked files
+        #[clap(long)]
+        git_only: bool,
+        /// Glob filter pattern (e.g. 'src/**/*.rs')
+        #[clap(long)]
+        filter: Option<String>,
+    },
     /// Auto-detect and configure AI coding agents for Cora MCP
     Install {
         /// List detected agents without installing
@@ -485,6 +497,12 @@ enum Command {
         /// Install ALL detected agents (non-interactive)
         #[clap(long, short)]
         yes: bool,
+        /// Remove cora MCP entry from detected agents (uninstall)
+        #[clap(long)]
+        remove: bool,
+        /// Validate agent configs after install/remove
+        #[clap(long)]
+        validate: bool,
     },
 
     /// Detect dead code — functions/methods with no callers
@@ -720,11 +738,26 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                // Load config for config-hash invalidation
-                let skip_patterns =
-                    crate::config::loader::load_config(None, None, None, None, None, false)
-                        .ok()
-                        .map(|c| c.rules_config.index_skip_files);
+                // Load config for config-hash invalidation + brain embedding backend
+                let config = crate::config::loader::load_config(
+                    cli.global.config.as_deref(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .ok();
+                let skip_patterns = config
+                    .as_ref()
+                    .map(|c| c.rules_config.index_skip_files.clone());
+
+                // Resolve embedding backend from brain config
+                let brain_mode = config
+                    .as_ref()
+                    .map(|c| c.brain.embedding.to_string())
+                    .unwrap_or_else(|| "auto".to_string());
+                crate::embed::resolve_backend(&brain_mode);
 
                 eprintln!("{}", "🔍 Indexing project...".cyan());
                 let stats = index::index_project_with_skip(
@@ -1086,6 +1119,20 @@ async fn main() -> Result<()> {
             let conn = index::open_global_index()?;
             let project_id = index::ensure_project(&conn, &project_root)?;
 
+            // Resolve embedding backend from config for query embedding
+            let brain_mode = crate::config::loader::load_config(
+                cli.global.config.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .ok()
+            .map(|c| c.brain.embedding.to_string())
+            .unwrap_or_else(|| "auto".to_string());
+            crate::embed::resolve_backend(&brain_mode);
+
             let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
 
             if json {
@@ -1438,14 +1485,16 @@ async fn main() -> Result<()> {
         }
         Command::Config { action } => match action {
             ConfigAction::Show { global, project } => {
-                config_cmd::execute_config_show(global, project)?;
+                config_cmd::execute_config_show(global, project, cli.global.config.as_deref())?;
                 0
             }
             ConfigAction::Set { key, value, global } => {
                 config_cmd::execute_config_set(&key, &value, global)?;
                 0
             }
-            ConfigAction::Validate => config_cmd::execute_config_validate()?,
+            ConfigAction::Validate => {
+                config_cmd::execute_config_validate(cli.global.config.as_deref())?
+            }
         },
         Command::Providers => {
             providers::execute_providers();
@@ -1475,8 +1524,27 @@ async fn main() -> Result<()> {
                 branch,
                 badge,
                 estimate,
+                config_path: cli.global.config.clone(),
             };
             debt::execute_debt(&opts)?
+        }
+        Command::Watch {
+            debounce,
+            git_only,
+            filter,
+        } => {
+            let project_root = std::env::current_dir()?;
+            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
+            let config_path = cli.global.config.as_deref();
+            commands::watch::run_watch(
+                &project_root,
+                config_path,
+                debounce,
+                git_only,
+                filter.as_deref(),
+                cli.global.verbose,
+            )?;
+            0
         }
         Command::Install {
             list,
@@ -1484,6 +1552,8 @@ async fn main() -> Result<()> {
             dry_run,
             force,
             yes,
+            remove,
+            validate,
         } => {
             let opts = commands::install::InstallOptions {
                 list,
@@ -1491,6 +1561,8 @@ async fn main() -> Result<()> {
                 dry_run,
                 force,
                 yes,
+                remove,
+                validate,
             };
             let output = commands::install::execute_install(&opts)?;
             println!("{output}");
@@ -1509,8 +1581,15 @@ async fn main() -> Result<()> {
             )?;
 
             // Load config for entry_point_patterns
-            let config = crate::config::loader::load_config(None, None, None, None, None, false)
-                .unwrap_or_default();
+            let config = crate::config::loader::load_config(
+                cli.global.config.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap_or_default();
             let entry_point_patterns = config.analysis.entry_point_patterns.clone();
 
             let opts = index::graph::DeadCodeOptions {

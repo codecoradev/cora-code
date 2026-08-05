@@ -110,7 +110,7 @@ FTS5 full-text search over symbol names and signatures.
 ```bash
 cora explore "authenticate"         # Search by name
 cora explore --kind function        # Filter by symbol kind
-cora explore --lang rust             # Filter by language
+cora explore --language rust        # Filter by language
 cora explore --limit 20              # Max results
 cora explore --json                 # JSON output
 ```
@@ -214,6 +214,43 @@ cora arch --json   # JSON output
 
 Shows: module breakdown, edge types (calls, imports), and top connector symbols.
 
+### `cora dead-code` — Dead Code Detection
+
+Find functions and methods that have zero callers — candidates for removal.
+
+```bash
+cora dead-code                     # Find dead functions
+cora dead-code --include-tests     # Include test functions (test_*, *_test)
+cora dead-code --min-lines 10      # Filter out tiny functions
+cora dead-code --json              # JSON output
+```
+
+> **Tip:** Use `analysis.entry_point_patterns` in `.cora.yaml` to mark entry points (e.g. `*Handler`, `main`) so they're not flagged as dead code.
+
+### `cora query` — Code Graph Query
+
+Query the call graph with simple pattern syntax.
+
+```bash
+cora query "main -> *"             # What does main call?
+cora query "* -> authenticate"     # What calls authenticate?
+cora query "MyStruct"              # Find all edges involving MyStruct
+cora query --limit 100 "main -> *"
+```
+
+Pattern syntax: `source -> target`, where each side can be a symbol name or `*` (wildcard).
+
+### `cora routes` — HTTP Route Listing
+
+List detected HTTP routes from framework annotations. Supports Axum, Actix, Express, FastAPI, Flask, and Go (net/http, gin, echo, chi).
+
+```bash
+cora routes                        # All routes
+cora routes --method GET           # Filter by HTTP method
+cora routes --prefix /api          # Filter by path prefix
+cora routes --json                 # JSON output
+```
+
 ## Test Impact Analysis
 
 ### `cora affected`
@@ -223,8 +260,9 @@ Find tests that are impacted by changed files.
 ```bash
 cora affected                              # From git diff
 cora affected src/auth.rs src/api.rs      # Specific files
-cora affected --test-glob "*test*"         # Custom test file pattern
-cora affected --json                     # JSON output
+cora affected --stdin                      # Pipe from git diff --name-only
+cora affected --filter "*test*"            # Custom test file pattern
+cora affected --json                       # JSON output
 ```
 
 ## MCP Integration
@@ -266,11 +304,13 @@ cora index --rebuild
 
 ## Schema Versioning
 
-The database uses automatic migrations. Current schema version: **v4**.
+The database uses automatic migrations. Current schema version: **v6**.
 
 | Version | Changes |
----------|---------|
+|---------|---------|
 | v1 | Initial symbols table + FTS5 |
 | v2 | Added language column |
 | v3 | Added `edges` table for call graph |
 | v4 | Added `embedding_tier`, `embedding_dims`, `embedding_model`, `last_embedded_at` to projects |
+| v5 | Added `reviews`, `findings`, `finding_events` tables for review history and findings tracking |
+| v6 | Added index config hash column for fingerprint invalidation on config changes |

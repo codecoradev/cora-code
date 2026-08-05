@@ -1,3 +1,4 @@
+pub mod agent_config;
 pub mod auth;
 pub mod commit_cmd;
 pub mod completion;
@@ -15,3 +16,4 @@ pub mod routes;
 pub mod scan;
 pub mod serve;
 pub mod upload;
+pub mod watch;

@@ -1,4 +1,7 @@
 /// Built-in rules for the rule engine.
+use regex::Regex;
+use std::sync::LazyLock;
+
 use crate::engine::Severity;
 use crate::engine::rules::types::CustomRule;
 
@@ -127,8 +130,14 @@ pub fn builtin_rules() -> Vec<CustomRule> {
 /// Returns `true` to suppress a finding that the regex matched but should be ignored.
 pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
     match rule_id {
+        "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line),
         "sec-hardcoded-url" => is_false_positive_url(line),
-        "crypto/hardcoded-secret" => is_false_positive_secret(line),
+        "config/cors-wildcard" => is_false_positive_cors(line),
+        "injection/sql-concat" => is_false_positive_sql_concat(line),
+        "config/debug-enabled" => is_false_positive_debug(line),
+        "injection/eval" => is_false_positive_eval(line),
+        "crypto/weak-hash" => is_false_positive_weak_hash(line),
+        "crypto/ssl-verify-disabled" => is_false_positive_ssl_verify(line),
         _ => false,
     }
 }
@@ -239,6 +248,282 @@ fn is_false_positive_secret(line: &str) -> bool {
                 return true;
             }
         }
+    }
+
+    false
+}
+
+/// Check if a `sql-concat` match is a false positive.
+///
+/// Suppresses: comment lines, string literal descriptions, and lines where
+/// the "+" is not actually string concatenation (e.g., arithmetic).
+fn is_false_positive_sql_concat(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines — SQL keywords in comments are not injection
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a `debug-enabled` match is a false positive.
+///
+/// Suppresses: comment lines documenting debug config, argument parser
+/// definitions, and environment variable references.
+fn is_false_positive_debug(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+    {
+        return true;
+    }
+
+    // Argument parser definitions (Python argparse, JS commander, etc.)
+    let lower = line.to_lowercase();
+    if lower.contains("add_argument")
+        || lower.contains("addoption")
+        || lower.contains("argument(")
+        || lower.contains(".option(")
+        || lower.contains("parser.")
+    {
+        return true;
+    }
+
+    // Environment variable references (DEBUG from env, not hardcoded)
+    if lower.contains("env")
+        && (lower.contains("getenv") || lower.contains("environ") || lower.contains("from_env"))
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Check if an `eval` match is a false positive.
+///
+/// Suppresses: comment lines, documentation, `evaluate` (not `eval`),
+/// and safe eval with literal expressions.
+fn is_false_positive_eval(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    let lower = line.to_lowercase();
+
+    // "evaluate" or "evaluation" is not "eval"
+    if lower.contains("evaluate") || lower.contains("evaluation") {
+        return true;
+    }
+
+    // Imports of eval from ast/json (safe parsing utilities)
+    if lower.contains("ast.literal_eval") || lower.contains("json.") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a `weak-hash` match is a false positive.
+///
+/// Suppresses: comment lines, documentation, and import statements
+/// that merely reference the API without calling it.
+fn is_false_positive_weak_hash(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    let lower = line.to_lowercase();
+
+    // Import/use statements (Python, Rust use, JS import)
+    if lower.contains("import ")
+        || lower.contains("use ")
+        || lower.contains("require(")
+        || lower.contains("#include")
+    {
+        return true;
+    }
+
+    // Type annotations or trait bounds (Rust)
+    if lower.contains("impl ") || lower.contains("fn ") || lower.contains("type ") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if an `ssl-verify-disabled` match is a false positive.
+///
+/// Suppresses: comment lines, documentation, config schema definitions,
+/// and environment variable references.
+fn is_false_positive_ssl_verify(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    let lower = line.to_lowercase();
+
+    // Environment variable references (verify from env config, not hardcoded)
+    if lower.contains("env")
+        && (lower.contains("getenv")
+            || lower.contains("environ")
+            || lower.contains("from_env")
+            || lower.contains("process.env"))
+    {
+        return true;
+    }
+
+    // Config schema/validation definitions (e.g., TypeScript interfaces, Pydantic)
+    if lower.contains("interface ")
+        || lower.contains("schema")
+        || lower.contains("field(")
+        || lower.contains("default:")
+    {
+        return true;
+    }
+
+    // Negation patterns — "verify = True" or "do not disable"
+    if lower.contains("verify") && lower.contains("true") && !lower.contains("false") {
+        return true;
+    }
+
+    false
+}
+
+/// Negation markers that indicate a line is documenting that wildcards
+/// are disallowed. Matched against the comment-stripped, lowercased line.
+/// Plain strings use `contains`; patterns ending with `.*` use regex.
+const CORS_NEGATION_MARKERS: &[&str] = &[
+    "no wildcard",
+    "no catch-all",
+    "no catch all",
+    "not.*wildcard",
+    "do not.*wildcard",
+    "do not.*\\*",
+    "without.*wildcard",
+    "never.*wildcard",
+    "disallow.*wildcard",
+    "prohibit.*wildcard",
+    "avoid.*wildcard",
+    "except.*wildcard",
+];
+
+static CORS_NEGATION_RE: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    CORS_NEGATION_MARKERS
+        .iter()
+        .filter_map(|m| Regex::new(m).ok())
+        .collect()
+});
+
+/// Strip comment prefix from a line for negation checking.
+/// Handles: `//`, `#`, `--`, `/*`, `*` (block comment continuation).
+fn strip_comment_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for prefix in &["//", "#", "--", "/*", "*"] {
+        if let Some(stripped) = trimmed.strip_prefix(prefix) {
+            return stripped.trim_start();
+        }
+    }
+    trimmed
+}
+
+/// Check if a CORS wildcard match is a false positive.
+///
+/// Suppresses: negation contexts ("no wildcard", "do not use *") only when
+/// the negation appears in a **comment prefix** (not mixed with code), and
+/// env var *read* patterns (`env::var("...")`, `getenv("...")`).
+///
+/// Does NOT suppress actual wildcard assignments like `CORS_CONFIG = "*"`
+/// or code that appears after a comment on the same line.
+fn is_false_positive_cors(line: &str) -> bool {
+    let lower = line.to_lowercase();
+
+    // Negation context — but ONLY in comment prefix, not mixed with code.
+    // First strip the comment prefix, then check if the remaining text
+    // is purely a negation statement (no assignment/code after it).
+    let comment_body = strip_comment_prefix(line);
+    let comment_lower = comment_body.to_lowercase();
+
+    // Only apply negation filter if the original line was a comment
+    // AND the comment body does NOT contain code indicators (=, ", ', wildcard *)
+    // after the negation phrase. This prevents suppressing mixed lines like
+    // `// no wildcard for now, but origin = "*"` where real code follows the comment.
+    let is_comment = line.trim_start() != comment_body;
+    if is_comment {
+        // Check for code indicators in the comment body — if present, the line
+        // contains actual code after the comment, so negation should NOT suppress.
+        let has_code = comment_body.contains('=')
+            || comment_body.contains("fn ")
+            || comment_body.contains("let ")
+            || comment_body.contains("const ");
+        if !has_code {
+            for re in CORS_NEGATION_RE.iter() {
+                if re.is_match(&comment_lower) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Env var READ patterns (not bare assignments).
+    // e.g., env::var("TITEN_CORS_ORIGINS"), getenv("CORS_CONFIG")
+    if lower.contains("env::var(") || lower.contains("getenv(") || lower.contains("os.environ") {
+        return true;
     }
 
     false
@@ -403,7 +688,126 @@ mod tests {
         ));
         assert!(!post_match_filter(
             "crypto/hardcoded-secret",
-            "const API_KEY = \"sk-abc123def456gh\""
+            "const API_KEY = \"***\""
+        ));
+    }
+
+    // ─── sec-hardcoded-secret (builtin rule ID) false positive tests ───
+
+    #[test]
+    fn builtin_rule_id_secret_empty_string_is_false_positive() {
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "let formAppSecret = $state('');"
+        ));
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "let password = '';"
+        ));
+    }
+
+    #[test]
+    fn builtin_rule_id_secret_svelte_state_is_false_positive() {
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "let formPassword = $state('default12345678');"
+        ));
+    }
+
+    #[test]
+    fn builtin_rule_id_secret_actual_hardcoded_is_real_finding() {
+        assert!(!post_match_filter(
+            "sec-hardcoded-secret",
+            "let password = supersecret12345"
+        ));
+    }
+
+    // ─── config/cors-wildcard false positive tests (issue #483) ───
+
+    #[test]
+    fn cors_negation_no_wildcard_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "// No wildcard — only explicit origins"
+        ));
+    }
+
+    #[test]
+    fn cors_negation_no_catch_all_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "// No catch-all origin pattern is permitted"
+        ));
+    }
+
+    #[test]
+    fn cors_negation_do_not_use_wildcard_is_false_positive() {
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "# Do not use * in production"
+        ));
+    }
+
+    #[test]
+    fn cors_env_var_name_is_false_positive() {
+        // env::var() read pattern — should be suppressed
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "let val = env::var(\"TITEN_CORS_ORIGINS\").unwrap();"
+        ));
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "let val = getenv(\"CORS_ALLOWED_ORIGINS\");"
+        ));
+        assert!(post_match_filter(
+            "config/cors-wildcard",
+            "os.environ.get(\"CORS_ORIGINS\")"
+        ));
+    }
+
+    #[test]
+    fn cors_config_assignment_is_not_false_positive() {
+        // Issue #488: bare CORS_CONFIG = "*" is a REAL finding, not env var read
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "CORS_CONFIG = \"*\""
+        ));
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "cors_origins = \"*\""
+        ));
+    }
+
+    #[test]
+    fn cors_mixed_comment_code_not_suppressed() {
+        // Issue #488: code after a comment should NOT be suppressed by negation
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "// no wildcard for now, but origin = \"*\""
+        ));
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "# except for wildcard endpoints: cors = \"*\""
+        ));
+    }
+
+    #[test]
+    fn cors_actual_wildcard_is_not_false_positive() {
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "Access-Control-Allow-Origin: *"
+        ));
+        assert!(!post_match_filter(
+            "config/cors-wildcard",
+            "let origin = \"*\";"
+        ));
+    }
+
+    #[test]
+    fn cors_unrelated_rule_not_affected() {
+        assert!(!post_match_filter(
+            "crypto/hardcoded-secret",
+            "No wildcard in this line"
         ));
     }
 }

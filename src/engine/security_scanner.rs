@@ -52,7 +52,10 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "injection/sql-concat",
         name: "SQL injection via string concatenation",
-        regex: r"(?i)(?:SELECT|INSERT|UPDATE|DELETE)\s+.*\+",
+        // Require a SQL keyword inside a string literal, followed by concatenation.
+        // This prevents matching comments, prose, and non-SQL code that happens
+        // to contain SQL keywords + "+".
+        regex: r#"(?i)(?:(?:SELECT|INSERT|UPDATE|DELETE)\b[^"\']*["\x27`][^"\']*\+|format!\s*\(\s*["\x27`]\s*(?:SELECT|INSERT|UPDATE|DELETE))"#,
         severity: Severity::Critical,
     },
     SecurityPattern {
@@ -74,20 +77,60 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "auth/hardcoded-role",
         name: "Hardcoded role or permission check",
-        regex: r"(?i)role\s*==\s*(?:admin|super|root)|is_admin\s*==\s*True",
+        // Match both quoted and unquoted role comparisons, property access
+        // (user.role), and strict equality (===) for JS/TS.
+        regex: r#"(?i)(?:\w+\.)*role\s*[=]{2,3}\s*["']?(?:admin|super|root|superuser)["']?|is_admin\s*==\s*True"#,
         severity: Severity::Major,
     },
     // ── Debug config ──
     SecurityPattern {
         id: "config/debug-enabled",
         name: "Debug mode enabled (production risk)",
-        regex: r"(?i)(?:DEBUG\s*=\s*True|debug:\s*true|--debug)",
+        // Only match actual config assignments, not CLI flag references.
+        // `--debug` is removed — it matches dev tooling, argument parsers,
+        // Dockerfiles, and documentation (too many false positives).
+        regex: r#"(?i)(?:DEBUG\s*=\s*True|debug\s*:\s*true|debug\s*=\s*true)"#,
         severity: Severity::Minor,
     },
     SecurityPattern {
         id: "config/cors-wildcard",
         name: "CORS wildcard allows all origins",
-        regex: r"(?i)(?:Access-Control-Allow-Origin|cors).*\*",
+        // Match real code patterns across frameworks — not the bare word "cors" in prose.
+        // Uses (?ix) for case-insensitive + extended (whitespace ignored, comments with #).
+        // Rust regex crate does NOT support lookahead (?!\w), so we use explicit
+        // trailing delimiters to prevent partial-word false positives.
+        regex: r#"(?ix)
+        (?:
+          # 1. HTTP response header (any spacing/quote style)
+          Access-Control-Allow-Origin \s* :? \s* ["']? \* ["']? (?: \s | ; | $ )
+        |
+          # 2. Generic keyword assignment with wildcard (covers quotes, brackets)
+          (?: cors | allow_origin | allowed_origins | allow_origins ) \s* [=:(\[] \s* ["'\[\{]{0,2} \* ["'\]\}]{0,2} (?: \s | ; | , | \) | \] | $ )
+        |
+          # 3. keyword origin assignment
+          origin \s* [:=] \s* ["']? \* ["']? (?: \s | ; | $ )
+        |
+          # 4. Django boolean flag
+          CORS_ALLOW_ALL_ORIGINS \s* = \s* True
+        |
+          # 5. Spring .allowedOrigins("*")
+          \. allowedOrigins \s* \( \s* ["'] \* ["'] \s* \)
+        |
+          # 6. .NET AllowAnyOrigin()
+          AllowAnyOrigin \s* \(
+        |
+          # 7. tower-http allow_origin(Any)
+          allow_origin \s* \( \s* Any \s* \)
+        |
+          # 8. Express cors({ origin: true })
+          cors \s* \( \s* \{ \s* origin \s* : \s* true
+        |
+          # 9. nginx add_header
+          add_header \s+ Access-Control-Allow-Origin \s+ \*
+        |
+          # 10. actix SetHeader
+          SetHeader \s* \( \s* ["'] Access-Control-Allow-Origin ["'] \s* , \s* ["'] \* ["']
+        )"#,
         severity: Severity::Major,
     },
     // ── TLS/SSL ──
@@ -127,6 +170,14 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
         // Skip test/spec/fixture/mock/example files
         if is_test_file(path) {
             debug!(file = path, "skipping test file in security scan");
+            continue;
+        }
+
+        // Skip documentation and non-code files — security patterns are designed
+        // for source code, not prose. Prevents false positives like flagging
+        // "CORS" in a markdown config guide (#483).
+        if is_doc_file(path) {
+            debug!(file = path, "skipping documentation file in security scan");
             continue;
         }
 
@@ -214,6 +265,26 @@ fn is_test_file(path: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if a file path is a documentation or non-code file.
+///
+/// Security scanner patterns are designed for source code. Scanning markdown,
+/// plain text, or reStructuredText produces false positives because security
+/// keywords (CORS, secret, password) appear naturally in documentation prose.
+fn is_doc_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    // Ensure the path contains a dot before extracting extension.
+    // Without this, extensionless files like "org" or "tex" would
+    // be treated as documentation (rsplit returns the whole string).
+    let ext = match lower.rfind('.') {
+        Some(pos) => &lower[pos + 1..],
+        None => return false,
+    };
+    matches!(
+        ext,
+        "md" | "markdown" | "mdx" | "txt" | "rst" | "adoc" | "asciidoc" | "tex" | "org"
+    )
 }
 
 #[cfg(test)]
@@ -449,7 +520,7 @@ mod tests {
     fn real_hardcoded_secret_still_detected_after_filter() {
         let chunks = vec![make_chunk(
             "src/config.py",
-            &["API_KEY = sk_live_abc123def456"],
+            &["API_KEY = \"sk_live_abc123def456ghi789\""],
         )];
         let findings = scan_security(&chunks, 10);
         let secret_findings: Vec<_> = findings
@@ -460,6 +531,732 @@ mod tests {
             secret_findings.len(),
             1,
             "Real hardcoded secret should still be detected"
+        );
+    }
+
+    // ─── CORS false positive tests (issue #483) ───
+
+    #[test]
+    fn detects_cors_wildcard_header() {
+        // The classic dangerous pattern — actual HTTP header with wildcard
+        let chunks = vec![make_chunk(
+            "src/server.rs",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(cors_findings.len(), 1, "Should detect wildcard CORS header");
+    }
+
+    #[test]
+    fn detects_cors_wildcard_assignment() {
+        // Code assignment like cors = "*" or origin = '*'
+        let chunks = vec![make_chunk("src/config.rs", &["let cors_origin = \"*\";"])];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors_findings.len(),
+            1,
+            "Should detect cors assignment with wildcard"
+        );
+    }
+
+    #[test]
+    fn detects_allowed_origins_wildcard() {
+        // Pattern: allowed_origins = "*"
+        let chunks = vec![make_chunk("src/app.py", &["allowed_origins = \"*\""])];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors_findings.len(),
+            1,
+            "Should detect allowed_origins with wildcard"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_cors_env_var_name() {
+        // Issue #483: TITEN_CORS_ORIGINS contains "cors" but is not a wildcard assignment.
+        // The * after it comes from markdown bold (**), not a CORS wildcard.
+        let chunks = vec![make_chunk(
+            "src/config.rs",
+            &["let val = std::env::var(\"TITEN_CORS_ORIGINS\").unwrap_or(\"*\");"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert!(
+            cors_findings.is_empty(),
+            "TITEN_CORS_ORIGINS env var name should not trigger CORS wildcard"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_cors_in_prose() {
+        // Issue #483: "CORS" keyword in documentation prose near a `*` character
+        let chunks = vec![make_chunk(
+            "src/config.rs",
+            &["// CORS configured via TITEN_CORS_ORIGINS env var"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert!(
+            cors_findings.is_empty(),
+            "CORS keyword in comment prose should not trigger"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_markdown_file() {
+        // Issue #483: .md files should be skipped entirely by security scanner
+        let chunks = vec![make_chunk(
+            "docs/deployment.md",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "Markdown files should not be scanned by security scanner"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_txt_file() {
+        let chunks = vec![make_chunk(
+            "docs/security.txt",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "Text files should not be scanned by security scanner"
+        );
+    }
+
+    #[test]
+    fn no_false_positive_rst_file() {
+        let chunks = vec![make_chunk(
+            "docs/api.rst",
+            &["Access-Control-Allow-Origin: *"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "reStructuredText files should not be scanned"
+        );
+    }
+
+    #[test]
+    fn real_cors_wildcard_in_rust_still_detected() {
+        // Make sure we don't over-suppress — actual code patterns still trigger
+        let chunks = vec![make_chunk(
+            "src/server.rs",
+            &[".layer(CorsLayer::new().allow_origin(\"*\"))"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors_findings.len(),
+            1,
+            "Real CORS wildcard in Rust code should be detected"
+        );
+    }
+
+    // ─── Framework-specific CORS patterns (issue #488) ───
+
+    #[test]
+    fn detects_cors_wildcard_nginx_add_header() {
+        let chunks = vec![make_chunk(
+            "nginx.conf",
+            &["add_header Access-Control-Allow-Origin *;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "nginx add_header wildcard should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_django() {
+        let chunks = vec![make_chunk(
+            "settings.py",
+            &["CORS_ALLOW_ALL_ORIGINS = True"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "Django CORS_ALLOW_ALL_ORIGINS should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_spring_boot() {
+        let chunks = vec![make_chunk("WebConfig.java", &[".allowedOrigins(\"*\")"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "Spring .allowedOrigins(\"*\") should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_dotnet_allowany() {
+        let chunks = vec![make_chunk("Startup.cs", &[".AllowAnyOrigin()"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(cors.len(), 1, ".NET AllowAnyOrigin() should be detected");
+    }
+
+    #[test]
+    fn detects_cors_wildcard_tower_http_any() {
+        let chunks = vec![make_chunk("src/main.rs", &[".allow_origin(Any)"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "tower-http allow_origin(Any) should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_express_origin_true() {
+        let chunks = vec![make_chunk("app.js", &["cors({ origin: true })"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "Express cors({{ origin: true }}) should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_fastapi_list() {
+        let chunks = vec![make_chunk("main.py", &["allow_origins=[\"*\"]"])];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(
+            cors.len(),
+            1,
+            "FastAPI allow_origins=[\"*\"] should be detected"
+        );
+    }
+
+    #[test]
+    fn detects_cors_wildcard_nginx_set_header_actix() {
+        let chunks = vec![make_chunk(
+            "src/server.rs",
+            &["SetHeader(\"Access-Control-Allow-Origin\", \"*\")"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let cors: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id == "config/cors-wildcard")
+            .collect();
+        assert_eq!(cors.len(), 1, "actix SetHeader wildcard should be detected");
+    }
+
+    #[test]
+    fn is_doc_file_does_not_match_extensionless() {
+        // Issue #489: extensionless files should not be treated as docs
+        assert!(!is_doc_file("org"));
+        assert!(!is_doc_file("tex"));
+        assert!(!is_doc_file("md"));
+        assert!(!is_doc_file("src/org"));
+        assert!(!is_doc_file("bin/tex"));
+    }
+
+    #[test]
+    fn is_doc_file_recognizes_common_extensions() {
+        assert!(is_doc_file("README.md"));
+        assert!(is_doc_file("docs/guide.markdown"));
+        assert!(is_doc_file("docs/api.mdx"));
+        assert!(is_doc_file("notes.txt"));
+        assert!(is_doc_file("docs/spec.rst"));
+        assert!(is_doc_file("docs/manual.adoc"));
+        assert!(is_doc_file("docs/manual.asciidoc"));
+        assert!(is_doc_file("paper.tex"));
+        assert!(is_doc_file("notes.org"));
+    }
+
+    #[test]
+    fn is_doc_file_does_not_match_code_files() {
+        assert!(!is_doc_file("src/main.rs"));
+        assert!(!is_doc_file("src/app.py"));
+        assert!(!is_doc_file("src/server.ts"));
+        assert!(!is_doc_file("src/index.js"));
+        assert!(!is_doc_file("src/config.go"));
+        assert!(!is_doc_file("Dockerfile"));
+        assert!(!is_doc_file("docker-compose.yml"));
+        assert!(!is_doc_file("Makefile"));
+    }
+
+    // ── #485: sql-concat false positive tests ──
+
+    #[test]
+    fn sql_concat_real_injection_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/db.py",
+            &["query = \"SELECT * FROM users WHERE id = \" + user_input"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "real SQL concat must be detected");
+        assert!(findings[0].rule_id.contains("sql"));
+    }
+
+    #[test]
+    fn sql_concat_format_macro_detected() {
+        let chunks = vec![make_chunk(
+            "src/db.rs",
+            &["let q = format!(\"SELECT * FROM users WHERE id = {}\", id);"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "format! with SELECT must be detected");
+    }
+
+    #[test]
+    fn sql_concat_comment_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/db.py",
+            &["// SELECT all users then concatenate results"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let sql_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("sql"))
+            .collect();
+        assert!(
+            sql_findings.is_empty(),
+            "comment with SQL keyword + '+' should not be flagged"
+        );
+    }
+
+    #[test]
+    fn sql_concat_python_comment_not_flagged() {
+        let chunks = vec![make_chunk("src/db.py", &["# SELECT a + b FROM joined"])];
+        let findings = scan_security(&chunks, 10);
+        let sql_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("sql"))
+            .collect();
+        assert!(sql_findings.is_empty());
+    }
+
+    #[test]
+    fn sql_concat_non_sql_plus_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/calc.rs",
+            &["let total = a + b; // UPDATE: not SQL"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let sql_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("sql"))
+            .collect();
+        assert!(sql_findings.is_empty());
+    }
+
+    // ── #486: debug-enabled false positive tests ──
+
+    #[test]
+    fn debug_real_assignment_still_detected() {
+        let chunks = vec![make_chunk("src/config.py", &["DEBUG = True"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "DEBUG = True must be detected");
+        assert!(findings[0].rule_id.contains("debug"));
+    }
+
+    #[test]
+    fn debug_yaml_true_still_detected() {
+        let chunks = vec![make_chunk("src/config.yml", &["debug: true"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "debug: true must be detected");
+    }
+
+    #[test]
+    fn debug_cli_flag_not_flagged() {
+        let chunks = vec![make_chunk(
+            "Dockerfile",
+            &["RUN cargo test -- --debug 2>/dev/null"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let debug_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("debug"))
+            .collect();
+        assert!(
+            debug_findings.is_empty(),
+            "--debug CLI flag should not be flagged"
+        );
+    }
+
+    #[test]
+    fn debug_argument_parser_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/cli.py",
+            &["parser.add_argument('--debug', help='Enable debug mode')"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let debug_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("debug"))
+            .collect();
+        assert!(
+            debug_findings.is_empty(),
+            "argument parser definition should not be flagged"
+        );
+    }
+
+    #[test]
+    fn debug_comment_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/config.py",
+            &["# Use --debug for verbose output"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let debug_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("debug"))
+            .collect();
+        assert!(debug_findings.is_empty());
+    }
+
+    // ── #490: hardcoded-role quoted pattern tests ──
+
+    #[test]
+    fn hardcoded_role_unquoted_still_detected() {
+        let chunks = vec![make_chunk("src/auth.rb", &["if role == admin"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "unquoted role check must be detected");
+        assert!(findings[0].rule_id.contains("role"));
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_double_quotes_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.js",
+            &["if (role == \"admin\") return true;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "quoted role == \"admin\" must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_single_quotes_detected() {
+        let chunks = vec![make_chunk("src/auth.py", &["if role == 'admin':"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "quoted role == 'admin' must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_strict_equality_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.ts",
+            &["if (role === \"admin\") return true;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "strict equality role === must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_property_access_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.js",
+            &["if (user.role == \"admin\") return true;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "user.role == \"admin\" must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_super_detected() {
+        let chunks = vec![make_chunk("src/auth.py", &["if role == \"super\":"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "role == \"super\" must be detected");
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_root_detected() {
+        let chunks = vec![make_chunk("src/auth.py", &["if role == 'root':"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "role == 'root' must be detected");
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_superuser_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.ts",
+            &["if (user.role === \"superuser\") grant_all();"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "role === \"superuser\" must be detected"
+        );
+    }
+
+    // ── #487: injection/eval post-match filter tests ──
+
+    #[test]
+    fn eval_real_injection_still_detected() {
+        let chunks = vec![make_chunk("src/app.py", &["result = eval(request.data)"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "eval(request.data) must be detected");
+    }
+
+    #[test]
+    fn eval_user_input_still_detected() {
+        let chunks = vec![make_chunk("src/app.py", &["eval(user_input)"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "eval(user_input) must be detected");
+    }
+
+    #[test]
+    fn eval_comment_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["// eval(request.body) — deprecated, use safe_parse()"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(findings.is_empty(), "eval in comment should be suppressed");
+    }
+
+    #[test]
+    fn evaluate_not_flagged_as_eval() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["result = evaluate(request, context)"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(findings.is_empty(), "evaluate() should not match eval rule");
+    }
+
+    #[test]
+    fn eval_docstring_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["\"\"\"Calls eval(params) for backwards compatibility.\"\"\""],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "eval in docstring should be suppressed"
+        );
+    }
+
+    #[test]
+    fn ast_literal_eval_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["data = ast.literal_eval(request.body)"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "ast.literal_eval should be suppressed (safe)"
+        );
+    }
+
+    // ── #487: crypto/weak-hash post-match filter tests ──
+
+    #[test]
+    fn weak_hash_real_usage_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["hashlib.md5(data).hexdigest()"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "hashlib.md5(data) must be detected");
+    }
+
+    #[test]
+    fn weak_hash_comment_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["// TODO: replace hashlib.md5 with sha256"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "hashlib.md5 in comment should be suppressed"
+        );
+    }
+
+    #[test]
+    fn weak_hash_import_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["from hashlib import md5, sha1, sha256"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "import of hashlib.md5 should be suppressed"
+        );
+    }
+
+    #[test]
+    fn weak_hash_rust_use_suppressed() {
+        let chunks = vec![make_chunk("src/crypto.rs", &["use sha1::Sha1;"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "Rust use of Digest::SHA1 should be suppressed"
+        );
+    }
+
+    #[test]
+    fn weak_hash_docstring_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["\"\"\"Uses hashlib.md5 for legacy compatibility.\"\"\""],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "hashlib.md5 in docstring should be suppressed"
+        );
+    }
+
+    // ── #487: crypto/ssl-verify-disabled post-match filter tests ──
+
+    #[test]
+    fn ssl_verify_disabled_real_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["requests.get(url, verify=False)"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "verify=False must be detected");
+    }
+
+    #[test]
+    fn ssl_verify_disabled_reject_unauthorized_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/client.ts",
+            &["agent: new https.Agent({ rejectUnauthorized: false })"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "rejectUnauthorized: false must be detected"
+        );
+    }
+
+    #[test]
+    fn ssl_verify_comment_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["# Do not set verify=False in production"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "verify=False in comment should be suppressed"
+        );
+    }
+
+    #[test]
+    fn ssl_verify_env_reference_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["verify = os.environ.get('SSL_VERIFY', 'True')"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(findings.is_empty(), "verify from env should be suppressed");
+    }
+
+    #[test]
+    fn ssl_verify_schema_definition_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/config.ts",
+            &["interface HttpConfig { verify: false }"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        // The regex `verify:\s*false` matches inside interface — but the
+        // post-match filter should suppress schema definitions.
+        assert!(
+            findings.is_empty(),
+            "verify: false in interface/schema should be suppressed"
+        );
+    }
+
+    #[test]
+    fn ssl_verify_true_not_flagged() {
+        let chunks = vec![make_chunk("src/client.py", &["verify: true"])];
+        let findings = scan_security(&chunks, 10);
+        // verify: true should NOT trigger the rule at all (regex requires False)
+        assert!(findings.is_empty(), "verify: true should not be flagged");
+    }
+
+    #[test]
+    fn ssl_verify_docstring_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["\"\"\"Never use verify=False in production code.\"\"\""],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "verify=False in docstring should be suppressed"
         );
     }
 }

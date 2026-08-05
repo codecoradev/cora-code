@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 /// Current schema version.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 /// Run database migrations (creates tables if not exist).
 pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
@@ -39,6 +39,9 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
     if current < 6 {
         migrate_v6(conn)?;
+    }
+    if current < 7 {
+        migrate_v7(conn)?;
     }
 
     Ok(())
@@ -346,6 +349,45 @@ fn migrate_v6(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Migration v7: Add `embed_fingerprint` column to symbols for incremental re-embedding.
+///
+/// Stores a hash of `name + signature` per symbol. On re-index, only symbols
+/// whose fingerprint has changed need to be re-embedded — dramatically reducing
+/// embedding time when a single file is modified.
+fn migrate_v7(conn: &Connection) -> anyhow::Result<()> {
+    // SQLite ALTER TABLE ADD COLUMN is idempotent-safe with IF NOT EXISTS? No —
+    // SQLite doesn't support IF NOT EXISTS for ADD COLUMN. Use pragma check instead.
+    let cols: Vec<String> = conn
+        .prepare("PRAGMA table_info(symbols)")?
+        .query_map([], |row| row.get::<_, String>(1))? // column 1 = name
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !cols.iter().any(|c| c == "embed_fingerprint") {
+        conn.execute_batch("ALTER TABLE symbols ADD COLUMN embed_fingerprint TEXT;")?;
+    }
+
+    // Also add to projects table: track which embedding backend was used.
+    // This allows detecting dimension mismatch when switching backends.
+    let pcols: Vec<String> = conn
+        .prepare("PRAGMA table_info(projects)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !pcols.iter().any(|c| c == "embedding_provider") {
+        conn.execute_batch("ALTER TABLE projects ADD COLUMN embedding_provider TEXT;")?;
+    }
+
+    if !pcols.iter().any(|c| c == "embedding_dims") {
+        conn.execute_batch("ALTER TABLE projects ADD COLUMN embedding_dims INTEGER;")?;
+    }
+
+    conn.execute("INSERT INTO schema_version (version) VALUES (7)", [])?;
+
+    Ok(())
+}
+
 /// Compute a stable hash of the indexing-relevant config.
 ///
 /// Any change to these fields will invalidate all stored fingerprints,
@@ -644,7 +686,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]

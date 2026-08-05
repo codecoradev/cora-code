@@ -178,9 +178,28 @@ pub fn scan_secrets(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindin
 /// Mask a secret value: show first 4 and last 4 chars, replace middle with ****.
 fn mask_secret(s: &str) -> String {
     if s.len() <= 12 {
-        return format!("{}****", &s[..s.len().min(4)]);
+        let end = floor_boundary(s, s.len().min(4));
+        return format!("{}****", &s[..end]);
     }
-    format!("{}****{}", &s[..4], &s[s.len() - 4..])
+    let head = floor_boundary(s, 4);
+    // For the tail, count back from the end until we have a valid boundary.
+    let tail_start = {
+        let mut idx = s.len() - 4;
+        while !s.is_char_boundary(idx) {
+            idx += 1;
+        }
+        idx
+    };
+    format!("{}****{}", &s[..head], &s[tail_start..])
+}
+
+/// Find the largest byte index <= `target` that is a valid UTF-8 char boundary.
+fn floor_boundary(s: &str, target: usize) -> usize {
+    let mut end = target.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 #[cfg(test)]
@@ -383,6 +402,25 @@ mod tests {
     #[test]
     fn mask_secret_medium() {
         assert_eq!(mask_secret("ghp_abcdef"), "ghp_****");
+    }
+
+    #[test]
+    fn mask_secret_multibyte_no_panic() {
+        // Secret containing multi-byte UTF-8 characters.
+        // Without char-boundary checking, &s[..4] could split a codepoint.
+        let secret = "🔒secret-api-key-value-1234567890";
+        // Should not panic and should still mask the middle.
+        let masked = mask_secret(secret);
+        assert!(masked.contains("****"));
+    }
+
+    #[test]
+    fn mask_secret_multibyte_short_no_panic() {
+        // Short secret (≤12 bytes) with multi-byte chars.
+        // "🔒ab" = 4 + 1 + 1 = 6 bytes, 3 chars.
+        let secret = "🔒ab";
+        let masked = mask_secret(secret);
+        assert!(masked.ends_with("****"));
     }
 
     #[test]

@@ -45,3 +45,4 @@ dist/
 *.zip
 .cora/history/
 .cora/index.db
+.commit-msg.txt
