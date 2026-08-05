@@ -56,6 +56,9 @@ pub struct Config {
     /// Analysis configuration — dead-code detection, entry-point patterns.
     #[serde(default, skip_serializing_if = "is_default")]
     pub analysis: AnalysisConfig,
+    /// Brain Mode configuration — embedding backend selection.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub brain: BrainConfig,
 }
 
 /// Provider configuration.
@@ -141,6 +144,7 @@ impl Default for Config {
             debt: crate::engine::debt_tracker::DebtConfig::default(),
             profile: None,
             analysis: AnalysisConfig::default(),
+            brain: BrainConfig::default(),
         }
     }
 }
@@ -412,6 +416,62 @@ pub struct AnalysisConfig {
     /// Example: `["*Handler", "resolve_*", "*Middleware"]`
     #[serde(default, skip_serializing_if = "is_default")]
     pub entry_point_patterns: Vec<String>,
+}
+
+/// Brain Mode configuration — controls embedding backend for vector search.
+///
+/// By default (`auto`), cora selects the best available backend at runtime:
+/// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
+/// Users can force a specific backend via `.cora.yaml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct BrainConfig {
+    /// Embedding backend selection.
+    ///
+    /// - `"auto"` (default) — best available: pretrained → hashing
+    /// - `"hashing"` — force 256d hashing trick (zero dependency)
+    /// - `"pretrained"` — force nomic 768d (requires `--features pretrained-embed`)
+    ///
+    /// Invalid values fall back to `"auto"` with a warning.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub embedding: BrainEmbeddingMode,
+}
+
+/// Embedding backend mode for Brain Mode.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BrainEmbeddingMode {
+    /// Best available backend (pretrained if compiled, else hashing).
+    #[default]
+    Auto,
+    /// Force 256d hashing trick (zero dependency).
+    Hashing,
+    /// Force nomic 768d pretrained (requires feature flag).
+    Pretrained,
+}
+
+impl std::fmt::Display for BrainEmbeddingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Hashing => write!(f, "hashing"),
+            Self::Pretrained => write!(f, "pretrained"),
+        }
+    }
+}
+
+impl std::str::FromStr for BrainEmbeddingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "hashing" => Ok(Self::Hashing),
+            "pretrained" => Ok(Self::Pretrained),
+            other => Err(format!(
+                "unknown brain.embedding value '{other}' — expected auto, hashing, or pretrained"
+            )),
+        }
+    }
 }
 
 fn is_default<T: Default + PartialEq>(val: &T) -> bool {

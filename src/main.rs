@@ -738,8 +738,8 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                // Load config for config-hash invalidation
-                let skip_patterns = crate::config::loader::load_config(
+                // Load config for config-hash invalidation + brain embedding backend
+                let config = crate::config::loader::load_config(
                     cli.global.config.as_deref(),
                     None,
                     None,
@@ -747,8 +747,17 @@ async fn main() -> Result<()> {
                     None,
                     false,
                 )
-                .ok()
-                .map(|c| c.rules_config.index_skip_files);
+                .ok();
+                let skip_patterns = config
+                    .as_ref()
+                    .map(|c| c.rules_config.index_skip_files.clone());
+
+                // Resolve embedding backend from brain config
+                let brain_mode = config
+                    .as_ref()
+                    .map(|c| c.brain.embedding.to_string())
+                    .unwrap_or_else(|| "auto".to_string());
+                crate::embed::resolve_backend(&brain_mode);
 
                 eprintln!("{}", "🔍 Indexing project...".cyan());
                 let stats = index::index_project_with_skip(
@@ -1109,6 +1118,20 @@ async fn main() -> Result<()> {
             }
             let conn = index::open_global_index()?;
             let project_id = index::ensure_project(&conn, &project_root)?;
+
+            // Resolve embedding backend from config for query embedding
+            let brain_mode = crate::config::loader::load_config(
+                cli.global.config.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .ok()
+            .map(|c| c.brain.embedding.to_string())
+            .unwrap_or_else(|| "auto".to_string());
+            crate::embed::resolve_backend(&brain_mode);
 
             let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
 
