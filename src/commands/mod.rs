@@ -1,3 +1,4 @@
+pub mod agent_config;
 pub mod auth;
 pub mod commit_cmd;
 pub mod completion;

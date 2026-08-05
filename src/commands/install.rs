@@ -1,20 +1,14 @@
-//! `cora install` subcommand — auto-detect and configure AI coding agents for Cora MCP.//!
+//! `cora install` subcommand — auto-detect and configure AI coding agents for Cora MCP.
+//!
 //! Detects installed AI coding agents by checking for known config files/directories,
 //! then writes MCP server config pointing to `cora mcp` for each detected agent.
 
+use super::agent_config::{
+    ConfigFormat, json_add_cora, json_has_cora, read_json_config, write_json_config,
+};
 use anyhow::{Context, Result};
 use colored::Colorize;
-use std::fs;
 use std::path::PathBuf;
-
-/// Config file format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigFormat {
-    Json,
-    Jsonc,
-    #[allow(dead_code)]
-    Yaml,
-}
 
 /// Information about a detected AI coding agent.
 #[derive(Debug, Clone)]
@@ -37,15 +31,6 @@ pub struct InstallOptions {
     /// Non-interactive mode.
     #[allow(dead_code)]
     pub yes: bool,
-}
-
-/// The Cora MCP server entry we inject into agent configs.
-fn cora_mcp_entry() -> serde_json::Value {
-    serde_json::json!({
-        "command": "cora",
-        "args": ["mcp"],
-        "description": "Cora Code — AI code review, code intelligence, dead code detection"
-    })
 }
 
 /// Build the list of known agents and their config paths.
@@ -115,31 +100,11 @@ fn detect_agents() -> Result<Vec<AgentInfo>> {
     Ok(detected)
 }
 
-/// Strip JSONC comments (// line comments and /* block comments */).
-/// Simple regex approach — sufficient for config files.
-fn strip_jsonc_comments(input: &str) -> String {
-    let re = regex::Regex::new(r"//.*|/\*[\s\S]*?\*/").expect("valid regex");
-    re.replace_all(input, "").to_string()
-}
+/// Install the cora MCP server entry into a JSON/JSONC agent config.
+fn install_json_agent(path: &std::path::Path, force: bool, dry_run: bool) -> Result<String> {
+    let mut config = read_json_config(path)?;
 
-/// Merge the cora MCP server entry into a JSON/JSONC config file.
-fn merge_json_config(path: &std::path::Path, force: bool, dry_run: bool) -> Result<String> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-
-    // For JSONC, strip comments before parsing
-    let clean = strip_jsonc_comments(&raw);
-
-    let mut config: serde_json::Value =
-        serde_json::from_str(&clean).context("Failed to parse JSON config")?;
-
-    let is_jsonc = raw.contains("//") || raw.contains("/*");
-    let has_existing = config
-        .get("mcpServers")
-        .and_then(|m| m.get("cora"))
-        .is_some();
-
-    if has_existing && !force {
+    if json_has_cora(&config) && !force {
         return Ok(format!(
             "  {} {} — cora entry already exists (use --force to overwrite)",
             "⏭ ".dimmed(),
@@ -147,17 +112,7 @@ fn merge_json_config(path: &std::path::Path, force: bool, dry_run: bool) -> Resu
         ));
     }
 
-    // Ensure mcpServers object exists
-    let servers = config
-        .as_object_mut()
-        .context("Config root is not a JSON object")?
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::json!({}));
-
-    servers
-        .as_object_mut()
-        .context("mcpServers is not an object")?
-        .insert("cora".to_string(), cora_mcp_entry());
+    json_add_cora(&mut config)?;
 
     if dry_run {
         Ok(format!(
@@ -166,71 +121,7 @@ fn merge_json_config(path: &std::path::Path, force: bool, dry_run: bool) -> Resu
             path.display()
         ))
     } else {
-        let output = if is_jsonc {
-            // Write back as JSONC with a header comment
-            format!(
-                "// Modified by cora install\n{}",
-                serde_json::to_string_pretty(&config)?
-            )
-        } else {
-            serde_json::to_string_pretty(&config)?
-        };
-        fs::write(path, &output).with_context(|| format!("Failed to write {}", path.display()))?;
-        Ok(format!(
-            "  {} {} — cora MCP server entry added",
-            "✓ ".green(),
-            path.display()
-        ))
-    }
-}
-
-/// Merge the cora MCP server entry into a YAML config file.
-fn merge_yaml_config(path: &std::path::Path, force: bool, dry_run: bool) -> Result<String> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
-
-    let mut config: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&raw).context("Failed to parse YAML config")?;
-
-    let has_existing = config
-        .get("mcpServers")
-        .and_then(|m| m.get("cora"))
-        .is_some();
-
-    if has_existing && !force {
-        return Ok(format!(
-            "  {} {} — cora entry already exists (use --force to overwrite)",
-            "⏭ ".dimmed(),
-            path.display()
-        ));
-    }
-
-    // Ensure mcpServers mapping exists
-    let servers = config
-        .as_mapping_mut()
-        .context("Config root is not a YAML mapping")?
-        .entry(serde_yaml_ng::Value::String("mcpServers".to_string()))
-        .or_insert_with(|| serde_yaml_ng::Value::Mapping(serde_yaml_ng::Mapping::new()));
-
-    if let Some(mapping) = servers.as_mapping_mut() {
-        let cora_entry_yaml: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str("command: cora\nargs:\n  - mcp\ndescription: 'Cora Code — AI code review, code intelligence, dead code detection'")
-                .expect("valid yaml");
-        mapping.insert(
-            serde_yaml_ng::Value::String("cora".to_string()),
-            cora_entry_yaml,
-        );
-    }
-
-    if dry_run {
-        Ok(format!(
-            "  {} {} — would write cora MCP server entry",
-            "🔍 ".cyan(),
-            path.display()
-        ))
-    } else {
-        let output = serde_yaml_ng::to_string(&config)?;
-        fs::write(path, output).with_context(|| format!("Failed to write {}", path.display()))?;
+        write_json_config(path, &config)?;
         Ok(format!(
             "  {} {} — cora MCP server entry added",
             "✓ ".green(),
@@ -243,9 +134,38 @@ fn merge_yaml_config(path: &std::path::Path, force: bool, dry_run: bool) -> Resu
 fn install_agent(agent: &AgentInfo, opts: &InstallOptions) -> Result<String> {
     match agent.format {
         ConfigFormat::Json | ConfigFormat::Jsonc => {
-            merge_json_config(&agent.config_path, opts.force, opts.dry_run)
+            install_json_agent(&agent.config_path, opts.force, opts.dry_run)
         }
-        ConfigFormat::Yaml => merge_yaml_config(&agent.config_path, opts.force, opts.dry_run),
+        ConfigFormat::Yaml => {
+            // YAML agents are rare; delegate to agent_config module.
+            use super::agent_config;
+            let mut config = agent_config::read_yaml_config(&agent.config_path)?;
+
+            if agent_config::yaml_has_cora(&config) && !opts.force {
+                return Ok(format!(
+                    "  {} {} — cora entry already exists (use --force to overwrite)",
+                    "⏭ ".dimmed(),
+                    agent.config_path.display()
+                ));
+            }
+
+            agent_config::yaml_add_cora(&mut config)?;
+
+            if opts.dry_run {
+                Ok(format!(
+                    "  {} {} — would write cora MCP server entry",
+                    "🔍 ".cyan(),
+                    agent.config_path.display()
+                ))
+            } else {
+                agent_config::write_yaml_config(&agent.config_path, &config)?;
+                Ok(format!(
+                    "  {} {} — cora MCP server entry added",
+                    "✓ ".green(),
+                    agent.config_path.display()
+                ))
+            }
+        }
     }
 }
 
