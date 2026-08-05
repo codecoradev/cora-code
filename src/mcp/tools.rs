@@ -997,6 +997,8 @@ fn handle_install(params: &serde_json::Value) -> ToolResult {
         dry_run,
         force: false,
         yes: true, // MCP is non-interactive
+        remove: false,
+        validate: false,
     };
 
     match crate::commands::install::execute_install(&opts) {
