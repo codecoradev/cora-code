@@ -1052,4 +1052,211 @@ mod tests {
             "role === \"superuser\" must be detected"
         );
     }
+
+    // ── #487: injection/eval post-match filter tests ──
+
+    #[test]
+    fn eval_real_injection_still_detected() {
+        let chunks = vec![make_chunk("src/app.py", &["result = eval(request.data)"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "eval(request.data) must be detected");
+    }
+
+    #[test]
+    fn eval_user_input_still_detected() {
+        let chunks = vec![make_chunk("src/app.py", &["eval(user_input)"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "eval(user_input) must be detected");
+    }
+
+    #[test]
+    fn eval_comment_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["// eval(request.body) — deprecated, use safe_parse()"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(findings.is_empty(), "eval in comment should be suppressed");
+    }
+
+    #[test]
+    fn evaluate_not_flagged_as_eval() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["result = evaluate(request, context)"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(findings.is_empty(), "evaluate() should not match eval rule");
+    }
+
+    #[test]
+    fn eval_docstring_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["\"\"\"Calls eval(params) for backwards compatibility.\"\"\""],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "eval in docstring should be suppressed"
+        );
+    }
+
+    #[test]
+    fn ast_literal_eval_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/app.py",
+            &["data = ast.literal_eval(request.body)"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "ast.literal_eval should be suppressed (safe)"
+        );
+    }
+
+    // ── #487: crypto/weak-hash post-match filter tests ──
+
+    #[test]
+    fn weak_hash_real_usage_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["hashlib.md5(data).hexdigest()"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "hashlib.md5(data) must be detected");
+    }
+
+    #[test]
+    fn weak_hash_comment_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["// TODO: replace hashlib.md5 with sha256"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "hashlib.md5 in comment should be suppressed"
+        );
+    }
+
+    #[test]
+    fn weak_hash_import_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["from hashlib import md5, sha1, sha256"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "import of hashlib.md5 should be suppressed"
+        );
+    }
+
+    #[test]
+    fn weak_hash_rust_use_suppressed() {
+        let chunks = vec![make_chunk("src/crypto.rs", &["use sha1::Sha1;"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "Rust use of Digest::SHA1 should be suppressed"
+        );
+    }
+
+    #[test]
+    fn weak_hash_docstring_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/crypto.py",
+            &["\"\"\"Uses hashlib.md5 for legacy compatibility.\"\"\""],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "hashlib.md5 in docstring should be suppressed"
+        );
+    }
+
+    // ── #487: crypto/ssl-verify-disabled post-match filter tests ──
+
+    #[test]
+    fn ssl_verify_disabled_real_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["requests.get(url, verify=False)"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "verify=False must be detected");
+    }
+
+    #[test]
+    fn ssl_verify_disabled_reject_unauthorized_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/client.ts",
+            &["agent: new https.Agent({ rejectUnauthorized: false })"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "rejectUnauthorized: false must be detected"
+        );
+    }
+
+    #[test]
+    fn ssl_verify_comment_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["# Do not set verify=False in production"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "verify=False in comment should be suppressed"
+        );
+    }
+
+    #[test]
+    fn ssl_verify_env_reference_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["verify = os.environ.get('SSL_VERIFY', 'True')"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(findings.is_empty(), "verify from env should be suppressed");
+    }
+
+    #[test]
+    fn ssl_verify_schema_definition_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/config.ts",
+            &["interface HttpConfig { verify: false }"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        // The regex `verify:\s*false` matches inside interface — but the
+        // post-match filter should suppress schema definitions.
+        assert!(
+            findings.is_empty(),
+            "verify: false in interface/schema should be suppressed"
+        );
+    }
+
+    #[test]
+    fn ssl_verify_true_not_flagged() {
+        let chunks = vec![make_chunk("src/client.py", &["verify: true"])];
+        let findings = scan_security(&chunks, 10);
+        // verify: true should NOT trigger the rule at all (regex requires False)
+        assert!(findings.is_empty(), "verify: true should not be flagged");
+    }
+
+    #[test]
+    fn ssl_verify_docstring_suppressed() {
+        let chunks = vec![make_chunk(
+            "src/client.py",
+            &["\"\"\"Never use verify=False in production code.\"\"\""],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            findings.is_empty(),
+            "verify=False in docstring should be suppressed"
+        );
+    }
 }

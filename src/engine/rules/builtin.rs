@@ -135,6 +135,9 @@ pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
         "config/cors-wildcard" => is_false_positive_cors(line),
         "injection/sql-concat" => is_false_positive_sql_concat(line),
         "config/debug-enabled" => is_false_positive_debug(line),
+        "injection/eval" => is_false_positive_eval(line),
+        "crypto/weak-hash" => is_false_positive_weak_hash(line),
+        "crypto/ssl-verify-disabled" => is_false_positive_ssl_verify(line),
         _ => false,
     }
 }
@@ -307,6 +310,135 @@ fn is_false_positive_debug(line: &str) -> bool {
     if lower.contains("env")
         && (lower.contains("getenv") || lower.contains("environ") || lower.contains("from_env"))
     {
+        return true;
+    }
+
+    false
+}
+
+/// Check if an `eval` match is a false positive.
+///
+/// Suppresses: comment lines, documentation, `evaluate` (not `eval`),
+/// and safe eval with literal expressions.
+fn is_false_positive_eval(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    let lower = line.to_lowercase();
+
+    // "evaluate" or "evaluation" is not "eval"
+    if lower.contains("evaluate") || lower.contains("evaluation") {
+        return true;
+    }
+
+    // Imports of eval from ast/json (safe parsing utilities)
+    if lower.contains("ast.literal_eval") || lower.contains("json.") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a `weak-hash` match is a false positive.
+///
+/// Suppresses: comment lines, documentation, and import statements
+/// that merely reference the API without calling it.
+fn is_false_positive_weak_hash(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    let lower = line.to_lowercase();
+
+    // Import/use statements (Python, Rust use, JS import)
+    if lower.contains("import ")
+        || lower.contains("use ")
+        || lower.contains("require(")
+        || lower.contains("#include")
+    {
+        return true;
+    }
+
+    // Type annotations or trait bounds (Rust)
+    if lower.contains("impl ") || lower.contains("fn ") || lower.contains("type ") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if an `ssl-verify-disabled` match is a false positive.
+///
+/// Suppresses: comment lines, documentation, config schema definitions,
+/// and environment variable references.
+fn is_false_positive_ssl_verify(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("--")
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    let lower = line.to_lowercase();
+
+    // Environment variable references (verify from env config, not hardcoded)
+    if lower.contains("env")
+        && (lower.contains("getenv")
+            || lower.contains("environ")
+            || lower.contains("from_env")
+            || lower.contains("process.env"))
+    {
+        return true;
+    }
+
+    // Config schema/validation definitions (e.g., TypeScript interfaces, Pydantic)
+    if lower.contains("interface ")
+        || lower.contains("schema")
+        || lower.contains("field(")
+        || lower.contains("default:")
+    {
+        return true;
+    }
+
+    // Negation patterns — "verify = True" or "do not disable"
+    if lower.contains("verify") && lower.contains("true") && !lower.contains("false") {
         return true;
     }
 
