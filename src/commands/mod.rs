@@ -16,3 +16,4 @@ pub mod routes;
 pub mod scan;
 pub mod serve;
 pub mod upload;
+pub mod watch;
