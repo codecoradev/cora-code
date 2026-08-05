@@ -34,11 +34,19 @@ pub fn run_watch(
     verbose: bool,
 ) -> Result<()> {
     let conn = crate::index::open_global_index()?;
-    // Load skip patterns from config
-    let skip_patterns: Option<Vec<String>> =
-        crate::config::loader::load_config(config_path, None, None, None, None, false)
-            .ok()
-            .map(|c| c.rules_config.index_skip_files);
+    // Load skip patterns + brain embedding backend from config
+    let config =
+        crate::config::loader::load_config(config_path, None, None, None, None, false).ok();
+    let skip_patterns: Option<Vec<String>> = config
+        .as_ref()
+        .map(|c| c.rules_config.index_skip_files.clone());
+
+    // Resolve embedding backend
+    let brain_mode = config
+        .as_ref()
+        .map(|c| c.brain.embedding.to_string())
+        .unwrap_or_else(|| "auto".to_string());
+    crate::embed::resolve_backend(&brain_mode);
 
     let skip_ref: Option<&[String]> = skip_patterns.as_deref();
 
