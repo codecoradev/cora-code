@@ -468,6 +468,18 @@ enum Command {
         #[clap(long)]
         estimate: bool,
     },
+    /// Watch for file changes and auto-reindex (standalone real-time watcher)
+    Watch {
+        /// Debounce window in milliseconds (default: 500)
+        #[clap(long, default_value = "500")]
+        debounce: u64,
+        /// Only trigger on git-tracked files
+        #[clap(long)]
+        git_only: bool,
+        /// Glob filter pattern (e.g. 'src/**/*.rs')
+        #[clap(long)]
+        filter: Option<String>,
+    },
     /// Auto-detect and configure AI coding agents for Cora MCP
     Install {
         /// List detected agents without installing
@@ -1492,6 +1504,23 @@ async fn main() -> Result<()> {
                 config_path: cli.global.config.clone(),
             };
             debt::execute_debt(&opts)?
+        }
+        Command::Watch {
+            debounce,
+            git_only,
+            filter,
+        } => {
+            let project_root = std::env::current_dir()?;
+            let config_path = cli.global.config.as_deref();
+            commands::watch::run_watch(
+                &project_root,
+                config_path,
+                debounce,
+                git_only,
+                filter.as_deref(),
+                cli.global.verbose,
+            )?;
+            0
         }
         Command::Install {
             list,
