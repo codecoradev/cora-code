@@ -25,7 +25,7 @@ features:
     details: OpenAI, Anthropic, Groq, Ollama, Z.AI, or any OpenAI-compatible API. Bring your own key, pick any model.
   - icon: ⚡
     title: Native Rust
-    details: Fast binary, no runtime dependencies, cross-platform. 10.4 MB single static binary.
+    details: Fast binary, no runtime dependencies, cross-platform. ~7.4 MB release binary.
   - icon: 🪝
     title: Pre-commit Hooks
     details: Catch issues before they reach CI. Review staged changes, unpushed commits, or any diff.

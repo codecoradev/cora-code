@@ -136,6 +136,46 @@ Unified data layer and massive performance improvements.
 - [#410](https://github.com/codecoradev/cora-code/issues/410) Batch symbol lookup in RRF — ✓ Done
 - [#422](https://github.com/codecoradev/cora-code/pull/422) Rayon parallel embedding — ✓ Done
 
+## v0.10 — Governance & Hardening
+
+Open-source governance and project-level hardening.
+
+- [CONTRIBUTING.md](https://github.com/codecoradev/cora-code/blob/main/CONTRIBUTING.md) Contribution guide — ✓ Done
+- [CODE_OF_CONDUCT.md](https://github.com/codecoradev/cora-code/blob/main/CODE_OF_CONDUCT.md) Code of Conduct — ✓ Done
+- [SECURITY.md](https://github.com/codecoradev/cora-code/blob/main/SECURITY.md) Security policy — ✓ Done
+- PR template, issue templates (bug report + feature request) — ✓ Done
+- Branch naming + conventional commits CI checks — ✓ Done
+
+## v0.11 — Review Intelligence
+
+Index-powered review pipeline — deterministic findings wired into every review.
+
+- Unused import detection via symbol graph — ✓ Done
+- Dead code detection in changed files during review — ✓ Done
+- Breaking change detection (removed public symbols) — ✓ Done
+- HTTP route extraction (Axum, Actix, Express, Go net/http) as `EdgeKind::Route` — ✓ Done
+- Brain enrichment Tier 1 — caller resolution, impact analysis, affected tests in review prompt — ✓ Done
+- `index_skip_files` config for bundler/entry-point false positive suppression — ✓ Done
+
+## v0.12 — Search Quality & Accuracy
+
+Fixes for FTS5 search and dead-code false positives.
+
+- [#451](https://github.com/codecoradev/cora-code/issues/451) FTS5 camelCase search fix — `file` column + `split_camel_case()` — ✓ Done
+- [#452](https://github.com/codecoradev/cora-code/issues/452) Dead-code false positives on framework entry points — `FRAMEWORK_ENTRY_PREFIXES` + `// cora: keep` suppression — ✓ Done
+- [#453](https://github.com/codecoradev/cora-code/issues/453) Sticky skip files fix — `index_config_hash` invalidation — ✓ Done
+- Schema v6 — FTS5 rebuild with `file` column, config hash tracking — ✓ Done
+
+## v0.13 — Runtime Brain Mode
+
+Runtime embedding backend selection — no recompilation needed to switch.
+
+- `brain.embedding` config (`auto` | `hashing` | `pretrained`) in `.cora.yaml` — ✓ Done
+- `Backend` enum + `resolve_backend()` with `OnceLock` caching — ✓ Done
+- Incremental per-symbol embedding via `embed_fingerprint` — ✓ Done
+- `BrainConfig` + `BrainEmbeddingMode` in config schema — ✓ Done
+- Schema v7 — `embed_fingerprint TEXT` column on `symbols` — ✓ Done
+
 ## Future — What's Next
 
 ### Other

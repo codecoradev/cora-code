@@ -5,17 +5,58 @@ All notable changes to cora-code are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.13.0]
+
+### Added
+
+- **Runtime embedding backend selection.** Brain Mode now reads `brain.embedding` from `.cora.yaml` to select the embedding backend at runtime instead of compile time. Supported values: `auto` (best available — default), `hashing` (force 256d zero-dependency), `pretrained` (force 768d nomic). No recompilation needed to switch.
+- **Incremental per-symbol embedding.** `embed_project()` now tracks an `embed_fingerprint` (hash of symbol name + signature) and skips re-embedding symbols that have not changed since the last index. On large projects, re-indexing after touching one file embeds only the changed symbols instead of all.
+- **Schema migration v7.** Adds `embed_fingerprint TEXT` column to the `symbols` table for incremental embedding tracking. Auto-migrates on first run; existing indexes are upgraded transparently.
+- **`Backend` enum + `resolve_backend()` in `embed` module.** Clean runtime dispatch with `OnceLock` caching, graceful fallback when a requested backend is not compiled, and `active_dims()` / `active_provider_name()` helpers.
+- **`BrainConfig` + `BrainEmbeddingMode` in config schema.** New `brain` section in `.cora.yaml` with `embedding` field. Includes `Display`, `FromStr`, and `serde` impls for CLI and YAML ergonomics.
+
+### Changed
+
+- **`embed_code_dispatch()` now checks `ACTIVE_BACKEND` at runtime.** Previously selected via `#[cfg]` at compile time only. Falls back to compile-time default if `resolve_backend()` was never called (lazy resolution).
+- **`cora index`, `cora brain`, `cora watch` all resolve embedding backend on startup.** Each command loads `.cora.yaml`, reads `brain.embedding`, and calls `resolve_backend()` before touching the vector index.
+- **Embedding doc comments updated.** Module-level docs now describe runtime selection and the three-tier architecture (hashing → pretrained → ONNX future).
+
+## [0.12.0]
+
+### Fixed
+
+- **FTS5 returning 0 results for camelCase queries (#451).** Added `file` column to FTS5 virtual table (schema v6), `split_camel_case()` identifier decomposition, and OR query expansion. Searches like `findUser` now correctly match via `find OR user`.
+- **Dead-code false positives on framework entry points (#452).** Added `FRAMEWORK_ENTRY_PREFIXES` with SQL LIKE pattern matching for common framework handlers (`handle_*`, `on_*`, `route_*`, etc.) — these are no longer flagged as dead code.
+- **Symbol-level suppression markers (#452).** Symbols containing `// cora: keep` in their body are excluded from dead-code detection.
+- **Sticky skip files on config change (#453).** Added `index_config_hash` column to projects table — when `.cora.yaml` changes, previously skipped files are re-evaluated instead of permanently skipped.
+
+### Added
+
+- **`entry_point_patterns` config field** — New field in `AnalysisConfig` and `.cora.yaml` `analysis` section. Custom list of glob patterns for framework-specific entry points beyond built-in defaults.
+- **Schema migration v6** — Auto-migration: adds `index_config_hash` to projects, drops and recreates FTS5 with `file` column, rebuilds search index.
+- **`index_project_with_skip()`** — Indexing now respects `index_skip_files` from config, skipping non-code files during symbol extraction.
+- **`split_camel_case()`** — Decomposes `camelCaseIdentifiers` into individual tokens for FTS5 search (`camelCase` → `camel OR case`).
+- **Enhanced `sanitize_fts_query()`** — Handles quoted phrases, trims whitespace, and escapes special FTS5 characters.
+- **31 new unit tests** — Tests for camelCase splitting, FTS5 query expansion, glob matching, suppression markers, framework prefix detection, schema migration v6, and config hash invalidation.
+
+### Changed
+
+- **`should_skip_file()` rewritten** — Simplified glob matching with early exit for non-glob patterns, explicit `**/name` branch handling.
+- **Governance documentation** — Added CONTRIBUTING.md, CODE_OF_CONDUCT.md, SECURITY.md, PR template, issue templates (bug report + feature request), and PR checks workflow (branch naming, conventional commits, PR description validation).
+
 ## [0.11.1]
 
 ### Fixed
 
 - **Index scanner false positives on entry-point files.** Added `index_skip_files` glob patterns to `RulesConfig`. Common bundler config files (`vite.config.ts`, `webpack.config.*`) and app entry points (`src/main.ts`, `src/index.tsx`) are now skipped by default — reducing noise from imports used by bundlers, not code.
-- **`cora scan` now includes index findings.** Fixed bug where `cora scan` did not wire index scanners — the scan command now runs `scan_project_index()` to produce deterministic findings alongside LLM analysis.
+- **`cora scan` now includes index findings.** Fixed bug where `cora scan` did not wire index scanners (unused imports, dead code) — the scan command now runs `scan_project_index()` to produce deterministic findings alongside LLM analysis.
 - **Error fallback preserves index findings.** When LLM review fails, the fallback path now includes all index-based findings instead of silently dropping them.
 
 ### Added
 
-- **`index_skip_files` config field** — New field in `RulesConfig` and `.cora.yaml` `rules_engine` section. Supports glob patterns (`*.config.ts`, `vite.config.*`, `**/main.ts`). Configurable per-project.
+- **`index_skip_files` config field** — New field in `RulesConfig` and `.cora.yaml` `rules_engine` section. Supports simple glob patterns (`*.config.ts`, `vite.config.*`, `**/main.ts`). Configurable per-project.
 - **`should_skip_file()` helper** — Glob matching utility for index scanner file filtering.
 - **8 new unit tests** — Tests for `should_skip_file()` covering exact match, wildcard suffix/prefix, `**/` patterns, and default skip list validation.
 
@@ -44,76 +85,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Context enrichment** — Impact analysis, affected tests, and brain search injected into LLM review prompt.
 - **Ruby AST extraction** — Fixed `body_statement` wrapper bug in class/module method extraction.
 
-## [0.8.3] - 2026-07-27
+### Technical
 
-### Added — Code Intelligence
+- **Resolved `test_extract_ruby`** — tree-sitter Ruby method extraction now correctly handles `body_statement` intermediate nodes.
+- **CI 10/10 green** — All checks pass including format, clippy, test, build, security audit.
 
-- **Svelte AST symbol indexing** (#384)
-  - `cora index` with `--features tree-sitter` now extracts functions, arrow functions, and types from `<script>` blocks in `.svelte` files.
-  - Uses TypeScript/JavaScript grammar delegation — zero new dependencies.
-  - Supports `lang="ts"` and `lang="js"` attributes with correct line number offsets.
-  - Replaces the v0.8.2 regex-based Svelte extractor with proper AST parsing.
-- **TypeScript arrow function extraction** (#384)
-  - `export const handler = () => {}` and `const cb = function() {}` are now captured as symbols with call edges.
-  - Previously only ALL_CAPS constants were indexed from `lexical_declaration`/`variable_declaration` nodes.
+## [0.10.0] - 2026-07-29
+
+### Highlights
+
+- **Dead code detection.** `cora dead-code` finds functions/methods with no callers using call graph analysis. Available as both CLI command and MCP tool (`cora.dead_code`).
+- **Graph query DSL.** `cora query "main -> *"` lets you traverse the code graph with simple patterns — no SQL needed. Available as both CLI and MCP (`cora.query`).
+- **Auto-config agent installer.** `cora install` detects installed AI coding agents (Cline, Cursor, Windsurf, etc.) and configures Cora as their MCP server. One command setup.
+- **Background reindex on serve.** `cora serve` now auto-reindexes the current project before starting the MCP server — always up-to-date symbols.
+- **Tree-sitter is now a default feature.** The `edges` table (IMPORTS, IMPLEMENTS, INHERITS, CHILD_OF) now populates correctly in all builds, including release binaries.
+
+### Added
+
+- **`cora dead-code` CLI command** (#427). Detect dead functions/methods with `--include-tests`, `--min-lines`, and `--json` flags.
+- **`cora.dead_code` MCP tool** (#428). Same dead code detection, accessible via Model Context Protocol.
+- **`cora query` CLI command** (#435). Simple graph traversal DSL: `"symbol -> *"` (callees), `"* -> symbol"` (callers), `"SymbolName"` (symbol lookup).
+- **`cora.query` MCP tool** (#435). Same query DSL via MCP.
+- **`cora install` CLI command** (#431). Auto-detect 40+ AI coding agents and configure Cora MCP with one command. Supports `--list`, `--dry-run`, `--agents`, `--force`.
+- **`cora.install` MCP tool** (#431). Same install detection via MCP.
+- **`cora serve` with auto-reindex** (#434). `cora serve` runs incremental reindex on startup before launching MCP server.
+- **Agent config module** (#432). Read/write support for JSON, JSONC, and YAML agent configuration files.
+
+### Changed
+
+- **Tree-sitter is now a default feature** (#429). `default = ["tree-sitter"]` in Cargo.toml. All builds (including release) now include AST-based extraction.
+- **Release workflow** explicitly builds with `--features tree-sitter`.
+- **CI workflow** explicitly builds/tests with `--features tree-sitter`.
+- **MCP tool count** increased from 16 to 18 tools.
 
 ### Fixed
 
-- **Project root detection for scoped queries** (#380, #382) — `resolve_project_root()` walks up from CWD to find project root instead of always using CWD.
-- **Vector search filtered by project_id** (#382) — `brain_search()` over-fetches + filters by project_id, preventing cross-project noise.
-- **Cross-project fallback for `cora callers`** (#381) — falls back to global index when no callers found in current project.
-- **Partial JSON recovery for scan results** (#383) — `extract_partial_json_objects()` handles truncated LLM JSON output.
-
-## [0.8.2] - 2026-07-24
-
-### Added — Code Intelligence
-
-- **Tree-sitter AST extraction for 8 additional languages** (#376)
-  - Java, C, C++, C#, Ruby, PHP, Scala, JavaScript — full AST-based symbol extraction.
-  - Tree-sitter now covers **12 languages** total (previously: Rust, Go, Python, TypeScript/TSX).
-  - AST path takes priority when tree-sitter is compiled; regex extractors remain as fallback.
-
-- **Svelte symbol indexing** (#375)
-  - Svelte components are now indexed (scripts, props, stores, imports).
-  - Uses TypeScript tree-sitter parser for script blocks.
-
-- **Dart symbol indexing** (#374)
-  - Classes, mixins, extensions, methods, top-level functions, and enums.
-
-### Changed — Documentation
-
-- Updated README, changelog (v0.8.0 + v0.8.1 entries), roadmap (v0.8 section), CLI reference, and code intelligence docs.
-
-## [Unreleased]
+- **`edges` table was always empty** (#429). Root cause: tree-sitter feature was not enabled by default, so AST extraction (which produces IMPORTS, IMPLEMENTS, INHERITS, CHILD_OF edges) was never compiled into release binaries. Now fixed — 352+ edges populated on rebuild.
 
 ## [0.9.0] - 2026-07-28
 
 ### Highlights
 
-- **Single source of truth.** Findings, debt, and reviews persist to `cora.db` — one global database.
-- **52× faster incremental indexing** (414ms → 6ms) and **40× faster brain search** (250ms → 5ms).
-- **`cora findings` CLI.** Track, dismiss, and reopen findings across all reviews.
+- **Single source of truth.** Review findings, scan findings, and tech debt snapshots now persist to `cora.db` — one global database, no more scattered file snapshots.
+- **Massive indexing speedup.** Rayon-parallel extraction + embedding, batch SQLite writes, PRAGMA tuning, and mtime:size fingerprinting deliver **52× faster incremental indexing** (414ms → 6ms) and **1.3× faster cold rebuild** (1,260ms → 936ms).
+- **`cora findings` CLI.** Track, filter, dismiss, and reopen findings across all your reviews.
 
 ### Added
 
-- **Persist review & scan findings to `cora.db`** (#397, #398). Best-effort logging — never blocks the pipeline.
-- **Auto-resolve stale findings** (#399). Prior findings auto-marked `resolved` when they no longer appear.
-- **`cora findings` CLI** (#400). `list`, `stats`, `dismiss`, `reopen` actions with `--json` support.
-- **Migration v5 schema** (#396). `reviews`, `findings`, `finding_events` tables. Auto-migrates.
-- **`cora index --rebuild`**. Drop and re-index from scratch.
-- **Rayon parallel processing** (#409, #422). File extraction and embedding in parallel.
-- **Vector index cached in memory** (#407). Eliminates file I/O on every brain search.
-- **Batch symbol lookup in RRF fusion** (#410). DB lookups batched instead of per-result.
-- **SQLite PRAGMA tuning** (#406). WAL, `synchronous=NORMAL`, mmap/cache sizing.
-- **Batch INSERT + transaction** (#404, #405, #411). Multi-row values, single transaction, FTS5 triggers disabled during bulk indexing.
-- **Mtime:size fingerprinting.** Replaces SHA256 for change detection.
+- **Persist review & scan findings to `cora.db`** (#397, #398). `cora review` and `cora scan` now save findings (severity, file, line, title, fingerprint) to the global database. Best-effort logging — never blocks the review pipeline on DB errors.
+- **Auto-resolve stale findings** (#399). When a new review/scan completes, findings from prior reviews that no longer appear are automatically marked `resolved` with an `auto_resolved` event. Findings that reappear stay `open`.
+- **`cora findings` CLI command** (#400). New subcommand with four actions:
+  - `cora findings list` — show open findings (use `--all`, `--severity`, `--file`, `--json` for filtering)
+  - `cora findings stats` — summary counts with resolution rate (`--json` supported)
+  - `cora findings dismiss <id>` — mark as won't-fix with optional `--reason`
+  - `cora findings reopen <id>` — reopen a dismissed/resolved finding
+- **Migration v5 schema** (#396). New tables: `reviews`, `findings`, `finding_events`. Auto-migrates on first run.
+- **`cora index --rebuild` flag.** Drop and re-index from scratch — useful for schema upgrades or corrupted indices.
+- **Rayon parallel processing** (#409, #422). File extraction and embedding computation now run in parallel across CPU cores via Rayon.
+- **Cache vector index in memory** (#407). `VECTOR_CACHE` (LazyLock) keeps the usearch HNSW index hot in memory — eliminates file I/O on every brain search.
+- **Batch symbol lookup in RRF fusion** (#410). Brain search now batches DB lookups instead of per-result queries.
+- **SQLite PRAGMA tuning** (#406). `journal_mode=WAL`, `synchronous=NORMAL`, `mmap_size=256MB`, `cache_size=-64MB` for faster writes.
+- **Batch INSERT via multi-row VALUES** (#405). Symbol insertion now uses multi-row `INSERT ... VALUES (?,?,?),(?,?,?),...` instead of per-row inserts.
+- **Batch transaction for `index_project`** (#404). All symbol/edge insertions wrapped in a single `BEGIN IMMEDIATE ... COMMIT`.
+- **Disable FTS5 triggers during bulk indexing** (#411). Triggers re-enabled after commit — avoids redundant index updates mid-batch.
+- **Mtime:size fingerprinting.** Replaces SHA256 content hashing for change detection. Trade-off: `--rebuild` available for full re-validation.
 
 ### Changed
 
-- **`cora debt` reads from `cora.db` as primary source** (#403). File snapshots are now fallback only.
-- **`graph.db` renamed to `cora.db`** (#395). Auto-migrates on first run.
+- **`cora debt` reads from `cora.db` as primary source** (#403). File snapshots are now fallback only. DB is the single source of truth for tech debt reports.
+- **`graph.db` renamed to `cora.db`** (#395). Auto-migrates existing `graph.db` on first run.
+- `db_writer` module now exposes `open_db_for_read()`, `open_db_for_write()`, and `compute_fingerprint_pub()` for use by the findings CLI.
 
 ### Performance
+
+Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 
 | Operation | Before (v0.8.3) | After (v0.9.0) | Speedup |
 |-----------|-----------------|-----------------|---------|
@@ -123,94 +168,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`cora brain` vector search filtered by project_id** (#382). Prevents cross-project noise.
-- **Project root detection** (#380). Walks up from CWD to find project config.
+- **`cora brain` vector search filtered by project_id** (#382). Over-fetches from global usearch index, filters at DB layer — prevents cross-project noise.
+- **Project root detection** (#380). Walks up from CWD to find `.cora.yaml` / `Cargo.toml` / `.git` instead of always using CWD.
 
-## [0.8.1] - 2026-07-24
-
-### Changed
-
-- **Version bump for crates.io publish** — no functional changes.
-
-## [0.8.0] - 2026-07-16
-
-### Highlights
-
-- **Brain Mode** — hybrid semantic search combining FTS5, vector KNN (usearch), and call-graph BFS with Reciprocal Rank Fusion (RRF). All local, no model download.
-- **Tree-sitter AST extraction** — opt-in `--features tree-sitter` builds get accurate symbol extraction and call graph edges for Rust, Go, Python, TypeScript/TSX.
-- **Architecture commands** — `cora trace` for call chain tracing, `cora arch` for module/edge overview.
-- **VitePress documentation** — migrated from SvelteKit to VitePress at `codecora.dev`.
+## [0.8.3] - 2026-07-27
 
 ### Added
 
-- **Brain Mode** — hybrid semantic search (#362)
-  - Three search signals fused via RRF (k=60): FTS5 keyword, usearch HNSW vector KNN, call-graph BFS.
-  - `cora brain <query>` command with `--json` and `--limit` flags.
-  - `cora.brain_search` MCP tool.
+- **Svelte AST symbol indexing.** `cora index` with `--features tree-sitter` now extracts functions, arrow functions, and types from `<script>` blocks in `.svelte` files. Uses TypeScript/JavaScript grammar delegation — zero new dependencies. Supports `lang="ts"` and `lang="js"` attributes with correct line number offsets. Closes #384.
+- **TypeScript arrow function extraction.** `export const handler = () => {}` and `const cb = function() {}` are now captured as symbols with call edges. Previously only ALL_CAPS constants were indexed from `lexical_declaration`/`variable_declaration` nodes.
 
-- **Static token embedding engine** (#354)
-  - Zero-dependency bag-of-tokens hashing producing 256d vectors.
-  - No model download, no GPU, no external service.
-  - Integrated into `cora index` for vector index population.
+### Fixed
 
-- **Tree-sitter AST extraction** (#356)
-  - Opt-in via `--features tree-sitter` at build time.
-  - Initial 4 languages: Rust, Go, Python, TypeScript/TSX.
-  - Schema v3 `edges` table for AST-derived call graph relationships.
+- **Project root detection for scoped queries** (#380, #382). `resolve_project_root()` now walks up from CWD to find `.cora.yaml`, `Cargo.toml`, or `.git` instead of always using CWD. Fixes `cora brain` and `cora callers` returning results from wrong projects.
+- **Vector search filtered by project_id** (#382). `brain_search()` now over-fetches from the global usearch index and filters by project_id at the DB layer, preventing cross-project noise in results.
+- **Cross-project fallback for `cora callers`** (#381). When a symbol has no callers in the current project, falls back to searching across all projects in the global index.
+- **Partial JSON recovery for scan results** (#383). `extract_partial_json_objects()` added as last-resort fallback when LLM returns truncated JSON arrays in scan output.
 
-- **`cora trace` and `cora arch`** (#358)
-  - `cora trace <symbol>` — depth-limited BFS call chain tracing (outgoing/incoming).
-  - `cora arch` — architecture overview showing modules, edge types, and top connectors.
+## [0.8.2] - 2026-07-25
 
-- **Global index database** (#355)
-  - Migrated from `.cora/index.db` (per-project) to `~/.codecora/cora-code/graph.db` (global).
-  - Multi-project search: index multiple repos, search across all of them.
+### Added
 
-- **Code Intelligence documentation** (#365)
-  - New `docs/code-intelligence.md` covering indexing, search, call graph, and MCP tools.
+- **8 additional tree-sitter languages.** Added AST extraction for C, C++, C#, Ruby, PHP, Scala, and JavaScript. Total tree-sitter supported languages: 12.
+- **Dart symbol indexing.** `cora index` now extracts classes, mixins, enums, extensions, functions, getters, and typedefs from `.dart` files. Closes #373.
+- **Svelte symbol indexing (regex).** Initial Svelte support via regex-based extraction — components (from filename), props, `$state`, `$derived`, functions. Closes #375. (Replaced by AST extraction in v0.8.3.)
+
+## [0.8.1] - 2026-07-24
+
+### Fixed
+
+- crates.io publish (503 transient on v0.8.0)
+
+
+## [0.8.0] - 2026-07-24
+
+### Highlights
+
+- **Brain Mode — hybrid code search.** `cora brain <query>` combines FTS5 keyword search, usearch vector similarity (HNSW), and graph BFS proximity into a single ranked result set via RRF fusion (k=60). Index-time embeddings use a zero-dependency static token method (256d) — no model download, no GPU.
+- **tree-sitter AST extraction + call edges.** Schema v3 adds an `edges` table storing caller→callee relationships. When `cora index` runs with `--features tree-sitter`, it extracts function calls from AST nodes, enabling `cora trace` and `cora arch`.
+- **`cora trace` and `cora arch` commands.** Trace symbol call chains (depth-limited) and display architecture overview (module breakdown, edge types, top connectors) from the indexed call graph.
+- **Static token embedding engine.** Zero-dependency bag-of-tokens hashing (256d) for code symbol embeddings — suitable for near-duplicate detection and semantic search without external models.
+- **Global index directory.** The symbol database migrated from `.cora/graph.db` (per-project) to `~/.codecora/cora-code/graph.db` (per-user), shared across all projects.
+- **Renamed `cora-cli` → `cora-code`.** Binary is now `cora`, crate is `cora-code`.
+
+### Added
+
+- **Phase 3 — Brain Mode** (#362)
+  - `CodeVectorIndex` — persistent usearch HNSW vector index with fs2 file locking, key↔symbol mapping, and disk serialization
+  - `brain_search()` — hybrid search: FTS5 + usearch KNN (cosine, top-50) + graph BFS (depth-2 from FTS hits) → RRF k=60 fusion
+  - Schema v4: `embedding_tier`, `embedding_dims`, `embedding_model`, `last_embedded_at` columns on `projects` table
+  - Index-time embedding: all symbols embedded via static tokens during `cora index`
+  - CLI: `cora brain <query> [--json] [--limit N]`
+  - MCP tool: `cora.brain_search` — semantic code search for AI coding agents
+- **Phase 2C — `cora trace` and `cora arch`** (#358)
+  - `cora trace <symbol>` — trace call chains from a symbol (depth-limited BFS on call edges)
+  - `cora arch` — architecture overview: module breakdown, edge types, top connectors
+- **Phase 2 — tree-sitter AST extraction + Schema v3** (#356)
+  - tree-sitter AST node extraction for Rust, Python, JavaScript, TypeScript, Go, Java
+  - Schema v3: `edges` table (caller_id, callee_id, edge_type) storing call relationships
+  - Gated behind `--features tree-sitter` (default build does not include tree-sitter)
+- **Phase 1 — Static token embedding engine** (#354)
+  - Bag-of-tokens hashing: 256d vectors from code text, zero external dependencies
+  - Pre-trained nomic-embed-code vocabulary included (768d, reserved for Phase 5)
+  - `tokenize_code()`, `embed_code()`, `cosine_similarity()` public API
+- **Global index migration** (#355)
+  - Symbol database moved from `.cora/graph.db` to `~/.codecora/cora-code/graph.db`
+  - `CODECORA_HOME` env var override for custom data directory
+- **Binary rename** (#338)
+  - Crate renamed `cora-cli` → `cora-code`
+  - Binary name: `cora`
 
 ### Changed
 
-- **Renamed `cora-cli` → `cora-code`** (#338) — crate name, repo description, all references.
-- **Security scanner false positives suppressed** (#369) — `sec-hardcoded-url` and `sec-hardcoded-secret/crypto` patterns refined to reduce noise (#357, #364).
-- **Uteke memory integration hidden from user-facing docs** (#367) — still functional, just not advertised externally.
-- **VitePress docs** — adopted `@codecora-theme`, retired SvelteKit `website/` directory.
-- **CI** — decoupled GitHub Release from crates.io publish (#371).
+- **Docs website** — adopted `@codecora/theme` + VitePress base `/cora/docs/`, retired standalone LandingPage (#348)
+- **Uteke memory integration** — removed from user-facing docs (implementation exists but undocumented until API stabilizes) (#367)
+
+### Fixed
+
+- **False positives suppressed in `sec-hardcoded-url` and `crypto/hardcoded-secret` rules** (#369, closes #357, #364)
+  - `post_match_filter()` added to `builtin.rs` — filters matches in XML/SVG `xmlns` attributes, Rust docstrings, config files, and bare identifiers
+  - Integrated into `security_scanner.rs` scan loop — all security scanner matches now pass through `post_match_filter`
+  - Docker hostname regex (`DOCKER_HOST_RE`) fixed — `\d+` now correctly matches port digits
+  - 31 targeted unit tests added for false positive suppression
+- **CI clippy lints** — `map_or(false, ...) → idiomatic `is_some_and(...)` (#369)
+
+### Stats
+
+- 56 files changed, +46,948 / -2,050 lines since v0.7.0
+- 11 PRs merged
 
 ## [0.7.0] - 2026-07-16
 
 ### Highlights
 
-- **Deeper, token-economical cross-file review** — reviews now resolve **who calls changed code** (blast radius), not just what changed code calls. Bounded scanning + thin slices + signature-only fallback keep token cost low.
-- **Config validation at load time** — out-of-range values and misspelled keys fail loudly instead of being silently ignored.
-- **Markdown false positives suppressed** — findings inside fenced code blocks dropped across all finding sources.
-- **Perf + security + correctness fixes** across the pipeline (10 perf bottlenecks, 2 CVE bumps, silent-corruption & best-practice bugs).
+- **Deeper, token-economical cross-file review.** Reviews now resolve **who calls the changed code** (inbound / blast-radius), not just what the changed code calls — so breaking signature/type changes can be flagged. Bounded scanning + thin slices + a signature-only budget fallback keep token cost low.
+- **Config is now validated at load time.** Out-of-range values (e.g. `temperature: 5`) and misspelled keys (`quailty_gate`) fail loudly instead of being silently ignored.
+- **Markdown false positives suppressed.** Findings inside fenced code blocks (a `git push` in a fenced `bash` block flagged as SQL injection) are now dropped across all finding sources.
+- **Performance, security, and correctness fixes** across the scan/review pipeline (10 perf bottlenecks, 2 CVE bumps, 8+ silent-corruption and best-practice bugs).
 
 ### Added
 
-- **Caller (blast-radius) resolution** — `review.context_chain.include_callers` (default `true`); gitignore-aware, bounded ≤400 files / ≤3 call-sites per symbol. New `ContextPriority::CallerSite`.
-- **Definition extraction** (Rust/Python/JS-TS/Go/Java-Kotlin) feeds caller resolution; Rust `mod foo;` and Java `import com.example.*` now extracted (#73, #72).
-- **Signature-only budget fallback** — injects a signature slice when the full body won't fit.
-- **`Config::validate()`** (#94) + **`Profile::validate()`** (#81) — reject out-of-range/unsupported values at load.
-- **`deny_unknown_fields`** on all config sections (#80).
+- **Inbound caller (blast-radius) resolution.** A new context-chain phase resolves call-sites of functions/types defined or modified in the diff, so breaking changes to their signatures surface their consumers. Gated by new `review.context_chain.include_callers` (default `true`); uses gitignore-aware walking and is bounded (≤400 files, ≤3 call-sites/symbol), injecting only the call line + 1 line of context. New `ContextPriority::CallerSite`.
+- **Definition extraction** (`extract_definitions_from_diff`) for Rust/Python/JS-TS/Go/Java-Kotlin — detects functions/types *declared* in the diff, feeding caller resolution. Rust `mod foo;` and Java `import com.example.*` wildcards are now extracted correctly (#73, #72).
+- **Signature-only budget fallback.** When the token budget can't fit a full function/type body, a thin signature slice (up to `{`) is injected instead of skipping the entry entirely (~3–5× more symbols under the same budget).
+- **`Config::validate()`** (#94) — rejects out-of-range/unsupported values at load: `temperature` (0.0–2.0), `max_tokens`/`timeout` (≥1), `max_tokens_param`, `response_format`, `output.format`, `hook.mode`/`on_violation`/`min_severity`, and `provider.base_url` scheme. Multiple errors are aggregated into one message.
+- **`Profile::validate()`** (#81) — focus `weight` must be 1–10, and `action`/`tone`/`detail_level` must be recognized values.
+- **`deny_unknown_fields`** on all config sections (#80) — misspelled YAML keys are rejected at parse time.
 
 ### Changed
 
-- **`CategoryAction` enum** (#57) — case-insensitive `block`/`warn`/`ignore`; typos fail loudly.
-- **Disabled quality gate never fails** (#58).
-- **`context_chain.max_context_tokens`** default 3000 → **5000**.
-- **`issue_type`** serializes consistently (#48); `type` kept as deserialize alias.
-- **`Severity::from_str_lossy`** avoids an allocation (#10).
+- **`CategoryAction` enum** (#57) — `quality_gate.categories.*.action` is now a case-insensitive enum (`block`/`warn`/`ignore`); a typo like `blok` fails loudly at config load instead of silently becoming blocking.
+- **Disabled quality gate never fails** (#58) — `evaluate()` forces `Pass` when `enabled: false`.
+- **`context_chain.max_context_tokens` default** raised 3000 → **5000**.
+- **`issue_type`** serializes consistently as `issue_type` (#48); `type` retained as a deserialize alias.
+- **`Severity::from_str_lossy`** uses `eq_ignore_ascii_case` (no allocation) (#10).
 
 ### Fixed
 
-- **Markdown fenced-code-block false positives** (#329) dropped across all finding sources.
-- **Cross-file resolver** now uses `ignore.files` (not `ignore.rules`) — no longer injects `node_modules`/`target` code.
-- **Test-file detection** (#87) and **glob excludes** (#66) no longer over-match (`latest`/`aspect`/`mysrc/`).
-- **Token estimation** (#68), **DB size** (#23).
-- **Project-sync workflow** no longer fails on merged PRs using `Refs #N`.
-- **10 performance bottlenecks** (#335); **silent data-corruption bugs** (#333).
-- **Security:** `anyhow` 1.0.102 → 1.0.103, `crossbeam-epoch` 0.9.18 → 0.9.20.
+- **Markdown fenced-code-block false positives** (#329) — findings inside fenced code blocks (triple-backtick / triple-tilde) in `.md`/`.mdx`/`.markdown` files are dropped across all finding sources (security/secrets/rules scanners + LLM). Fence state is tracked across full hunk context, so it works even when only the block body was edited.
+- **Cross-file resolver used the wrong ignore list** — `review.rs` passed `ignore.rules` (finding-type strings) instead of `ignore.files` (`target/**`, `node_modules/**`); the resolver could inject build-artifact code. Now uses `ignore.files`.
+- **Test-file detection over-match** (#87) — `is_test_file` is path-segment aware; `latest`, `aspect`, `attestation` are no longer mistaken for test files.
+- **Directory glob excludes over-permissive** (#66) — `src/` matches only at segment boundaries (`mysrc/` no longer caught).
+- **Token estimation** (#68) — non-empty content returns ≥1 token (was 0 under integer division).
+- **DB size** (#23) — `index_stats` queries `PRAGMA page_size` instead of assuming 4096 bytes.
+- **Project-sync workflow** — a merged PR referencing issues via `Refs #N` (not `Closes #N`) no longer fails the `sync` check.
+- **10 scan/review performance bottlenecks** (#335) — precompiled regex, batched DB queries, early cutoffs, file-content cache, single reused Tokio runtime, single-transaction prune, etc.
+- **Security:** bumped `anyhow` 1.0.102 → 1.0.103 (RUSTSEC-2026-0190) and `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204).
+- Various silent-data-corruption bugs resolved (#333): severity sort, security-findings fallback, deterministic debt-snapshot hashing, debt-trend math, config precedence, `context_chain` merge, and hook-install composition.
 
 ## [0.6.2] - 2026-06-21
 
@@ -238,7 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
-- Added 4 regression tests for token usage threading.
+- Added 4 regression tests for token usage threading: `parse_review_preserves_usage_when_provided`, `parse_review_returns_none_usage_when_not_provided`, `parse_scan_preserves_usage_when_provided`, `usage_to_token_usage_maps_fields_correctly`.
 
 ## [0.6.1] - 2026-06-17
 
@@ -766,13 +850,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.8.2...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.13.0...develop
+[0.13.0]: https://github.com/codecoradev/cora-code/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/codecoradev/cora-code/compare/v0.11.1...v0.12.0
+[0.11.1]: https://github.com/codecoradev/cora-code/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/codecoradev/cora-code/compare/v0.9.0...v0.11.0
+[0.9.0]: https://github.com/codecoradev/cora-code/compare/v0.8.3...v0.9.0
+[0.8.3]: https://github.com/codecoradev/cora-code/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/codecoradev/cora-code/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/codecoradev/cora-code/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/codecoradev/cora-code/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/codecoradev/cora-code/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/codecoradev/cora-code/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/codecoradev/cora-code/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/codecoradev/cora-code/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/codecoradev/cora-code/compare/v0.4.6...v0.5.0
 [0.4.6]: https://github.com/codecoradev/cora-code/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/codecoradev/cora-code/compare/v0.4.4...v0.4.5

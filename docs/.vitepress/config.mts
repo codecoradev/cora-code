@@ -26,6 +26,7 @@ export default createConfig({
         items: [
           { text: 'Usage', link: '/usage' },
           { text: 'Configuration', link: '/configuration' },
+          { text: 'Code Intelligence', link: '/code-intelligence' },
           { text: 'Providers', link: '/providers' },
           { text: 'CLI Reference', link: '/cli-reference' },
           { text: 'Examples', link: '/examples' },
