@@ -133,6 +133,8 @@ pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
         "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line),
         "sec-hardcoded-url" => is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
+        "injection/sql-concat" => is_false_positive_sql_concat(line),
+        "config/debug-enabled" => is_false_positive_debug(line),
         _ => false,
     }
 }
@@ -243,6 +245,69 @@ fn is_false_positive_secret(line: &str) -> bool {
                 return true;
             }
         }
+    }
+
+    false
+}
+
+/// Check if a `sql-concat` match is a false positive.
+///
+/// Suppresses: comment lines, string literal descriptions, and lines where
+/// the "+" is not actually string concatenation (e.g., arithmetic).
+fn is_false_positive_sql_concat(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines — SQL keywords in comments are not injection
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+    {
+        return true;
+    }
+
+    // Python/Rust docstrings
+    if trimmed.contains("\"\"\"") || trimmed.contains("'''") {
+        return true;
+    }
+
+    false
+}
+
+/// Check if a `debug-enabled` match is a false positive.
+///
+/// Suppresses: comment lines documenting debug config, argument parser
+/// definitions, and environment variable references.
+fn is_false_positive_debug(line: &str) -> bool {
+    let trimmed = line.trim();
+
+    // Comment lines
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+    {
+        return true;
+    }
+
+    // Argument parser definitions (Python argparse, JS commander, etc.)
+    let lower = line.to_lowercase();
+    if lower.contains("add_argument")
+        || lower.contains("addoption")
+        || lower.contains("argument(")
+        || lower.contains(".option(")
+        || lower.contains("parser.")
+    {
+        return true;
+    }
+
+    // Environment variable references (DEBUG from env, not hardcoded)
+    if lower.contains("env")
+        && (lower.contains("getenv") || lower.contains("environ") || lower.contains("from_env"))
+    {
+        return true;
     }
 
     false

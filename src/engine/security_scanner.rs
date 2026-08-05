@@ -52,7 +52,10 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "injection/sql-concat",
         name: "SQL injection via string concatenation",
-        regex: r"(?i)(?:SELECT|INSERT|UPDATE|DELETE)\s+.*\+",
+        // Require a SQL keyword inside a string literal, followed by concatenation.
+        // This prevents matching comments, prose, and non-SQL code that happens
+        // to contain SQL keywords + "+".
+        regex: r#"(?i)(?:(?:SELECT|INSERT|UPDATE|DELETE)\b[^"\']*["\x27`][^"\']*\+|format!\s*\(\s*["\x27`]\s*(?:SELECT|INSERT|UPDATE|DELETE))"#,
         severity: Severity::Critical,
     },
     SecurityPattern {
@@ -74,14 +77,19 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "auth/hardcoded-role",
         name: "Hardcoded role or permission check",
-        regex: r"(?i)role\s*==\s*(?:admin|super|root)|is_admin\s*==\s*True",
+        // Match both quoted and unquoted role comparisons, property access
+        // (user.role), and strict equality (===) for JS/TS.
+        regex: r#"(?i)(?:\w+\.)*role\s*[=]{2,3}\s*["']?(?:admin|super|root|superuser)["']?|is_admin\s*==\s*True"#,
         severity: Severity::Major,
     },
     // ── Debug config ──
     SecurityPattern {
         id: "config/debug-enabled",
         name: "Debug mode enabled (production risk)",
-        regex: r"(?i)(?:DEBUG\s*=\s*True|debug:\s*true|--debug)",
+        // Only match actual config assignments, not CLI flag references.
+        // `--debug` is removed — it matches dev tooling, argument parsers,
+        // Dockerfiles, and documentation (too many false positives).
+        regex: r#"(?i)(?:DEBUG\s*=\s*True|debug\s*:\s*true|debug\s*=\s*true)"#,
         severity: Severity::Minor,
     },
     SecurityPattern {
@@ -827,5 +835,221 @@ mod tests {
         assert!(!is_doc_file("Dockerfile"));
         assert!(!is_doc_file("docker-compose.yml"));
         assert!(!is_doc_file("Makefile"));
+    }
+
+    // ── #485: sql-concat false positive tests ──
+
+    #[test]
+    fn sql_concat_real_injection_still_detected() {
+        let chunks = vec![make_chunk(
+            "src/db.py",
+            &["query = \"SELECT * FROM users WHERE id = \" + user_input"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "real SQL concat must be detected");
+        assert!(findings[0].rule_id.contains("sql"));
+    }
+
+    #[test]
+    fn sql_concat_format_macro_detected() {
+        let chunks = vec![make_chunk(
+            "src/db.rs",
+            &["let q = format!(\"SELECT * FROM users WHERE id = {}\", id);"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "format! with SELECT must be detected");
+    }
+
+    #[test]
+    fn sql_concat_comment_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/db.py",
+            &["// SELECT all users then concatenate results"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let sql_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("sql"))
+            .collect();
+        assert!(
+            sql_findings.is_empty(),
+            "comment with SQL keyword + '+' should not be flagged"
+        );
+    }
+
+    #[test]
+    fn sql_concat_python_comment_not_flagged() {
+        let chunks = vec![make_chunk("src/db.py", &["# SELECT a + b FROM joined"])];
+        let findings = scan_security(&chunks, 10);
+        let sql_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("sql"))
+            .collect();
+        assert!(sql_findings.is_empty());
+    }
+
+    #[test]
+    fn sql_concat_non_sql_plus_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/calc.rs",
+            &["let total = a + b; // UPDATE: not SQL"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let sql_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("sql"))
+            .collect();
+        assert!(sql_findings.is_empty());
+    }
+
+    // ── #486: debug-enabled false positive tests ──
+
+    #[test]
+    fn debug_real_assignment_still_detected() {
+        let chunks = vec![make_chunk("src/config.py", &["DEBUG = True"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "DEBUG = True must be detected");
+        assert!(findings[0].rule_id.contains("debug"));
+    }
+
+    #[test]
+    fn debug_yaml_true_still_detected() {
+        let chunks = vec![make_chunk("src/config.yml", &["debug: true"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "debug: true must be detected");
+    }
+
+    #[test]
+    fn debug_cli_flag_not_flagged() {
+        let chunks = vec![make_chunk(
+            "Dockerfile",
+            &["RUN cargo test -- --debug 2>/dev/null"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let debug_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("debug"))
+            .collect();
+        assert!(
+            debug_findings.is_empty(),
+            "--debug CLI flag should not be flagged"
+        );
+    }
+
+    #[test]
+    fn debug_argument_parser_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/cli.py",
+            &["parser.add_argument('--debug', help='Enable debug mode')"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let debug_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("debug"))
+            .collect();
+        assert!(
+            debug_findings.is_empty(),
+            "argument parser definition should not be flagged"
+        );
+    }
+
+    #[test]
+    fn debug_comment_not_flagged() {
+        let chunks = vec![make_chunk(
+            "src/config.py",
+            &["# Use --debug for verbose output"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        let debug_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule_id.contains("debug"))
+            .collect();
+        assert!(debug_findings.is_empty());
+    }
+
+    // ── #490: hardcoded-role quoted pattern tests ──
+
+    #[test]
+    fn hardcoded_role_unquoted_still_detected() {
+        let chunks = vec![make_chunk("src/auth.rb", &["if role == admin"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "unquoted role check must be detected");
+        assert!(findings[0].rule_id.contains("role"));
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_double_quotes_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.js",
+            &["if (role == \"admin\") return true;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "quoted role == \"admin\" must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_single_quotes_detected() {
+        let chunks = vec![make_chunk("src/auth.py", &["if role == 'admin':"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "quoted role == 'admin' must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_strict_equality_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.ts",
+            &["if (role === \"admin\") return true;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "strict equality role === must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_property_access_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.js",
+            &["if (user.role == \"admin\") return true;"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "user.role == \"admin\" must be detected"
+        );
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_super_detected() {
+        let chunks = vec![make_chunk("src/auth.py", &["if role == \"super\":"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "role == \"super\" must be detected");
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_root_detected() {
+        let chunks = vec![make_chunk("src/auth.py", &["if role == 'root':"])];
+        let findings = scan_security(&chunks, 10);
+        assert!(!findings.is_empty(), "role == 'root' must be detected");
+    }
+
+    #[test]
+    fn hardcoded_role_quoted_superuser_detected() {
+        let chunks = vec![make_chunk(
+            "src/auth.ts",
+            &["if (user.role === \"superuser\") grant_all();"],
+        )];
+        let findings = scan_security(&chunks, 10);
+        assert!(
+            !findings.is_empty(),
+            "role === \"superuser\" must be detected"
+        );
     }
 }
