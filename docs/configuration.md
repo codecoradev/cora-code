@@ -97,6 +97,9 @@ analysis:
     - "*Handler"
     - "resolve_*"
 
+brain:
+  embedding: auto           # auto | hashing | pretrained
+
 profile: clean-code        # security-first | performance | clean-code | beginner-friendly | minimal | rust-strict | typescript-strict | go-pragmatic
 ```
 
@@ -460,6 +463,25 @@ Default `index_skip_files` patterns (bundled with cora):
 > **Why skip these?** Entry-point files and bundler configs often import symbols that are consumed by the bundler/compiler, not by other source code. Index scanners detect these as "unused" because there are no code-level references. Skipping them eliminates the most common source of false positives.
 
 Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`), wildcard prefix (`vite.*`), and any-directory (`**/main.ts`).
+
+### Brain Embedding Backend
+
+Control which embedding backend Brain Mode uses for vector search. Selectable at runtime — no recompilation needed to switch.
+
+```yaml
+brain:
+  embedding: auto   # auto | hashing | pretrained
+```
+
+| Value | Dimensions | Description |
+|-------|------------|-------------|
+| `auto` (default) | 256 or 768 | Best available — uses `pretrained` if compiled with `pretrained-embed` feature, otherwise `hashing` |
+| `hashing` | 256 | Force zero-dependency bag-of-tokens hashing. Always available, no model download |
+| `pretrained` | 768 | Force nomic-embed-code distilled embeddings. Requires `pretrained-embed` feature at build time |
+
+> **⚠️ Cannot mix dimensions.** 256d and 768d vectors cannot coexist in the same usearch index. After changing this setting, run `cora index --rebuild` to regenerate embeddings with the new backend.
+
+> **Note:** If you select `pretrained` but cora was built without the `pretrained-embed` feature, it falls back to `hashing` with a warning.
 
 ## Ignore Files
 

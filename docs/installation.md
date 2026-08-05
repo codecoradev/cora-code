@@ -21,7 +21,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 Pin a specific version:
 
 ```bash
-$ CORA_VERSION=v0.6.1 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
+$ CORA_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
 ```
 
 ## Install via Cargo
@@ -46,10 +46,19 @@ Supported platforms:
 - Windows x86_64
 
 ```bash
-# Download and extract
-$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-linux-x86_64.tar.gz | tar xz
+# Download and extract (Linux x86_64 example)
+$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-x86_64-unknown-linux-gnu-v0.13.0.tar.gz | tar xz
 $ mv cora ~/.local/bin/cora
 ```
+
+Asset naming convention: `cora-{target-triple}-{version}.tar.gz` (Linux/macOS) or `.zip` (Windows). Replace the target triple as needed:
+
+| Platform | Asset name |
+|----------|------------|
+| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-v0.13.0.tar.gz` |
+| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-v0.13.0.tar.gz` |
+| macOS ARM64 | `cora-aarch64-apple-darwin-v0.13.0.tar.gz` |
+| Windows x86_64 | `cora-x86_64-pc-windows-msvc-v0.13.0.zip` |
 
 ## Build from Source
 
@@ -85,7 +94,7 @@ Confirm cora is installed correctly:
 
 ```bash
 $ cora --version
-cora 0.6.1
+cora 0.13.0
 
 $ cora auth status
 Provider: openai
@@ -103,7 +112,7 @@ $ which -a cora
 
 # Should match the latest release
 $ cora --version
-cora 0.6.1
+cora 0.13.0
 ```
 
 If `which -a cora` shows more than one path (e.g. `~/.local/bin/cora` and `~/.cargo/bin/cora`), remove the one you don't want or reorder your `PATH`. See [Issue #314](https://github.com/codecoradev/cora-code/issues/314) for background.
