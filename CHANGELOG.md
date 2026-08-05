@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0]
+
+### Added
+
+- **Runtime embedding backend selection.** Brain Mode now reads `brain.embedding` from `.cora.yaml` to select the embedding backend at runtime instead of compile time. Supported values: `auto` (best available — default), `hashing` (force 256d zero-dependency), `pretrained` (force 768d nomic). No recompilation needed to switch.
+- **Incremental per-symbol embedding.** `embed_project()` now tracks an `embed_fingerprint` (hash of symbol name + signature) and skips re-embedding symbols that have not changed since the last index. On large projects, re-indexing after touching one file embeds only the changed symbols instead of all.
+- **Schema migration v7.** Adds `embed_fingerprint TEXT` column to the `symbols` table for incremental embedding tracking. Auto-migrates on first run; existing indexes are upgraded transparently.
+- **`Backend` enum + `resolve_backend()` in `embed` module.** Clean runtime dispatch with `OnceLock` caching, graceful fallback when a requested backend is not compiled, and `active_dims()` / `active_provider_name()` helpers.
+- **`BrainConfig` + `BrainEmbeddingMode` in config schema.** New `brain` section in `.cora.yaml` with `embedding` field. Includes `Display`, `FromStr`, and `serde` impls for CLI and YAML ergonomics.
+
+### Changed
+
+- **`embed_code_dispatch()` now checks `ACTIVE_BACKEND` at runtime.** Previously selected via `#[cfg]` at compile time only. Falls back to compile-time default if `resolve_backend()` was never called (lazy resolution).
+- **`cora index`, `cora brain`, `cora watch` all resolve embedding backend on startup.** Each command loads `.cora.yaml`, reads `brain.embedding`, and calls `resolve_backend()` before touching the vector index.
+- **Embedding doc comments updated.** Module-level docs now describe runtime selection and the three-tier architecture (hashing → pretrained → ONNX future).
+
 ## [0.12.0]
 
 ### Fixed
