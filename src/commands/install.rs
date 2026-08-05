@@ -20,7 +20,7 @@ struct AgentInfo {
 
 /// Install subcommand options.
 pub struct InstallOptions {
-    /// List detected agents without installing.
+    /// List detected agents only.
     pub list: bool,
     /// Specific agents to install (comma-separated).
     pub agents: Option<String>,
@@ -31,6 +31,10 @@ pub struct InstallOptions {
     /// Non-interactive mode.
     #[allow(dead_code)]
     pub yes: bool,
+    /// Remove cora MCP entry (uninstall mode).
+    pub remove: bool,
+    /// Validate agent configs after install/remove.
+    pub validate: bool,
 }
 
 /// Build the list of known agents and their config paths.
@@ -100,6 +104,14 @@ fn detect_agents() -> Result<Vec<AgentInfo>> {
     Ok(detected)
 }
 
+/// Validate that a config file still parses correctly after modification.
+fn validate_json_config(path: &std::path::Path) -> Result<()> {
+    let config = read_json_config(path)?;
+    // If it parses without error, it's valid.
+    let _ = serde_json::to_string(&config)?;
+    Ok(())
+}
+
 /// Install the cora MCP server entry into a JSON/JSONC agent config.
 fn install_json_agent(path: &std::path::Path, force: bool, dry_run: bool) -> Result<String> {
     let mut config = read_json_config(path)?;
@@ -130,40 +142,98 @@ fn install_json_agent(path: &std::path::Path, force: bool, dry_run: bool) -> Res
     }
 }
 
-/// Install the cora MCP server entry for a single agent.
+/// Remove the cora MCP server entry from a JSON/JSONC agent config.
+fn uninstall_json_agent(path: &std::path::Path, dry_run: bool) -> Result<String> {
+    use super::agent_config;
+
+    let mut config = read_json_config(path)?;
+
+    if !agent_config::json_has_cora(&config) {
+        return Ok(format!(
+            "  {} {} — no cora entry found",
+            "⏭ ".dimmed(),
+            path.display()
+        ));
+    }
+
+    agent_config::json_remove_cora(&mut config);
+
+    if dry_run {
+        Ok(format!(
+            "  {} {} — would remove cora MCP server entry",
+            "🔍 ".cyan(),
+            path.display()
+        ))
+    } else {
+        write_json_config(path, &config)?;
+        Ok(format!(
+            "  {} {} — cora MCP server entry removed",
+            "✓ ".green(),
+            path.display()
+        ))
+    }
+}
+
+/// Install or remove the cora MCP server entry for a single agent.
 fn install_agent(agent: &AgentInfo, opts: &InstallOptions) -> Result<String> {
     match agent.format {
         ConfigFormat::Json | ConfigFormat::Jsonc => {
-            install_json_agent(&agent.config_path, opts.force, opts.dry_run)
+            if opts.remove {
+                uninstall_json_agent(&agent.config_path, opts.dry_run)
+            } else {
+                install_json_agent(&agent.config_path, opts.force, opts.dry_run)
+            }
         }
         ConfigFormat::Yaml => {
-            // YAML agents are rare; delegate to agent_config module.
             use super::agent_config;
             let mut config = agent_config::read_yaml_config(&agent.config_path)?;
 
-            if agent_config::yaml_has_cora(&config) && !opts.force {
-                return Ok(format!(
-                    "  {} {} — cora entry already exists (use --force to overwrite)",
-                    "⏭ ".dimmed(),
-                    agent.config_path.display()
-                ));
-            }
-
-            agent_config::yaml_add_cora(&mut config)?;
-
-            if opts.dry_run {
-                Ok(format!(
-                    "  {} {} — would write cora MCP server entry",
-                    "🔍 ".cyan(),
-                    agent.config_path.display()
-                ))
+            if opts.remove {
+                if !agent_config::yaml_has_cora(&config) {
+                    return Ok(format!(
+                        "  {} {} — no cora entry found",
+                        "⏭ ".dimmed(),
+                        agent.config_path.display()
+                    ));
+                }
+                agent_config::yaml_remove_cora(&mut config);
+                if opts.dry_run {
+                    Ok(format!(
+                        "  {} {} — would remove cora MCP server entry",
+                        "🔍 ".cyan(),
+                        agent.config_path.display()
+                    ))
+                } else {
+                    agent_config::write_yaml_config(&agent.config_path, &config)?;
+                    Ok(format!(
+                        "  {} {} — cora MCP server entry removed",
+                        "✓ ".green(),
+                        agent.config_path.display()
+                    ))
+                }
             } else {
-                agent_config::write_yaml_config(&agent.config_path, &config)?;
-                Ok(format!(
-                    "  {} {} — cora MCP server entry added",
-                    "✓ ".green(),
-                    agent.config_path.display()
-                ))
+                if agent_config::yaml_has_cora(&config) && !opts.force {
+                    return Ok(format!(
+                        "  {} {} — cora entry already exists (use --force to overwrite)",
+                        "⏭ ".dimmed(),
+                        agent.config_path.display()
+                    ));
+                }
+                agent_config::yaml_add_cora(&mut config)?;
+                if opts.dry_run {
+                    Ok(format!(
+                        "  {} {} — would write cora MCP server entry",
+                        "🔍 ".cyan(),
+                        agent.config_path.display()
+                    ))
+                } else {
+                    agent_config::write_yaml_config(&agent.config_path, &config)?;
+                    Ok(format!(
+                        "  {} {} — cora MCP server entry added",
+                        "✓ ".green(),
+                        agent.config_path.display()
+                    ))
+                }
             }
         }
     }
@@ -217,9 +287,17 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
         return Ok(lines.join("\n"));
     }
 
-    // Install mode
+    // Install or remove mode
+    let action = if opts.remove {
+        "Removing"
+    } else {
+        "Configuring"
+    };
+    let noun = if opts.remove { "from" } else { "for" };
     let mut lines = vec![format!(
-        "Configuring cora MCP for {} agent(s)…{}",
+        "{} cora MCP {} {} agent(s)…{}",
+        action,
+        noun,
         agents.len(),
         if opts.dry_run { " (dry run)" } else { "" }
     )];
@@ -230,8 +308,53 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
         lines.push(format!("{} {}", agent.name.bold(), result));
     }
 
+    // Post-install validation
+    if opts.validate && !opts.dry_run {
+        lines.push(String::new());
+        lines.push("Validating agent configs…".to_string());
+        let mut errors = 0;
+        for agent in &agents {
+            match agent.format {
+                ConfigFormat::Json | ConfigFormat::Jsonc => {
+                    if let Err(e) = validate_json_config(&agent.config_path) {
+                        lines.push(format!(
+                            "  {} {} — INVALID: {}",
+                            "✗ ".red(),
+                            agent.config_path.display(),
+                            e
+                        ));
+                        errors += 1;
+                    } else {
+                        lines.push(format!(
+                            "  {} {} — valid JSON",
+                            "✓ ".green(),
+                            agent.config_path.display()
+                        ));
+                    }
+                }
+                ConfigFormat::Yaml => {
+                    lines.push(format!(
+                        "  {} {} — skipped (YAML validation not implemented)",
+                        "⏭ ".dimmed(),
+                        agent.config_path.display()
+                    ));
+                }
+            }
+        }
+        if errors > 0 {
+            lines.push(format!(
+                "\n{} {errors} config(s) failed validation!",
+                "⚠ ".yellow()
+            ));
+        }
+    }
+
     lines.push(String::new());
-    lines.push("Done. Restart your AI agent to pick up the new MCP server.".to_string());
+    if opts.remove {
+        lines.push("Done. Restart your AI agent to pick up the changes.".to_string());
+    } else {
+        lines.push("Done. Restart your AI agent to pick up the new MCP server.".to_string());
+    }
 
     Ok(lines.join("\n"))
 }

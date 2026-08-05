@@ -485,6 +485,12 @@ enum Command {
         /// Install ALL detected agents (non-interactive)
         #[clap(long, short)]
         yes: bool,
+        /// Remove cora MCP entry from detected agents (uninstall)
+        #[clap(long)]
+        remove: bool,
+        /// Validate agent configs after install/remove
+        #[clap(long)]
+        validate: bool,
     },
 
     /// Detect dead code — functions/methods with no callers
@@ -1493,6 +1499,8 @@ async fn main() -> Result<()> {
             dry_run,
             force,
             yes,
+            remove,
+            validate,
         } => {
             let opts = commands::install::InstallOptions {
                 list,
@@ -1500,6 +1508,8 @@ async fn main() -> Result<()> {
                 dry_run,
                 force,
                 yes,
+                remove,
+                validate,
             };
             let output = commands::install::execute_install(&opts)?;
             println!("{output}");
