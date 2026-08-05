@@ -35,7 +35,7 @@ Scans your project, extracts symbol definitions (functions, structs, enums, trai
 |-----------|-----------|---------|
 | Symbol table (regex) | Regex extractors (15 languages) | SQLite FTS5 |
 | Symbol table (AST) | Tree-sitter grammars (12 languages, opt-in) | SQLite FTS5 |
-| Vector embeddings | Static token hashing (256d) | usearch HNSW index |
+| Vector embeddings | Static hashing (256d) or pretrained nomic (768d), runtime-selectable | usearch HNSW index |
 | Call graph | Regex scope tracking + tree-sitter AST edges | SQLite `edges` table |
 
 ```bash
@@ -151,16 +151,21 @@ The `signals` field shows which search signals matched: `"fts"`, `"vector"`, `"g
 
 #### Embedding Engine
 
-Phase 3 uses **static token embeddings** — a zero-dependency bag-of-tokens hashing method that produces 256-dimensional vectors. No model download, no GPU, no external service.
+Cora supports multiple embedding backends, selectable at runtime via `brain.embedding` in `.cora.yaml`. No recompilation needed to switch.
 
-| Property | Value |
-----------|-------|
-| Dimensions | 256 (fixed) |
-| Method | Bag-of-tokens hashing |
-| Dependencies | None (pure Rust) |
-| Quality | Good for near-duplicate detection and semantic grouping |
+| Backend | Dimensions | Method | Feature Flag | When to use |
+|---------|------------|--------|--------------|-------------|
+| `hashing` | 256 | Bag-of-tokens hashing | Always available | Zero-dependency, fast, good for near-duplicate detection |
+| `pretrained` | 768 | Nomic-embed-code distilled | `pretrained-embed` | Better semantic matching, real code embeddings |
+| `auto` (default) | — | Picks best available | — | Uses `pretrained` if compiled, falls back to `hashing` |
 
-Future phases will add optional higher-quality embedding models (see Roadmap).
+```yaml
+# .cora.yaml
+brain:
+  embedding: auto   # auto | hashing | pretrained
+```
+
+> **Note:** 256d and 768d embeddings cannot be mixed in the same index. Changing the backend requires `cora index --rebuild`. Future phases will add ONNX-based embedding models (see Roadmap).
 
 ## Call Graph Commands
 
@@ -284,12 +289,13 @@ All code intelligence features are available as MCP tools for AI coding agents:
 
 ```
 ~/.codecora/cora-code/
-├── graph.db              # SQLite database
+├── cora.db               # SQLite database (renamed from graph.db in v0.9)
 │   ├── projects         # One row per indexed project
 │   ├── symbols          # All symbols from all projects
 │   ├── symbols_fts      # FTS5 virtual table for keyword search
 │   ├── edges            # Call relationships (caller_id → callee_id)
-│   └── reviews          # Review history for tech debt tracking
+│   ├── reviews          # Review history for tech debt tracking
+│   └── findings         # Review findings + finding_events
 └── cora_index.usearch   # usearch HNSW vector index
     ├── cora_index.usearch.keys    # Key-to-symbol-id mapping
     └── cora_index.usearch.lock    # File lock (fs2)
@@ -304,7 +310,7 @@ cora index --rebuild
 
 ## Schema Versioning
 
-The database uses automatic migrations. Current schema version: **v6**.
+The database uses automatic migrations. Current schema version: **v7**.
 
 | Version | Changes |
 |---------|---------|
@@ -313,4 +319,5 @@ The database uses automatic migrations. Current schema version: **v6**.
 | v3 | Added `edges` table for call graph |
 | v4 | Added `embedding_tier`, `embedding_dims`, `embedding_model`, `last_embedded_at` to projects |
 | v5 | Added `reviews`, `findings`, `finding_events` tables for review history and findings tracking |
-| v6 | Added index config hash column for fingerprint invalidation on config changes |
+| v6 | Added index config hash column for fingerprint invalidation on config changes; rebuilt FTS5 with `file` column for camelCase search |
+| v7 | Added `embed_fingerprint TEXT` column to `symbols` for incremental per-symbol embedding |

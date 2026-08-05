@@ -123,6 +123,7 @@ Key configuration options:
 | `ignore` | File patterns and rules to skip |
 | `hook` | Pre-commit hook settings: mode, severity threshold, max diff size |
 | `llm` | LLM parameters: temperature, max_tokens, timeout |
+| `brain.embedding` | Embedding backend: `auto`, `hashing` (256d), or `pretrained` (768d) |
 
 ## Next Steps
 
@@ -131,6 +132,7 @@ Now that you have cora running, explore these topics to get the most out of it:
 - [Installation](./installation) — install options and shell completions
 - [Usage](./usage) — review modes, output formats, and configuration
 - [Configuration](./configuration) — full .cora.yaml reference, quality gate, security scanner, MCP server
+- [Code Intelligence](./code-intelligence) — symbol index, call graph, brain mode, embedding backends
 - [Providers](./providers) — setting up OpenAI, Anthropic, Groq, Ollama, and Z.AI
 - [CLI Reference](./cli-reference) — full command documentation
 - [Examples](./examples) — CI/CD setup for GitHub, GitLab, Gitea, Bitbucket

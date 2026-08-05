@@ -850,7 +850,18 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.6.1...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.13.0...develop
+[0.13.0]: https://github.com/codecoradev/cora-code/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/codecoradev/cora-code/compare/v0.11.1...v0.12.0
+[0.11.1]: https://github.com/codecoradev/cora-code/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/codecoradev/cora-code/compare/v0.9.0...v0.11.0
+[0.9.0]: https://github.com/codecoradev/cora-code/compare/v0.8.3...v0.9.0
+[0.8.3]: https://github.com/codecoradev/cora-code/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/codecoradev/cora-code/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/codecoradev/cora-code/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/codecoradev/cora-code/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/codecoradev/cora-code/compare/v0.6.2...v0.7.0
+[0.6.2]: https://github.com/codecoradev/cora-code/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/codecoradev/cora-code/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/codecoradev/cora-code/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/codecoradev/cora-code/compare/v0.4.6...v0.5.0
