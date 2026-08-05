@@ -215,10 +215,43 @@ fn node_name(node: &tree_sitter::Node, source: &str) -> String {
     if let Some(n) = node.child_by_field_name("name") {
         return node_text(&n, source);
     }
-    if let Some(n) =
-        find_child_by_kind(node, &["identifier", "type_identifier", "field_identifier"])
-    {
+    if let Some(n) = find_child_by_kind(
+        node,
+        &[
+            "identifier",
+            "type_identifier",
+            "field_identifier",
+            "name",
+            "qualified_name",
+        ],
+    ) {
         return node_text(&n, source);
+    }
+    String::new()
+}
+
+/// Find the first type_identifier or generic_type descendant in a node (for extends clauses).
+fn first_type_identifier(node: &tree_sitter::Node, source: &str) -> String {
+    let mut c = node.walk();
+    if c.goto_first_child() {
+        loop {
+            let n = c.node();
+            if n.kind() == "type_identifier"
+                || n.kind() == "generic_type"
+                || n.kind() == "identifier"
+            {
+                return node_text(&n, source);
+            }
+            // Recurse one level for nested expressions
+            if let Some(inner) =
+                find_child_by_kind(&n, &["type_identifier", "generic_type", "identifier"])
+            {
+                return node_text(&inner, source);
+            }
+            if !c.goto_next_sibling() {
+                break;
+            }
+        }
     }
     String::new()
 }
@@ -730,6 +763,99 @@ fn extract_typescript(
                 let name = node_name(node, source);
                 if !name.is_empty() {
                     let line = (node.start_position().row + 1) as u32;
+                    // Inheritance: class Foo extends Bar
+                    // tree-sitter-ts wraps extends/implements in class_heritage
+                    let heritage = find_child_by_kind(node, &["class_heritage"]);
+                    // Some grammars put extends_clause directly on class_declaration
+                    let extends_direct = find_child_by_kind(node, &["extends_clause"]);
+                    if let Some(heritage) = heritage {
+                        let mut hc = heritage.walk();
+                        if hc.goto_first_child() {
+                            loop {
+                                let hn = hc.node();
+                                if hn.kind() == "extends_clause" {
+                                    // First type_identifier in extends = parent class
+                                    let parent = first_type_identifier(&hn, source);
+                                    if !parent.is_empty() {
+                                        edges.push(AstEdge {
+                                            source: name.clone(),
+                                            kind: EdgeKind::Inherits,
+                                            target: parent,
+                                            file: file_path.to_string(),
+                                            line,
+                                        });
+                                    }
+                                } else if hn.kind() == "implements_clause" {
+                                    // All type_identifiers in implements = interfaces
+                                    let mut tc = hn.walk();
+                                    if tc.goto_first_child() {
+                                        loop {
+                                            if tc.node().kind() == "type_identifier"
+                                                || tc.node().kind() == "generic_type"
+                                                || tc.node().kind() == "identifier"
+                                            {
+                                                let iface = node_text(&tc.node(), source);
+                                                if !iface.is_empty() {
+                                                    edges.push(AstEdge {
+                                                        source: name.clone(),
+                                                        kind: EdgeKind::Implements,
+                                                        target: iface,
+                                                        file: file_path.to_string(),
+                                                        line,
+                                                    });
+                                                }
+                                            }
+                                            if !tc.goto_next_sibling() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if !hc.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    } else if let Some(extends_clause) = extends_direct {
+                        // Direct extends_clause (no class_heritage wrapper)
+                        let parent = first_type_identifier(&extends_clause, source);
+                        if !parent.is_empty() {
+                            edges.push(AstEdge {
+                                source: name.clone(),
+                                kind: EdgeKind::Inherits,
+                                target: parent,
+                                file: file_path.to_string(),
+                                line,
+                            });
+                        }
+                        // Also check for implements_clause sibling
+                        if let Some(impl_clause) = find_child_by_kind(node, &["implements_clause"])
+                        {
+                            let mut tc = impl_clause.walk();
+                            if tc.goto_first_child() {
+                                loop {
+                                    if tc.node().kind() == "type_identifier"
+                                        || tc.node().kind() == "generic_type"
+                                        || tc.node().kind() == "identifier"
+                                    {
+                                        let iface = node_text(&tc.node(), source);
+                                        if !iface.is_empty() {
+                                            edges.push(AstEdge {
+                                                source: name.clone(),
+                                                kind: EdgeKind::Implements,
+                                                target: iface,
+                                                file: file_path.to_string(),
+                                                line,
+                                            });
+                                        }
+                                    }
+                                    if !tc.goto_next_sibling() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     nodes.push(AstNode {
                         name: name.clone(),
                         kind: SymbolKind::Class,
@@ -2019,6 +2145,46 @@ fn extract_php(
                 let name = node_name(node, source);
                 if !name.is_empty() {
                     let line = (node.start_position().row + 1) as u32;
+                    // Inheritance: class Foo extends Bar
+                    // PHP grammar uses base_clause child (no "superclass" field)
+                    if let Some(base) = find_child_by_kind(node, &["base_clause"]) {
+                        let parent = node_name(&base, source);
+                        if !parent.is_empty() {
+                            edges.push(AstEdge {
+                                source: name.clone(),
+                                kind: EdgeKind::Inherits,
+                                target: parent,
+                                file: file_path.to_string(),
+                                line,
+                            });
+                        }
+                    }
+                    // Interfaces: class Foo implements Bar, Baz
+                    // PHP grammar uses class_interface_clause child
+                    if let Some(ifaces) = find_child_by_kind(node, &["class_interface_clause"]) {
+                        let mut ic = ifaces.walk();
+                        if ic.goto_first_child() {
+                            loop {
+                                let cn = ic.node();
+                                // PHP interface names are `name` or `qualified_name` nodes
+                                if cn.kind() == "name" || cn.kind() == "qualified_name" {
+                                    let iface = node_text(&cn, source);
+                                    if !iface.is_empty() {
+                                        edges.push(AstEdge {
+                                            source: name.clone(),
+                                            kind: EdgeKind::Implements,
+                                            target: iface,
+                                            file: file_path.to_string(),
+                                            line,
+                                        });
+                                    }
+                                }
+                                if !ic.goto_next_sibling() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     nodes.push(AstNode {
                         name: name.clone(),
                         kind: SymbolKind::Class,
@@ -2146,6 +2312,25 @@ fn extract_scala(
                     } else {
                         SymbolKind::Class
                     };
+                    // Inheritance and trait mixing: class Foo extends Bar with Baz
+                    if let Some(extends_clause) = find_child_by_kind(node, &["extends_clause"]) {
+                        // First type = parent class (Inherits)
+                        if let Some(base) = find_child_by_kind(
+                            &extends_clause,
+                            &["type_identifier", "generic_type", "class_type"],
+                        ) {
+                            let parent = node_text(&base, source);
+                            if !parent.is_empty() {
+                                edges.push(AstEdge {
+                                    source: name.clone(),
+                                    kind: EdgeKind::Inherits,
+                                    target: parent,
+                                    file: file_path.to_string(),
+                                    line,
+                                });
+                            }
+                        }
+                    }
                     nodes.push(AstNode {
                         name: name.clone(),
                         kind,
@@ -2525,6 +2710,90 @@ export const processForm = (data: string) => {
             names.contains(&"inline"),
             "inline script function should be extracted, got: {:?}",
             names
+        );
+    }
+
+    // ─── Edge extraction tests (#437) ───────────────────────────────
+
+    #[test]
+    fn test_extract_typescript_class_extends() {
+        let code = r#"class Dog extends Animal {
+    bark() { return; }
+}"#;
+        let (_nodes, edges) = extract(code, "ts", "dog.ts");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Inherits && e.source == "Dog" && e.target == "Animal"),
+            "expected Dog -> Animal Inherits edge, got edges: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn test_extract_typescript_class_implements() {
+        let code = r#"class Repository implements Comparable, Serializable {
+    compare() { return 0; }
+}"#;
+        let (_nodes, edges) = extract(code, "ts", "repo.ts");
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::Implements
+                && e.source == "Repository"
+                && e.target == "Comparable"),
+            "expected Repository -> Comparable Implements edge, got: {:?}",
+            edges
+        );
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::Implements
+                && e.source == "Repository"
+                && e.target == "Serializable"),
+            "expected Repository -> Serializable Implements edge, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn test_extract_php_class_extends() {
+        let code = r#"<?php
+class Dog extends Animal {
+    public function bark() { return; }
+}"#;
+        let (_nodes, edges) = extract(code, "php", "dog.php");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Inherits && e.source == "Dog" && e.target == "Animal"),
+            "expected Dog -> Animal Inherits edge, got edges: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn test_extract_php_class_implements() {
+        let code = r#"<?php
+class Repository implements Comparable, Serializable {
+    public function compare() { return 0; }
+}"#;
+        let (_nodes, edges) = extract(code, "php", "repo.php");
+        assert!(
+            edges.iter().any(|e| e.kind == EdgeKind::Implements
+                && e.source == "Repository"
+                && e.target == "Comparable"),
+            "expected Repository -> Comparable Implements edge, got: {:?}",
+            edges
+        );
+    }
+
+    #[test]
+    fn test_extract_scala_class_extends() {
+        let code = "class Dog extends Animal {\n  def bark(): Unit = {}\n}";
+        let (_nodes, edges) = extract(code, "scala", "dog.scala");
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Inherits && e.source == "Dog" && e.target == "Animal"),
+            "expected Dog -> Animal Inherits edge, got edges: {:?}",
+            edges
         );
     }
 }
