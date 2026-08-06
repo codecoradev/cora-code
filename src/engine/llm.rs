@@ -198,6 +198,11 @@ CRITICAL CONSTRAINTS:
    When in doubt, downgrade severity rather than omitting — a borderline concern is a valid minor/info finding.
 4. Common patterns to always check: unvalidated inputs, missing error handling, resource leaks, race conditions, off-by-one errors, unchecked edge cases.
 
+LANGUAGE-SPECIFIC FALSE POSITIVE AWARENESS:
+- In Rust, `Vec::retain()`, `Vec::append()`, `Vec::retain_mut()`, `Vec::splice()`, `Vec::dedup()`, `Vec::sort()`, `Vec::sort_by()` mutate the vector IN-PLACE. Do NOT flag code as "missing assignment" or "result ignored" when these methods are called — the mutation is the intended side effect.
+- In Rust, `Err` arms that return early (e.g. `Err(e) => return error_response(...)`) are ERROR HANDLING paths. Do NOT flag them for missing post-conditions (like "filter not applied") — no data flows through error paths.
+- In general, distinguish happy paths from error/early-return paths. Post-conditions (filters, transformations, validations) only need to hold on the happy path, not on every match arm.
+
 SEVERITY LEVELS:
 - "critical": Security vulnerabilities, crashes, data loss, breaking bugs
 - "major": Bugs that affect functionality, logic errors, missing error handling, significant problems
