@@ -59,6 +59,19 @@ pub struct Config {
     /// Brain Mode configuration — embedding backend selection.
     #[serde(default, skip_serializing_if = "is_default")]
     pub brain: BrainConfig,
+    /// Enable background update check on startup (default: true).
+    #[serde(default = "default_update_check", skip_serializing_if = "is_true")]
+    pub update_check: bool,
+}
+
+/// Default value for `update_check` config field.
+fn default_update_check() -> bool {
+    true
+}
+
+/// serde helper: skip serializing when value is `true` (the default).
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Provider configuration.
@@ -145,6 +158,7 @@ impl Default for Config {
             profile: None,
             analysis: AnalysisConfig::default(),
             brain: BrainConfig::default(),
+            update_check: true,
         }
     }
 }

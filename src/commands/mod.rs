@@ -15,5 +15,7 @@ pub mod review;
 pub mod routes;
 pub mod scan;
 pub mod serve;
+pub mod update_check;
+pub mod upgrade;
 pub mod upload;
 pub mod watch;

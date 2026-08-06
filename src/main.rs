@@ -545,6 +545,17 @@ enum Command {
 
     /// Start MCP server with auto-reindex on startup
     Serve,
+
+    /// Check for updates and self-upgrade the cora binary
+    Upgrade {
+        /// Skip confirmation prompt (useful for CI/automation)
+        #[clap(long)]
+        yes: bool,
+
+        /// Only check if an update is available, do not download
+        #[clap(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -660,6 +671,14 @@ async fn main() -> Result<()> {
     // Handle --no-color
     if cli.global.no_color {
         colored::control::set_override(false);
+    }
+
+    // Background update check (non-blocking, cached 24h).
+    // Skip for `upgrade` command itself and when `--no-update-check` is set.
+    let skip_update_check = matches!(cli.command, Command::Upgrade { .. })
+        || std::env::var("CORA_NO_UPDATE_CHECK").map(|v| v == "1" || v == "true").unwrap_or(false);
+    if !skip_update_check {
+        commands::update_check::spawn_background_check(true);
     }
 
     // Dispatch based on subcommand
@@ -1636,6 +1655,9 @@ async fn main() -> Result<()> {
         Command::Serve => {
             commands::serve::execute_serve()?;
             0
+        }
+        Command::Upgrade { yes, check } => {
+            commands::upgrade::run(yes, check).await?
         }
     };
 
