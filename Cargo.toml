@@ -74,6 +74,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 usearch = "2"
 fs2 = "0.4"
 
+# Self-update (upgrade command)
+flate2 = "1"
+tar = "0.4"
+
 # Tree-sitter AST parsing (optional — enable with --features tree-sitter)
 tree-sitter = { version = "0.26", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
