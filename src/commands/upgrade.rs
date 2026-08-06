@@ -28,7 +28,10 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("{} Cannot determine current binary path: {e}", "[ERROR]".red());
+            eprintln!(
+                "{} Cannot determine current binary path: {e}",
+                "[ERROR]".red()
+            );
             eprintln!("        If installed via cargo, run: cargo install --path .");
             return Ok(1);
         }
@@ -52,7 +55,10 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
 
     // Check if already up to date
     if latest_clean == current_version {
-        println!("{} Already up to date ({current_version})", "[INFO]".green());
+        println!(
+            "{} Already up to date ({current_version})",
+            "[INFO]".green()
+        );
         return Ok(0);
     }
 
@@ -113,7 +119,8 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
         }
     };
 
-    fs::write(&archive_path, &archive_bytes).map_err(|e| anyhow::anyhow!("Failed to write archive: {e}"))?;
+    fs::write(&archive_path, &archive_bytes)
+        .map_err(|e| anyhow::anyhow!("Failed to write archive: {e}"))?;
 
     // Verify checksum
     let checksums_url = format!(
@@ -168,12 +175,18 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
     }
 
     // Verify archive integrity (path traversal check)
-    let file = fs::File::open(&archive_path).map_err(|e| anyhow::anyhow!("Failed to open archive: {e}"))?;
+    let file = fs::File::open(&archive_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open archive: {e}"))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
-    for entry in archive.entries().map_err(|e| anyhow::anyhow!("Failed to read archive entries: {e}"))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| anyhow::anyhow!("Failed to read archive entries: {e}"))?
+    {
         let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read archive entry: {e}"))?;
-        let path = entry.path().map_err(|e| anyhow::anyhow!("Archive path error: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| anyhow::anyhow!("Archive path error: {e}"))?;
         let path_str = path.to_string_lossy();
         if path_str.starts_with('/') || path_str.contains("..") {
             let _ = fs::remove_dir_all(&temp_dir);
@@ -188,10 +201,13 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
 
     // Extract
     println!("{} Extracting ...", "[INFO]".green());
-    let file = fs::File::open(&archive_path).map_err(|e| anyhow::anyhow!("Failed to open archive: {e}"))?;
+    let file = fs::File::open(&archive_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open archive: {e}"))?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
-    archive.unpack(&temp_dir).map_err(|e| anyhow::anyhow!("Failed to extract archive: {e}"))?;
+    archive
+        .unpack(&temp_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to extract archive: {e}"))?;
 
     // Find and replace binary
     let extracted_binary = temp_dir.join(BINARY_NAME);
@@ -210,15 +226,21 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
 
     // Copy to temp file first, then rename (atomic on POSIX)
     let temp_new = install_dir.join(format!("{BINARY_NAME}.new"));
-    fs::copy(&extracted_binary, &temp_new).map_err(|e| anyhow::anyhow!("Failed to copy new binary: {e}"))?;
+    fs::copy(&extracted_binary, &temp_new)
+        .map_err(|e| anyhow::anyhow!("Failed to copy new binary: {e}"))?;
 
     // Verify the new binary runs
-    match std::process::Command::new(&temp_new).arg("--version").output() {
+    match std::process::Command::new(&temp_new)
+        .arg("--version")
+        .output()
+    {
         Ok(output) if output.status.success() => {
             let new_version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let extracted_version =
-                new_version.split_whitespace().nth(1).unwrap_or("unknown");
-            println!("{} Verified new binary: {extracted_version}", "[INFO]".green());
+            let extracted_version = new_version.split_whitespace().nth(1).unwrap_or("unknown");
+            println!(
+                "{} Verified new binary: {extracted_version}",
+                "[INFO]".green()
+            );
         }
         Ok(output) => {
             let _ = fs::remove_file(&temp_new);
@@ -239,7 +261,8 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
     }
 
     // Atomic rename
-    fs::rename(&temp_new, &current_exe).map_err(|e| anyhow::anyhow!("Failed to replace binary: {e}"))?;
+    fs::rename(&temp_new, &current_exe)
+        .map_err(|e| anyhow::anyhow!("Failed to replace binary: {e}"))?;
 
     // Cleanup
     let _ = fs::remove_dir_all(&temp_dir);
@@ -364,4 +387,3 @@ fn sha256_file(path: &PathBuf) -> anyhow::Result<String> {
     io::copy(&mut file, &mut hasher).map_err(|e| anyhow::anyhow!("Failed to read file: {e}"))?;
     Ok(format!("{:x}", hasher.finalize()))
 }
-

@@ -676,7 +676,9 @@ async fn main() -> Result<()> {
     // Background update check (non-blocking, cached 24h).
     // Skip for `upgrade` command itself and when `--no-update-check` is set.
     let skip_update_check = matches!(cli.command, Command::Upgrade { .. })
-        || std::env::var("CORA_NO_UPDATE_CHECK").map(|v| v == "1" || v == "true").unwrap_or(false);
+        || std::env::var("CORA_NO_UPDATE_CHECK")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
     if !skip_update_check {
         commands::update_check::spawn_background_check(true);
     }
@@ -1656,9 +1658,7 @@ async fn main() -> Result<()> {
             commands::serve::execute_serve()?;
             0
         }
-        Command::Upgrade { yes, check } => {
-            commands::upgrade::run(yes, check).await?
-        }
+        Command::Upgrade { yes, check } => commands::upgrade::run(yes, check).await?,
     };
 
     std::process::exit(exit_code);

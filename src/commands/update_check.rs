@@ -66,17 +66,9 @@ pub fn spawn_background_check(enabled: bool) {
 fn print_update_banner(latest: &str) {
     let current = env!("CARGO_PKG_VERSION");
     eprintln!();
-    eprintln!(
-        "  ⚠ Update available: {}  (currently {})",
-        latest, current
-    );
-    eprintln!(
-        "    Run `cora upgrade` to update."
-    );
-    eprintln!(
-        "    https://github.com/{}/releases/tag/{}",
-        REPO, latest
-    );
+    eprintln!("  ⚠ Update available: {}  (currently {})", latest, current);
+    eprintln!("    Run `cora upgrade` to update.");
+    eprintln!("    https://github.com/{}/releases/tag/{}", REPO, latest);
     eprintln!();
 }
 
@@ -90,10 +82,7 @@ fn read_cache() -> Option<UpdateCache> {
     let cache: UpdateCache = serde_json::from_str(&content).ok()?;
 
     // Check freshness
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
 
     if now.saturating_sub(cache.checked_at) > CACHE_TTL_SECS {
         return None; // Expired
