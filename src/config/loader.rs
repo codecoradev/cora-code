@@ -54,7 +54,7 @@ pub fn find_cora_file(start: &Path) -> std::result::Result<Option<(PathBuf, Cora
     }
 }
 
-/// Load the global config from `~/.cora/config.yaml`.
+/// Load the global config from `~/.codecora/cora-code/config.yaml`.
 /// Returns `None` if the file doesn't exist or can't be parsed.
 fn load_global_config() -> std::result::Result<Option<CoraFile>, CoraError> {
     let dir = cora_dir()?;
@@ -69,9 +69,9 @@ fn load_global_config() -> std::result::Result<Option<CoraFile>, CoraError> {
     Ok(Some(cora))
 }
 
-/// Migrate old `~/.cora/config.toml` to the new format if it exists.
-/// - Non-secret keys → `~/.cora/config.yaml`
-/// - `api_key` → `~/.cora/auth.toml`
+/// Migrate old `config.toml` to the new format if it exists.
+/// - Non-secret keys → `config.yaml`
+/// - `api_key` → `auth.toml`
 /// - Delete the old file after successful migration.
 /// - Creates `.migrated` marker to prevent re-running.
 #[allow(
@@ -216,7 +216,7 @@ fn migrate_old_config() {
     } else {
         // Create marker to prevent re-running migration
         let _ = std::fs::write(dir.join(MIGRATION_MARKER), "");
-        debug!("migrated ~/.cora/config.toml to new format");
+        debug!("migrated config.toml to new format");
     }
 }
 
@@ -256,7 +256,7 @@ pub fn load_config(
         debug!("provider migration failed: {}", e);
     });
 
-    // 1. Load global config (~/.cora/config.yaml)
+    // 1. Load global config (~/.codecora/cora-code/config.yaml)
     if let Some(cora) = load_global_config()? {
         cora.merge_into(&mut config)?;
     }
@@ -307,13 +307,13 @@ pub fn load_config(
 }
 
 /// Build an `LLMConfig` from the resolved `Config`, fetching the API key
-/// from: CLI flag / CORA_API_KEY env → ~/.cora/auth.toml → provider-specific env vars.
+/// from: CLI flag / CORA_API_KEY env → ~/.codecora/cora-code/auth.toml → provider-specific env vars.
 ///
 /// If none of those are set, auto-detect from known provider env vars (`OPENAI_API_KEY`, etc.)
 /// and configure `provider/model/base_url` from the matching preset.
 ///
 /// Provider/model/base_url resolution:
-///   CORA_* env vars > .cora.yaml (project) > ~/.cora/config.yaml (global) > auto-detect > defaults
+///   CORA_* env vars > .cora.yaml (project) > ~/.codecora/cora-code/config.yaml (global) > auto-detect > defaults
 pub fn build_llm_config(
     config: &Config,
     cli_api_key: Option<&str>,
@@ -408,14 +408,90 @@ pub fn build_llm_config(
     })
 }
 
-/// Get the cora config directory: ~/.cora/
+/// Get the cora config/data directory.
+///
+/// Returns `~/.codecora/cora-code/` (or `CODECORA_HOME` override).
+/// On first call, migrates files from legacy `~/.cora/` if the new directory is empty.
+///
+/// ```text
+/// Default:           $HOME/.codecora/cora-code/
+/// CODECORA_HOME set: $CODECORA_HOME/cora-code/
+/// ```
 pub fn cora_dir() -> std::result::Result<PathBuf, CoraError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| CoraError::ConfigRead("cannot determine home directory".into()))?;
-    Ok(home.join(".cora"))
+    let new_dir = crate::data_dir::cora_data_dir();
+
+    // One-time migration from legacy ~/.cora/ → ~/.codecora/cora-code/
+    migrate_legacy_cora_dir(&new_dir);
+
+    Ok(new_dir)
 }
 
-/// Read the stored API key from ~/.cora/auth.toml.
+/// Migrate files from legacy `~/.cora/` to the new `~/.codecora/cora-code/` directory.
+///
+/// Runs only once — a `.migrated` marker file prevents re-running.
+/// Does NOT delete old files; users can clean up manually.
+fn migrate_legacy_cora_dir(new_dir: &std::path::Path) {
+    let marker = new_dir.join(".migrated-to-codecora");
+    if marker.is_file() {
+        return;
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let old_dir = home.join(".cora");
+    if !old_dir.is_dir() {
+        return;
+    }
+
+    // Ensure new directory exists
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        debug!("skip migration, cannot create new dir: {e}");
+        return;
+    }
+
+    // Files to migrate (copy, don't move — user can clean up old ones)
+    let files_to_migrate = ["config.yaml", "auth.toml", "config.toml"];
+    let mut migrated_any = false;
+
+    for filename in &files_to_migrate {
+        let old_path = old_dir.join(filename);
+        let new_path = new_dir.join(filename);
+
+        if old_path.is_file() && !new_path.exists() {
+            match std::fs::copy(&old_path, &new_path) {
+                Ok(_) => {
+                    debug!("migrated {filename} from ~/.cora/ to ~/.codecora/cora-code/");
+                    migrated_any = true;
+                }
+                Err(e) => {
+                    debug!("failed to migrate {filename}: {e}");
+                }
+            }
+        }
+    }
+
+    // Migrate old marker so we don't re-run the TOML→YAML migration
+    let old_marker = old_dir.join(".migrated");
+    if old_marker.is_file() {
+        let new_marker = new_dir.join(".migrated");
+        if !new_marker.exists() {
+            let _ = std::fs::copy(&old_marker, &new_marker);
+        }
+    }
+
+    // Write our marker so this migration never runs again
+    let _ = std::fs::write(&marker, "1");
+
+    if migrated_any {
+        eprintln!(
+            "ℹ️  Migrated cora config from ~/.cora/ to ~/.codecora/cora-code/. \
+             Old files are kept as backup — safe to remove after verifying."
+        );
+    }
+}
+
+/// Read the stored API key from auth.toml.
 pub fn load_api_key_from_auth_file() -> std::result::Result<Option<String>, CoraError> {
     let dir = cora_dir()?;
     let path = dir.join(AUTH_FILENAME);
@@ -468,7 +544,7 @@ pub fn load_api_key_from_auth_file() -> std::result::Result<Option<String>, Cora
     Ok(key)
 }
 
-/// Save an API key to ~/.cora/auth.toml.
+/// Save an API key to auth.toml.
 pub fn save_api_key(key: &str) -> std::result::Result<(), CoraError> {
     let dir = cora_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| CoraError::AuthError(e.to_string()))?;
@@ -507,7 +583,7 @@ pub fn save_api_key(key: &str) -> std::result::Result<(), CoraError> {
     Ok(())
 }
 
-/// Remove the stored API key from ~/.cora/auth.toml.
+/// Remove the stored API key from auth.toml.
 pub fn remove_api_key() -> std::result::Result<(), CoraError> {
     let dir = cora_dir()?;
     let path = dir.join(AUTH_FILENAME);
@@ -528,7 +604,7 @@ pub fn auth_status() -> std::result::Result<AuthStatus, CoraError> {
             has_key: true,
         });
     }
-    // ~/.cora/auth.toml
+    // auth.toml in cora_data_dir
     if load_api_key_from_auth_file()?.is_some() {
         let dir = cora_dir()?;
         return Ok(AuthStatus {
@@ -556,7 +632,7 @@ pub struct ProviderInfo {
     pub model: String,
 }
 
-/// Save provider info (name, base_url, model) to `~/.cora/config.yaml`
+/// Save provider info (name, base_url, model) to config.yaml
 /// (global config, not secrets).
 pub fn save_provider_info(
     provider: &str,
@@ -675,7 +751,7 @@ fn migrate_provider_info_from_auth() -> std::result::Result<(), CoraError> {
     Ok(())
 }
 
-/// Load stored provider info from `~/.cora/config.yaml`.
+/// Load stored provider info from config.yaml.
 /// Returns `None` if no provider info is stored.
 pub fn load_provider_info() -> std::result::Result<Option<ProviderInfo>, CoraError> {
     // Migrate auth.toml provider info → config.yaml if needed
@@ -736,7 +812,7 @@ pub fn load_provider_info() -> std::result::Result<Option<ProviderInfo>, CoraErr
     }))
 }
 
-/// Remove stored provider info from `~/.cora/config.yaml`
+/// Remove stored provider info from config.yaml
 /// while keeping other settings.
 pub fn remove_provider_info() -> std::result::Result<(), CoraError> {
     let dir = cora_dir()?;
