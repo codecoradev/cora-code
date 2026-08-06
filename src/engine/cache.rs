@@ -6,11 +6,71 @@ use tracing::debug;
 
 use crate::engine::types::ReviewResponse;
 
-/// Get the cache directory: ~/.cache/cora/reviews/
+/// Get the cache directory: ~/.codecora/cora-code/cache/reviews/
 fn cache_dir() -> std::result::Result<PathBuf, CoraError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| CoraError::ConfigRead("cannot determine home directory".into()))?;
-    Ok(home.join(".cache").join("cora").join("reviews"))
+    let dir = crate::data_dir::cora_data_dir()
+        .join("cache")
+        .join("reviews");
+
+    // One-time migration from legacy ~/.cache/cora/reviews/
+    migrate_legacy_cache_dir(&dir);
+
+    Ok(dir)
+}
+
+/// Migrate review cache from legacy `~/.cache/cora/reviews/` to the new location.
+fn migrate_legacy_cache_dir(new_dir: &std::path::Path) {
+    let marker = new_dir
+        .parent()
+        .map(|p| p.join(".migrated-to-codecora"))
+        .unwrap_or_else(|| new_dir.join(".migrated-to-codecora"));
+    if marker.is_file() {
+        return;
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let old_dir = home.join(".cache").join("cora").join("reviews");
+    if !old_dir.is_dir() {
+        // No legacy cache — write marker so we never check again
+        let _ = std::fs::create_dir_all(new_dir);
+        let _ = std::fs::write(&marker, "1");
+        return;
+    }
+
+    // Ensure new directory exists
+    if let Err(e) = std::fs::create_dir_all(new_dir) {
+        debug!("skip cache migration, cannot create new dir: {e}");
+        return;
+    }
+
+    // Move all .json cache files
+    let entries = match std::fs::read_dir(&old_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let filename = path.file_name().unwrap_or_default();
+            let new_path = new_dir.join(filename);
+            if !new_path.exists() && std::fs::rename(&path, &new_path).is_ok() {
+                count += 1;
+            }
+        }
+    }
+
+    // Write marker
+    let _ = std::fs::write(&marker, "1");
+
+    if count > 0 {
+        debug!(
+            "migrated {count} cache files from ~/.cache/cora/reviews/ to ~/.codecora/cora-code/cache/reviews/"
+        );
+    }
 }
 
 /// Compute SHA-256 hex digest of the diff content + config parameters.
