@@ -7,7 +7,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/codecoradev/cora-code?style=social)](https://github.com/codecoradev/cora-code/stargazers)
 [![CI](https://github.com/codecoradev/cora-code/actions/workflows/ci.yml/badge.svg)](https://github.com/codecoradev/cora-code/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/cora-code.svg)](https://crates.io/crates/cora-code)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 
 </div>
