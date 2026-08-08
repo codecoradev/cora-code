@@ -7,7 +7,7 @@ Bring Your Own Keys (BYOK) — no managed API, no cloud service. Runs locally ag
 diffs, scans, or branches. Includes a built-in symbol index, call graph, and hybrid
 semantic search engine (Brain Mode).
 
-- **License:** MIT
+- **License:** Apache-2.0
 - **Edition:** Rust 2024 (MSRV 1.85)
 - **Repo:** `codecoradev/cora-code`
 - **Default branch:** `develop`
@@ -457,7 +457,7 @@ When submitting cora to directories, aggregators, or showcases (Trendshift, etc.
 - CI checks (10)
 - GitHub Marketplace action published
 - MCP server with 15 tools
-- MIT license
+- Apache-2.0 license
 - Active development cadence
 
 ### Pre-Submission Checks
