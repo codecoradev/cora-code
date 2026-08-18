@@ -239,6 +239,8 @@ review:
 - Layered repo (handler/service/repository split) where bugs manifest several layers from the root cause → `3` for that repo's `.cora.yaml`.
 - Want *precision* rather than *reach* → keep `2` and rely on `cora impact` interactively with `--depth` to explore specific symbols on demand.
 
+> **Note:** `impact_depth` only governs the *automatic* blast-radius context injected during `cora review`. The interactive `cora impact` / `cora trace` commands default to `--depth 3` and are unaffected by this setting.
+
 ## Quality Gate
 
 Quality gate evaluates review findings against configurable thresholds to produce a **PASS/FAIL** result. This is useful for CI enforcement — block merges when code quality drops below your standards.
