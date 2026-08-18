@@ -90,6 +90,13 @@ Complete command reference for the cora CLI.
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |
 
+Scan notes:
+
+- **Deterministic index findings** — when a symbol index exists, `cora scan` adds no-LLM findings (unused imports, dead code) from the index alongside LLM results.
+- **Brain context** — with `review.context_chain.use_brain: true`, scan batches are enriched with the same symbol-index intelligence as review (impact analysis, affected tests, semantic search).
+- **Persistence** — scan results are persisted to the global `cora.db` and fingerprinted; findings from previous scans that no longer reproduce are auto-resolved.
+- **Exit code 2** — also returned when `hook.mode: block` and a finding exceeds `hook.min_severity`.
+
 ### Code Intelligence
 
 See [Code Intelligence](./code-intelligence) for detailed usage.

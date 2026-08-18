@@ -86,9 +86,9 @@ quality_gate:
     max_security: 0
 
 bundling:
-  max_chars_per_group: 12000
+  max_chars_per_group: 60000
   max_files_per_group: 20
-  strategy: directory        # directory | language
+  strategy: smart            # smart | flat
   coalesce_by_directory: true
   coalesce_by_language: true
 
@@ -217,7 +217,7 @@ review:
 | `max_context_tokens` | `5000` | Approx. 20 KB of code injected. |
 | `follow_depth` | `1` | Outbound recursion depth (`1` = direct references). |
 | `include_tests` | `true` | Map changed source to its test files. |
-| `include_callers` | `true` | Inbound caller resolution. Scans source files (gitignore-aware — `target/`, `node_modules/` are never scanned), bounded to ≤400 files and ≤3 call-sites per symbol. |
+| `include_callers` | `true` | Inbound caller resolution. When the symbol index is unavailable (regex fallback): gitignore-aware file scan bounded to ≤400 files and ≤3 call-sites per symbol. When the index is available (default path, `prefer_index: true`): up to 20 call-sites per symbol, filtered by `ignore.files` patterns. |
 | `use_brain` | `true` | Enrich prompt with symbol-index intelligence (impact analysis, affected tests, semantic search). Only active when `cora index` has been run. |
 | `impact_depth` | `2` | Blast-radius traversal depth. See [Impact depth guidance](#impact-depth-guidance) below. |
 | `prefer_index` | `true` | Prefer symbol index (FTS5 + call graph) over regex scanning for outbound resolution. |
@@ -432,7 +432,7 @@ Write your own regex-based rules in `.cora.yaml`:
 rules:
   - id: no-unwrap
     pattern: "\\.unwrap\\(\\)"
-    severity: warning
+    severity: minor
     message: "Avoid unwrap() in production code — use proper error handling"
     languages: ["rust"]
     exclude: ["tests/**"]
@@ -547,7 +547,7 @@ review:
 
 ## Bundling
 
-Control how multiple files are grouped into LLM batches during `cora scan`. Cora automatically chunks large file sets into groups that fit within provider token limits.
+> **Deprecation notice:** as of the current release, `cora scan` does **not** read this section — batch sizing is governed by `--batch-files` (default 20) and an internal ~60,000-character batch budget. These keys are parsed but have no effect on `cora scan`. They are kept for backward compatibility; do not rely on them.
 
 ```yaml
 bundling:
