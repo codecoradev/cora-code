@@ -202,6 +202,20 @@ cora trace --json                     # JSON output
 
 Requires schema v3 edges table. When built with `--features tree-sitter`, Cora uses AST-based edge extraction for more accurate call graphs. Regex-only builds still generate edges via scope tracking.
 
+### Call Graph Semantics & Limitations
+
+**Cross-file and multi-level.** The call graph is stored per-edge with file and line, and `impact`/`trace` traverse it with BFS plus cycle protection. A caller three abstraction layers away from the symbol — through any number of intermediate files — is reachable by raising `--depth` (see [Impact Depth Guidance](/configuration#impact-depth-guidance)).
+
+**Cross-project fallback.** If a symbol has no callers in the current project's scope, `cora callers` automatically falls back to a lookup across **all indexed projects** and reports which project each match came from. Useful when a symbol is defined in one repo and consumed from another (e.g. a shared crate consumed via workspace or git dependency).
+
+**Static analysis — what it cannot see.** Edges are extracted statically, so they can be missing for:
+
+- **Dynamic dispatch** — trait objects (`dyn Trait`), virtual/interface calls. The concrete callee is only known at runtime.
+- **Callbacks and function pointers** — a function passed as an argument and invoked elsewhere has no direct edge to its eventual call-site.
+- **Reflection / string-based dispatch** — unresolvable statically by definition.
+
+In these cases the traversal chain can end early, and `cora impact` may under-report the blast radius. For dynamic-dispatch-heavy code, treat the call graph as a lower bound and confirm with tests or manual tracing.
+
 ```bash
 # Build with tree-sitter for best call graph accuracy
 cargo install --git https://github.com/codecoradev/cora-code --features tree-sitter
