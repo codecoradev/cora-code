@@ -33,8 +33,8 @@ Scans your project, extracts symbol definitions (functions, structs, enums, trai
 
 | Component | Technology | Storage |
 |-----------|-----------|---------|
-| Symbol table (regex) | Regex extractors (15 languages) | SQLite FTS5 |
-| Symbol table (AST) | Tree-sitter grammars (12 languages, opt-in) | SQLite FTS5 |
+| Symbol table (regex) | Regex extractors (18 languages) | SQLite FTS5 |
+| Symbol table (AST) | Tree-sitter grammars (12+ languages, enabled by default) | SQLite FTS5 |
 | Vector embeddings | Static hashing (256d) or pretrained nomic (768d), runtime-selectable | usearch HNSW index |
 | Call graph | Regex scope tracking + tree-sitter AST edges | SQLite `edges` table |
 
@@ -48,7 +48,7 @@ cora index --prune     # Remove symbols from deleted files
 
 ### Supported Languages
 
-Cora extracts symbols using two strategies — **regex** (always available) and **tree-sitter AST** (opt-in via `--features tree-sitter` at build time):
+Cora extracts symbols using two strategies — **regex** (always available) and **tree-sitter AST** (enabled by default in release builds; can be disabled at build time):
 
 | | Regex Extraction | AST (Tree-sitter) |
 |--|-----------------|-------------------|
@@ -71,7 +71,7 @@ Cora extracts symbols using two strategies — **regex** (always available) and 
 | **Lua** | ✅ | — |
 | **Zig** | ✅ | — |
 
-**Regex-only** languages work out of the box. For **AST-accurate** extraction (full call graph, precise imports/exports), build with tree-sitter:
+**Regex-only** languages work out of the box. Tree-sitter AST extraction is **enabled by default** in normal builds (`default = ["tree-sitter"]` in `Cargo.toml`); only minimal/no-default-feature builds fall back to regex-only. To explicitly enable it:
 
 ```bash
 cargo install --git https://github.com/codecoradev/cora-code --features tree-sitter
@@ -83,7 +83,7 @@ All projects share a **single global database**:
 
 ```
 ~/.codecora/cora-code/
-├── graph.db              # SQLite — symbols, FTS5 index, call edges
+├── cora.db               # SQLite — symbols, FTS5 index, call edges
 └── cora_index.usearch   # usearch HNSW — 256d vector embeddings
 ```
 
@@ -195,16 +195,30 @@ Trace execution paths through the call graph.
 
 ```bash
 cora trace "main"                    # Trace outward (callees)
-cora trace "handle_request" --incoming  # Trace inward (callers)
+cora trace "handle_request" --direction incoming  # Trace inward (callers)
 cora trace "process" --depth 4         # Limit traversal depth
 cora trace --json                     # JSON output
 ```
 
-Requires schema v3 edges table. When built with `--features tree-sitter`, Cora uses AST-based edge extraction for more accurate call graphs. Regex-only builds still generate edges via scope tracking.
+Requires schema v3 edges table. Cora uses tree-sitter AST-based edge extraction for more accurate call graphs (enabled by default). Regex-only builds (no-default-features) still generate edges via scope tracking.
+
+### Call Graph Semantics & Limitations
+
+**Cross-file and multi-level.** The call graph is stored per-edge with file and line, and `impact`/`trace` traverse it with BFS plus cycle protection. A caller three abstraction layers away from the symbol — through any number of intermediate files — is reachable by raising `--depth` (see [Impact Depth Guidance](/configuration#impact-depth-guidance)).
+
+**Cross-project fallback.** If a symbol has no callers in the current project's scope, `cora callers` automatically falls back to a lookup across **all indexed projects** and reports which project each match came from. Useful when a symbol is defined in one repo and consumed from another (e.g. a shared crate consumed via workspace or git dependency).
+
+**Static analysis — what it cannot see.** Edges are extracted statically, so they can be missing for:
+
+- **Dynamic dispatch** — trait objects (`dyn Trait`), virtual/interface calls. The concrete callee is only known at runtime.
+- **Callbacks and function pointers** — a function passed as an argument and invoked elsewhere has no direct edge to its eventual call-site.
+- **Reflection / string-based dispatch** — unresolvable statically by definition.
+
+In these cases the traversal chain can end early, and `cora impact` may under-report the blast radius. For dynamic-dispatch-heavy code, treat the call graph as a lower bound and confirm with tests or manual tracing.
 
 ```bash
 # Build with tree-sitter for best call graph accuracy
-cargo install --git https://github.com/codecoradev/cora-code --features tree-sitter
+cargo install --git https://github.com/codecoradev/cora-code   # tree-sitter included by default
 cora index --rebuild  # Re-index to get AST edges
 ```
 
@@ -297,8 +311,7 @@ All code intelligence features are available as MCP tools for AI coding agents:
 │   ├── reviews          # Review history for tech debt tracking
 │   └── findings         # Review findings + finding_events
 └── cora_index.usearch   # usearch HNSW vector index
-    ├── cora_index.usearch.keys    # Key-to-symbol-id mapping
-    └── cora_index.usearch.lock    # File lock (fs2)
+    └── cora_index.keys           # Key-to-symbol-id mapping (lock is held on the .usearch file itself, fs2)
 ```
 
 To reset everything:

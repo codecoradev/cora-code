@@ -109,7 +109,7 @@ fn execute_auth_login_noninteractive(
     println!(
         "{} API key saved to {}",
         "✅".green().bold(),
-        "~/.cora/auth.toml".green()
+        "~/.codecora/cora-code/auth.toml".green()
     );
     println!(
         "{} Provider: {} | Model: {} | Base: {}",
@@ -336,7 +336,7 @@ fn print_saved(provider: &str, model: &str, base_url: &str) {
     println!(
         "{} API key saved to {}",
         "✅".green().bold(),
-        "~/.cora/auth.toml".green()
+        "~/.codecora/cora-code/auth.toml".green()
     );
     println!(
         "{} Provider: {} | Model: {} | Base: {}",

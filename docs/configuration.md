@@ -86,9 +86,9 @@ quality_gate:
     max_security: 0
 
 bundling:
-  max_chars_per_group: 12000
+  max_chars_per_group: 60000
   max_files_per_group: 20
-  strategy: directory        # directory | language
+  strategy: smart            # smart | flat
   coalesce_by_directory: true
   coalesce_by_language: true
 
@@ -217,10 +217,29 @@ review:
 | `max_context_tokens` | `5000` | Approx. 20 KB of code injected. |
 | `follow_depth` | `1` | Outbound recursion depth (`1` = direct references). |
 | `include_tests` | `true` | Map changed source to its test files. |
-| `include_callers` | `true` | Inbound caller resolution. Scans source files (gitignore-aware — `target/`, `node_modules/` are never scanned), bounded to ≤400 files and ≤3 call-sites per symbol. |
+| `include_callers` | `true` | Inbound caller resolution. When the symbol index is unavailable (regex fallback): gitignore-aware file scan bounded to ≤400 files and ≤3 call-sites per symbol. When the index is available (default path, `prefer_index: true`): up to 20 call-sites per symbol, filtered by `ignore.files` patterns. |
 | `use_brain` | `true` | Enrich prompt with symbol-index intelligence (impact analysis, affected tests, semantic search). Only active when `cora index` has been run. |
-| `impact_depth` | `2` | Blast-radius traversal depth (`1` = direct callers, `2` = callers of callers). |
+| `impact_depth` | `2` | Blast-radius traversal depth. See [Impact depth guidance](#impact-depth-guidance) below. |
 | `prefer_index` | `true` | Prefer symbol index (FTS5 + call graph) over regex scanning for outbound resolution. |
+
+### Impact Depth Guidance
+
+`impact_depth` controls how many levels **up** the call graph the blast-radius traversal follows:
+
+- `1` — direct callers only. Cheapest, misses indirect breakage.
+- `2` — callers of callers. **Recommended default** — covers the common layered case (handler → service → helper).
+- `3` — deep blast radius for strongly layered codebases (handler → service → repository → helper). Higher token cost.
+- `4+` — rarely worth it. The traversal is BFS with cycle protection, so it is always safe, but on real codebases the caller count grows quickly with depth: heavily-used utility functions and entry points turn into hubs with hundreds of callers, and the injected context fills with noise rather than signal.
+
+**Why not "unlimited"?** Setting a very large depth is technically valid — traversal stops on its own once every reachable caller is visited — but on any non-trivial repo it surfaces the entire transitive caller closure. The prompt budget (`max_context_tokens`) then truncates the output arbitrarily, so you pay full traversal cost for context the LLM never sees.
+
+**How to choose:**
+
+- Small / flat repo → leave at `2`.
+- Layered repo (handler/service/repository split) where bugs manifest several layers from the root cause → `3` for that repo's `.cora.yaml`.
+- Want *precision* rather than *reach* → keep `2` and rely on `cora impact` interactively with `--depth` to explore specific symbols on demand.
+
+> **Note:** `impact_depth` only governs the *automatic* blast-radius context injected during `cora review`. The interactive `cora impact` / `cora trace` commands default to `--depth 3` and are unaffected by this setting.
 
 ## Quality Gate
 
@@ -413,7 +432,7 @@ Write your own regex-based rules in `.cora.yaml`:
 rules:
   - id: no-unwrap
     pattern: "\\.unwrap\\(\\)"
-    severity: warning
+    severity: minor
     message: "Avoid unwrap() in production code — use proper error handling"
     languages: ["rust"]
     exclude: ["tests/**"]
@@ -528,7 +547,7 @@ review:
 
 ## Bundling
 
-Control how multiple files are grouped into LLM batches during `cora scan`. Cora automatically chunks large file sets into groups that fit within provider token limits.
+> **Deprecation notice:** as of the current release, `cora scan` does **not** read this section — batch sizing is governed by `--batch-files` (default 20) and an internal ~60,000-character batch budget. These keys are parsed but have no effect on `cora scan`. They are kept for backward compatibility; do not rely on them.
 
 ```yaml
 bundling:

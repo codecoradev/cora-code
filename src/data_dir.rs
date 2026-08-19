@@ -61,6 +61,13 @@ pub fn graph_db_path() -> PathBuf {
     new_db
 }
 
+/// Path to the update check cache file.
+///
+/// Stored at `~/.codecora/cora-code/update-cache.json`.
+pub fn update_cache_path() -> PathBuf {
+    cora_data_dir().join("update-cache.json")
+}
+
 /// Ensure the cora-code data directory exists.
 pub fn ensure_data_dir() -> anyhow::Result<PathBuf> {
     let dir = cora_data_dir();
