@@ -3,7 +3,7 @@ use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
 use crate::engine::llm;
-use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse};
+use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse, Severity};
 
 /// Load a custom system prompt from a file path.
 /// Returns the file content, or None if the file doesn't exist, can't be read,
@@ -433,6 +433,11 @@ async fn review_diff_inner(
     // Apply ignore rules: filter out issues matching ignored patterns
     response.issues = apply_ignore_rules(response.issues, &config.ignore.rules);
 
+    // Drop low-severity findings on unchanged (context) lines — these are
+    // pre-existing code that appeared in the diff due to surrounding changes,
+    // not new code introduced by the PR (#507 Pattern #3).
+    response.issues = apply_context_line_filter(response.issues, &diff_chunks);
+
     // Calculate should_block based on min_severity
     let min_severity = config.hook.min_severity_level();
     // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above
@@ -650,6 +655,75 @@ fn apply_ignore_rules(mut issues: Vec<ReviewIssue>, ignore_rules: &[String]) -> 
             remaining = issues.len(),
             rules = ignore_rules.len(),
             "filtered issues via ignore rules"
+        );
+    }
+
+    issues
+}
+
+/// Drop findings on unchanged (context) or removed lines (#507 Pattern #3).
+///
+/// The LLM sometimes flags pre-existing code that appears in the diff purely
+/// because surrounding lines changed. These findings are not about code the PR
+/// introduces — they are noise.
+///
+/// **Policy:** Only drop `Minor` and `Info` severity findings on context/removed
+/// lines. `Critical` and `Major` findings are kept regardless, because they may
+/// represent real risks worth surfacing even in pre-existing code.
+fn apply_context_line_filter(
+    mut issues: Vec<ReviewIssue>,
+    diff_chunks: &[crate::engine::diff_parser::FileChunk],
+) -> Vec<ReviewIssue> {
+    use crate::engine::diff_parser::DiffLineType;
+
+    // Build lookup: (file, new_line_no) -> is_added
+    // Only includes lines present in the diff (Add or Context). Lines not in
+    // the diff at all are left alone (LLM line numbers can be imprecise).
+    let mut line_kinds: std::collections::HashMap<(String, u32), DiffLineType> =
+        std::collections::HashMap::new();
+    for chunk in diff_chunks {
+        let path = chunk
+            .new_path
+            .as_deref()
+            .or(chunk.old_path.as_deref())
+            .unwrap_or("");
+        for hunk in &chunk.chunks {
+            for line in &hunk.lines {
+                if let Some(ln) = line.new_line_no {
+                    line_kinds.insert((path.to_string(), ln), line.line_type);
+                }
+            }
+        }
+    }
+
+    let before = issues.len();
+    issues.retain(|issue| {
+        // Keep findings without a concrete line number
+        let Some(ln) = issue.line else {
+            return true;
+        };
+
+        // Only filter if we can resolve this (file, line) to a diff line
+        let Some(kind) = line_kinds.get(&(issue.file.clone(), ln)) else {
+            return true; // not in diff — can't determine, keep
+        };
+
+        match kind {
+            DiffLineType::Add => true, // genuinely new code — always keep
+            DiffLineType::Context | DiffLineType::Remove => {
+                // Pre-existing code — only keep if severity is high enough
+                // Ord: Critical(0) < Major(1) < Minor(2) < Info(3)
+                issue.severity <= Severity::Major
+            }
+        }
+    });
+
+    let dropped = before - issues.len();
+    if dropped > 0 {
+        debug!(
+            dropped,
+            remaining = issues.len(),
+            "removed low-severity findings on unchanged diff context lines (#507)"
         );
     }
 

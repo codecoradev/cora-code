@@ -4,6 +4,14 @@ Cora is a solo-maintained project with a strong product direction. Contributions
 
 This document helps you decide *whether* and *how* to contribute in a way that's likely to get merged, so neither of us wastes time.
 
+> ### 📋 Contribution Terms
+>
+> By submitting a contribution, you agree to the terms in [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) (for individuals) or [CLA_CORPORATE.md](CLA_CORPORATE.md) (for employees contributing on behalf of their employer).
+>
+> **TL;DR:** You retain copyright. You grant CodeCoraDev a license to use your contribution — including in commercial products. Contributions are voluntary and unpaid. If you prefer not to sign, that's okay — but your PR cannot be merged.
+>
+> All commits must include `Signed-off-by: Your Name <email>` (same format as `git commit -s`).
+
 ## How this project is run
 
 - Cora has one active maintainer ([@ajianaz](https://github.com/ajianaz)).
@@ -278,6 +286,32 @@ Don't file them as public issues. See [SECURITY.md](SECURITY.md).
 
 See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
+## Contribution Terms
+
+CodeCoraDev projects are open-source and community-driven. By submitting a
+contribution (pull request, issue report, documentation, or any other creative
+work), you agree that:
+
+1. **No Compensation:** Contributions are voluntary and unpaid. CodeCoraDev
+   does not offer bounties, payments, or equity for contributions unless
+   explicitly stated in a separate written agreement.
+
+2. **License Grant:** You grant CodeCoraDev a perpetual, worldwide,
+   non-exclusive, royalty-free license to use, modify, and distribute your
+   contribution under the project's open-source license and any future license
+   that CodeCoraDev may adopt (including proprietary/commercial licenses).
+
+3. **Original Work:** Your contribution is your original work or properly
+   attributed third-party work under a compatible license.
+
+4. **No Obligation:** CodeCoraDev is not obligated to accept, use, or maintain
+   any contribution.
+
+A Contributor License Agreement (CLA) is required for contributions to be
+merged. See [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) or
+[CLA_CORPORATE.md](CLA_CORPORATE.md) for details.
+
 ## License
 
-By contributing you agree your work is licensed under [MIT](LICENSE). No CLA required.
+By contributing you agree your work is licensed under [Apache-2.0](LICENSE).
+A CLA is required — see [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md).

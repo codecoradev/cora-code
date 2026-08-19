@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Relicensed from MIT to Apache-2.0.** All 18 CodeCoraDev repositories now
+  standardize on Apache-2.0 for patent grant protection and open-core model
+  compatibility. Added CLA (Individual + Corporate) for contributor copyright
+  and patent grants.
+- **Added Contributor License Agreement (CLA).** Individual and Corporate CLA
+  documents added (`CLA_INDIVIDUAL.md`, `CLA_CORPORATE.md`). CLA includes
+  SIAC arbitration, patent retaliation, moral rights acknowledgment, and
+  no-compensation clause.
+- **Updated CONTRIBUTING.md.** Added Contribution Terms section with
+  no-compensation notice, CLA requirement, and Apache-2.0 license reference.
+- **Updated README license badge** from MIT to Apache-2.0.
+
 ## [0.13.0]
 
 ### Added
