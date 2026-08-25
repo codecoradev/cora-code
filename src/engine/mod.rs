@@ -1,6 +1,7 @@
 pub mod bundling;
 pub mod cache;
 pub mod chunker;
+pub mod comment_sanitizer;
 pub mod context;
 pub mod db_writer;
 pub mod debt_tracker;
