@@ -2,6 +2,7 @@ use crate::error::CoraError;
 use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
+use crate::engine::comment_sanitizer;
 use crate::engine::llm;
 use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse, Severity};
 
@@ -127,8 +128,35 @@ async fn review_diff_inner(
     let static_context =
         crate::engine::static_analysis::collect_static_context(diff, &config.static_analysis);
 
-    // Parse diff and run rule engine
+    // Parse diff and run rule engine. Deterministic scanners (rules, secrets,
+    // security) always operate on the ORIGINAL unsanitized diff — only the
+    // LLM sees sanitized text (ALIBI defense, arXiv:2607.24964).
     let diff_chunks = crate::engine::diff_parser::parse_diff(diff);
+    let sanitize_report = crate::engine::comment_sanitizer::flag_claims(&diff_chunks);
+    let review_diff_text: std::borrow::Cow<'_, str> = if config.sanitize_comments {
+        let mut sanitized_chunks = crate::engine::diff_parser::parse_diff(diff);
+        let full_report = crate::engine::comment_sanitizer::sanitize_chunks(&mut sanitized_chunks);
+        let rendered = crate::engine::comment_sanitizer::render_sanitized_diff(&sanitized_chunks);
+        debug!(
+            sanitized = full_report.lines_sanitized,
+            claims = full_report.suspicious_claims.len(),
+            "ALIBI comment defense applied"
+        );
+        if rendered.is_empty() {
+            std::borrow::Cow::Borrowed(diff)
+        } else {
+            std::borrow::Cow::Owned(rendered)
+        }
+    } else {
+        if !sanitize_report.suspicious_claims.is_empty() {
+            debug!(
+                claims = sanitize_report.suspicious_claims.len(),
+                "Untrusted verification claims flagged in added comments"
+            );
+        }
+        std::borrow::Cow::Borrowed(diff)
+    };
+
     let rule_findings = crate::engine::rules::run_rules(&diff_chunks, &config.rules_config);
 
     // Run deterministic secrets pre-scan
@@ -183,6 +211,9 @@ async fn review_diff_inner(
     let mut context_parts: Vec<String> = Vec::new();
     if let Some(sa) = static_context.as_deref() {
         context_parts.push(sa.to_string());
+    }
+    if let Some(warning) = comment_sanitizer::format_claim_warning(&sanitize_report) {
+        context_parts.push(warning);
     }
     for ctx in [
         rule_context.as_str(),
@@ -285,7 +316,7 @@ async fn review_diff_inner(
     let llm_result: Result<ReviewResponse, CoraError> = if stream {
         llm::review_diff_stream(
             llm_config,
-            diff,
+            &review_diff_text,
             &config.focus,
             &config.rules,
             &config.response_format,
@@ -296,7 +327,7 @@ async fn review_diff_inner(
     } else {
         llm::review_diff(
             llm_config,
-            diff,
+            &review_diff_text,
             &config.focus,
             &config.rules,
             &config.response_format,
