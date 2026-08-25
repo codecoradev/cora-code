@@ -130,8 +130,13 @@ fn split_comment(line: &str) -> Option<(&str, &str)> {
         let pos = line.find('#').unwrap_or(0);
         return Some((&line[..pos], &line[pos + 1..]));
     }
+    // `--` only when preceded by whitespace or line start (SQL/Lua comments);
+    // a bare `--` marks C/C++ decrement (e.g. `i--`).
     if let Some(pos) = find_marker(line, "--") {
-        return Some((&line[..pos], &line[pos + 2..]));
+        let before_ok = pos == 0 || line.as_bytes()[pos - 1].is_ascii_whitespace();
+        if before_ok {
+            return Some((&line[..pos], &line[pos + 2..]));
+        }
     }
     // `;` only at line start (ASM/Lisp) — trailing `;` is a statement
     // terminator in C-family languages.
@@ -293,6 +298,16 @@ mod tests {
     fn sql_and_asm_markers() {
         let (_, comment) = split_comment("SELECT 1; -- sanitizer passed").unwrap();
         assert!(comment.contains("sanitizer passed"));
+    }
+
+    #[test]
+    fn decrement_not_treated_as_comment() {
+        // C/C++ decrement operators must not be stripped
+        assert!(split_comment("i--;").is_none());
+        assert!(split_comment("x = arr[i--] + 1;").is_none());
+        // SQL-style comment after whitespace still detected
+        let (_, c) = split_comment("SELECT 1 -- sanitizer passed").unwrap();
+        assert!(c.contains("sanitizer passed"));
     }
 
     #[test]

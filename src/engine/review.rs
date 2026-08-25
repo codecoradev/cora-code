@@ -128,35 +128,34 @@ async fn review_diff_inner(
     let static_context =
         crate::engine::static_analysis::collect_static_context(diff, &config.static_analysis);
 
-    // Parse diff and run rule engine
-    let mut diff_chunks = crate::engine::diff_parser::parse_diff(diff);
-
-    // ALIBI defense (arXiv:2607.24964): strip comments from added lines
-    // before the LLM sees them, and surface fabricated verification claims
-    // as untrusted context. Prompt-level "ignore comments" instructions are
-    // proven ineffective — only removing/flagging the text helps.
-    let sanitize_report = if config.sanitize_comments {
-        crate::engine::comment_sanitizer::sanitize_chunks(&mut diff_chunks)
-    } else {
-        crate::engine::comment_sanitizer::flag_claims(&diff_chunks)
-    };
+    // Parse diff and run rule engine. Deterministic scanners (rules, secrets,
+    // security) always operate on the ORIGINAL unsanitized diff — only the
+    // LLM sees sanitized text (ALIBI defense, arXiv:2607.24964).
+    let diff_chunks = crate::engine::diff_parser::parse_diff(diff);
+    let sanitize_report = crate::engine::comment_sanitizer::flag_claims(&diff_chunks);
     let review_diff_text: std::borrow::Cow<'_, str> = if config.sanitize_comments {
-        let rendered = crate::engine::comment_sanitizer::render_sanitized_diff(&diff_chunks);
+        let mut sanitized_chunks = crate::engine::diff_parser::parse_diff(diff);
+        let full_report = crate::engine::comment_sanitizer::sanitize_chunks(&mut sanitized_chunks);
+        let rendered = crate::engine::comment_sanitizer::render_sanitized_diff(&sanitized_chunks);
+        debug!(
+            sanitized = full_report.lines_sanitized,
+            claims = full_report.suspicious_claims.len(),
+            "ALIBI comment defense applied"
+        );
         if rendered.is_empty() {
             std::borrow::Cow::Borrowed(diff)
         } else {
             std::borrow::Cow::Owned(rendered)
         }
     } else {
+        if !sanitize_report.suspicious_claims.is_empty() {
+            debug!(
+                claims = sanitize_report.suspicious_claims.len(),
+                "Untrusted verification claims flagged in added comments"
+            );
+        }
         std::borrow::Cow::Borrowed(diff)
     };
-    if sanitize_report.lines_sanitized > 0 || !sanitize_report.suspicious_claims.is_empty() {
-        debug!(
-            sanitized = sanitize_report.lines_sanitized,
-            claims = sanitize_report.suspicious_claims.len(),
-            "ALIBI comment defense applied"
-        );
-    }
 
     let rule_findings = crate::engine::rules::run_rules(&diff_chunks, &config.rules_config);
 
