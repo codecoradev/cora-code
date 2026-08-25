@@ -226,6 +226,14 @@ Return a JSON array of objects with these fields:
 - "body": string — detailed explanation with specific code reference
 - "suggested_fix": string or null — optional fix suggestion
 
+EXPLANATION STYLE (moderate-explanation principle, arXiv:2607.24601):
+Keep each finding at moderate depth: severity + a short reason (1-3
+sentences) + the specific code evidence it points to. Do NOT include
+long reasoning chains, step-by-step derivations, or exhaustive
+justifications — overly long explanations reduce agreement with the
+finding without adding value. Trust the reader to reason from the
+evidence.
+
 If no issues are found, return: []
 
 Return ONLY the JSON array. No markdown code fences, no explanation, no conversational text.
