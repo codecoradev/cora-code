@@ -1355,4 +1355,50 @@ mod tests {
         assert_eq!(orphan.line, 20);
         assert_eq!(orphan.reason, "no callers found");
     }
+
+    /// Regression (#519): a symbol defined in one crate/file and called via
+    /// method syntax (`obj.remember_with_contradiction()`) from another
+    /// crate's file must NOT be flagged dead. Mirrors the real uteke
+    /// workspace case: definition in uteke-core, caller in uteke-cli.
+    #[test]
+    fn test_dead_code_resolves_cross_file_method_calls() {
+        use super::super::index_file;
+
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+
+        // "uteke-core": the definition.
+        index_file(
+            &conn,
+            pid,
+            "crates/core/src/consolidate.rs",
+            r#"
+pub fn remember_with_contradiction(content: &str) -> usize { content.len() }
+"#,
+            "rs",
+        )
+        .unwrap();
+
+        // "uteke-cli": a cross-crate caller using method syntax.
+        index_file(
+            &conn,
+            pid,
+            "crates/cli/src/commands/maintenance.rs",
+            r#"
+pub fn maintenance() -> usize {
+    let store = Store;
+    store.remember_with_contradiction("note")
+}
+"#,
+            "rs",
+        )
+        .unwrap();
+
+        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
+        assert!(
+            !dead.iter().any(|d| d.name == "remember_with_contradiction"),
+            "cross-crate method call must prevent false-positive dead code, got: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
 }
