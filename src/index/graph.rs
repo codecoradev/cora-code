@@ -603,6 +603,10 @@ pub struct DeadCodeOptions {
     /// Each entry is a SQL LIKE pattern (e.g. `%Handler`, `%Listener`, `%Route`).
     /// These are checked against symbol names in addition to WELL_KNOWN_NAMES.
     pub entry_point_patterns: Vec<String>,
+    /// Include public API surface (`pub`/`export` items) in dead code results.
+    /// By default these are skipped: their purpose is external consumption,
+    /// so absence of internal callers does not make them dead (#520).
+    pub include_pub_api: bool,
 }
 
 /// Well-known symbol names that should not be flagged as dead code even when
@@ -796,6 +800,19 @@ pub fn find_dead_code(
     // Exclude test functions unless requested.
     if !opts.include_tests {
         sql.push_str(" AND s.name NOT LIKE 'test_%' AND s.name NOT LIKE '%_test'");
+    }
+
+    // Exclude public API surface unless explicitly requested (#520): `pub`
+    // (Rust, incl. `pub(crate)`) and `export` (TS/JS) items are consumed
+    // externally, so missing internal callers does not make them dead.
+    if !opts.include_pub_api {
+        sql.push_str(
+            " AND (s.signature IS NULL OR (
+                   s.signature NOT LIKE 'pub %'
+                   AND s.signature NOT LIKE 'pub(%'
+                   AND s.signature NOT LIKE 'export %'
+               ))",
+        );
     }
 
     // Exclude symbols with `// cora: keep` suppression marker in their signature.
@@ -1339,8 +1356,7 @@ mod tests {
             pid,
             &DeadCodeOptions {
                 include_tests: true,
-                min_lines: None,
-                entry_point_patterns: vec![],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1354,5 +1370,101 @@ mod tests {
         assert_eq!(orphan.file, "src/lib.rs");
         assert_eq!(orphan.line, 20);
         assert_eq!(orphan.reason, "no callers found");
+    }
+
+    /// Regression (#519): a symbol defined in one crate/file and called via
+    /// method syntax (`obj.remember_with_contradiction()`) from another
+    /// crate's file must NOT be flagged dead. Mirrors the real uteke
+    /// workspace case: definition in uteke-core, caller in uteke-cli.
+    #[test]
+    fn test_dead_code_resolves_cross_file_method_calls() {
+        use super::super::index_file;
+
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+
+        // "uteke-core": the definition.
+        index_file(
+            &conn,
+            pid,
+            "crates/core/src/consolidate.rs",
+            r#"
+pub fn remember_with_contradiction(content: &str) -> usize { content.len() }
+"#,
+            "rs",
+        )
+        .unwrap();
+
+        // "uteke-cli": a cross-crate caller using method syntax.
+        index_file(
+            &conn,
+            pid,
+            "crates/cli/src/commands/maintenance.rs",
+            r#"
+pub fn maintenance() -> usize {
+    let store = Store;
+    store.remember_with_contradiction("note")
+}
+"#,
+            "rs",
+        )
+        .unwrap();
+
+        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
+        assert!(
+            !dead.iter().any(|d| d.name == "remember_with_contradiction"),
+            "cross-crate method call must prevent false-positive dead code, got: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression (#520): public API surface is skipped by default — missing
+    /// internal callers does not make a `pub` item dead — and can be opted
+    /// back in with `include_pub_api`. Private helpers still get flagged.
+    #[test]
+    fn test_dead_code_skips_pub_api_by_default() {
+        use super::super::index_file;
+
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+
+        index_file(
+            &conn,
+            pid,
+            "src/lib.rs",
+            r#"
+pub async fn chunk_markdown_embed_aware(text: &str) -> usize { text.len() }
+
+fn internal_only_helper() -> u8 { 7 }
+"#,
+            "rs",
+        )
+        .unwrap();
+
+        // Default: pub items are treated as API surface and skipped.
+        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !names.contains(&"chunk_markdown_embed_aware"),
+            "pub fn must be skipped by default"
+        );
+        assert!(
+            names.contains(&"internal_only_helper"),
+            "private helper without callers is dead"
+        );
+
+        // Opt-in: pub items are reported again.
+        let all = find_dead_code(
+            &conn,
+            pid,
+            &DeadCodeOptions {
+                include_pub_api: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let names_all: Vec<&str> = all.iter().map(|d| d.name.as_str()).collect();
+        assert!(names_all.contains(&"chunk_markdown_embed_aware"));
+        assert!(names_all.contains(&"internal_only_helper"));
     }
 }

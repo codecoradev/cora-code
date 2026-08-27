@@ -211,11 +211,12 @@ pub fn list_tools() -> Vec<Tool> {
         // ─── Dead Code Detection ───
         Tool {
             name: "cora.dead_code".to_string(),
-            description: "Find potentially dead code — functions/methods with no callers in the codebase.".to_string(),
+            description: "Find potentially dead code — functions/methods with no callers in the codebase. Public API surface (pub/export) is skipped by default.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "include_tests": { "type": "boolean", "description": "Include test functions in results" },
+                    "include_pub_api": { "type": "boolean", "description": "Include public API surface (pub/export items); skipped by default since they are consumed externally" },
                     "min_lines": { "type": "integer", "description": "Minimum lines of code to report" }
                 },
                 "required": []
@@ -1069,6 +1070,10 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         .get("include_tests")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let include_pub_api = params
+        .get("include_pub_api")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let min_lines = params
         .get("min_lines")
         .and_then(|v| v.as_u64())
@@ -1078,6 +1083,7 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         include_tests,
         min_lines,
         entry_point_patterns: vec![],
+        include_pub_api,
     };
 
     match crate::index::graph::find_dead_code(&conn, project_id, &opts) {

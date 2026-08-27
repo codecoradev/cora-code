@@ -510,6 +510,11 @@ enum Command {
         /// Include test functions (test_*, _test) in results
         #[clap(long)]
         include_tests: bool,
+        /// Include public API surface (pub/export items) in results.
+        /// By default they are skipped: they are consumed externally, so
+        /// missing internal callers does not make them dead (#520).
+        #[clap(long)]
+        include_pub: bool,
         /// Minimum lines of code (filter out tiny functions)
         #[clap(long)]
         min_lines: Option<u32>,
@@ -1614,15 +1619,16 @@ async fn main() -> Result<()> {
         }
         Command::DeadCode {
             include_tests,
+            include_pub,
             min_lines,
             json,
         } => {
-            let conn = index::open_global_index()?;
+            // Resolve the project root the same way `cora index` does, so
+            // dead-code queries the workspace the index actually built (#522).
             let cwd = std::env::current_dir().with_context(|| "failed to get cwd")?;
-            let project_id = index::schema::get_or_create_project(
-                &conn,
-                cwd.to_str().with_context(|| "invalid UTF-8 in cwd path")?,
-            )?;
+            let project_root = index::resolve_project_root(&cwd).unwrap_or(cwd.clone());
+            let conn = index::open_global_index()?;
+            let project_id = index::ensure_project(&conn, &project_root)?;
 
             // Load config for entry_point_patterns
             let config = crate::config::loader::load_config(
@@ -1640,6 +1646,7 @@ async fn main() -> Result<()> {
                 include_tests,
                 min_lines,
                 entry_point_patterns,
+                include_pub_api: include_pub,
             };
             let results = index::graph::find_dead_code(&conn, project_id, &opts)?;
             if json {
