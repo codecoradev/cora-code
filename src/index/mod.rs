@@ -56,8 +56,15 @@ pub fn ensure_project(conn: &Connection, root: &Path) -> anyhow::Result<i64> {
 
 /// Detect the project root by walking up from `start` looking for marker files.
 ///
-/// Search order: `.cora.yaml` → `Cargo.toml` → `package.json` → `.git` (dir or file).
-/// Returns the directory containing the first marker found, or `None` if none is found.
+/// Resolution order:
+/// 1. `.cora.yaml` — explicit user override, always wins immediately.
+/// 2. A `Cargo.toml` declaring a `[workspace]` section — a Rust workspace root
+///    beats a nested member crate's plain `Cargo.toml`, so indexing from inside
+///    `crates/*` and resolving from the repo root land on the same project (#522).
+/// 3. The first plain marker (`Cargo.toml`, `package.json`, `.git`) as fallback.
+///
+/// The walk never climbs past a git repository boundary, so an unrelated
+/// `[workspace]` outside the repo cannot hijack resolution.
 pub fn resolve_project_root(start: &Path) -> Option<std::path::PathBuf> {
     let dir = if start.is_file() {
         start.parent()?
@@ -65,22 +72,52 @@ pub fn resolve_project_root(start: &Path) -> Option<std::path::PathBuf> {
         start
     };
 
-    const MARKERS: &[&str] = &[".cora.yaml", "Cargo.toml", "package.json", ".git"];
-
     let mut current = dir.to_path_buf();
+    let mut fallback: Option<std::path::PathBuf> = None;
     loop {
-        for marker in MARKERS {
-            let candidate = current.join(marker);
-            if candidate.exists() {
-                debug!(root = %current.display(), marker, "detected project root");
-                return Some(current);
+        // 1. Explicit cora config wins immediately.
+        if current.join(".cora.yaml").is_file() {
+            debug!(root = %current.display(), marker = ".cora.yaml", "detected project root");
+            return Some(current);
+        }
+
+        // 2. Cargo workspace root beats a nested member crate manifest.
+        let cargo_toml = current.join("Cargo.toml");
+        if cargo_toml.is_file()
+            && std::fs::read_to_string(&cargo_toml)
+                .map(|s| s.contains("[workspace"))
+                .unwrap_or(false)
+        {
+            debug!(root = %current.display(), marker = "[workspace] Cargo.toml", "detected project root");
+            return Some(current);
+        }
+
+        // 3. First plain marker is the fallback (original behavior).
+        if fallback.is_none() {
+            const MARKERS: &[&str] = &["Cargo.toml", "package.json", ".git"];
+            for marker in MARKERS {
+                if current.join(marker).exists() {
+                    fallback = Some(current.clone());
+                    break;
+                }
             }
+        }
+
+        // Repo boundary: stop AFTER giving this directory its own chance to
+        // match above (a repo root can legitimately be the workspace root).
+        if current.join(".git").exists() {
+            break;
         }
         match current.parent() {
             Some(parent) if parent != current => current = parent.to_path_buf(),
-            _ => return None,
+            _ => break,
         }
     }
+
+    if let Some(root) = &fallback {
+        debug!(root = %root.display(), "detected project root");
+    }
+    fallback
 }
 
 /// Resolve `project_id` from the current directory, using project root detection.
@@ -805,5 +842,108 @@ pub struct AuthService {
             root.join("Cargo.toml").exists(),
             "resolved root should contain Cargo.toml"
         );
+    }
+
+    /// Regression (#522): running `cora index` from inside a workspace member
+    /// crate must resolve to the WORKSPACE root (the member's plain
+    /// `Cargo.toml` is not the project root), so CLI and MCP agree on one
+    /// project_id instead of silently creating two.
+    #[test]
+    fn test_resolve_project_root_prefers_workspace_root() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let member = ws.join("crates").join("app");
+        std::fs::create_dir_all(&member).unwrap();
+
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(member.join("src.rs"), "fn main() {}\n").unwrap();
+
+        let resolved = resolve_project_root(&member);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(ws.as_path()),
+            "workspace root should win over a member crate's plain Cargo.toml"
+        );
+    }
+
+    /// An explicit `.cora.yaml` anywhere along the walk always wins — it is a
+    /// deliberate user override of project-root detection.
+    #[test]
+    fn test_resolve_project_root_cora_yaml_wins_over_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let member = ws.join("crates").join("app");
+        std::fs::create_dir_all(&member).unwrap();
+
+        std::fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .unwrap();
+        std::fs::write(ws.join(".cora.yaml"), "version: 1\n").unwrap();
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        std::fs::write(member.join(".cora.yaml"), "version: 1\n").unwrap();
+
+        let resolved = resolve_project_root(&member);
+        assert_eq!(resolved.as_deref(), Some(member.as_path()));
+    }
+
+    /// Root detection must not climb above a git repository boundary: an
+    /// unrelated `[workspace]` Cargo.toml outside the repo must never hijack
+    /// resolution.
+    #[test]
+    fn test_resolve_project_root_stops_at_git_boundary() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let outer_ws = tmp.path().join("outer");
+        let repo = outer_ws.join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        std::fs::write(
+            outer_ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+        // Repo itself has no markers other than .git and one plain file dir.
+        let deep = repo.join("src");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let resolved = resolve_project_root(&deep);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(repo.as_path()),
+            ".git must stop the upward walk"
+        );
+    }
+
+    /// Regression (#522): an incremental no-op re-index (all fingerprints
+    /// match) must keep reporting the STORED symbol count — DB state must
+    /// survive untouched re-runs.
+    #[test]
+    fn test_incremental_index_preserves_counts() {
+        let conn = mem_conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {} pub fn beta() {}\n").unwrap();
+
+        let first = index_project(&conn, &root, false).unwrap();
+        assert_eq!(first.files_indexed, 1);
+        assert!(first.symbols_indexed > 0);
+
+        // Second run: everything unchanged → skipped, nothing wiped.
+        let second = index_project(&conn, &root, false).unwrap();
+        assert_eq!(second.files_skipped, 1);
+        assert_eq!(second.files_indexed, 0);
+
+        let summary = index_stats(&conn, ensure_project(&conn, &root).unwrap()).unwrap();
+        assert_eq!(
+            summary.total_symbols as usize, first.symbols_indexed,
+            "stored symbols must survive an incremental no-op re-run"
+        );
+        assert_eq!(summary.total_files, 1);
     }
 }
