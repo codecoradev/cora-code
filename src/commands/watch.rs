@@ -37,9 +37,13 @@ pub fn run_watch(
     // Load skip patterns + brain embedding backend from config
     let config =
         crate::config::loader::load_config(config_path, None, None, None, None, false).ok();
-    let skip_patterns: Option<Vec<String>> = config
-        .as_ref()
-        .map(|c| c.rules_config.index_skip_files.clone());
+    // Same merged exclusion set as `cora index` (#521).
+    let skip_patterns: Option<Vec<String>> = config.as_ref().map(|c| {
+        let mut pats = c.ignore.files.clone();
+        pats.extend(c.rules_config.index_skip_files.iter().cloned());
+        pats.dedup();
+        pats
+    });
 
     // Resolve embedding backend
     let brain_mode = config
