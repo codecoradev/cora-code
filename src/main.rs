@@ -787,17 +787,40 @@ async fn main() -> Result<()> {
                     verbose || cli.global.verbose,
                     skip_patterns.as_deref(),
                 )?;
-                eprintln!(
-                    "{}",
-                    format!(
-                        "✅ Indexed {} symbols from {} files ({} skipped, {} errors)",
-                        stats.symbols_indexed,
-                        stats.files_indexed,
-                        stats.files_skipped,
-                        stats.errors
-                    )
-                    .green()
-                );
+                if stats.files_indexed == 0 && stats.errors == 0 {
+                    // Incremental no-op: fingerprints all matched. Report the
+                    // STORED totals instead of a confusing zeros line (#522).
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "✓ Index up to date ({} files unchanged)",
+                            stats.files_skipped
+                        )
+                        .green()
+                    );
+                    if let Ok(summary) = index::index_stats(&conn, project_id) {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "   {} symbols across {} files",
+                                summary.total_symbols, summary.total_files
+                            )
+                            .dimmed()
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "✅ Indexed {} symbols from {} files ({} skipped, {} errors)",
+                            stats.symbols_indexed,
+                            stats.files_indexed,
+                            stats.files_skipped,
+                            stats.errors
+                        )
+                        .green()
+                    );
+                }
                 eprintln!(
                     "{}",
                     format!(
