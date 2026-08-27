@@ -3,7 +3,6 @@
 // ! Provides proper AST-based symbol and edge extraction using tree-sitter.
 // ! Only compiled when the `tree-sitter` feature is enabled.
 
-#![cfg(feature = "tree-sitter")]
 #![allow(dead_code, unused)]
 
 use crate::index::extract::CallSite;
