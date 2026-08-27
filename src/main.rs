@@ -769,9 +769,14 @@ async fn main() -> Result<()> {
                     false,
                 )
                 .ok();
-                let skip_patterns = config
-                    .as_ref()
-                    .map(|c| c.rules_config.index_skip_files.clone());
+                // Exclusion patterns = review's ignore.files + index.skip_files
+                // so dead-code/index scanners respect the same ignores (#521).
+                let skip_patterns: Option<Vec<String>> = config.as_ref().map(|c| {
+                    let mut pats = c.ignore.files.clone();
+                    pats.extend(c.rules_config.index_skip_files.iter().cloned());
+                    pats.dedup();
+                    pats
+                });
 
                 // Resolve embedding backend from brain config
                 let brain_mode = config
@@ -798,6 +803,16 @@ async fn main() -> Result<()> {
                     )
                     .green()
                 );
+                if stats.files_excluded > 0 {
+                    eprintln!(
+                        "{}",
+                        format!(
+                            "   {} files excluded by ignore patterns",
+                            stats.files_excluded
+                        )
+                        .dimmed()
+                    );
+                }
                 eprintln!(
                     "{}",
                     format!(

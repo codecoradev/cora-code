@@ -249,14 +249,17 @@ fn load_all_fingerprints(
 ///
 /// Returns summary stats.
 pub fn index_project(conn: &Connection, root: &Path, verbose: bool) -> anyhow::Result<IndexStats> {
-    index_project_with_skip(conn, root, verbose, None)
+    index_project_with_id(conn, ensure_project(conn, root)?, root, verbose, None)
 }
 
-/// Index a project directory, with config hash invalidation.
+/// Index a project directory, honoring skip patterns (glob `*`/`**`, matched
+/// against paths relative to the project root).
 ///
-/// If `skip_patterns` is provided, the config hash is compared against
-/// the stored hash in the DB. If they differ, all fingerprints are
-/// cleared, forcing a full re-index.
+/// Patterns do two things:
+/// 1. Files matching are EXCLUDED from indexing entirely (#521), so index
+///    consumers like dead-code and review's index scanners never see them.
+/// 2. The pattern list is hashed into the DB; a change forces a full
+///    re-index so previously indexed-but-now-excluded files get purged.
 pub fn index_project_with_skip(
     conn: &Connection,
     root: &Path,
@@ -307,7 +310,7 @@ pub fn index_project_with_skip(
         }
     }
 
-    index_project_with_id(conn, project_id, root, verbose)
+    index_project_with_id(conn, project_id, root, verbose, skip_patterns)
 }
 
 /// Internal: index a project with an already-resolved `project_id`.
@@ -316,6 +319,7 @@ fn index_project_with_id(
     project_id: i64,
     root: &Path,
     verbose: bool,
+    skip_patterns: Option<&[String]>,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
 
@@ -343,6 +347,16 @@ fn index_project_with_id(
 
         let language = crate::engine::diff_parser::detect_language(&rel_str);
         if language == "unknown" || language == "text" {
+            continue;
+        }
+
+        // Config-driven exclusion (#521): honor ignore.files /
+        // index_skip_files so dead-code, review index scanners, and brain
+        // never see these files.
+        if skip_patterns.is_some_and(|patterns| {
+            crate::engine::index_scanner::should_skip_file(&rel_str, patterns)
+        }) {
+            stats.files_excluded += 1;
             continue;
         }
 
@@ -618,6 +632,8 @@ pub struct IndexStats {
     pub files_scanned: usize,
     pub files_indexed: usize,
     pub files_skipped: usize,
+    /// Files excluded by config skip patterns (ignore.files / index.skip_files).
+    pub files_excluded: usize,
     pub symbols_indexed: usize,
     pub errors: usize,
     pub embedded_symbols: Option<usize>,
@@ -733,6 +749,41 @@ pub struct AuthService {
 
         let stats = index_stats(&conn, project_id).unwrap();
         assert_eq!(stats.total_symbols, 0);
+    }
+
+    /// Regression (#521): skip patterns must EXCLUDE files from indexing
+    /// (previously they only invalidated fingerprints), so dead-code and
+    /// review's index scanners stop reporting matches from ignored dirs.
+    #[test]
+    fn test_skip_patterns_exclude_files_from_index() {
+        let conn = mem_conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir(root.join("examples")).unwrap();
+        std::fs::write(
+            root.join("examples").join("demo.py"),
+            "def client_method():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("core.py"), "def core_fn():\n    pass\n").unwrap();
+
+        // First run: no patterns → everything indexed.
+        let stats = index_project_with_skip(&conn, &root, false, Some(&[])).unwrap();
+        assert_eq!(stats.files_scanned, 2);
+        assert_eq!(stats.files_excluded, 0);
+
+        // Second run WITH a pattern: examples/ excluded via full re-index…
+        let pats = vec!["examples/**".to_string()];
+        let stats = index_project_with_skip(&conn, &root, false, Some(&pats)).unwrap();
+        assert_eq!(stats.files_excluded, 1);
+        assert!(stats.files_indexed > 0, "remaining files get re-indexed");
+
+        let pid = ensure_project(&conn, &root).unwrap();
+        let summary = index_stats(&conn, pid).unwrap();
+        assert_eq!(
+            summary.total_files, 1,
+            "only core.py remains indexed after exclusion"
+        );
     }
 
     #[test]
