@@ -430,7 +430,8 @@ pub async fn review_diff(
         Some(create_spinner("Reviewing diff…"))
     };
 
-    let user_prompt = build_review_prompt(diff, focus, rules, static_context);
+    let enclosing = enclosing_section(diff);
+    let user_prompt = build_review_prompt(diff, focus, rules, static_context, Some(&enclosing));
 
     let system_prompt = system_prompt_override.unwrap_or(REVIEW_SYSTEM_PROMPT);
 
@@ -505,7 +506,8 @@ pub async fn review_diff_stream(
     system_prompt_override: Option<&str>,
     static_context: Option<&str>,
 ) -> std::result::Result<ReviewResponse, CoraError> {
-    let user_prompt = build_review_prompt(diff, focus, rules, static_context);
+    let enclosing = enclosing_section(diff);
+    let user_prompt = build_review_prompt(diff, focus, rules, static_context, Some(&enclosing));
 
     let system_prompt = system_prompt_override.unwrap_or(REVIEW_SYSTEM_PROMPT);
 
@@ -792,11 +794,35 @@ pub(crate) fn extract_file_paths_from_diff(diff: &str) -> Vec<String> {
 
 /// Build the user prompt for diff review.
 #[allow(clippy::format_push_string)]
-fn build_review_prompt(
+/// Always-on prompt guardrail (#523): stop plausible-but-wrong reachability
+/// claims that come from reasoning over diff hunks alone.
+pub(crate) const CONTROL_FLOW_GUARDRAIL: &str = "Control-flow guardrail: do NOT claim an execution path is unreachable or \
+that a call is missing on a branch unless the surrounding code confirms it — \
+shared match/if arms are reached by every producer feeding them.";
+
+/// Build the enclosing-scope prompt section for a diff (#523).
+///
+/// Reads post-image files relative to CWD (diff paths are repo-rooted);
+/// returns an empty string when no hunk qualifies or files are unreadable.
+pub(crate) fn enclosing_section(diff: &str) -> String {
+    let snippets =
+        crate::engine::enclosing::extract_enclosing_snippets(diff, std::path::Path::new("."));
+    if snippets.is_empty() {
+        return String::new();
+    }
+    crate::engine::enclosing::render_for_prompt(&snippets, |f| {
+        std::fs::read_to_string(f)
+            .map(|c| c.lines().map(String::from).collect())
+            .ok()
+    })
+}
+
+pub(crate) fn build_review_prompt(
     diff: &str,
     focus: &[String],
     rules: &[String],
     static_context: Option<&str>,
+    enclosing_context: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -820,6 +846,14 @@ fn build_review_prompt(
         }
     }
 
+    // Inject enclosing-scope code for branching hunks (#523)
+    if let Some(ctx) = enclosing_context {
+        if !ctx.is_empty() {
+            prompt.push_str(ctx);
+            prompt.push('\n');
+        }
+    }
+
     if !focus.is_empty() {
         prompt.push_str(&format!("Focus areas: {}\n\n", focus.join(", ")));
     }
@@ -831,6 +865,9 @@ fn build_review_prompt(
         }
         prompt.push('\n');
     }
+
+    prompt.push_str(CONTROL_FLOW_GUARDRAIL);
+    prompt.push_str("\n\n");
 
     prompt.push_str("Review the following diff:\n\n```diff\n");
     prompt.push_str(diff);
@@ -1702,34 +1739,34 @@ mod tests {
 
     #[test]
     fn build_prompt_basic() {
-        let prompt = build_review_prompt("diff content", &[], &[], None);
+        let prompt = build_review_prompt("diff content", &[], &[], None, None);
         assert!(prompt.contains("diff content"));
         assert!(prompt.contains("```diff"));
     }
 
     #[test]
     fn build_prompt_with_focus() {
-        let prompt = build_review_prompt("d", &["security".to_string()], &[], None);
+        let prompt = build_review_prompt("d", &["security".to_string()], &[], None, None);
         assert!(prompt.contains("Focus areas: security"));
     }
 
     #[test]
     fn build_prompt_with_rules() {
-        let prompt = build_review_prompt("d", &[], &["no unwrap".to_string()], None);
+        let prompt = build_review_prompt("d", &[], &["no unwrap".to_string()], None, None);
         assert!(prompt.contains("no unwrap"));
     }
 
     #[test]
     fn build_prompt_contains_file_paths() {
         let diff = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n- old\n+ new";
-        let prompt = build_review_prompt(diff, &[], &[], None);
+        let prompt = build_review_prompt(diff, &[], &[], None, None);
         assert!(prompt.contains("Valid files in this diff:"));
         assert!(prompt.contains("src/main.rs"));
     }
 
     #[test]
     fn build_prompt_no_file_paths_for_empty_diff() {
-        let prompt = build_review_prompt("no diff headers here", &[], &[], None);
+        let prompt = build_review_prompt("no diff headers here", &[], &[], None, None);
         assert!(!prompt.contains("Valid files in this diff:"));
     }
 
