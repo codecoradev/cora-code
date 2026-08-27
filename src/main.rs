@@ -1201,28 +1201,26 @@ async fn main() -> Result<()> {
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
+            } else if results.is_empty() {
+                println!("{}", "No results found.".dimmed());
             } else {
-                if results.is_empty() {
-                    println!("{}", "No results found.".dimmed());
-                } else {
+                println!(
+                    "{} {} results for '{}'",
+                    "🧠".magenta(),
+                    results.len().to_string().bold(),
+                    query_str
+                );
+                println!("{}", "─".repeat(60).dimmed());
+                for r in &results {
+                    let signals = r.signals.join(",");
+                    let score = format!("{:.4}", r.score);
                     println!(
-                        "{} {} results for '{}'",
-                        "🧠".magenta(),
-                        results.len().to_string().bold(),
-                        query_str
+                        "  {:<40} {:<15} {} {}",
+                        format!("{} ({})", r.name, r.file).green(),
+                        format!("[{}]", r.kind).dimmed(),
+                        format!("score={}", score).cyan(),
+                        format!("signals={}", signals).dimmed(),
                     );
-                    println!("{}", "─".repeat(60).dimmed());
-                    for r in &results {
-                        let signals = r.signals.join(",");
-                        let score = format!("{:.4}", r.score);
-                        println!(
-                            "  {:<40} {:<15} {} {}",
-                            format!("{} ({})", r.name, r.file).green(),
-                            format!("[{}]", r.kind).dimmed(),
-                            format!("score={}", score).cyan(),
-                            format!("signals={}", signals).dimmed(),
-                        );
-                    }
                 }
             }
             0
