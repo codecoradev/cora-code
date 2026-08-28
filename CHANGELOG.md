@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Empty LLM responses from reasoning models.** Models like GLM can spend the entire `max_tokens` budget on chain-of-thought and return `content: ""` with `finish_reason: "length"`, which previously surfaced as a misleading `EOF while parsing` error. Cora now reads `finish_reason`/`reasoning_content`, automatically retries with a doubled budget (up to 32768), salvages JSON from reasoning text as a last resort, and reports an explicit "EMPTY response" error when nothing is recoverable (#536).
+
+### Changed
+
+- **Default `max_tokens` raised from 4096 to 8192** to give reasoning models headroom above their chain-of-thought (#536).
+
 ### Changed
 
 - **Relicensed from MIT to Apache-2.0.** All 18 CodeCoraDev repositories now

@@ -150,7 +150,7 @@ impl Default for Config {
             scan_system_prompt_override: None,
             scan_system_prompt_file: None,
             temperature: 0.0,
-            max_tokens: 4096,
+            max_tokens: 8192, // #536: reasoning models need headroom above chain-of-thought
             max_tokens_param: "auto".to_string(),
             timeout: 600,
             cache_ttl: 1440, // 24h in minutes
@@ -1340,7 +1340,7 @@ scan:
     #[test]
     fn config_default_max_tokens() {
         let cfg = Config::default();
-        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.max_tokens, 8192);
     }
 
     #[test]
@@ -1402,7 +1402,7 @@ llm:
         cora.merge_into(&mut cfg).unwrap();
         assert_eq!(cfg.temperature, 0.7);
         // Other LLM fields should remain at defaults
-        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.max_tokens, 8192);
         assert_eq!(cfg.timeout, 600);
         assert_eq!(cfg.cache_ttl, 1440);
     }
