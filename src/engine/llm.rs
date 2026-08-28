@@ -42,6 +42,55 @@ static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     })
 });
 
+/// Cap for the empty-content budget escalation (#536).
+const MAX_TOKENS_CEILING: u32 = 32_768;
+
+/// Next output budget when a response came back with empty content.
+/// `finish_reason == "length"` means reasoning consumed the budget — double
+/// it, capped at [`MAX_TOKENS_CEILING`]. Any other reason → give up (None).
+fn next_budget_on_empty(finish_reason: Option<&str>, current: u32) -> Option<u32> {
+    if finish_reason != Some("length") {
+        return None;
+    }
+    let doubled = current.saturating_mul(2);
+    (doubled <= MAX_TOKENS_CEILING).then_some(doubled)
+}
+
+/// Flatten a `reasoning_content` value (string or content-parts array) to text.
+fn reasoning_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let joined: Vec<String> = parts
+                .iter()
+                .filter_map(|p| {
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(std::string::ToString::to_string)
+                })
+                .collect();
+            (!joined.is_empty()).then(|| {
+                joined.join(
+                    "
+",
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Last-resort raw response when `content` is empty: some models write the
+/// final JSON inside their reasoning. Only accept when it plausibly contains
+/// JSON — the parse layer still validates.
+fn salvage_from_reasoning(reasoning: Option<&Value>) -> Option<String> {
+    let text = reasoning_text(reasoning?)?;
+    let trimmed = text.trim();
+    let plausible =
+        trimmed.starts_with('[') || trimmed.starts_with('{') || trimmed.contains("```json");
+    plausible.then(|| trimmed.to_string())
+}
+
 /// Return the shared `reqwest::Client` for LLM API requests.
 pub fn shared_client() -> reqwest::Client {
     SHARED_CLIENT.clone()
@@ -80,7 +129,20 @@ struct ChatResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Response-side message: `content` may be ABSENT or null when a reasoning
+/// model spends the entire output budget on chain-of-thought (#536), and some
+/// providers expose the thinking under `reasoning_content` (string or parts).
+#[derive(Debug, Clone, Deserialize)]
+struct ResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<Value>,
 }
 
 /// Usage statistics from the LLM API response.
@@ -342,18 +404,53 @@ async fn chat_completion(
     let parsed: ChatResponse =
         serde_json::from_str(&body).map_err(|e| CoraError::LlmParse(format!("{e}: {body}")))?;
 
-    let content = parsed
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .unwrap_or_default();
-
     let usage = parsed.usage.as_ref().and_then(parse_usage_value);
 
     debug!(tokens = ?usage, "LLM response received");
     tracing::Span::current().record("tokens_used", usage.as_ref().map(|u| u.total_tokens));
 
-    Ok((content, usage))
+    let choice = parsed.choices.first();
+    let finish_reason = choice.and_then(|c| c.finish_reason.clone());
+    let reasoning = choice.and_then(|c| c.message.reasoning_content.clone());
+    let content = choice
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    if !content.trim().is_empty() {
+        return Ok((content, usage));
+    }
+
+    // Empty content (#536): a reasoning model can spend the whole output
+    // budget on chain-of-thought. Recover instead of failing — first by
+    // raising the budget, then by salvaging JSON from the reasoning text.
+    if let Some(next) = next_budget_on_empty(finish_reason.as_deref(), config.max_tokens) {
+        tracing::warn!(
+            finish_reason = ?finish_reason,
+            from = config.max_tokens,
+            to = next,
+            "empty LLM content — retrying with raised max_tokens"
+        );
+        let mut raised = config.clone();
+        raised.max_tokens = next;
+        return Box::pin(chat_completion(
+            &raised,
+            system_prompt,
+            user_message,
+            spinner,
+            response_format,
+        ))
+        .await;
+    }
+
+    if let Some(salvaged) = salvage_from_reasoning(reasoning.as_ref()) {
+        tracing::warn!("content empty — salvaged JSON from reasoning_content");
+        return Ok((salvaged, usage));
+    }
+
+    Err(CoraError::LlmParse(format!(
+        "provider returned an EMPTY response (finish_reason={finish_reason:?})          after raising max_tokens to {}. Raise `max_tokens` in config or disable          reasoning on the model.",
+        config.max_tokens
+    )))
 }
 
 /// Create an animated spinner for LLM operations.
@@ -883,6 +980,12 @@ pub(crate) fn parse_review_response(
     raw: &str,
     usage: Option<&Usage>,
 ) -> std::result::Result<(Vec<ReviewIssue>, String, Option<TokenUsage>), CoraError> {
+    if raw.trim().is_empty() {
+        return Err(CoraError::LlmParse(
+            "provider returned an EMPTY response (no message content). Common cause:              reasoning consumed the output budget — raise `max_tokens` in config."
+                .to_string(),
+        ));
+    }
     let (json_str, summary) = extract_json_and_summary(raw);
 
     // Strip markdown code fences if present
@@ -1327,6 +1430,37 @@ fn strip_code_fences(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_doubles_only_on_length() {
+        assert_eq!(next_budget_on_empty(Some("length"), 4096), Some(8192));
+        assert_eq!(next_budget_on_empty(Some("length"), 32768), None);
+        assert_eq!(next_budget_on_empty(Some("stop"), 4096), None);
+        assert_eq!(next_budget_on_empty(None, 4096), None);
+    }
+
+    #[test]
+    fn salvage_accepts_only_jsonish_reasoning() {
+        let arr = Value::String("[{\"file\":\"a.rs\"}]".to_string());
+        assert!(salvage_from_reasoning(Some(&arr)).is_some());
+
+        let fenced = Value::String("thinking... ```json\n[]\n```".to_string());
+        assert!(salvage_from_reasoning(Some(&fenced)).is_some());
+
+        let parts = Value::Array(vec![serde_json::json!({"text": "{\"x\":1}"})]);
+        assert!(salvage_from_reasoning(Some(&parts)).is_some());
+
+        let prose = Value::String("the diff looks fine overall".to_string());
+        assert!(salvage_from_reasoning(Some(&prose)).is_none());
+        assert!(salvage_from_reasoning(None).is_none());
+    }
+
+    #[test]
+    fn empty_raw_is_explicit_not_eof() {
+        let err = parse_review_response("", None).unwrap_err();
+        assert!(err.to_string().contains("EMPTY"), "got: {err}");
+    }
+
     use crate::engine::types::Severity;
 
     const SINGLE_ISSUE_JSON: &str = r#"[{"file":"src/main.rs","line":42,"severity":"critical","issue_type":"security","title":"SQL Injection","body":"User input is concatenated directly into SQL query.","suggested_fix":"Use parameterized queries."}]"#;
