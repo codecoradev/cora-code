@@ -3,7 +3,6 @@
 // ! Provides proper AST-based symbol and edge extraction using tree-sitter.
 // ! Only compiled when the `tree-sitter` feature is enabled.
 
-#![cfg(feature = "tree-sitter")]
 #![allow(dead_code, unused)]
 
 use crate::index::extract::CallSite;
@@ -417,13 +416,20 @@ fn extract_rust(
                                         let name = node_name(&gc, source);
                                         if !name.is_empty() {
                                             nodes.push(AstNode {
-                                                name,
+                                                name: name.clone(),
                                                 kind: SymbolKind::Function,
                                                 file: file_path.to_string(),
                                                 line: (gc.start_position().row + 1) as u32,
                                                 signature: signature_for_node(&gc, source),
                                                 parent: Some(type_n.clone()),
                                             });
+                                            // Walk impl-method bodies for call
+                                            // edges too — without this,
+                                            // cross-crate callers of these
+                                            // methods are invisible (#519).
+                                            extract_calls_from_node(
+                                                &gc, source, file_path, &name, &mut edges,
+                                            );
                                         }
                                     }
                                     if !dc.goto_next_sibling() {
@@ -455,6 +461,16 @@ fn extract_rust(
     (nodes, edges)
 }
 
+/// Reduce a call target to its final name segment so it joins against symbol
+/// names: method calls (`self.export_full`, `manager.remember()`) and
+/// qualified paths (`std::mem::drop`) all become their bare final name (#519).
+fn normalize_callee_name(raw: &str) -> &str {
+    raw.rsplit(['.', ':'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(raw)
+}
+
 /// Walk function body for call expressions using cursor-based DFS.
 fn extract_calls_from_node(
     node: &tree_sitter::Node,
@@ -472,12 +488,13 @@ fn extract_calls_from_node(
     ) {
         if node.kind() == "call_expression" {
             if let Some(fn_node) = node.child_by_field_name("function") {
-                let callee = node_text(&fn_node, source);
+                let raw = node_text(&fn_node, source);
+                let callee = normalize_callee_name(&raw);
                 if !callee.is_empty() {
                     edges.push(AstEdge {
                         source: caller.to_string(),
                         kind: EdgeKind::Calls,
-                        target: callee,
+                        target: callee.to_string(),
                         file: file_path.to_string(),
                         line: (node.start_position().row + 1) as u32,
                     });
@@ -2641,6 +2658,55 @@ export const processForm = (data: string) => {
             edges
                 .iter()
                 .any(|e| e.source == "handler" && e.target == "greet" && e.kind == EdgeKind::Calls)
+        );
+    }
+
+    /// Regression (#519): method calls (`self.export_full()`,
+    /// `manager.remember_with_contradiction()`) and qualified paths
+    /// (`std::mem::drop(...)`) must record the FINAL name segment as the
+    /// call target, so the edge joins against symbol names across files and
+    /// crates. Previously the raw text (`self.export_full`) was stored and
+    /// dead-code mis-flagged these symbols as uncalled.
+    #[test]
+    fn test_method_call_target_records_bare_name() {
+        let code = r#"
+pub struct StructuralExporter;
+
+impl StructuralExporter {
+    pub fn export_full(&self) -> String { String::new() }
+}
+
+struct Manager;
+
+impl Manager {
+    pub fn maintenance(&self, x: &StructuralExporter) {
+        let out = x.export_full();
+        std::mem::drop(out);
+    }
+}
+"#;
+        let (nodes, edges) = extract(code, "rs", "maintenance.rs");
+        assert!(nodes.iter().any(|n| n.name == "export_full"));
+
+        // Method-call edge lands on the bare method name…
+        assert!(
+            edges.iter().any(|e| e.source == "maintenance"
+                && e.target == "export_full"
+                && e.kind == EdgeKind::Calls),
+            "expected Calls edge to bare name 'export_full', got: {:?}",
+            edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Calls)
+                .map(|e| &e.target)
+                .collect::<Vec<_>>()
+        );
+
+        // …and qualified paths resolve to their final segment too.
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.source == "maintenance" && e.target == "drop"),
+            "expected Calls edge to 'drop' from std::mem::drop"
         );
     }
 

@@ -57,6 +57,9 @@ review:
   system_prompt: "You are a senior code reviewer."
   # system_prompt_file: ./review-prompt.md
   response_format: json_object
+  # Strip comments from added diff lines before the LLM sees them
+  # (ALIBI defense, arXiv:2607.24964). Claim flagging is always on.
+  sanitize_comments: false
   static_analysis:
     auto_clippy: false       # auto-run `cargo clippy` (Rust only)
     clippy_output_file: ""   # or read clippy output from file

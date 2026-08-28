@@ -117,11 +117,15 @@ pub async fn execute_scan(
     // 2b. Run index-powered deterministic scans (unused imports, dead code)
     // These work even without LLM and add findings to the final report.
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
+    // Same merged exclusion set as `cora index` (#521).
+    let mut index_skip = config.ignore.files.clone();
+    index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
+    index_skip.dedup();
     let index_findings = crate::engine::index_scanner::scan_project_index(
         &root_abs,
         &files,
         config.rules_config.max_findings,
-        &config.rules_config.index_skip_files,
+        &index_skip,
     );
     if !index_findings.is_empty() {
         eprintln!(

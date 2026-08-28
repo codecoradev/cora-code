@@ -42,6 +42,55 @@ static SHARED_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     })
 });
 
+/// Cap for the empty-content budget escalation (#536).
+const MAX_TOKENS_CEILING: u32 = 32_768;
+
+/// Next output budget when a response came back with empty content.
+/// `finish_reason == "length"` means reasoning consumed the budget — double
+/// it, capped at [`MAX_TOKENS_CEILING`]. Any other reason → give up (None).
+fn next_budget_on_empty(finish_reason: Option<&str>, current: u32) -> Option<u32> {
+    if finish_reason != Some("length") {
+        return None;
+    }
+    let doubled = current.saturating_mul(2);
+    (doubled <= MAX_TOKENS_CEILING).then_some(doubled)
+}
+
+/// Flatten a `reasoning_content` value (string or content-parts array) to text.
+fn reasoning_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => {
+            let joined: Vec<String> = parts
+                .iter()
+                .filter_map(|p| {
+                    p.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(std::string::ToString::to_string)
+                })
+                .collect();
+            (!joined.is_empty()).then(|| {
+                joined.join(
+                    "
+",
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Last-resort raw response when `content` is empty: some models write the
+/// final JSON inside their reasoning. Only accept when it plausibly contains
+/// JSON — the parse layer still validates.
+fn salvage_from_reasoning(reasoning: Option<&Value>) -> Option<String> {
+    let text = reasoning_text(reasoning?)?;
+    let trimmed = text.trim();
+    let plausible =
+        trimmed.starts_with('[') || trimmed.starts_with('{') || trimmed.contains("```json");
+    plausible.then(|| trimmed.to_string())
+}
+
 /// Return the shared `reqwest::Client` for LLM API requests.
 pub fn shared_client() -> reqwest::Client {
     SHARED_CLIENT.clone()
@@ -80,7 +129,20 @@ struct ChatResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Response-side message: `content` may be ABSENT or null when a reasoning
+/// model spends the entire output budget on chain-of-thought (#536), and some
+/// providers expose the thinking under `reasoning_content` (string or parts).
+#[derive(Debug, Clone, Deserialize)]
+struct ResponseMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<Value>,
 }
 
 /// Usage statistics from the LLM API response.
@@ -226,6 +288,14 @@ Return a JSON array of objects with these fields:
 - "body": string — detailed explanation with specific code reference
 - "suggested_fix": string or null — optional fix suggestion
 
+EXPLANATION STYLE (moderate-explanation principle, arXiv:2607.24601):
+Keep each finding at moderate depth: severity + a short reason (1-3
+sentences) + the specific code evidence it points to. Do NOT include
+long reasoning chains, step-by-step derivations, or exhaustive
+justifications — overly long explanations reduce agreement with the
+finding without adding value. Trust the reader to reason from the
+evidence.
+
 If no issues are found, return: []
 
 Return ONLY the JSON array. No markdown code fences, no explanation, no conversational text.
@@ -334,18 +404,53 @@ async fn chat_completion(
     let parsed: ChatResponse =
         serde_json::from_str(&body).map_err(|e| CoraError::LlmParse(format!("{e}: {body}")))?;
 
-    let content = parsed
-        .choices
-        .first()
-        .map(|c| c.message.content.clone())
-        .unwrap_or_default();
-
     let usage = parsed.usage.as_ref().and_then(parse_usage_value);
 
     debug!(tokens = ?usage, "LLM response received");
     tracing::Span::current().record("tokens_used", usage.as_ref().map(|u| u.total_tokens));
 
-    Ok((content, usage))
+    let choice = parsed.choices.first();
+    let finish_reason = choice.and_then(|c| c.finish_reason.clone());
+    let reasoning = choice.and_then(|c| c.message.reasoning_content.clone());
+    let content = choice
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    if !content.trim().is_empty() {
+        return Ok((content, usage));
+    }
+
+    // Empty content (#536): a reasoning model can spend the whole output
+    // budget on chain-of-thought. Recover instead of failing — first by
+    // raising the budget, then by salvaging JSON from the reasoning text.
+    if let Some(next) = next_budget_on_empty(finish_reason.as_deref(), config.max_tokens) {
+        tracing::warn!(
+            finish_reason = ?finish_reason,
+            from = config.max_tokens,
+            to = next,
+            "empty LLM content — retrying with raised max_tokens"
+        );
+        let mut raised = config.clone();
+        raised.max_tokens = next;
+        return Box::pin(chat_completion(
+            &raised,
+            system_prompt,
+            user_message,
+            spinner,
+            response_format,
+        ))
+        .await;
+    }
+
+    if let Some(salvaged) = salvage_from_reasoning(reasoning.as_ref()) {
+        tracing::warn!("content empty — salvaged JSON from reasoning_content");
+        return Ok((salvaged, usage));
+    }
+
+    Err(CoraError::LlmParse(format!(
+        "provider returned an EMPTY response (finish_reason={finish_reason:?})          after raising max_tokens to {}. Raise `max_tokens` in config or disable          reasoning on the model.",
+        config.max_tokens
+    )))
 }
 
 /// Create an animated spinner for LLM operations.
@@ -422,7 +527,8 @@ pub async fn review_diff(
         Some(create_spinner("Reviewing diff…"))
     };
 
-    let user_prompt = build_review_prompt(diff, focus, rules, static_context);
+    let enclosing = enclosing_section(diff);
+    let user_prompt = build_review_prompt(diff, focus, rules, static_context, Some(&enclosing));
 
     let system_prompt = system_prompt_override.unwrap_or(REVIEW_SYSTEM_PROMPT);
 
@@ -497,7 +603,8 @@ pub async fn review_diff_stream(
     system_prompt_override: Option<&str>,
     static_context: Option<&str>,
 ) -> std::result::Result<ReviewResponse, CoraError> {
-    let user_prompt = build_review_prompt(diff, focus, rules, static_context);
+    let enclosing = enclosing_section(diff);
+    let user_prompt = build_review_prompt(diff, focus, rules, static_context, Some(&enclosing));
 
     let system_prompt = system_prompt_override.unwrap_or(REVIEW_SYSTEM_PROMPT);
 
@@ -784,11 +891,35 @@ pub(crate) fn extract_file_paths_from_diff(diff: &str) -> Vec<String> {
 
 /// Build the user prompt for diff review.
 #[allow(clippy::format_push_string)]
-fn build_review_prompt(
+/// Always-on prompt guardrail (#523): stop plausible-but-wrong reachability
+/// claims that come from reasoning over diff hunks alone.
+pub(crate) const CONTROL_FLOW_GUARDRAIL: &str = "Control-flow guardrail: do NOT claim an execution path is unreachable or \
+that a call is missing on a branch unless the surrounding code confirms it — \
+shared match/if arms are reached by every producer feeding them.";
+
+/// Build the enclosing-scope prompt section for a diff (#523).
+///
+/// Reads post-image files relative to CWD (diff paths are repo-rooted);
+/// returns an empty string when no hunk qualifies or files are unreadable.
+pub(crate) fn enclosing_section(diff: &str) -> String {
+    let snippets =
+        crate::engine::enclosing::extract_enclosing_snippets(diff, std::path::Path::new("."));
+    if snippets.is_empty() {
+        return String::new();
+    }
+    crate::engine::enclosing::render_for_prompt(&snippets, |f| {
+        std::fs::read_to_string(f)
+            .map(|c| c.lines().map(String::from).collect())
+            .ok()
+    })
+}
+
+pub(crate) fn build_review_prompt(
     diff: &str,
     focus: &[String],
     rules: &[String],
     static_context: Option<&str>,
+    enclosing_context: Option<&str>,
 ) -> String {
     let mut prompt = String::new();
 
@@ -812,6 +943,14 @@ fn build_review_prompt(
         }
     }
 
+    // Inject enclosing-scope code for branching hunks (#523)
+    if let Some(ctx) = enclosing_context {
+        if !ctx.is_empty() {
+            prompt.push_str(ctx);
+            prompt.push('\n');
+        }
+    }
+
     if !focus.is_empty() {
         prompt.push_str(&format!("Focus areas: {}\n\n", focus.join(", ")));
     }
@@ -823,6 +962,9 @@ fn build_review_prompt(
         }
         prompt.push('\n');
     }
+
+    prompt.push_str(CONTROL_FLOW_GUARDRAIL);
+    prompt.push_str("\n\n");
 
     prompt.push_str("Review the following diff:\n\n```diff\n");
     prompt.push_str(diff);
@@ -838,6 +980,12 @@ pub(crate) fn parse_review_response(
     raw: &str,
     usage: Option<&Usage>,
 ) -> std::result::Result<(Vec<ReviewIssue>, String, Option<TokenUsage>), CoraError> {
+    if raw.trim().is_empty() {
+        return Err(CoraError::LlmParse(
+            "provider returned an EMPTY response (no message content). Common cause:              reasoning consumed the output budget — raise `max_tokens` in config."
+                .to_string(),
+        ));
+    }
     let (json_str, summary) = extract_json_and_summary(raw);
 
     // Strip markdown code fences if present
@@ -1282,6 +1430,37 @@ fn strip_code_fences(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn budget_doubles_only_on_length() {
+        assert_eq!(next_budget_on_empty(Some("length"), 4096), Some(8192));
+        assert_eq!(next_budget_on_empty(Some("length"), 32768), None);
+        assert_eq!(next_budget_on_empty(Some("stop"), 4096), None);
+        assert_eq!(next_budget_on_empty(None, 4096), None);
+    }
+
+    #[test]
+    fn salvage_accepts_only_jsonish_reasoning() {
+        let arr = Value::String("[{\"file\":\"a.rs\"}]".to_string());
+        assert!(salvage_from_reasoning(Some(&arr)).is_some());
+
+        let fenced = Value::String("thinking... ```json\n[]\n```".to_string());
+        assert!(salvage_from_reasoning(Some(&fenced)).is_some());
+
+        let parts = Value::Array(vec![serde_json::json!({"text": "{\"x\":1}"})]);
+        assert!(salvage_from_reasoning(Some(&parts)).is_some());
+
+        let prose = Value::String("the diff looks fine overall".to_string());
+        assert!(salvage_from_reasoning(Some(&prose)).is_none());
+        assert!(salvage_from_reasoning(None).is_none());
+    }
+
+    #[test]
+    fn empty_raw_is_explicit_not_eof() {
+        let err = parse_review_response("", None).unwrap_err();
+        assert!(err.to_string().contains("EMPTY"), "got: {err}");
+    }
+
     use crate::engine::types::Severity;
 
     const SINGLE_ISSUE_JSON: &str = r#"[{"file":"src/main.rs","line":42,"severity":"critical","issue_type":"security","title":"SQL Injection","body":"User input is concatenated directly into SQL query.","suggested_fix":"Use parameterized queries."}]"#;
@@ -1694,34 +1873,34 @@ mod tests {
 
     #[test]
     fn build_prompt_basic() {
-        let prompt = build_review_prompt("diff content", &[], &[], None);
+        let prompt = build_review_prompt("diff content", &[], &[], None, None);
         assert!(prompt.contains("diff content"));
         assert!(prompt.contains("```diff"));
     }
 
     #[test]
     fn build_prompt_with_focus() {
-        let prompt = build_review_prompt("d", &["security".to_string()], &[], None);
+        let prompt = build_review_prompt("d", &["security".to_string()], &[], None, None);
         assert!(prompt.contains("Focus areas: security"));
     }
 
     #[test]
     fn build_prompt_with_rules() {
-        let prompt = build_review_prompt("d", &[], &["no unwrap".to_string()], None);
+        let prompt = build_review_prompt("d", &[], &["no unwrap".to_string()], None, None);
         assert!(prompt.contains("no unwrap"));
     }
 
     #[test]
     fn build_prompt_contains_file_paths() {
         let diff = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n- old\n+ new";
-        let prompt = build_review_prompt(diff, &[], &[], None);
+        let prompt = build_review_prompt(diff, &[], &[], None, None);
         assert!(prompt.contains("Valid files in this diff:"));
         assert!(prompt.contains("src/main.rs"));
     }
 
     #[test]
     fn build_prompt_no_file_paths_for_empty_diff() {
-        let prompt = build_review_prompt("no diff headers here", &[], &[], None);
+        let prompt = build_review_prompt("no diff headers here", &[], &[], None, None);
         assert!(!prompt.contains("Valid files in this diff:"));
     }
 

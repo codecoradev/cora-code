@@ -43,6 +43,9 @@ pub struct Config {
     pub cache_ttl: u64,
     /// Static analysis context injection for reviews.
     pub static_analysis: StaticAnalysisConfig,
+    /// Strip comments from added diff lines before the LLM sees them
+    /// (ALIBI defense, arXiv:2607.24964).
+    pub sanitize_comments: bool,
     /// Rule engine configuration.
     pub rules_config: RulesConfig,
     /// Context chain configuration — cross-file dependency extraction.
@@ -143,10 +146,11 @@ impl Default for Config {
             response_format: "none".to_string(),
             review_system_prompt_override: None,
             review_system_prompt_file: None,
+            sanitize_comments: false,
             scan_system_prompt_override: None,
             scan_system_prompt_file: None,
             temperature: 0.0,
-            max_tokens: 4096,
+            max_tokens: 8192, // #536: reasoning models need headroom above chain-of-thought
             max_tokens_param: "auto".to_string(),
             timeout: 600,
             cache_ttl: 1440, // 24h in minutes
@@ -404,6 +408,10 @@ pub struct ReviewSection {
     /// Static analysis context injection (e.g., clippy output).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_analysis: Option<StaticAnalysisConfig>,
+    /// Strip comments from added diff lines before the LLM sees them
+    /// (ALIBI defense, arXiv:2607.24964).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sanitize_comments: Option<bool>,
     /// Context chain configuration (cross-file dependency extraction).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_chain: Option<crate::engine::context::types::ContextConfig>,
@@ -657,6 +665,9 @@ impl CoraFile {
             }
             if let Some(sa) = &r.static_analysis {
                 config.static_analysis.clone_from(sa);
+            }
+            if let Some(v) = r.sanitize_comments {
+                config.sanitize_comments = v;
             }
             if let Some(cc) = &r.context_chain {
                 config.context_chain.clone_from(cc);
@@ -1211,6 +1222,7 @@ review:
                 system_prompt: None,
                 system_prompt_file: None,
                 static_analysis: None,
+                sanitize_comments: None,
                 context_chain: None,
             }),
             ..Default::default()
@@ -1228,6 +1240,7 @@ review:
                 system_prompt: Some("Custom prompt here.".to_string()),
                 system_prompt_file: None,
                 static_analysis: None,
+                sanitize_comments: None,
                 context_chain: None,
             }),
             ..Default::default()
@@ -1248,6 +1261,7 @@ review:
                 system_prompt: None,
                 system_prompt_file: Some("prompts/review.md".to_string()),
                 static_analysis: None,
+                sanitize_comments: None,
                 context_chain: None,
             }),
             ..Default::default()
@@ -1326,7 +1340,7 @@ scan:
     #[test]
     fn config_default_max_tokens() {
         let cfg = Config::default();
-        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.max_tokens, 8192);
     }
 
     #[test]
@@ -1388,7 +1402,7 @@ llm:
         cora.merge_into(&mut cfg).unwrap();
         assert_eq!(cfg.temperature, 0.7);
         // Other LLM fields should remain at defaults
-        assert_eq!(cfg.max_tokens, 4096);
+        assert_eq!(cfg.max_tokens, 8192);
         assert_eq!(cfg.timeout, 600);
         assert_eq!(cfg.cache_ttl, 1440);
     }

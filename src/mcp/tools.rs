@@ -211,11 +211,12 @@ pub fn list_tools() -> Vec<Tool> {
         // ─── Dead Code Detection ───
         Tool {
             name: "cora.dead_code".to_string(),
-            description: "Find potentially dead code — functions/methods with no callers in the codebase.".to_string(),
+            description: "Find potentially dead code — functions/methods with no callers in the codebase. Public API surface (pub/export) is skipped by default.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "include_tests": { "type": "boolean", "description": "Include test functions in results" },
+                    "include_pub_api": { "type": "boolean", "description": "Include public API surface (pub/export items); skipped by default since they are consumed externally" },
                     "min_lines": { "type": "integer", "description": "Minimum lines of code to report" }
                 },
                 "required": []
@@ -707,7 +708,7 @@ fn handle_index_status() -> ToolResult {
 
     match crate::index::index_stats(&conn, project_id) {
         Ok(stats) => {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "exists": true,
                 "total_symbols": stats.total_symbols,
                 "total_files": stats.total_files,
@@ -715,10 +716,60 @@ fn handle_index_status() -> ToolResult {
                 "symbols_by_kind": stats.symbols_by_kind,
                 "symbols_by_language": stats.symbols_by_language,
             });
+            if let Some(hint) = project_root_mismatch_hint(&conn, project_id, stats.total_symbols) {
+                json["hint"] = serde_json::json!(hint);
+            }
             ToolResult::text(serde_json::to_string_pretty(&json).unwrap_or_default())
         }
         Err(e) => ToolResult::error(format!("Failed to get stats: {e}")),
     }
+}
+
+/// Surface a silent project-root mismatch (#522): the resolved project has no
+/// indexed symbols while other indexed projects in the same global DB do —
+/// usually because CLI and MCP resolved different project roots.
+fn project_root_mismatch_hint(
+    conn: &rusqlite::Connection,
+    project_id: i64,
+    total_symbols: usize,
+) -> Option<String> {
+    if total_symbols > 0 {
+        return None;
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.root_path, COUNT(s.id)
+             FROM projects p
+             JOIN symbols s ON s.project_id = p.id
+             WHERE p.id != ?1
+             GROUP BY p.id
+             ORDER BY COUNT(s.id) DESC
+             LIMIT 3",
+        )
+        .ok()?;
+    let rows: Vec<(String, i64)> = stmt
+        .query_map([project_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let list: Vec<String> = rows
+        .iter()
+        .map(|(root, n)| format!("{root} ({n} symbols)"))
+        .collect();
+    Some(format!(
+        "This project root has 0 indexed symbols, but the global index holds data for \
+         other roots: {}. Likely a project-root mismatch between where 'cora index' ran \
+         and where this session resolved the root. Run 'cora index' at your project root.",
+        list.join(", ")
+    ))
 }
 
 // ─── Review Pipeline Handlers (Phase 2) ───
@@ -1019,6 +1070,10 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         .get("include_tests")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let include_pub_api = params
+        .get("include_pub_api")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let min_lines = params
         .get("min_lines")
         .and_then(|v| v.as_u64())
@@ -1028,6 +1083,7 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         include_tests,
         min_lines,
         entry_point_patterns: vec![],
+        include_pub_api,
     };
 
     match crate::index::graph::find_dead_code(&conn, project_id, &opts) {
@@ -1158,6 +1214,46 @@ mod tests {
         let result = handle_tool_call("cora.index_status", &serde_json::json!({}));
         // May error if no index — that's acceptable
         assert!(result.is_error || result.content[0].text.contains("total_symbols"));
+    }
+
+    /// Regression (#522): when the resolved project has zero symbols but the
+    /// global DB holds data for other roots, index_status must carry a hint
+    /// naming those roots instead of silently reporting zeros.
+    #[test]
+    fn project_root_mismatch_hint_on_zero_symbol_project() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::run_migrations(&conn).unwrap();
+
+        let indexed_pid =
+            crate::index::schema::get_or_create_project(&conn, "/workspace/uteke").unwrap();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, signature, language, project_id)
+             VALUES ('alpha', 'function', 'lib.rs', 1, '', 'rust', ?1)",
+            [indexed_pid],
+        )
+        .unwrap();
+        let empty_pid =
+            crate::index::schema::get_or_create_project(&conn, "/workspace/uteke/crates/app")
+                .unwrap();
+
+        let hint = project_root_mismatch_hint(&conn, empty_pid, 0);
+        assert!(
+            hint.is_some(),
+            "zero-symbol project beside an indexed one must hint"
+        );
+        let hint = hint.unwrap();
+        assert!(
+            hint.contains("/workspace/uteke"),
+            "hint should name the root that actually holds data: {hint}"
+        );
+        assert!(
+            hint.contains("(1 symbols)"),
+            "hint should include counts: {hint}"
+        );
+
+        // Happy paths produce no hint.
+        assert!(project_root_mismatch_hint(&conn, empty_pid, 5).is_none());
+        assert!(project_root_mismatch_hint(&conn, indexed_pid, 1).is_none());
     }
 
     #[test]

@@ -12,6 +12,8 @@ use crate::engine::diff_parser::{DiffLineType, FileChunk};
 use crate::engine::rules::types::RuleFinding;
 use crate::index::graph;
 
+use std::collections::HashSet;
+
 /// Check if a file path matches any of the skip patterns.
 /// Supports simple glob patterns:
 /// - Exact: `"src/main.ts"` → full path match
@@ -298,13 +300,32 @@ pub fn scan_breaking_changes(
         }
     };
 
-    let project_id = match crate::index::ensure_project(&conn, project_root) {
+    scan_breaking_changes_with(&conn, chunks, project_root, max_findings, skip_patterns)
+}
+
+/// [`scan_breaking_changes`] against an explicit connection — testable with an
+/// in-memory index.
+pub(crate) fn scan_breaking_changes_with(
+    conn: &rusqlite::Connection,
+    chunks: &[FileChunk],
+    project_root: &std::path::Path,
+    max_findings: usize,
+    skip_patterns: &[String],
+) -> Vec<RuleFinding> {
+    let project_id = match crate::index::ensure_project(conn, project_root) {
         Ok(id) => id,
         Err(_) => {
             debug!("failed to get project_id — skipping breaking change scan");
             return Vec::new();
         }
     };
+
+    // Symbol names (re)defined by this very diff — the post-image of the change.
+    // A removal candidate whose name still exists post-change is signature
+    // drift, a move, or a wording tweak of the definition line, not a removal;
+    // reporting it as "removal breaks N callers" against a possibly-stale
+    // index is a false positive (#533).
+    let added_defs = collect_added_definitions(chunks);
 
     let mut findings = Vec::new();
 
@@ -355,10 +376,15 @@ pub fn scan_breaking_changes(
                             continue;
                         }
 
+                        // The diff itself redefines this symbol — not a removal.
+                        if added_defs.contains(symbol_name) {
+                            continue;
+                        }
+
                         let line_no = line.old_line_no.unwrap_or(0);
 
                         // Check if this symbol has callers in the index
-                        match graph::find_callers(&conn, project_id, symbol_name, 10) {
+                        match graph::find_callers(conn, project_id, symbol_name, 10) {
                             Ok(callers) if !callers.is_empty() => {
                                 let caller_list = callers
                                     .iter()
@@ -403,6 +429,41 @@ pub fn scan_breaking_changes(
 
     debug!(count = findings.len(), "breaking change scan complete");
     findings
+}
+
+/// Names of symbol definitions appearing on added lines across the whole diff.
+///
+/// Same regex set as the removal scan, applied to `+` lines — the post-image
+/// of the change. Diff-global (all chunks), so a definition moved between
+/// files is still recognized as continuing to exist.
+fn collect_added_definitions(chunks: &[FileChunk]) -> HashSet<String> {
+    let patterns: &[&str] = &[
+        r"(?m)^(?:pub\s+)?(?:fn|struct|enum|trait|mod|type|const|static)\s+(\w+)",
+        r"(?m)^export\s+(?:async\s+)?(?:function|const|class|interface|type)\s+(\w+)",
+        r"(?m)^(?:func|type|var|const)\s+(\w+)",
+        r"(?m)^(?:async\s+)?(?:def|class)\s+(\w+)",
+    ];
+    let compiled: Vec<regex::Regex> = patterns
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect();
+
+    let mut names = HashSet::new();
+    for chunk in chunks {
+        for hunk in &chunk.chunks {
+            for line in &hunk.lines {
+                if line.line_type != DiffLineType::Add {
+                    continue;
+                }
+                for re in &compiled {
+                    if let Some(caps) = re.captures(&line.content) {
+                        names.insert(caps[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 /// Scan a full project for index-based findings (unused imports + dead code).
@@ -583,6 +644,149 @@ mod tests {
         let findings =
             scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
         assert!(findings.is_empty(), "no index means no caller data");
+    }
+
+    // --- scan_breaking_changes_with: stale-index false-positive guard (#533) ---
+
+    /// In-memory index with caller edges for a symbol, mirroring a populated
+    /// global index that may be out of date relative to the diff.
+    fn index_with_callers(callee: &str, callers: &[(&str, &str, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        crate::index::schema::run_migrations(&conn).expect("migrations");
+        let project_id =
+            crate::index::schema::get_or_create_project(&conn, "/fixture/proj").expect("project");
+        for (caller, file, line) in callers {
+            conn.execute(
+                "INSERT INTO call_graph (caller, callee, file, line, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![caller, callee, file, line, project_id],
+            )
+            .expect("insert call_graph");
+        }
+        conn
+    }
+
+    fn project_root() -> &'static std::path::Path {
+        std::path::Path::new("/fixture/proj")
+    }
+
+    /// Build a chunk the way the real diff parser does: content WITHOUT the
+    /// leading marker (the parser strips `+`/`-`/space before storing).
+    fn chunk_lines(path: &str, lines: &[(&str, &str)]) -> FileChunk {
+        FileChunk {
+            old_path: Some(path.to_string()),
+            new_path: Some(path.to_string()),
+            language: "rust".to_string(),
+            is_binary: false,
+            is_deleted: false,
+            is_new: false,
+            chunks: vec![crate::engine::diff_parser::DiffHunk {
+                old_start: 1,
+                old_count: 0,
+                new_start: 1,
+                new_count: 0,
+                header: "@@ -1 +1 @@".to_string(),
+                lines: lines
+                    .iter()
+                    .map(|(marker, content)| crate::engine::diff_parser::DiffLine {
+                        line_type: match *marker {
+                            "+" => DiffLineType::Add,
+                            "-" => DiffLineType::Remove,
+                            _ => DiffLineType::Context,
+                        },
+                        content: content.to_string(),
+                        old_line_no: None,
+                        new_line_no: None,
+                    })
+                    .collect(),
+            }],
+        }
+    }
+
+    #[test]
+    fn signature_drift_against_stale_index_is_not_a_removal() {
+        // The reported FP (#533): only the signature line changed, so the old
+        // definition shows up as a `-` line while the same symbol is re-added.
+        let conn = index_with_callers("build_review_prompt", &[("handler_a", "src/api.rs", 42)]);
+        let chunks = vec![chunk_lines(
+            "src/engine/llm.rs",
+            &[
+                ("-", "pub fn build_review_prompt(diff: &str) -> String {"),
+                (
+                    "+",
+                    "pub fn build_review_prompt(diff: &str, scope: &str) -> String {",
+                ),
+            ],
+        )];
+        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        assert!(
+            findings.is_empty(),
+            "signature-only drift must not be reported as removal, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn genuine_removal_with_callers_still_fires() {
+        let conn = index_with_callers("important_api", &[("caller_x", "src/app.rs", 7)]);
+        let chunks = vec![chunk_lines(
+            "src/lib.rs",
+            &[("-", "pub fn important_api() {}")],
+        )];
+        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        assert_eq!(findings.len(), 1, "a true removal must still be reported");
+        assert_eq!(findings[0].rule_id, "index-breaking-change");
+        assert_eq!(findings[0].severity, Severity::Major);
+    }
+
+    #[test]
+    fn rename_reports_only_the_old_name() {
+        let conn = index_with_callers("old_name", &[("caller_y", "src/app.rs", 3)]);
+        let chunks = vec![chunk_lines(
+            "src/lib.rs",
+            &[("-", "pub fn old_name() {}"), ("+", "pub fn new_name() {}")],
+        )];
+        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        assert_eq!(findings.len(), 1, "rename is still breaking for old_name");
+        assert!(findings[0].title.contains("old_name"));
+    }
+
+    #[test]
+    fn cross_file_move_is_not_a_removal() {
+        let conn = index_with_callers("moved_fn", &[("caller_z", "src/main.rs", 11)]);
+        let chunks = vec![
+            chunk_lines("src/old_location.rs", &[("-", "pub fn moved_fn() {}")]),
+            chunk_lines("src/new_location.rs", &[("+", "pub fn moved_fn() {}")]),
+        ];
+        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        assert!(
+            findings.is_empty(),
+            "a definition moved between files still exists post-change, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn added_definitions_are_diff_global() {
+        let chunks = vec![
+            chunk_lines(
+                "a.rs",
+                &[("-", "pub fn gone() {}"), ("+", "pub fn kept_one() {}")],
+            ),
+            chunk_lines("b.py", &[("+", "def kept_two():"), ("+", "    pass")]),
+            chunk_lines("c.rs", &[(" ", "pub fn unchanged_context() {}")]),
+        ];
+        let names = collect_added_definitions(&chunks);
+        assert!(names.contains("kept_one"));
+        assert!(names.contains("kept_two"));
+        assert!(
+            !names.contains("gone"),
+            "removed line is not part of post-image"
+        );
+        assert!(
+            !names.contains("unchanged_context"),
+            "context lines are not additions"
+        );
     }
 
     // --- should_skip_file tests ---

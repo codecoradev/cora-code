@@ -1,10 +1,12 @@
 pub mod bundling;
 pub mod cache;
 pub mod chunker;
+pub mod comment_sanitizer;
 pub mod context;
 pub mod db_writer;
 pub mod debt_tracker;
 pub mod diff_parser;
+pub mod enclosing;
 pub mod index_bridge;
 pub mod index_scanner;
 pub mod language_analyzer;
