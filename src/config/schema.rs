@@ -445,8 +445,19 @@ pub struct AnalysisConfig {
 /// By default (`auto`), cora selects the best available backend at runtime:
 /// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
 /// Users can force a specific backend via `.cora.yaml`.
+fn default_vector_store() -> String {
+    "usearch".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BrainConfig {
+    /// Vector store backend for Brain Mode search.
+    ///
+    /// - `"usearch"` (default) — HNSW graph, f32
+    /// - `"vecq"` — 4-bit quantized brute-force scan (pure Rust, deterministic,
+    ///   ~6x smaller index; recall trade absorbed by RRF fusion)
+    #[serde(default = "default_vector_store")]
+    pub vector_store: String,
     /// Embedding backend selection.
     ///
     /// - `"auto"` (default) — best available: pretrained → hashing

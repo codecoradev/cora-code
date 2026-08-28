@@ -789,6 +789,7 @@ async fn main() -> Result<()> {
                     .map(|c| c.brain.embedding.to_string())
                     .unwrap_or_else(|| "auto".to_string());
                 crate::embed::resolve_backend(&brain_mode);
+                index::vector::apply_config_store(config.as_ref());
 
                 eprintln!("{}", "🔍 Indexing project...".cyan());
                 let stats = index::index_project_with_skip(
@@ -1197,6 +1198,16 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "auto".to_string());
             crate::embed::resolve_backend(&brain_mode);
 
+            let brain_cfg = crate::config::loader::load_config(
+                cli.global.config.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .ok();
+            index::vector::apply_config_store(brain_cfg.as_ref());
             let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
 
             if json {

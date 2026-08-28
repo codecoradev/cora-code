@@ -51,6 +51,7 @@ pub fn run_watch(
         .map(|c| c.brain.embedding.to_string())
         .unwrap_or_else(|| "auto".to_string());
     crate::embed::resolve_backend(&brain_mode);
+    crate::index::vector::apply_config_store(config.as_ref());
 
     let skip_ref: Option<&[String]> = skip_patterns.as_deref();
 
