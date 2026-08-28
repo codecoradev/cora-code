@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-28
+
 ### Fixed
 
 - **Empty LLM responses from reasoning models.** Models like GLM can spend the entire `max_tokens` budget on chain-of-thought and return `content: ""` with `finish_reason: "length"`, which previously surfaced as a misleading `EOF while parsing` error. Cora now reads `finish_reason`/`reasoning_content`, automatically retries with a doubled budget (up to 32768), salvages JSON from reasoning text as a last resort, and reports an explicit "EMPTY response" error when nothing is recoverable (#536).
+
+- **Dead-code false positives from cross-crate method calls.** Method calls inside Rust `impl` blocks were never walked for call edges, and call targets stored raw AST text (`self.export_full`) that could not join against symbol names — 557 false positives on a 5-crate workspace (#519).
+- **Index root mismatch between CLI and MCP.** Running `cora index` inside a workspace member crate created a separate project row from the one MCP resolved, so `index_status` reported 0 symbols despite a populated DB. Root resolution now prefers a `[workspace]` Cargo.toml and never climbs past a `.git` boundary (#522).
+- **`ignore.files` was not honored by the index.** Skip patterns only invalidated fingerprints; matched files were still indexed and surfaced in dead-code/review findings. They are now excluded from indexing entirely (#521).
 
 ### Changed
 
@@ -17,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Default `max_tokens` raised from 4096 to 8192** to give reasoning models headroom above their chain-of-thought (#536).
+- **Dead-code now skips public API surface by default** (`pub`/`export` items) — new `--include-pub` flag and MCP `include_pub_api` parameter opt back in (#520).
+- **Review prompts include enclosing control-flow scope.** Hunks touching branching constructs get the enclosing function from the post-image (120-line cap), plus an always-on guardrail against unverified reachability claims (#523).
+- **Incremental re-index reports honestly.** No-op runs print "Index up to date" with stored totals instead of "Indexed 0 symbols"; MCP `index_status` carries a root-mismatch hint (#522).
 - **Relicensed from MIT to Apache-2.0.** All 18 CodeCoraDev repositories now
   standardize on Apache-2.0 for patent grant protection and open-core model
   compatibility. Added CLA (Individual + Corporate) for contributor copyright
