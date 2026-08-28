@@ -19,7 +19,7 @@ semantic search engine (Brain Mode).
 ```bash
 cargo build              # Build (debug)
 cargo build --release    # Build (release)
-cargo test               # Run all 708 tests (default) / 714 (tree-sitter)
+cargo test               # Run all 934 tests (default) / 934 (tree-sitter)
 cargo clippy --all-targets -- -D warnings  # Lint (strict -D warnings)
 cargo fmt --all -- --check  # Format check
 ```
@@ -74,6 +74,7 @@ src/
 │   ├── llm.rs           # LLM API interaction
 │   ├── types.rs         # Severity, finding, and result types
 │   ├── diff_parser.rs   # Diff → FileChunk parsing
+│   ├── enclosing.rs     # Enclosing-scope control-flow context for review prompts
 │   ├── chunker.rs       # Auto-chunking large diffs
 │   ├── profiles.rs      # Quality profiles (strict/balanced/lax)
 │   ├── quality_gate.rs  # Quality gate thresholds + pass/fail
@@ -125,7 +126,7 @@ src/
 ## Testing
 
 ```bash
-cargo test               # 708 tests (default) / 714 (tree-sitter)
+cargo test               # 934 tests (default) / 934 (tree-sitter)
                          #   637 unit tests
                          #    16 CLI integration tests
                          #     6 config tests
