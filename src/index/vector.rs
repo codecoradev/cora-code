@@ -161,6 +161,7 @@ impl CodeVectorIndex {
         let mut lock_file = acquire_file_lock(path)?;
 
         let mut buffer = Vec::new();
+        let mut dirty = false;
         if lock_file.metadata().context("read vecq metadata")?.len() > 0 {
             use std::io::{Read, Seek, SeekFrom};
             lock_file
@@ -174,19 +175,23 @@ impl CodeVectorIndex {
         // KNOWN LIMITATION (#542): vecq-core 0.2.0 `from_bytes` restores codes
         // and scales but NOT the keyed map (see codecoradev/vecq#32), so a
         // reloaded index would silently search empty. Until key serialization
-        // ships upstream, reload always rebuilds fresh — safe (never
-        // mis-searches); `cora index` re-embeds on the next run.
+        // ships upstream, reload always rebuilds fresh. To keep the next
+        // `cora index` honest, mark the index dirty here — `embed_project`
+        // will then clear embed fingerprints and re-embed everything instead
+        // of skipping unchanged symbols against an empty index.
         if buffer.len() >= 24 {
             tracing::warn!(
-                "vecq persistence lacks key serialization upstream (vecq#32) —                  recreating index; run `cora index` to re-embed symbols"
+                "vecq persistence lacks key serialization upstream (vecq#32) — \
+                 recreating index; `cora index` will re-embed all symbols"
             );
+            dirty = true;
         }
         let index = vecq_core::VecqIndex::new(dims, VECQ_SEED);
 
         Ok(Self {
             inner: Inner::Vecq(Box::new(index)),
             path: Some(path.to_path_buf()),
-            dirty: false,
+            dirty,
             _lock_file: Some(lock_file),
         })
     }

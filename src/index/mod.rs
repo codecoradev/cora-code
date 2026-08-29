@@ -531,8 +531,12 @@ fn index_project_with_id(
         stats.files_scanned, stats.files_indexed, stats.symbols_indexed, stats.errors
     );
 
-    // Embed symbols into vector index for brain search — only when files changed
-    if stats.files_indexed > 0 {
+    // Embed symbols into vector index for brain search — when files changed,
+    // or when the stored index was discarded on reload (vecq #542: a fresh
+    // process rebuilds the vecq index empty; if all files are unchanged this
+    // would be the only chance to re-embed — without it the vector signal
+    // stays dead until a file actually changes).
+    if stats.files_indexed > 0 || brain::vector_index_needs_rebuild() {
         match brain::embed_project(conn, project_id) {
             Ok(n) => {
                 stats.embedded_symbols = Some(n);
