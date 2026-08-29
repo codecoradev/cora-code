@@ -158,6 +158,22 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         cache.as_mut().unwrap()
     };
 
+    // ── Self-heal after vecq reload-discard (#542, vecq#32) ──────────
+    // A vecq index reloaded from disk is rebuilt empty (upstream lacks key
+    // serialization) and arrives dirty. Stored fingerprints would skip all
+    // unchanged symbols, permanently excluding them from vector search.
+    // Clear fingerprints so this run re-embeds every symbol in the project.
+    if vi.is_dirty() && vi.is_empty() {
+        let cleared = conn.execute(
+            "UPDATE symbols SET embed_fingerprint = NULL WHERE project_id = ?1",
+            rusqlite::params![project_id],
+        )?;
+        tracing::info!(
+            cleared,
+            "vector index rebuilt from empty (vecq reload) — re-embedding all symbols"
+        );
+    }
+
     // ── Incremental: fetch stored fingerprints ──────────────────────
     // Only re-embed symbols whose name+signature has changed.
     let mut stmt = conn.prepare(
@@ -353,6 +369,20 @@ fn fts5_search(conn: &Connection, project_id: i64, query: &str, limit: usize) ->
             Vec::new()
         }
     }
+}
+
+/// True when the on-disk vector index exists but will be discarded on reload —
+/// i.e. vecq backend with a non-empty `.vecq` file that cannot restore its
+/// key map (vecq#32). `cora index` uses this to force a re-embed even when
+/// no files changed, so the vector signal heals instead of staying empty.
+pub fn vector_index_needs_rebuild() -> bool {
+    if crate::index::vector::current_vector_store() != crate::index::vector::VectorStoreKind::Vecq {
+        return false;
+    }
+    let path = vector_index_path().with_extension("vecq");
+    std::fs::metadata(&path)
+        .map(|m| m.len() > 24)
+        .unwrap_or(false)
 }
 
 /// usearch vector search → (symbol_id, cosine_similarity) pairs, filtered to project.

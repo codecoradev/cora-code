@@ -350,6 +350,7 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-typescript",
  "usearch",
+ "vecq-core",
  "which",
 ]
 
@@ -2395,6 +2396,12 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vecq-core"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5f5e3c486177edd6c21108dfe621a7e9c85730c0dbb0ce76673e6682a68e90b"
 
 [[package]]
 name = "version_check"

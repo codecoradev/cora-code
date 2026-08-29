@@ -328,6 +328,8 @@ pub struct CoraFile {
     pub profile: Option<crate::engine::profiles::ProfileRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis: Option<AnalysisConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brain: Option<BrainSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -445,8 +447,19 @@ pub struct AnalysisConfig {
 /// By default (`auto`), cora selects the best available backend at runtime:
 /// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
 /// Users can force a specific backend via `.cora.yaml`.
+fn default_vector_store() -> String {
+    "usearch".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct BrainConfig {
+    /// Vector store backend for Brain Mode search.
+    ///
+    /// - `"usearch"` (default) — HNSW graph, f32
+    /// - `"vecq"` — 4-bit quantized brute-force scan (pure Rust, deterministic,
+    ///   ~6x smaller index; recall trade absorbed by RRF fusion)
+    #[serde(default = "default_vector_store")]
+    pub vector_store: String,
     /// Embedding backend selection.
     ///
     /// - `"auto"` (default) — best available: pretrained → hashing
@@ -456,6 +469,16 @@ pub struct BrainConfig {
     /// Invalid values fall back to `"auto"` with a warning.
     #[serde(default, skip_serializing_if = "is_default")]
     pub embedding: BrainEmbeddingMode,
+}
+
+/// `.cora.yaml` `brain:` section — mirrors the subset of [`BrainConfig`]
+/// that is meaningful in a config file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrainSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_store: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<BrainEmbeddingMode>,
 }
 
 /// Embedding backend mode for Brain Mode.
@@ -764,6 +787,16 @@ impl CoraFile {
                     .analysis
                     .entry_point_patterns
                     .clone_from(&analysis.entry_point_patterns);
+            }
+        }
+        // Merge brain config (Brain Mode vector store / embedding backend).
+        // Field-wise like the other sections: unset fields keep Config defaults.
+        if let Some(brain) = &self.brain {
+            if let Some(v) = &brain.vector_store {
+                config.brain.vector_store.clone_from(v);
+            }
+            if let Some(v) = &brain.embedding {
+                config.brain.embedding = v.clone();
             }
         }
         Ok(())
