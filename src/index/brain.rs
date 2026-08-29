@@ -385,17 +385,55 @@ pub fn vector_index_needs_rebuild() -> bool {
         .unwrap_or(false)
 }
 
+/// Return a read guard over the vector index cache, loading the on-disk
+/// index once per process if needed (#545). VECTOR_CACHE used to be
+/// populated only by `embed_project` (i.e. `cora index`), so a fresh search
+/// process (`cora brain`, MCP tools) always saw an empty cache and the
+/// vector signal never fired. Load failures degrade gracefully: the cache
+/// stays `None` and search falls back to FTS + graph signals.
+///
+/// `RwLockWriteGuard::downgrade` is still unstable, so this drops the write
+/// guard and re-acquires a read lock; a concurrent reader may load twice,
+/// which is idempotent (same file, same result).
+fn ensure_vector_cache() -> std::sync::RwLockReadGuard<'static, Option<CodeVectorIndex>> {
+    {
+        let cache = VECTOR_CACHE.read().unwrap();
+        if cache.is_some() {
+            return cache;
+        }
+    }
+
+    let mut cache = VECTOR_CACHE.write().unwrap();
+    if cache.is_none() {
+        let dims = active_dims();
+        match CodeVectorIndex::load_or_create(&vector_index_path(), dims) {
+            Ok(vi) => *cache = Some(vi),
+            Err(e) => tracing::warn!("vector index load failed (search degrades to FTS): {e}"),
+        }
+    }
+    drop(cache);
+
+    VECTOR_CACHE.read().unwrap()
+}
+
 /// usearch vector search → (symbol_id, cosine_similarity) pairs, filtered to project.
 /// Uses cached vector index and cached project ID set — no disk I/O per query.
 fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) -> Vec<(i64, f32)> {
-    // Read-lock the cached vector index — no disk load
-    let cache = VECTOR_CACHE.read().unwrap();
+    // Read-lock the cached vector index — lazy-loads from disk on the first
+    // search in this process (#545).
+    let cache = ensure_vector_cache();
     let vi = match cache.as_ref() {
         Some(v) if !v.is_empty() => v,
         _ => return Vec::new(),
     };
 
     let vec = embed_code_dispatch(query);
+
+    // Dimension mismatch (e.g. embedding provider switched since the index
+    // was built) would panic inside the backend — degrade to other signals.
+    if vi.dims() != vec.len() {
+        return Vec::new();
+    }
 
     // Over-fetch to compensate for post-filter by project_id.
     let over_fetch = (limit * 5).max(50);
