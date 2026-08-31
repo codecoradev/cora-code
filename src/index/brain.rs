@@ -62,17 +62,20 @@ fn vector_index_path() -> std::path::PathBuf {
 /// The index file contains usearch binary data — we can't easily read the
 /// dimensionality without loading it. Instead, we check the `embedding_dims`
 /// column in the projects table, which is written during embedding.
-fn check_dimension_compat(vi_path: &std::path::Path, expected_dims: usize) {
+fn check_dimension_compat(vi_path: &std::path::Path, expected_dims: usize) -> bool {
     // Attempt to load the index just to check its dimensions.
     // If it fails (empty, corrupt, etc.), we'll create fresh — no warning needed.
+    // Returns true when a stale index was removed: the vector index is a
+    // single file shared by every project, so its fingerprints are now all
+    // stale and callers must clear them.
     let Ok(file) = std::fs::File::open(vi_path) else {
-        return;
+        return false;
     };
     let Ok(metadata) = file.metadata() else {
-        return;
+        return false;
     };
     if metadata.len() == 0 {
-        return; // Empty file — will create fresh
+        return false; // Empty file — will create fresh
     }
 
     // Try to load and check dims
@@ -102,18 +105,22 @@ fn check_dimension_compat(vi_path: &std::path::Path, expected_dims: usize) {
             // Delete the stale index so embed_project creates a fresh one
             if let Err(e) = std::fs::remove_file(vi_path) {
                 tracing::warn!("  Failed to remove stale index: {e}");
+                false
             } else {
                 let keys_path = vi_path.with_extension("keys");
                 let _ = std::fs::remove_file(&keys_path);
                 tracing::info!("  Removed stale vector index — will create fresh on next index");
+                true
             }
         }
         Ok(Some(_)) => {
             // Dimensions match — all good
+            false
         }
         _ => {
             // Couldn't read dimensions (corrupt, unsupported, etc.)
             // embed_project will handle creation
+            false
         }
     }
 }
@@ -140,9 +147,11 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     // Check for existing index with mismatched dimensions (e.g. user rebuilt
     // with/without pretrained-embed feature). Warn but continue — the index
     // will be corrupted for searches until re-indexed.
-    if vi_path.exists() {
-        check_dimension_compat(&vi_path, active);
-    }
+    let dims_stale = if vi_path.exists() {
+        check_dimension_compat(&vi_path, active)
+    } else {
+        false
+    };
 
     // Acquire write lock — block searches while embedding.
     // This is fine because embedding only happens during `cora index`,
@@ -158,19 +167,21 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
         cache.as_mut().unwrap()
     };
 
-    // ── Self-heal after vecq reload-discard (#542, vecq#32) ──────────
-    // A vecq index reloaded from disk is rebuilt empty (upstream lacks key
-    // serialization) and arrives dirty. Stored fingerprints would skip all
-    // unchanged symbols, permanently excluding them from vector search.
-    // Clear fingerprints so this run re-embeds every symbol in the project.
-    if vi.is_dirty() && vi.is_empty() {
-        let cleared = conn.execute(
-            "UPDATE symbols SET embed_fingerprint = NULL WHERE project_id = ?1",
-            rusqlite::params![project_id],
-        )?;
+    // ── Self-heal after a global index rebuild (#542, vecq#32) ───────
+    // The vector index is one shared file across projects. A vecq reload
+    // that had to rebuild it (legacy pre-0.3.0 file, width change, dim
+    // change, corruption) or a stale usearch index removed for a dims
+    // mismatch leaves every project's vectors gone while their stored
+    // fingerprints still say "embedded" — the incremental path would skip
+    // those symbols forever. Clear fingerprints for ALL projects: the
+    // current project re-embeds in this run; every other project re-embeds
+    // on its next `cora index` run that reaches embed_project
+    // (cross-project scheduling: #545).
+    if dims_stale || (vi.is_dirty() && vi.is_empty()) {
+        let cleared = conn.execute("UPDATE symbols SET embed_fingerprint = NULL", [])?;
         tracing::info!(
             cleared,
-            "vector index rebuilt from empty (vecq reload) — re-embedding all symbols"
+            "vector index rebuilt from empty — all projects re-embed on their next index run"
         );
     }
 
@@ -372,17 +383,17 @@ fn fts5_search(conn: &Connection, project_id: i64, query: &str, limit: usize) ->
 }
 
 /// True when the on-disk vector index exists but will be discarded on reload —
-/// i.e. vecq backend with a non-empty `.vecq` file that cannot restore its
-/// key map (vecq#32). `cora index` uses this to force a re-embed even when
-/// no files changed, so the vector signal heals instead of staying empty.
+/// i.e. vecq backend whose `.vecq` file predates keyed persistence (vecq#32),
+/// is unreadable, or was built with different dims. `cora index` uses this to
+/// force a re-embed even when no files changed, so the vector signal heals
+/// instead of staying empty. Healthy keyed files (vecq-core 0.3.0+) reload
+/// as-is and return false.
 pub fn vector_index_needs_rebuild() -> bool {
     if crate::index::vector::current_vector_store() != crate::index::vector::VectorStoreKind::Vecq {
         return false;
     }
     let path = vector_index_path().with_extension("vecq");
-    std::fs::metadata(&path)
-        .map(|m| m.len() > 24)
-        .unwrap_or(false)
+    path.exists() && crate::index::vector::vecq_file_needs_rebuild(&path, active_dims())
 }
 
 /// Return a read guard over the vector index cache, loading the on-disk
