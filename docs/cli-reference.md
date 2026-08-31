@@ -166,6 +166,19 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora mcp` | Start MCP server for AI coding agents (Claude Code, Cursor, Windsurf) |
 | `cora serve` | Start MCP server with auto-reindex on startup |
 
+### Self-Upgrade
+
+| Command | Description |
+|---------|-------------|
+| `cora upgrade --check` | Check for a newer release; no download |
+| `cora upgrade` | Detect OS/arch, download the latest GitHub release asset, verify its SHA-256 checksum, and replace the running binary |
+| `cora upgrade -y` | Same, but skip the confirmation prompt (CI/automation) |
+
+Notes:
+
+- Background update notification: a non-blocking check runs on startup, cached for 24 h at `~/.codecora/cora-code/update-cache.json`. Notices go to stderr only. Disable with the `CORA_NO_UPDATE_CHECK=1` environment variable.
+- If the running binary came from `cargo install --path .`, prefer re-running that instead of `cora upgrade` (the release asset would shadow your source build).
+
 ## Quick Examples
 
 ```bash
