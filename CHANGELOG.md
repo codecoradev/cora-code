@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-31
+
 ### Added
 
 - **Opt-in `vecq` vector store for Brain Mode.** Set `brain.vector_store: vecq` in `.cora.yaml` to replace the usearch HNSW index with a vecq quantized scan (pure Rust, deterministic, ~5x smaller). Keyed persistence included: symbol ids survive reload, so a fresh process serves the index as-is and `cora index` no longer re-embeds unchanged projects (#542, #547).
