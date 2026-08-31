@@ -72,7 +72,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Vector search (Phase 3 — Brain Mode)
 usearch = "2"
-vecq-core = "0.2.0"
+vecq-core = "0.3.0"
 fs2 = "0.4"
 
 # Self-update (upgrade command)

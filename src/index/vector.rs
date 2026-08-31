@@ -25,7 +25,7 @@ pub enum VectorStoreKind {
     /// HNSW graph over f32 vectors (the historical default).
     #[default]
     Usearch,
-    /// vecq 4-bit quantized scan — pure Rust, deterministic, ~6x smaller.
+    /// vecq quantized scan — pure Rust, deterministic, ~5x smaller.
     Vecq,
 }
 
@@ -38,8 +38,69 @@ impl VectorStoreKind {
     }
 }
 
+/// vecq quantization width (`brain.vector_bits` in `.cora.yaml`).
+///
+/// Default is 4-bit + residual rescore: on cora's default hashing-trick
+/// embeddings it measured the best recall@10 at 4-bit scan speed across
+/// 1k/5k/13k-symbol indexes (recall study, 2026-08) — plain 5-bit, the
+/// vecq-core default, trailed by ~4-7 points at every scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorBits {
+    /// 4-bit base codes + second-pass residual rescoring (format v1.4).
+    #[default]
+    Residual,
+    /// Plain 4-bit Lloyd-Max (max compression, lowest recall).
+    B4,
+    /// Plain 5-bit Lloyd-Max (vecq-core's out-of-the-box default).
+    B5,
+    /// Plain 6-bit Lloyd-Max (highest plain recall, slowest scan).
+    B6,
+}
+
+impl VectorBits {
+    /// Lenient like [`VectorStoreKind::parse`]: empty/unknown → Residual.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "4" => Self::B4,
+            "5" => Self::B5,
+            "6" => Self::B6,
+            _ => Self::Residual, // "residual", "" and anything unknown
+        }
+    }
+
+    fn create(&self, dims: usize) -> vecq_core::VecqIndex {
+        match self {
+            Self::Residual => vecq_core::VecqIndex::with_residual(dims, VECQ_SEED),
+            Self::B4 => Self::create_plain(dims, 4),
+            Self::B5 => Self::create_plain(dims, 5),
+            Self::B6 => Self::create_plain(dims, 6),
+        }
+    }
+
+    fn create_plain(dims: usize, bits: u8) -> vecq_core::VecqIndex {
+        let mut index = vecq_core::VecqIndex::new(dims, VECQ_SEED);
+        index.set_bits(bits);
+        index
+    }
+
+    /// Whether an on-disk index was built at this width. A mismatch triggers
+    /// one rebuild so a config change actually takes effect instead of
+    /// silently serving the old width forever.
+    fn matches(&self, index: &vecq_core::VecqIndex) -> bool {
+        match self {
+            Self::Residual => index.is_residual(),
+            Self::B4 => !index.is_residual() && index.bits() == 4,
+            Self::B5 => !index.is_residual() && index.bits() == 5,
+            Self::B6 => !index.is_residual() && index.bits() == 6,
+        }
+    }
+}
+
 static VECTOR_STORE: LazyLock<std::sync::RwLock<VectorStoreKind>> =
     LazyLock::new(|| std::sync::RwLock::new(VectorStoreKind::Usearch));
+
+static VECTOR_BITS: LazyLock<std::sync::RwLock<VectorBits>> =
+    LazyLock::new(|| std::sync::RwLock::new(VectorBits::default()));
 
 /// Select the physical vector store used by NEW indexes (process-wide).
 /// Existing on-disk indexes keep their own format via file extension.
@@ -51,14 +112,30 @@ pub fn current_vector_store() -> VectorStoreKind {
     *VECTOR_STORE.read().unwrap()
 }
 
-/// Apply `brain.vector_store` from a loaded config (any process entry that
-/// touches Brain search/embedding must call this before opening the index,
-/// or `.vecq`/`.usearch` files silently diverge between runs).
+/// Select the vecq quantization width used by NEW indexes (process-wide).
+pub fn set_vector_bits(bits: VectorBits) {
+    *VECTOR_BITS.write().unwrap() = bits;
+}
+
+pub fn current_vector_bits() -> VectorBits {
+    *VECTOR_BITS.read().unwrap()
+}
+
+/// Apply `brain.vector_store` + `brain.vector_bits` from a loaded config (any
+/// process entry that touches Brain search/embedding must call this before
+/// opening the index, or `.vecq`/`.usearch` files silently diverge between
+/// runs).
 pub fn apply_config_store(config: Option<&crate::config::schema::Config>) {
-    let kind = config
-        .map(|c| VectorStoreKind::parse(&c.brain.vector_store))
+    let (kind, bits) = config
+        .map(|c| {
+            (
+                VectorStoreKind::parse(&c.brain.vector_store),
+                VectorBits::parse(&c.brain.vector_bits),
+            )
+        })
         .unwrap_or_default();
     set_vector_store(kind);
+    set_vector_bits(bits);
 }
 
 /// Hashing-trick embedding dimensions (zero-dependency fallback).
@@ -113,9 +190,7 @@ impl CodeVectorIndex {
                     symbol_to_key: HashMap::new(),
                     next_key: 0,
                 },
-                VectorStoreKind::Vecq => {
-                    Inner::Vecq(Box::new(vecq_core::VecqIndex::new(dims, VECQ_SEED)))
-                }
+                VectorStoreKind::Vecq => Inner::Vecq(Box::new(current_vector_bits().create(dims))),
             },
             path: None,
             dirty: false,
@@ -161,7 +236,6 @@ impl CodeVectorIndex {
         let mut lock_file = acquire_file_lock(path)?;
 
         let mut buffer = Vec::new();
-        let mut dirty = false;
         if lock_file.metadata().context("read vecq metadata")?.len() > 0 {
             use std::io::{Read, Seek, SeekFrom};
             lock_file
@@ -172,21 +246,57 @@ impl CodeVectorIndex {
                 .context("read vecq file")?;
         }
 
-        // KNOWN LIMITATION (#542): vecq-core 0.2.0 `from_bytes` restores codes
-        // and scales but NOT the keyed map (see codecoradev/vecq#32), so a
-        // reloaded index would silently search empty. Until key serialization
-        // ships upstream, reload always rebuilds fresh. To keep the next
-        // `cora index` honest, mark the index dirty here — `embed_project`
-        // will then clear embed fingerprints and re-embed everything instead
-        // of skipping unchanged symbols against an empty index.
-        if buffer.len() >= 24 {
-            tracing::warn!(
-                "vecq persistence lacks key serialization upstream (vecq#32) — \
-                 recreating index; `cora index` will re-embed all symbols"
-            );
-            dirty = true;
+        let bits = current_vector_bits();
+        let mut index = bits.create(dims);
+        let mut dirty = false;
+        if !buffer.is_empty() {
+            match vecq_core::VecqIndex::from_bytes(&buffer) {
+                Ok(loaded)
+                    if loaded.dim() == dims && bits.matches(&loaded) && vecq_has_keys(&loaded) =>
+                {
+                    index = loaded;
+                }
+                // Dim mismatch (e.g. rebuilt with/without pretrained-embed):
+                // keeping the loaded dims would panic on the next insert.
+                Ok(loaded) if loaded.dim() != dims => {
+                    tracing::warn!(
+                        "vecq index dims {} != current {dims} — recreating; \
+                         `cora index` will re-embed all symbols",
+                        loaded.dim()
+                    );
+                    dirty = true;
+                }
+                Ok(loaded) if !bits.matches(&loaded) => {
+                    tracing::warn!(
+                        "vecq index width ({}) != configured brain.vector_bits ({bits:?}) — \
+                         recreating; `cora index` will re-embed all symbols",
+                        if loaded.is_residual() {
+                            "residual".to_string()
+                        } else {
+                            format!("{}-bit", loaded.bits())
+                        }
+                    );
+                    dirty = true;
+                }
+                // Legacy vecq-core 0.2.x file (vecq#32): parses fine but
+                // carries no keyed-slot table, and cora's symbol ids live in
+                // the key map — searching it would silently return nothing.
+                Ok(_) => {
+                    tracing::warn!(
+                        "vecq file predates keyed persistence (vecq#32) — \
+                         recreating index; `cora index` will re-embed all symbols"
+                    );
+                    dirty = true;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "vecq index unreadable ({e}) — recreating; \
+                         `cora index` will re-embed all symbols"
+                    );
+                    dirty = true;
+                }
+            }
         }
-        let index = vecq_core::VecqIndex::new(dims, VECQ_SEED);
 
         Ok(Self {
             inner: Inner::Vecq(Box::new(index)),
@@ -446,6 +556,37 @@ fn create_usearch_index(dims: usize) -> Result<Index> {
     Index::new(&options).context("create usearch index")
 }
 
+/// cora only inserts via `add_keyed`, so every live slot of a healthy index
+/// carries a key. Files written by vecq-core 0.2.x (before format v1.3)
+/// load with vectors but no key table — searching them would silently
+/// return nothing (vecq#32).
+fn vecq_has_keys(index: &vecq_core::VecqIndex) -> bool {
+    index.is_empty() || (0..index.slots()).any(|s| index.key_of(s).is_some())
+}
+
+/// True when the `.vecq` file exists but cannot serve keyed search after
+/// reload — legacy vecq#32 file, unreadable, built with different dims, or
+/// at a different width than the configured `brain.vector_bits`. Mirrors
+/// exactly what [`CodeVectorIndex::load_or_create`] will decide, so
+/// `cora index` can force a re-embed when the index is about to be rebuilt.
+pub fn vecq_file_needs_rebuild(path: &Path, dims: usize) -> bool {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return false, // no file / unreadable — nothing to rebuild
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    match vecq_core::VecqIndex::from_bytes(&bytes) {
+        Ok(loaded) => {
+            loaded.dim() != dims
+                || !current_vector_bits().matches(&loaded)
+                || !vecq_has_keys(&loaded)
+        }
+        Err(_) => true,
+    }
+}
+
 /// Convert cosine distance (0..2) to cosine similarity (0..1).
 pub fn cosine_distance_to_similarity(distance: f32) -> f32 {
     (1.0 - distance).clamp(0.0, 1.0)
@@ -591,39 +732,101 @@ mod tests {
     }
 
     #[test]
-    fn test_vecq_backend_roundtrip() {
+    fn test_vecq_backend_roundtrip_all_widths() {
+        for bits in [
+            VectorBits::Residual,
+            VectorBits::B4,
+            VectorBits::B5,
+            VectorBits::B6,
+        ] {
+            let _g = with_store_lock();
+            set_vector_store(VectorStoreKind::Vecq);
+            set_vector_bits(bits);
+            let mut idx = CodeVectorIndex::new(64).unwrap();
+
+            idx.insert(1, &make_unit_vec(64, 0)).unwrap();
+            idx.insert(2, &make_unit_vec(64, 1)).unwrap();
+            assert_eq!(idx.len(), 2);
+
+            // Replace semantics
+            idx.insert(1, &make_unit_vec(64, 2)).unwrap();
+            assert_eq!(idx.len(), 2);
+
+            // Removal
+            assert!(idx.remove(2));
+            assert!(!idx.remove(2));
+            assert_eq!(idx.len(), 1);
+
+            let results = idx.search(&make_unit_vec(64, 2), 5);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, 1);
+            // distance conversion: similarity ~1.0 -> distance ~0.0
+            assert!(results[0].1 < 0.05, "dist={:?}", results[0].1);
+
+            set_vector_bits(VectorBits::default());
+            set_vector_store(VectorStoreKind::Usearch);
+        }
+    }
+
+    #[test]
+    fn test_vecq_save_and_load_restores_keys() {
         let _g = with_store_lock();
         set_vector_store(VectorStoreKind::Vecq);
-        let mut idx = CodeVectorIndex::new(64).unwrap();
+        set_vector_bits(VectorBits::default()); // residual
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.usearch"); // caller names it; backend picks .vecq
 
-        idx.insert(1, &make_unit_vec(64, 0)).unwrap();
-        idx.insert(2, &make_unit_vec(64, 1)).unwrap();
-        assert_eq!(idx.len(), 2);
+        {
+            let mut idx = CodeVectorIndex::new(64).unwrap();
+            idx.insert(10, &make_unit_vec(64, 0)).unwrap();
+            idx.insert(20, &make_unit_vec(64, 1)).unwrap();
+            idx.path = Some(path.clone());
+            idx.save().unwrap();
+        }
 
-        // Replace semantics
-        idx.insert(1, &make_unit_vec(64, 2)).unwrap();
-        assert_eq!(idx.len(), 2);
+        assert!(dir.path().join("test.vecq").exists());
+        // vecq-core 0.3.0 keyed persistence (vecq#32 closed): symbol-id keys
+        // survive reload, so a fresh process serves the index as-is.
+        let idx2 = CodeVectorIndex::load_or_create(&path, 64).unwrap();
+        assert_eq!(idx2.len(), 2, "keyed map must survive reload");
+        assert!(!idx2.is_dirty(), "healthy keyed file loads clean");
 
-        // Removal
-        assert!(idx.remove(2));
-        assert!(!idx.remove(2));
-        assert_eq!(idx.len(), 1);
-
-        let results = idx.search(&make_unit_vec(64, 2), 5);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, 1);
-        // distance conversion: similarity ~1.0 -> distance ~0.0
-        assert!(results[0].1 < 0.05, "dist={:?}", results[0].1);
-
+        let results = idx2.search(&make_unit_vec(64, 0), 1);
+        assert_eq!(results[0].0, 10);
         set_vector_store(VectorStoreKind::Usearch);
     }
 
     #[test]
-    fn test_vecq_save_and_load_uses_own_extension() {
+    fn test_vecq_legacy_keyless_file_rebuilds() {
         let _g = with_store_lock();
         set_vector_store(VectorStoreKind::Vecq);
+        // The simulated legacy file is plain 5-bit; match that width so the
+        // load hits the keyless arm rather than the width-mismatch arm.
+        set_vector_bits(VectorBits::B5);
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch"); // caller names it; backend picks .vecq
+        let path = dir.path().join("test.usearch");
+        let vecq_path = dir.path().join("test.vecq");
+
+        // Simulate a vecq-core 0.2.x file (vecq#32): vectors serialized
+        // without a keyed-slot table, which is what unkeyed `add()` produces.
+        let mut legacy = vecq_core::VecqIndex::new(64, VECQ_SEED);
+        legacy.add(&make_unit_vec(64, 0));
+        std::fs::write(&vecq_path, legacy.to_bytes()).unwrap();
+
+        let idx = CodeVectorIndex::load_or_create(&path, 64).unwrap();
+        assert!(idx.is_empty(), "keyless file must not be served");
+        assert!(idx.is_dirty(), "keyless file must trigger a rebuild");
+        set_vector_bits(VectorBits::default());
+        set_vector_store(VectorStoreKind::Usearch);
+    }
+
+    #[test]
+    fn test_vecq_width_switch_rebuilds() {
+        let _g = with_store_lock();
+        set_vector_store(VectorStoreKind::Vecq);
+        set_vector_bits(VectorBits::default()); // residual
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.usearch");
 
         {
             let mut idx = CodeVectorIndex::new(64).unwrap();
@@ -632,11 +835,48 @@ mod tests {
             idx.save().unwrap();
         }
 
-        assert!(dir.path().join("test.vecq").exists());
-        // Upstream gap (vecq#32): keys are not serialized, so reload rebuilds
-        // fresh instead of serving a silently-empty index.
-        let idx2 = CodeVectorIndex::load_or_create(&path, 64).unwrap();
-        assert!(idx2.is_empty(), "reload must not serve a keyless index");
+        // A healthy keyed index must NOT be kept when the configured width
+        // changed — the rebuild makes brain.vector_bits actually take effect.
+        set_vector_bits(VectorBits::B5);
+        let idx = CodeVectorIndex::load_or_create(&path, 64).unwrap();
+        assert!(idx.is_empty(), "width-mismatched file must not be served");
+        assert!(idx.is_dirty(), "width change must trigger a rebuild");
+        set_vector_bits(VectorBits::default());
+        set_vector_store(VectorStoreKind::Usearch);
+    }
+
+    #[test]
+    fn test_vecq_corrupt_file_rebuilds() {
+        let _g = with_store_lock();
+        set_vector_store(VectorStoreKind::Vecq);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.usearch");
+        std::fs::write(dir.path().join("test.vecq"), vec![0u8; 64]).unwrap();
+
+        let idx = CodeVectorIndex::load_or_create(&path, 64).unwrap();
+        assert!(idx.is_empty());
+        assert!(idx.is_dirty());
+        set_vector_store(VectorStoreKind::Usearch);
+    }
+
+    #[test]
+    fn test_vecq_dim_mismatch_rebuilds() {
+        let _g = with_store_lock();
+        set_vector_store(VectorStoreKind::Vecq);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.usearch");
+
+        {
+            let mut idx = CodeVectorIndex::new(64).unwrap();
+            idx.insert(10, &make_unit_vec(64, 0)).unwrap();
+            idx.path = Some(path.clone());
+            idx.save().unwrap();
+        }
+
+        let idx = CodeVectorIndex::load_or_create(&path, 128).unwrap();
+        assert!(idx.is_empty());
+        assert!(idx.is_dirty());
+        assert_eq!(idx.dims(), 128);
         set_vector_store(VectorStoreKind::Usearch);
     }
 
@@ -647,6 +887,17 @@ mod tests {
         assert_eq!(VectorStoreKind::parse("usearch"), VectorStoreKind::Usearch);
         assert_eq!(VectorStoreKind::parse(""), VectorStoreKind::Usearch);
         assert_eq!(VectorStoreKind::parse("bogus"), VectorStoreKind::Usearch);
+    }
+
+    #[test]
+    fn vector_bits_parse_is_lenient() {
+        assert_eq!(VectorBits::parse("residual"), VectorBits::Residual);
+        assert_eq!(VectorBits::parse(" RESIDUAL "), VectorBits::Residual);
+        assert_eq!(VectorBits::parse("4"), VectorBits::B4);
+        assert_eq!(VectorBits::parse("5"), VectorBits::B5);
+        assert_eq!(VectorBits::parse("6"), VectorBits::B6);
+        assert_eq!(VectorBits::parse(""), VectorBits::Residual);
+        assert_eq!(VectorBits::parse("bogus"), VectorBits::Residual);
     }
 
     #[test]
