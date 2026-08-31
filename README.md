@@ -58,6 +58,8 @@ cargo install --git https://github.com/codecoradev/cora-code
 
 > Pin a version: `CORA_VERSION=v0.6.1 curl -fsSL ... | sh`
 
+**Upgrading:** run `cora upgrade` (downloads the latest release, verifies its SHA-256 checksum, replaces the binary) or `cora upgrade --check` to just see if one is available. If you installed via `cargo install --path .`, re-run that instead.
+
 **Verify which `cora` you're running** — `which -a cora` will reveal stale copies from other channels:
 
 ```bash
@@ -213,6 +215,7 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora serve` | Start MCP server + auto-reindex on startup |
 | `cora install` | Auto-detect and configure AI coding agents |
 | `cora hook install` | Install pre-commit hook |
+| `cora upgrade` | Self-upgrade from GitHub Releases (checksum-verified) |
 
 See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for all flags and examples.
 
