@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "cora-code"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -350,6 +350,7 @@ dependencies = [
  "tree-sitter-scala",
  "tree-sitter-typescript",
  "usearch",
+ "vecq-core",
  "which",
 ]
 
@@ -2395,6 +2396,12 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
+name = "vecq-core"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "543ddd2e748c26c39bd8ca5ab9c43eb01ba0ca13750a1428b08e8c7dc0d9def7"
 
 [[package]]
 name = "version_check"

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-31
+
+### Added
+
+- **Opt-in `vecq` vector store for Brain Mode.** Set `brain.vector_store: vecq` in `.cora.yaml` to replace the usearch HNSW index with a vecq quantized scan (pure Rust, deterministic, ~5x smaller). Keyed persistence included: symbol ids survive reload, so a fresh process serves the index as-is and `cora index` no longer re-embeds unchanged projects (#542, #547).
+- **`brain.vector_bits` quantization-width knob.** `residual` (default) | `4` | `5` | `6` — 4-bit base codes with second-pass residual rescoring, or plain Lloyd-Max widths. The default is residual: best recall@10 at 4-bit scan speed in a recall study on cora's own embeddings, ahead of plain 5-bit at 1k/5k/13k-symbol scales. Changing the width rebuilds the index once on the next `cora index` instead of silently serving the old width; unknown values fall back to `residual`.
+
+### Fixed
+
+- **Vector signal never fired in a fresh process.** `cora brain` and MCP `brain_search` only saw the vector index if the same process had run the embed — otherwise results silently degraded to FTS-only. The search path now lazy-loads the on-disk index once per process, with a dimension guard against backend switches (#545).
+- **Stale embed fingerprints after a global vector-index rebuild.** The vector index is a single file shared by all projects; rebuilding it (width/dims change, legacy file, corruption) wiped every project's vectors while their fingerprints still said "embedded" — the incremental path would skip those symbols forever. A rebuild now clears fingerprints for all projects, and the usearch dims-mismatch path (which deleted the index without clearing) joins the same heal.
+
+### Changed
+
+- **vecq-core dependency 0.2.0 → 0.3.0.** Picks up the 4-bit+residual mode, plain 5/6-bit widths, runtime-detected AVX2 scoring, and file formats v1.3–v1.5 with the keyed-slot table. Pre-0.3.0 `.vecq` files carry no key table and rebuild once with a warning, then upgrade to the keyed format.
+
 ## [0.14.0] - 2026-08-28
 
 ### Fixed

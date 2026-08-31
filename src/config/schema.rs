@@ -328,6 +328,8 @@ pub struct CoraFile {
     pub profile: Option<crate::engine::profiles::ProfileRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis: Option<AnalysisConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brain: Option<BrainSection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -445,8 +447,33 @@ pub struct AnalysisConfig {
 /// By default (`auto`), cora selects the best available backend at runtime:
 /// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
 /// Users can force a specific backend via `.cora.yaml`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+fn default_vector_store() -> String {
+    "usearch".to_string()
+}
+
+fn default_vector_bits() -> String {
+    "residual".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrainConfig {
+    /// Vector store backend for Brain Mode search.
+    ///
+    /// - `"usearch"` (default) — HNSW graph, f32
+    /// - `"vecq"` — quantized brute-force scan (pure Rust, deterministic,
+    ///   ~5x smaller index; recall trade absorbed by RRF fusion)
+    #[serde(default = "default_vector_store")]
+    pub vector_store: String,
+    /// Quantization width for the `vecq` store (ignored by `usearch`).
+    ///
+    /// - `"residual"` (default) — 4-bit base + second-pass residual codes:
+    ///   best recall at 4-bit scan speed on cora's default embeddings
+    /// - `"4"` / `"5"` / `"6"` — plain Lloyd-Max width
+    ///
+    /// Invalid values fall back to `"residual"`. Changing the width rebuilds
+    /// the index once on the next `cora index`.
+    #[serde(default = "default_vector_bits")]
+    pub vector_bits: String,
     /// Embedding backend selection.
     ///
     /// - `"auto"` (default) — best available: pretrained → hashing
@@ -456,6 +483,31 @@ pub struct BrainConfig {
     /// Invalid values fall back to `"auto"` with a warning.
     #[serde(default, skip_serializing_if = "is_default")]
     pub embedding: BrainEmbeddingMode,
+}
+
+// Manual Default so `Config::default()` carries the documented values
+// ("usearch"/"residual") — the derived one would leave empty strings, and
+// the store/width parsers only meet those values leniently.
+impl Default for BrainConfig {
+    fn default() -> Self {
+        Self {
+            vector_store: default_vector_store(),
+            vector_bits: default_vector_bits(),
+            embedding: BrainEmbeddingMode::default(),
+        }
+    }
+}
+
+/// `.cora.yaml` `brain:` section — mirrors the subset of [`BrainConfig`]
+/// that is meaningful in a config file.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrainSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_store: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_bits: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<BrainEmbeddingMode>,
 }
 
 /// Embedding backend mode for Brain Mode.
@@ -766,6 +818,19 @@ impl CoraFile {
                     .clone_from(&analysis.entry_point_patterns);
             }
         }
+        // Merge brain config (Brain Mode vector store / embedding backend).
+        // Field-wise like the other sections: unset fields keep Config defaults.
+        if let Some(brain) = &self.brain {
+            if let Some(v) = &brain.vector_store {
+                config.brain.vector_store.clone_from(v);
+            }
+            if let Some(v) = &brain.vector_bits {
+                config.brain.vector_bits.clone_from(v);
+            }
+            if let Some(v) = &brain.embedding {
+                config.brain.embedding = v.clone();
+            }
+        }
         Ok(())
     }
 }
@@ -835,6 +900,48 @@ mod tests {
         assert_eq!(cfg.provider.provider, "openai");
         assert_eq!(cfg.provider.model, "gpt-4o-mini");
         assert_eq!(cfg.output.format, "pretty");
+    }
+
+    #[test]
+    fn brain_vector_bits_defaults_to_residual() {
+        let cfg = Config::default();
+        assert_eq!(cfg.brain.vector_bits, "residual");
+        assert_eq!(cfg.brain.vector_store, "usearch");
+    }
+
+    #[test]
+    fn merge_brain_vector_store_and_bits() {
+        let mut cfg = Config::default();
+        let cora = CoraFile::from_str(
+            r"
+brain:
+  vector_store: vecq
+  vector_bits: '6'
+  embedding: hashing
+",
+        )
+        .unwrap();
+
+        cora.merge_into(&mut cfg).unwrap();
+
+        assert_eq!(cfg.brain.vector_store, "vecq");
+        assert_eq!(cfg.brain.vector_bits, "6");
+    }
+
+    #[test]
+    fn merge_brain_vector_bits_absent_keeps_default() {
+        let mut cfg = Config::default();
+        let cora = CoraFile::from_str(
+            r"
+brain:
+  vector_store: vecq
+",
+        )
+        .unwrap();
+
+        cora.merge_into(&mut cfg).unwrap();
+
+        assert_eq!(cfg.brain.vector_bits, "residual");
     }
 
     #[test]
