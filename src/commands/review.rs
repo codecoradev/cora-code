@@ -410,8 +410,35 @@ fn get_git_context() -> (Option<String>, Option<String>) {
     (CONTEXT.0.clone(), CONTEXT.1.clone())
 }
 
-/// Get the diff based on the provided options.
+/// Merged summary for chunked review reports (#556).
+///
+/// Per-chunk summaries win when present. Otherwise the fallback must
+/// reflect reality: chunks can return issues with an EMPTY summary
+/// string, so the no-findings message must only be printed when
+/// `issue_count == 0`. The old fallback keyed only off `summaries` /
+/// `any_error` and printed "No issues found across all chunks." even
+/// when issues were found (live: gaira PR #108, run #1388 verdict).
+fn merged_chunk_summary(summaries: &[String], issue_count: usize, any_error: bool) -> String {
+    if !summaries.is_empty() {
+        return summaries.join("\n\n");
+    }
+    if issue_count > 0 {
+        if any_error {
+            return format!(
+                "{issue_count} issue(s) found across chunks; review completed with partial results (some chunks failed)."
+            );
+        }
+        return format!("{issue_count} issue(s) found across chunks.");
+    }
+    if any_error {
+        "Review completed with partial results (some chunks failed).".to_string()
+    } else {
+        "No issues found across all chunks.".to_string()
+    }
+}
+
 fn get_diff(opts: &ReviewOptions, _config: &Config) -> Result<String> {
+    // Get the diff based on the provided options.
     if let Some(ref diff_file) = opts.diff_file {
         let path = std::path::Path::new(diff_file);
         if !path.exists() {
@@ -612,15 +639,7 @@ async fn execute_chunked_review(
     }
 
     // Build merged response
-    let merged_summary = if summaries.is_empty() {
-        if any_error {
-            "Review completed with partial results (some chunks failed).".to_string()
-        } else {
-            "No issues found across all chunks.".to_string()
-        }
-    } else {
-        summaries.join("\n\n")
-    };
+    let merged_summary = merged_chunk_summary(&summaries, all_issues.len(), any_error);
 
     let merged_response = ReviewResponse {
         issues: all_issues,
@@ -815,6 +834,50 @@ mod tests {
             tokens_used: None,
             should_block,
         }
+    }
+
+    // ─── #556: chunked summary fallback must reflect actual findings ───
+
+    #[test]
+    fn chunk_summary_issues_without_summaries_are_reported() {
+        // Live regression: gaira PR #108 run #1388 — chunks returned issues
+        // with empty summaries; old code printed "No issues found across
+        // all chunks." under a "Found 1 issue" header.
+        let s = merged_chunk_summary(&[], 1, false);
+        assert_eq!(s, "1 issue(s) found across chunks.");
+        assert!(!s.contains("No issues found"));
+    }
+
+    #[test]
+    fn chunk_summary_no_findings_message_only_when_clean() {
+        let s = merged_chunk_summary(&[], 0, false);
+        assert_eq!(s, "No issues found across all chunks.");
+    }
+
+    #[test]
+    fn chunk_summary_partial_error_with_issues_mentions_both() {
+        let s = merged_chunk_summary(&[], 2, true);
+        assert!(s.starts_with("2 issue(s) found across chunks;"));
+        assert!(s.contains("partial results"));
+    }
+
+    #[test]
+    fn chunk_summary_partial_error_without_issues_stays_honest() {
+        let s = merged_chunk_summary(&[], 0, true);
+        assert_eq!(
+            s,
+            "Review completed with partial results (some chunks failed)."
+        );
+    }
+
+    #[test]
+    fn chunk_summary_per_chunk_summaries_win() {
+        let summaries = vec![
+            "[Chunk 1/2 — a] ok".to_string(),
+            "[Chunk 2/2 — b] fine".to_string(),
+        ];
+        let s = merged_chunk_summary(&summaries, 0, false);
+        assert_eq!(s, "[Chunk 1/2 — a] ok\n\n[Chunk 2/2 — b] fine");
     }
 
     // ─── #312: exit code must match filtered output ───
