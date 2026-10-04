@@ -619,7 +619,6 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32;
 
     fn make_unit_vec(dims: usize, idx: usize) -> Vec<f32> {
         let mut v = vec![0.0f32; dims];
