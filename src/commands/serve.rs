@@ -10,7 +10,13 @@ pub fn execute_serve() -> anyhow::Result<()> {
     let conn = crate::index::open_global_index()?;
     let _project_id = crate::index::ensure_project(&conn, &project_root)?;
 
-    let stats = crate::index::index_project(&conn, &project_root, false)?;
+    let skip_patterns = crate::index::prepare_index_config(None);
+    let stats = crate::index::index_project_with_skip(
+        &conn,
+        &project_root,
+        false,
+        skip_patterns.as_deref(),
+    )?;
 
     if stats.files_indexed > 0 {
         eprintln!(

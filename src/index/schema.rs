@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 /// Current schema version.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 /// Run database migrations (creates tables if not exist).
 pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
@@ -42,6 +42,9 @@ pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
     }
     if current < 7 {
         migrate_v7(conn)?;
+    }
+    if current < 8 {
+        migrate_v8(conn)?;
     }
 
     Ok(())
@@ -388,6 +391,42 @@ fn migrate_v7(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Migration v8: key `files` by `(project_id, path)` instead of `path` alone.
+///
+/// `path` was a global PRIMARY KEY, so two projects with the same relative
+/// path (e.g. `src/main.rs`) overwrote each other's fingerprint row and
+/// `project_id`, forcing a perpetual re-index. The table is rebuilt in one
+/// transaction; rows without a `project_id` (pre-v2 leftovers) are dropped
+/// since they cannot be attributed and will be re-created on the next index.
+fn migrate_v8(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        DROP TABLE IF EXISTS files_v8;
+        CREATE TABLE files_v8 (
+            project_id    INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            path          TEXT NOT NULL,
+            fingerprint   TEXT NOT NULL,
+            last_indexed  TEXT NOT NULL,
+            language      TEXT NOT NULL DEFAULT 'unknown',
+            symbol_count  INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (project_id, path)
+        );
+        INSERT OR REPLACE INTO files_v8
+            (project_id, path, fingerprint, last_indexed, language, symbol_count)
+            SELECT project_id, path, fingerprint, last_indexed, language, symbol_count
+            FROM files WHERE project_id IS NOT NULL;
+        DROP TABLE files;
+        ALTER TABLE files_v8 RENAME TO files;
+        CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
+        ",
+    )?;
+    tx.execute("INSERT INTO schema_version (version) VALUES (8)", [])?;
+    tx.commit()?;
+
+    Ok(())
+}
+
 /// Compute a stable hash of the indexing-relevant config.
 ///
 /// Any change to these fields will invalidate all stored fingerprints,
@@ -686,7 +725,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -786,5 +825,79 @@ mod tests {
         let h2 = compute_index_config_hash(&[]);
         assert_eq!(h1, h2, "empty patterns should be deterministic");
         assert!(!h1.is_empty(), "hash should not be empty");
+    }
+
+    /// v8: files is keyed by (project_id, path); upgrade from a v7 database
+    /// preserves rows and lets two projects share a relative path.
+    #[test]
+    fn test_migrate_v8_files_keyed_by_project_and_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT DEFAULT (datetime('now')));",
+        )
+        .unwrap();
+        migrate_v1(&conn).unwrap();
+        migrate_v2(&conn).unwrap();
+        migrate_v3(&conn).unwrap();
+        migrate_v4(&conn).unwrap();
+        migrate_v5(&conn).unwrap();
+        migrate_v6(&conn).unwrap();
+        migrate_v7(&conn).unwrap();
+
+        let p1 = get_or_create_project(&conn, "/tmp/p1").unwrap();
+        conn.execute(
+            "INSERT INTO files (path, fingerprint, last_indexed, project_id)
+             VALUES ('main.rs', 'fp1', 'now', ?1)",
+            [p1],
+        )
+        .unwrap();
+        // Orphan row from before project tracking: cannot be attributed.
+        conn.execute(
+            "INSERT INTO files (path, fingerprint, last_indexed) VALUES ('old.rs', 'x', 'now')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+        // Idempotent re-run.
+        run_migrations(&conn).unwrap();
+
+        let version: i32 = conn
+            .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+
+        let p2 = get_or_create_project(&conn, "/tmp/p2").unwrap();
+        conn.execute(
+            "INSERT INTO files (path, fingerprint, last_indexed, project_id)
+             VALUES ('main.rs', 'fp2', 'now', ?1)",
+            [p2],
+        )
+        .unwrap();
+
+        let fp: String = conn
+            .query_row(
+                "SELECT fingerprint FROM files WHERE path = 'main.rs' AND project_id = ?1",
+                [p1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fp, "fp1", "migrated row must survive");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 2, "orphan dropped, both project rows present");
+
+        // Same (project, path) twice is still a conflict.
+        assert!(
+            conn.execute(
+                "INSERT INTO files (path, fingerprint, last_indexed, project_id)
+                 VALUES ('main.rs', 'dup', 'now', ?1)",
+                [p1],
+            )
+            .is_err()
+        );
     }
 }

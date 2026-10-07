@@ -737,8 +737,13 @@ async fn main() -> Result<()> {
             } else if watch {
                 // Initial index
                 eprintln!("{}", "🔍 Initial index...".cyan());
-                let stats =
-                    index::index_project(&conn, &project_root, verbose || cli.global.verbose)?;
+                let skip_patterns = index::prepare_index_config(cli.global.config.as_deref());
+                let stats = index::index_project_with_skip(
+                    &conn,
+                    &project_root,
+                    verbose || cli.global.verbose,
+                    skip_patterns.as_deref(),
+                )?;
                 eprintln!(
                     "{}",
                     format!(
@@ -751,7 +756,12 @@ async fn main() -> Result<()> {
                 // Poll loop: re-index changed files every 2 seconds
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(2));
-                    let stats = index::index_project(&conn, &project_root, false)?;
+                    let stats = index::index_project_with_skip(
+                        &conn,
+                        &project_root,
+                        false,
+                        skip_patterns.as_deref(),
+                    )?;
                     if stats.files_indexed > 0 {
                         eprintln!(
                             "{}",
@@ -764,32 +774,8 @@ async fn main() -> Result<()> {
                     }
                 }
             } else {
-                // Load config for config-hash invalidation + brain embedding backend
-                let config = crate::config::loader::load_config(
-                    cli.global.config.as_deref(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                )
-                .ok();
-                // Exclusion patterns = review's ignore.files + index.skip_files
-                // so dead-code/index scanners respect the same ignores (#521).
-                let skip_patterns: Option<Vec<String>> = config.as_ref().map(|c| {
-                    let mut pats = c.ignore.files.clone();
-                    pats.extend(c.rules_config.index_skip_files.iter().cloned());
-                    pats.dedup();
-                    pats
-                });
-
-                // Resolve embedding backend from brain config
-                let brain_mode = config
-                    .as_ref()
-                    .map(|c| c.brain.embedding.to_string())
-                    .unwrap_or_else(|| "auto".to_string());
-                crate::embed::resolve_backend(&brain_mode);
-                index::vector::apply_config_store(config.as_ref());
+                // Config-hash invalidation, skip patterns, brain embedding backend.
+                let skip_patterns = index::prepare_index_config(cli.global.config.as_deref());
 
                 eprintln!("{}", "🔍 Indexing project...".cyan());
                 let stats = index::index_project_with_skip(

@@ -113,12 +113,12 @@ pub fn find_callers(
     symbol_name: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<CallerResult>> {
-    let pattern = format!("%{symbol_name}%");
+    let pattern = symbol_name;
 
     let mut stmt = conn.prepare(
         "SELECT DISTINCT cg.caller, cg.file, cg.line
          FROM call_graph cg
-         WHERE cg.callee LIKE ?1 AND cg.project_id = ?2
+         WHERE cg.callee = ?1 AND cg.project_id = ?2
          LIMIT ?3",
     )?;
 
@@ -146,13 +146,13 @@ pub fn find_callers_cross_project(
     symbol_name: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<CrossProjectCallerResult>> {
-    let pattern = format!("%{symbol_name}%");
+    let pattern = symbol_name;
 
     let mut stmt = conn.prepare(
         "SELECT DISTINCT cg.caller, cg.file, cg.line, p.root_path
          FROM call_graph cg
          JOIN projects p ON cg.project_id = p.id
-         WHERE cg.callee LIKE ?1
+         WHERE cg.callee = ?1
          LIMIT ?2",
     )?;
 
@@ -178,12 +178,12 @@ pub fn find_callees(
     symbol_name: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<CalleeResult>> {
-    let pattern = format!("%{symbol_name}%");
+    let pattern = symbol_name;
 
     let mut stmt = conn.prepare(
         "SELECT DISTINCT cg.callee, cg.file, cg.line
          FROM call_graph cg
-         WHERE cg.caller LIKE ?1 AND cg.project_id = ?2
+         WHERE cg.caller = ?1 AND cg.project_id = ?2
          LIMIT ?3",
     )?;
 
@@ -372,13 +372,13 @@ fn find_callees_edges(
     symbol_name: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<EdgeRow>> {
-    let pattern = format!("%{symbol_name}%");
+    let pattern = symbol_name;
 
     // Try edges table first (has typed relationships)
     let mut stmt = conn.prepare(
         "SELECT source, kind, target, file, line
          FROM edges
-         WHERE source LIKE ?1 AND project_id = ?2
+         WHERE source = ?1 AND project_id = ?2
          LIMIT ?3",
     )?;
 
@@ -406,7 +406,7 @@ fn find_callees_edges(
     let mut stmt = conn.prepare(
         "SELECT caller, 'CALLS', callee, file, line
          FROM call_graph
-         WHERE caller LIKE ?1 AND project_id = ?2
+         WHERE caller = ?1 AND project_id = ?2
          LIMIT ?3",
     )?;
 
@@ -436,12 +436,12 @@ fn find_callers_edges(
     symbol_name: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<EdgeRow>> {
-    let pattern = format!("%{symbol_name}%");
+    let pattern = symbol_name;
 
     let mut stmt = conn.prepare(
         "SELECT source, kind, target, file, line
          FROM edges
-         WHERE target LIKE ?1 AND project_id = ?2
+         WHERE target = ?1 AND project_id = ?2
          LIMIT ?3",
     )?;
 
@@ -468,7 +468,7 @@ fn find_callers_edges(
     let mut stmt = conn.prepare(
         "SELECT caller, 'CALLS', callee, file, line
          FROM call_graph
-         WHERE callee LIKE ?1 AND project_id = ?2
+         WHERE callee = ?1 AND project_id = ?2
          LIMIT ?3",
     )?;
 
@@ -1404,6 +1404,75 @@ pub fn remember_with_contradiction(content: &str) -> usize { content.len() }
 pub fn maintenance() -> usize {
     let store = Store;
     store.remember_with_contradiction("note")
+
+    fn call(caller: &str, callee: &str, file: &str) -> CallEdge {
+        CallEdge {
+            caller: caller.to_string(),
+            callee: callee.to_string(),
+            file: file.to_string(),
+            line: 1,
+        }
+    }
+
+    /// Regression: callers were matched with `LIKE '%name%'`, so removing
+    /// `run` flagged callers of `rerun`, and `_`/`%` acted as wildcards.
+    #[test]
+    fn test_find_callers_exact_match_only() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        store_edges(
+            &conn,
+            pid,
+            &[
+                call("a", "run", "a.rs"),
+                call("b", "rerun", "b.rs"),
+                call("c", "get_users", "c.rs"),
+                call("d", "getXusers", "d.rs"),
+            ],
+        )
+        .unwrap();
+
+        let callers = find_callers(&conn, pid, "run", 100).unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].caller, "a");
+
+        // `_` must not behave as a single-char wildcard.
+        let callers = find_callers(&conn, pid, "get_users", 100).unwrap();
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].caller, "c");
+
+        // `%` must not match everything.
+        assert!(find_callers(&conn, pid, "%", 100).unwrap().is_empty());
+        assert!(find_callers_cross_project(&conn, "run", 100)
+            .unwrap()
+            .iter()
+            .all(|r| r.caller == "a"));
+    }
+
+    /// Exact matching must not break transitive traversal.
+    #[test]
+    fn test_impact_analysis_and_trace_exact_recursion() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        store_edges(
+            &conn,
+            pid,
+            &[
+                call("mid", "run", "m.rs"),
+                call("top", "mid", "t.rs"),
+                call("other", "rerun", "o.rs"),
+            ],
+        )
+        .unwrap();
+
+        let impact = impact_analysis(&conn, pid, "run", 3).unwrap();
+        let names: Vec<&str> = impact.iter().map(|n| n.symbol.as_str()).collect();
+        assert_eq!(names, vec!["mid", "top"]);
+
+        let trace = trace_path(&conn, pid, "run", 3, TraceDirection::Incoming).unwrap();
+        let names: Vec<&str> = trace.iter().map(|n| n.symbol.as_str()).collect();
+        assert_eq!(names, vec!["mid", "top"]);
+    }
 }
 "#,
             "rs",
