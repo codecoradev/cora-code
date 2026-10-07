@@ -2,7 +2,6 @@ use crate::error::CoraError;
 use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
-use crate::engine::comment_sanitizer;
 use crate::engine::llm;
 use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse, Severity};
 
@@ -47,13 +46,6 @@ pub fn resolve_system_prompt(inline: Option<&str>, file_path: Option<&str>) -> O
     } else {
         None
     }
-}
-
-/// Exclusion patterns for review-time index scanners: the exact set the
-/// indexer uses (`ignore.files` + `index_skip_files`), so review and index
-/// never disagree about which files are out of scope.
-pub fn index_skip_patterns(config: &Config) -> Vec<String> {
-    crate::index::skip_patterns_from_config(Some(config)).unwrap_or_default()
 }
 
 /// Run a code review on the given diff string with optional streaming and cache control.
@@ -139,7 +131,6 @@ async fn review_diff_inner(
     // security) always operate on the ORIGINAL unsanitized diff — only the
     // LLM sees sanitized text (ALIBI defense, arXiv:2607.24964).
     let diff_chunks = crate::engine::diff_parser::parse_diff(diff);
-    let sanitize_report = crate::engine::comment_sanitizer::flag_claims(&diff_chunks);
     let review_diff_text: std::borrow::Cow<'_, str> = if config.sanitize_comments {
         let mut sanitized_chunks = crate::engine::diff_parser::parse_diff(diff);
         let full_report = crate::engine::comment_sanitizer::sanitize_chunks(&mut sanitized_chunks);
@@ -155,99 +146,30 @@ async fn review_diff_inner(
             std::borrow::Cow::Owned(rendered)
         }
     } else {
-        if !sanitize_report.suspicious_claims.is_empty() {
-            debug!(
-                claims = sanitize_report.suspicious_claims.len(),
-                "Untrusted verification claims flagged in added comments"
-            );
-        }
         std::borrow::Cow::Borrowed(diff)
     };
 
-    let rule_findings = crate::engine::rules::run_rules(&diff_chunks, &config.rules_config);
-
-    // Run deterministic secrets pre-scan
-    let secrets_findings = crate::engine::secrets_scanner::scan_secrets(
-        &diff_chunks,
-        config.rules_config.max_findings,
-    );
-
-    // Run deterministic security pattern scan (weak crypto, injection, etc.)
-    let security_findings = crate::engine::security_scanner::scan_security(
-        &diff_chunks,
-        config.rules_config.max_findings,
-    );
-
-    // Run index-powered scans (requires symbol graph — graceful no-op without index)
-    // One bridge, rooted via resolve_project_root, shared by every index-backed
-    // step so a run from a subdirectory agrees with `cora index` (#566).
+    // Index bridge: one project handle, rooted via resolve_project_root, shared
+    // by every index-backed step so a run from a subdirectory agrees with
+    // `cora index` (#566).
     let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
     let project_root = if index_bridge.root().as_os_str().is_empty() {
         std::env::current_dir().unwrap_or_default()
     } else {
         index_bridge.root().to_path_buf()
     };
-    // Same exclusion set the indexer uses (ignore.files + index_skip_files).
-    let skip_patterns = &index_skip_patterns(config);
-    let index_unused_findings = crate::engine::index_scanner::scan_unused_imports(
-        &index_bridge,
-        &diff_chunks,
-        config.rules_config.max_findings,
-        skip_patterns,
-    );
-    let index_dead_findings = crate::engine::index_scanner::scan_dead_code_in_review(
-        &index_bridge,
-        &diff_chunks,
-        config.rules_config.max_findings,
-        skip_patterns,
-    );
-    let index_breaking_findings = crate::engine::index_scanner::scan_breaking_changes(
-        &index_bridge,
-        &diff_chunks,
-        config.rules_config.max_findings,
-        skip_patterns,
-    );
 
-    let rule_context = crate::engine::rules::format_rule_context(&rule_findings);
-    let secrets_context = crate::engine::rules::format_rule_context(&secrets_findings);
-    let security_context = crate::engine::rules::format_rule_context(&security_findings);
-    let index_unused_context = crate::engine::rules::format_rule_context(&index_unused_findings);
-    let index_dead_context = crate::engine::rules::format_rule_context(&index_dead_findings);
-    let index_breaking_context =
-        crate::engine::rules::format_rule_context(&index_breaking_findings);
-    // Keep a clone for merging after LLM (rule_findings may be consumed in error fallback)
-    let rule_findings_clone = rule_findings.clone();
-    let secrets_findings_clone = secrets_findings.clone();
-    let security_findings_clone = security_findings.clone();
-    let index_unused_findings_clone = index_unused_findings.clone();
-    let index_dead_findings_clone = index_dead_findings.clone();
-    let index_breaking_findings_clone = index_breaking_findings.clone();
-
-    // Combine all context sections for LLM prompt (static analysis + all scanner findings)
-    let mut context_parts: Vec<String> = Vec::new();
-    if let Some(sa) = static_context.as_deref() {
-        context_parts.push(sa.to_string());
+    // All deterministic checks (rules, secrets, security, index scans) on the
+    // ORIGINAL diff — no LLM involved. Context = static analysis + claim
+    // warning + one block per scanner family.
+    let deterministic = crate::engine::deterministic::run(&diff_chunks, config, &index_bridge);
+    if !deterministic.claims.suspicious_claims.is_empty() && !config.sanitize_comments {
+        debug!(
+            claims = deterministic.claims.suspicious_claims.len(),
+            "Untrusted verification claims flagged in added comments"
+        );
     }
-    if let Some(warning) = comment_sanitizer::format_claim_warning(&sanitize_report) {
-        context_parts.push(warning);
-    }
-    for ctx in [
-        rule_context.as_str(),
-        secrets_context.as_str(),
-        security_context.as_str(),
-        index_unused_context.as_str(),
-        index_dead_context.as_str(),
-        index_breaking_context.as_str(),
-    ] {
-        if !ctx.is_empty() {
-            context_parts.push(ctx.to_string());
-        }
-    }
-    let combined_context = if context_parts.is_empty() {
-        None
-    } else {
-        Some(context_parts.join("\n\n"))
-    };
+    let combined_context = deterministic.context(static_context.as_deref());
 
     // Build context chain (cross-file dependency extraction)
     // NOTE: pass ignore.files (e.g. target/**, node_modules/**) so the resolver
@@ -358,19 +280,13 @@ async fn review_diff_inner(
         Ok(resp) => resp,
         Err(e) => {
             // LLM failed — return deterministic findings only (don't silently swallow them)
-            if !rule_findings.is_empty()
-                || !secrets_findings.is_empty()
-                || !security_findings.is_empty()
-                || !index_unused_findings.is_empty()
-                || !index_dead_findings.is_empty()
-                || !index_breaking_findings.is_empty()
-            {
-                let n_rules = rule_findings.len();
-                let n_secrets = secrets_findings.len();
-                let n_security = security_findings.len();
-                let n_index_unused = index_unused_findings.len();
-                let n_index_dead = index_dead_findings.len();
-                let n_index_breaking = index_breaking_findings.len();
+            if !deterministic.is_empty() {
+                let n_rules = deterministic.rules.len();
+                let n_secrets = deterministic.secrets.len();
+                let n_security = deterministic.security.len();
+                let n_index_unused = deterministic.index_unused.len();
+                let n_index_dead = deterministic.index_dead.len();
+                let n_index_breaking = deterministic.index_breaking.len();
                 debug!(
                     error = %e,
                     rule_findings = n_rules,
@@ -381,24 +297,7 @@ async fn review_diff_inner(
                     index_breaking = n_index_breaking,
                     "LLM call failed, returning deterministic findings only"
                 );
-                let mut all_deterministic =
-                    crate::engine::rules::merge_rule_findings(vec![], rule_findings);
-                all_deterministic =
-                    crate::engine::rules::merge_rule_findings(all_deterministic, secrets_findings);
-                all_deterministic =
-                    crate::engine::rules::merge_rule_findings(all_deterministic, security_findings);
-                all_deterministic = crate::engine::rules::merge_rule_findings(
-                    all_deterministic,
-                    index_unused_findings,
-                );
-                all_deterministic = crate::engine::rules::merge_rule_findings(
-                    all_deterministic,
-                    index_dead_findings,
-                );
-                all_deterministic = crate::engine::rules::merge_rule_findings(
-                    all_deterministic,
-                    index_breaking_findings,
-                );
+                let all_deterministic = deterministic.merge_into(vec![]);
                 let mut fallback = ReviewResponse {
                     issues: all_deterministic,
                     summary: format!(
@@ -420,33 +319,8 @@ async fn review_diff_inner(
         }
     };
 
-    // Merge rule findings + secrets findings + security findings + index findings with LLM issues
-    if !rule_findings_clone.is_empty() {
-        response.issues =
-            crate::engine::rules::merge_rule_findings(response.issues, rule_findings_clone);
-    }
-    if !secrets_findings_clone.is_empty() {
-        response.issues =
-            crate::engine::rules::merge_rule_findings(response.issues, secrets_findings_clone);
-    }
-    if !security_findings_clone.is_empty() {
-        response.issues =
-            crate::engine::rules::merge_rule_findings(response.issues, security_findings_clone);
-    }
-    if !index_unused_findings_clone.is_empty() {
-        response.issues =
-            crate::engine::rules::merge_rule_findings(response.issues, index_unused_findings_clone);
-    }
-    if !index_dead_findings_clone.is_empty() {
-        response.issues =
-            crate::engine::rules::merge_rule_findings(response.issues, index_dead_findings_clone);
-    }
-    if !index_breaking_findings_clone.is_empty() {
-        response.issues = crate::engine::rules::merge_rule_findings(
-            response.issues,
-            index_breaking_findings_clone,
-        );
-    }
+    // Merge deterministic findings (rules, secrets, security, index) with LLM issues
+    response.issues = deterministic.merge_into(response.issues);
 
     // Filter out issues with invalid file paths (hallucination guard)
     if !valid_files.is_empty() {

@@ -274,15 +274,10 @@ mod tests {
         let (_d, root) = project(YAML);
         let config = load_project_only(&root).unwrap();
         let session = IndexSession::from_bridge(memory_bridge(&root), Some(&config)).unwrap();
-        let review_patterns = crate::engine::review::index_skip_patterns(&config);
+        let review_patterns = crate::engine::deterministic::skip_patterns(&config);
         assert_eq!(Some(review_patterns.as_slice()), session.skip_patterns());
-        assert!(crate::engine::index_scanner::should_skip_file(
-            "gen/b.rs",
-            &review_patterns
-        ));
-        assert!(crate::engine::index_scanner::should_skip_file(
-            "vendor/c.rs",
-            &review_patterns
-        ));
+        let matcher = crate::engine::path_match::PathMatcher::new(&review_patterns);
+        assert!(matcher.is_match("gen/b.rs"));
+        assert!(matcher.is_match("vendor/c.rs"));
     }
 }
