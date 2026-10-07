@@ -11,6 +11,7 @@ mod extract;
 pub mod graph;
 pub mod queries;
 pub mod schema;
+pub mod session;
 mod symbols;
 pub mod vector;
 
@@ -297,20 +298,6 @@ pub fn skip_patterns_from_config(
         pats.dedup();
         pats
     })
-}
-
-/// Load config for an index run: resolves the brain embedding backend and
-/// vector store, and returns the skip patterns (`None` if config failed to load).
-pub fn prepare_index_config(config_path: Option<&str>) -> Option<Vec<String>> {
-    let config =
-        crate::config::loader::load_config(config_path, None, None, None, None, false).ok();
-    let brain_mode = config
-        .as_ref()
-        .map(|c| c.brain.embedding.to_string())
-        .unwrap_or_else(|| "auto".to_string());
-    crate::embed::resolve_backend(&brain_mode);
-    vector::apply_config_store(config.as_ref());
-    skip_patterns_from_config(config.as_ref())
 }
 
 /// Index a project directory with NO skip patterns, respecting .gitignore.

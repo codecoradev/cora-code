@@ -54,11 +54,6 @@ impl IndexBridge {
         crate::index::resolve_project_root(start).unwrap_or_else(|| start.to_path_buf())
     }
 
-    /// [`Self::resolve_root`] applied to the current working directory.
-    pub fn current_root() -> anyhow::Result<PathBuf> {
-        Ok(Self::resolve_root(&std::env::current_dir()?))
-    }
-
     /// Tolerant open of the global index for the project containing `start`.
     ///
     /// Never creates the database and never fails: use [`Self::is_available`].

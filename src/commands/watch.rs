@@ -10,47 +10,28 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use colored::Colorize;
 
-use crate::index;
+use crate::index::session::IndexSession;
 
-/// Entry point for `cora watch`.
+/// Entry point for `cora watch` (also backs `cora index --watch`).
 ///
 /// Runs an initial index, then polls for changes at the debounce interval.
 /// On each poll cycle, re-indexes the project and reports updated files/symbols.
+/// Config, backend, skip patterns and root all come from the [`IndexSession`].
 ///
 /// # Arguments
-/// * `project_root` — Root directory to watch
-/// * `config_path` — Optional path to `.cora.yaml`
-/// * `debounce_ms` — Minimum time between reindex cycles (default 500ms)
-/// * `git_only` — If true, only process files tracked by git
-/// * `filter` — Optional glob pattern (e.g. `src/**/*.rs`)
-/// * `verbose` — Verbose output
-#[allow(clippy::too_many_arguments)]
+/// * `session` - configured index session (owns root, DB, skip patterns)
+/// * `debounce_ms` - Minimum time between reindex cycles (default 500ms)
+/// * `git_only` - If true, only process files tracked by git
+/// * `filter` - Optional glob pattern (e.g. `src/**/*.rs`)
+/// * `verbose` - Verbose output
 pub fn run_watch(
-    project_root: &Path,
-    config_path: Option<&str>,
+    session: &IndexSession,
     debounce_ms: u64,
     git_only: bool,
     filter: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    let (conn, _project_id, _root) =
-        crate::engine::index_bridge::IndexBridge::open_or_create(project_root)?
-            .into_strict_parts()?;
-    // Load skip patterns + brain embedding backend from config
-    let config =
-        crate::config::loader::load_config(config_path, None, None, None, None, false).ok();
-    // Same merged exclusion set as `cora index` (#521).
-    let skip_patterns = crate::index::skip_patterns_from_config(config.as_ref());
-
-    // Resolve embedding backend
-    let brain_mode = config
-        .as_ref()
-        .map(|c| c.brain.embedding.to_string())
-        .unwrap_or_else(|| "auto".to_string());
-    crate::embed::resolve_backend(&brain_mode);
-    crate::index::vector::apply_config_store(config.as_ref());
-
-    let skip_ref: Option<&[String]> = skip_patterns.as_deref();
+    let project_root = session.root();
 
     // Build git-tracked file set if --git-only
     let git_files: Option<HashSet<PathBuf>> = if git_only {
@@ -71,7 +52,7 @@ pub fn run_watch(
 
     // Initial index
     eprintln!("{}", "🔍 Initial index...".cyan());
-    let stats = index::index_project_with_skip(&conn, project_root, verbose, skip_ref)?;
+    let stats = session.index(verbose)?;
     eprintln!(
         "{}",
         format!(
@@ -114,7 +95,7 @@ pub fn run_watch(
         }
 
         // Re-index
-        let stats = index::index_project_with_skip(&conn, project_root, verbose, skip_ref)?;
+        let stats = session.index(verbose)?;
 
         if stats.files_indexed > 0 {
             eprintln!(

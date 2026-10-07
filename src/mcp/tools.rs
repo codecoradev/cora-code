@@ -935,7 +935,9 @@ fn handle_brain_search(params: &serde_json::Value) -> ToolResult {
         Err(e) => return ToolResult::error(e.to_string()),
     };
 
-    crate::index::vector::apply_config_store(load_project_config().ok().as_ref());
+    // Same session step as `cora brain` (backend + vector store), but with
+    // project-only config: no env/global/API keys (#563).
+    crate::index::session::configure_for_search(crate::index::session::ConfigSource::ProjectOnly);
     match crate::index::brain::brain_search(&conn, project_id, query, limit) {
         Ok(results) => {
             if results.is_empty() {
