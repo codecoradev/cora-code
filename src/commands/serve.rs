@@ -3,12 +3,8 @@
 /// Execute the serve command: auto-reindex the current project, then start the MCP server.
 pub fn execute_serve() -> anyhow::Result<()> {
     // 1. Auto-reindex current project (incremental — skips unchanged files)
-    let project_root = std::env::current_dir()?;
-    let project_root =
-        crate::index::resolve_project_root(&project_root).unwrap_or(project_root.clone());
-
-    let conn = crate::index::open_global_index()?;
-    let _project_id = crate::index::ensure_project(&conn, &project_root)?;
+    let (conn, _project_id, project_root) =
+        crate::engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
     let skip_patterns = crate::index::prepare_index_config(None);
     let stats = crate::index::index_project_with_skip(

@@ -211,8 +211,8 @@ pub fn execute_query_cli(
     json_flag: bool,
     limit: usize,
 ) -> anyhow::Result<String> {
-    let conn = crate::index::open_global_index()?;
-    let (project_id, _root) = crate::index::resolve_project_id(&conn)?;
+    let (conn, project_id, _root) =
+        crate::engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
     let pattern = parse_query(pattern_str)?;
     let results = execute_query(&pattern, project_id, &conn, limit)?;

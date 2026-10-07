@@ -438,13 +438,17 @@ fn handle_list_profiles() -> ToolResult {
 /// Uses project root detection (walks up from CWD looking for markers).
 /// Returns helpful error if not found.
 fn open_index_db() -> anyhow::Result<(rusqlite::Connection, i64)> {
-    let db_path = crate::data_dir::graph_db_path();
-    if !db_path.exists() {
-        anyhow::bail!("No symbol index found. Run 'cora index' first to build the index.");
+    use crate::engine::index_bridge::{IndexBridge, NoIndexError};
+    match IndexBridge::open_strict_cwd() {
+        Ok(bridge) => {
+            let (conn, project_id, _root) = bridge.into_strict_parts()?;
+            Ok((conn, project_id))
+        }
+        Err(e) if e.downcast_ref::<NoIndexError>().is_some() => {
+            anyhow::bail!("No symbol index found. Run 'cora index' first to build the index.")
+        }
+        Err(e) => Err(e),
     }
-    let conn = crate::index::open_global_index()?;
-    let (project_id, _root) = crate::index::resolve_project_id(&conn)?;
-    Ok((conn, project_id))
 }
 
 fn handle_search_symbols(params: &serde_json::Value) -> ToolResult {

@@ -172,22 +172,30 @@ async fn review_diff_inner(
     );
 
     // Run index-powered scans (requires symbol graph — graceful no-op without index)
+    // One bridge, rooted via resolve_project_root, shared by every index-backed
+    // step so a run from a subdirectory agrees with `cora index` (#566).
+    let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
+    let project_root = if index_bridge.root().as_os_str().is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        index_bridge.root().to_path_buf()
+    };
     let skip_patterns = &config.rules_config.index_skip_files;
     let index_unused_findings = crate::engine::index_scanner::scan_unused_imports(
+        &index_bridge,
         &diff_chunks,
-        std::env::current_dir().unwrap_or_default().as_path(),
         config.rules_config.max_findings,
         skip_patterns,
     );
     let index_dead_findings = crate::engine::index_scanner::scan_dead_code_in_review(
+        &index_bridge,
         &diff_chunks,
-        std::env::current_dir().unwrap_or_default().as_path(),
         config.rules_config.max_findings,
         skip_patterns,
     );
     let index_breaking_findings = crate::engine::index_scanner::scan_breaking_changes(
+        &index_bridge,
         &diff_chunks,
-        std::env::current_dir().unwrap_or_default().as_path(),
         config.rules_config.max_findings,
         skip_patterns,
     );
@@ -239,7 +247,7 @@ async fn review_diff_inner(
     let context_chain = crate::engine::context::build_context_chain(
         &diff_chunks,
         &config.context_chain,
-        std::env::current_dir().unwrap_or_default().as_path(),
+        &project_root,
         &config.ignore.files,
     );
 
@@ -294,7 +302,7 @@ async fn review_diff_inner(
         match build_brain_context(
             &diff_chunks,
             config.context_chain.impact_depth,
-            std::env::current_dir().unwrap_or_default().as_path(),
+            &index_bridge,
         ) {
             Some(brain_ctx) if !brain_ctx.is_empty() => {
                 debug!(
@@ -778,11 +786,9 @@ fn is_valid_file_path(issue_file: &str, valid_files: &[String]) -> bool {
 pub(crate) fn build_brain_context(
     diff_chunks: &[crate::engine::diff_parser::FileChunk],
     impact_depth: u32,
-    project_root: &std::path::Path,
+    bridge: &crate::engine::index_bridge::IndexBridge,
 ) -> Option<String> {
-    // Try to open the global symbol index
-    let conn = crate::index::open_global_index().ok()?;
-    let project_id = crate::index::ensure_project(&conn, project_root).ok()?;
+    let (conn, project_id) = bridge.parts()?;
 
     // Extract defined symbols from the diff
     let defs = crate::engine::context::extraction::extract_definitions_from_diff(diff_chunks);
@@ -799,7 +805,7 @@ pub(crate) fn build_brain_context(
             continue;
         }
         if let Ok(nodes) =
-            crate::index::graph::impact_analysis(&conn, project_id, &def.name, impact_depth)
+            crate::index::graph::impact_analysis(conn, project_id, &def.name, impact_depth)
         {
             if !nodes.is_empty() {
                 impact_lines.push(format!(
@@ -838,7 +844,7 @@ pub(crate) fn build_brain_context(
         }
         // Walk impact nodes, collect files containing "test" or "spec"
         if let Ok(nodes) = crate::index::graph::impact_analysis(
-            &conn, project_id, &def.name, 1, // depth 1 is enough for test detection
+            conn, project_id, &def.name, 1, // depth 1 is enough for test detection
         ) {
             for node in &nodes {
                 let lower = node.file.to_lowercase();
@@ -849,7 +855,7 @@ pub(crate) fn build_brain_context(
         }
         // Also search FTS5 for test symbols matching this function name
         if let Ok(results) =
-            crate::index::brain::brain_search(&conn, project_id, &format!("test {}", def.name), 3)
+            crate::index::brain::brain_search(conn, project_id, &format!("test {}", def.name), 3)
         {
             for r in results {
                 let lower = r.file.to_lowercase();
@@ -880,7 +886,7 @@ pub(crate) fn build_brain_context(
         if def.name.len() < 2 {
             continue;
         }
-        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &def.name, 3) {
+        if let Ok(results) = crate::index::brain::brain_search(conn, project_id, &def.name, 3) {
             for r in results {
                 // Skip results from the same file as the definition
                 if r.file == def.file {
@@ -922,10 +928,9 @@ pub(crate) fn build_brain_context(
 pub(crate) fn build_scan_brain_context(
     files: &[crate::engine::scanner::FileEntry],
     impact_depth: u32,
-    project_root: &std::path::Path,
+    bridge: &crate::engine::index_bridge::IndexBridge,
 ) -> Option<String> {
-    let conn = crate::index::open_global_index().ok()?;
-    let project_id = crate::index::ensure_project(&conn, project_root).ok()?;
+    let (conn, project_id) = bridge.parts()?;
 
     // Extract function/type names from each file using simple heuristics.
     // For scan we don't have tree-sitter AST — we use the index's FTS5
@@ -939,7 +944,7 @@ pub(crate) fn build_scan_brain_context(
     let mut all_symbols: Vec<crate::index::brain::BrainResult> = Vec::new();
     for file_path in file_paths.iter().take(10) {
         let query = format!("file:\"{file_path}\"");
-        if let Ok(results) = crate::index::brain::brain_search(&conn, project_id, &query, 5) {
+        if let Ok(results) = crate::index::brain::brain_search(conn, project_id, &query, 5) {
             all_symbols.extend(results.into_iter().filter(|r| r.name.len() >= 2));
         }
     }
@@ -955,7 +960,7 @@ pub(crate) fn build_scan_brain_context(
     let mut impact_lines: Vec<String> = Vec::new();
     for r in &unique_symbols {
         if let Ok(nodes) =
-            crate::index::graph::impact_analysis(&conn, project_id, &r.name, impact_depth)
+            crate::index::graph::impact_analysis(conn, project_id, &r.name, impact_depth)
         {
             if nodes.len() > 2 {
                 impact_lines.push(format!(
@@ -979,7 +984,7 @@ pub(crate) fn build_scan_brain_context(
     // Reuse the same symbols — no additional brain_search calls needed.
     let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &unique_symbols {
-        if let Ok(nodes) = crate::index::graph::impact_analysis(&conn, project_id, &r.name, 1) {
+        if let Ok(nodes) = crate::index::graph::impact_analysis(conn, project_id, &r.name, 1) {
             for node in &nodes {
                 let lower = node.file.to_lowercase();
                 if lower.contains("test") || lower.contains("spec") || lower.contains("_test") {

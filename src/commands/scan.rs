@@ -121,8 +121,9 @@ pub async fn execute_scan(
     let mut index_skip = config.ignore.files.clone();
     index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
     index_skip.dedup();
+    let index_bridge = crate::engine::index_bridge::IndexBridge::open(&root_abs);
     let index_findings = crate::engine::index_scanner::scan_project_index(
-        &root_abs,
+        &index_bridge,
         &files,
         config.rules_config.max_findings,
         &index_skip,
@@ -154,7 +155,7 @@ pub async fn execute_scan(
         crate::engine::review::build_scan_brain_context(
             &files,
             config.context_chain.impact_depth,
-            &root_abs,
+            &index_bridge,
         )
     } else {
         None

@@ -181,14 +181,10 @@ pub fn resolve_stale_findings(project_root: &str, current_fingerprints: &[String
 }
 
 /// Open the global `cora.db` and ensure migrations are up to date.
+///
+/// Delegates to the shared index opener so PRAGMAs live in one place.
 fn open_db() -> anyhow::Result<Connection> {
-    crate::data_dir::ensure_data_dir()?;
-    let db_path = crate::data_dir::graph_db_path();
-    let conn = Connection::open(&db_path)?;
-    conn.execute_batch("PRAGMA foreign_keys=ON;")?;
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-    schema::run_migrations(&conn)?;
-    Ok(conn)
+    crate::index::open_global_index()
 }
 
 /// Open cora.db in read-only mode (no migrations, no WAL).

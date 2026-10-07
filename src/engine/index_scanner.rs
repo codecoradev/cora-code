@@ -9,6 +9,7 @@ use tracing::debug;
 
 use crate::engine::Severity;
 use crate::engine::diff_parser::{DiffLineType, FileChunk};
+use crate::engine::index_bridge::IndexBridge;
 use crate::engine::rules::types::RuleFinding;
 use crate::index::graph;
 
@@ -110,25 +111,14 @@ pub fn should_skip_file(file_path: &str, skip_patterns: &[String]) -> bool {
 ///
 /// Returns `Vec<RuleFinding>` with severity `Minor` for each unused import.
 pub fn scan_unused_imports(
+    bridge: &IndexBridge,
     chunks: &[FileChunk],
-    project_root: &std::path::Path,
     max_findings: usize,
     skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
-    let conn = match crate::index::open_global_index() {
-        Ok(c) => c,
-        Err(_) => {
-            debug!("no global index available — skipping unused import scan");
-            return Vec::new();
-        }
-    };
-
-    let project_id = match crate::index::ensure_project(&conn, project_root) {
-        Ok(id) => id,
-        Err(_) => {
-            debug!("failed to get project_id — skipping unused import scan");
-            return Vec::new();
-        }
+    let Some((conn, project_id)) = bridge.parts() else {
+        debug!("no project index available — skipping unused import scan");
+        return Vec::new();
     };
 
     let mut findings = Vec::new();
@@ -162,7 +152,7 @@ pub fn scan_unused_imports(
         }
 
         if seen_files.insert(file.to_string()) {
-            match graph::find_unused_imports(&conn, file, project_id) {
+            match graph::find_unused_imports(conn, file, project_id) {
                 Ok(unused) => {
                     for u in &unused {
                         findings.push(RuleFinding {
@@ -204,25 +194,14 @@ pub fn scan_unused_imports(
 ///
 /// Returns `Vec<RuleFinding>` with severity `Info` for each dead symbol.
 pub fn scan_dead_code_in_review(
+    bridge: &IndexBridge,
     chunks: &[FileChunk],
-    project_root: &std::path::Path,
     max_findings: usize,
     skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
-    let conn = match crate::index::open_global_index() {
-        Ok(c) => c,
-        Err(_) => {
-            debug!("no global index available — skipping dead code scan");
-            return Vec::new();
-        }
-    };
-
-    let project_id = match crate::index::ensure_project(&conn, project_root) {
-        Ok(id) => id,
-        Err(_) => {
-            debug!("failed to get project_id — skipping dead code scan");
-            return Vec::new();
-        }
+    let Some((conn, project_id)) = bridge.parts() else {
+        debug!("no project index available — skipping dead code scan");
+        return Vec::new();
     };
 
     let mut findings = Vec::new();
@@ -244,7 +223,7 @@ pub fn scan_dead_code_in_review(
         }
 
         if seen_files.insert(file.to_string()) {
-            match graph::find_dead_code_in_file(&conn, file, project_id, false) {
+            match graph::find_dead_code_in_file(conn, file, project_id, false) {
                 Ok(dead) => {
                     for d in &dead {
                         findings.push(RuleFinding {
@@ -287,37 +266,14 @@ pub fn scan_dead_code_in_review(
 ///
 /// Returns `Vec<RuleFinding>` with severity `Major` for each breaking change.
 pub fn scan_breaking_changes(
+    bridge: &IndexBridge,
     chunks: &[FileChunk],
-    project_root: &std::path::Path,
     max_findings: usize,
     skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
-    let conn = match crate::index::open_global_index() {
-        Ok(c) => c,
-        Err(_) => {
-            debug!("no global index available — skipping breaking change scan");
-            return Vec::new();
-        }
-    };
-
-    scan_breaking_changes_with(&conn, chunks, project_root, max_findings, skip_patterns)
-}
-
-/// [`scan_breaking_changes`] against an explicit connection — testable with an
-/// in-memory index.
-pub(crate) fn scan_breaking_changes_with(
-    conn: &rusqlite::Connection,
-    chunks: &[FileChunk],
-    project_root: &std::path::Path,
-    max_findings: usize,
-    skip_patterns: &[String],
-) -> Vec<RuleFinding> {
-    let project_id = match crate::index::ensure_project(conn, project_root) {
-        Ok(id) => id,
-        Err(_) => {
-            debug!("failed to get project_id — skipping breaking change scan");
-            return Vec::new();
-        }
+    let Some((conn, project_id)) = bridge.parts() else {
+        debug!("no project index available — skipping breaking change scan");
+        return Vec::new();
     };
 
     // Symbol names (re)defined by this very diff — the post-image of the change.
@@ -470,7 +426,7 @@ fn collect_added_definitions(chunks: &[FileChunk]) -> HashSet<String> {
 /// Designed for `cora scan` which operates on file paths, not diffs.
 /// Returns findings for any file in the project that has an index DB.
 pub fn scan_project_index(
-    root: &std::path::Path,
+    bridge: &IndexBridge,
     files: &[crate::engine::scanner::FileEntry],
     max_findings: usize,
     skip_patterns: &[String],
@@ -479,20 +435,9 @@ pub fn scan_project_index(
 
     let mut findings = Vec::new();
 
-    let conn = match crate::index::open_global_index() {
-        Ok(c) => c,
-        Err(_) => {
-            debug!("no global index available — skipping project index scan");
-            return findings;
-        }
-    };
-
-    let project_id = match crate::index::ensure_project(&conn, root) {
-        Ok(id) => id,
-        Err(_) => {
-            debug!("failed to get project_id — skipping project index scan");
-            return findings;
-        }
+    let Some((conn, project_id)) = bridge.parts() else {
+        debug!("no project index available — skipping project index scan");
+        return findings;
     };
 
     // Scan for unused imports across all files in the scan set
@@ -502,7 +447,7 @@ pub fn scan_project_index(
             continue;
         }
         if seen_files.insert(entry.path.clone()) {
-            match graph::find_unused_imports(&conn, &entry.path, project_id) {
+            match graph::find_unused_imports(conn, &entry.path, project_id) {
                 Ok(unused) => {
                     for u in &unused {
                         findings.push(ReviewIssue {
@@ -536,7 +481,7 @@ pub fn scan_project_index(
 
     // Scan for dead code in the indexed project
     let opts = graph::DeadCodeOptions::default();
-    match graph::find_dead_code(&conn, project_id, &opts) {
+    match graph::find_dead_code(conn, project_id, &opts) {
         Ok(dead) => {
             for func in dead.into_iter().take(max_findings - findings.len()) {
                 findings.push(ReviewIssue {
@@ -605,7 +550,7 @@ mod tests {
     fn scan_unused_imports_no_index_graceful() {
         // No index available — should return empty, not panic
         let chunks = vec![make_chunk("src/main.rs", "+use std::collections::HashMap;")];
-        let findings = scan_unused_imports(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
+        let findings = scan_unused_imports(&IndexBridge::unavailable(), &chunks, 10, &[]);
         assert!(
             findings.is_empty(),
             "should gracefully return empty without index"
@@ -615,8 +560,7 @@ mod tests {
     #[test]
     fn scan_dead_code_no_index_graceful() {
         let chunks = vec![make_chunk("src/main.rs", "+fn foo() {}")];
-        let findings =
-            scan_dead_code_in_review(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
+        let findings = scan_dead_code_in_review(&IndexBridge::unavailable(), &chunks, 10, &[]);
         assert!(
             findings.is_empty(),
             "should gracefully return empty without index"
@@ -626,8 +570,7 @@ mod tests {
     #[test]
     fn scan_breaking_changes_no_index_graceful() {
         let chunks = vec![make_chunk("src/main.rs", "-pub fn important_api() {}")];
-        let findings =
-            scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
+        let findings = scan_breaking_changes(&IndexBridge::unavailable(), &chunks, 10, &[]);
         assert!(
             findings.is_empty(),
             "should gracefully return empty without index"
@@ -641,20 +584,27 @@ mod tests {
             "-pub fn important_api() {}\n+pub fn new_api() {}",
         )];
         // No index, so no callers detected — but the pattern should still compile
-        let findings =
-            scan_breaking_changes(&chunks, std::path::Path::new("/nonexistent"), 10, &[]);
+        let findings = scan_breaking_changes(&IndexBridge::unavailable(), &chunks, 10, &[]);
         assert!(findings.is_empty(), "no index means no caller data");
     }
 
-    // --- scan_breaking_changes_with: stale-index false-positive guard (#533) ---
+    // --- scan_breaking_changes: stale-index false-positive guard (#533) ---
 
     /// In-memory index with caller edges for a symbol, mirroring a populated
     /// global index that may be out of date relative to the diff.
-    fn index_with_callers(callee: &str, callers: &[(&str, &str, i64)]) -> rusqlite::Connection {
+    fn index_with_callers(callee: &str, callers: &[(&str, &str, i64)]) -> IndexBridge {
+        index_at_root(std::path::Path::new("/fixture/proj"), callee, callers)
+    }
+
+    /// Same, with the project registered under `root` and the bridge opened from `start`.
+    fn index_at_root(
+        root: &std::path::Path,
+        callee: &str,
+        callers: &[(&str, &str, i64)],
+    ) -> IndexBridge {
         let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
         crate::index::schema::run_migrations(&conn).expect("migrations");
-        let project_id =
-            crate::index::schema::get_or_create_project(&conn, "/fixture/proj").expect("project");
+        let project_id = crate::index::ensure_project(&conn, root).expect("project");
         for (caller, file, line) in callers {
             conn.execute(
                 "INSERT INTO call_graph (caller, callee, file, line, project_id) \
@@ -663,11 +613,7 @@ mod tests {
             )
             .expect("insert call_graph");
         }
-        conn
-    }
-
-    fn project_root() -> &'static std::path::Path {
-        std::path::Path::new("/fixture/proj")
+        IndexBridge::from_connection(conn, root).expect("bridge")
     }
 
     /// Build a chunk the way the real diff parser does: content WITHOUT the
@@ -707,7 +653,7 @@ mod tests {
     fn signature_drift_against_stale_index_is_not_a_removal() {
         // The reported FP (#533): only the signature line changed, so the old
         // definition shows up as a `-` line while the same symbol is re-added.
-        let conn = index_with_callers("build_review_prompt", &[("handler_a", "src/api.rs", 42)]);
+        let bridge = index_with_callers("build_review_prompt", &[("handler_a", "src/api.rs", 42)]);
         let chunks = vec![chunk_lines(
             "src/engine/llm.rs",
             &[
@@ -718,7 +664,7 @@ mod tests {
                 ),
             ],
         )];
-        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
         assert!(
             findings.is_empty(),
             "signature-only drift must not be reported as removal, got: {:?}",
@@ -728,12 +674,12 @@ mod tests {
 
     #[test]
     fn genuine_removal_with_callers_still_fires() {
-        let conn = index_with_callers("important_api", &[("caller_x", "src/app.rs", 7)]);
+        let bridge = index_with_callers("important_api", &[("caller_x", "src/app.rs", 7)]);
         let chunks = vec![chunk_lines(
             "src/lib.rs",
             &[("-", "pub fn important_api() {}")],
         )];
-        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
         assert_eq!(findings.len(), 1, "a true removal must still be reported");
         assert_eq!(findings[0].rule_id, "index-breaking-change");
         assert_eq!(findings[0].severity, Severity::Major);
@@ -741,24 +687,24 @@ mod tests {
 
     #[test]
     fn rename_reports_only_the_old_name() {
-        let conn = index_with_callers("old_name", &[("caller_y", "src/app.rs", 3)]);
+        let bridge = index_with_callers("old_name", &[("caller_y", "src/app.rs", 3)]);
         let chunks = vec![chunk_lines(
             "src/lib.rs",
             &[("-", "pub fn old_name() {}"), ("+", "pub fn new_name() {}")],
         )];
-        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
         assert_eq!(findings.len(), 1, "rename is still breaking for old_name");
         assert!(findings[0].title.contains("old_name"));
     }
 
     #[test]
     fn cross_file_move_is_not_a_removal() {
-        let conn = index_with_callers("moved_fn", &[("caller_z", "src/main.rs", 11)]);
+        let bridge = index_with_callers("moved_fn", &[("caller_z", "src/main.rs", 11)]);
         let chunks = vec![
             chunk_lines("src/old_location.rs", &[("-", "pub fn moved_fn() {}")]),
             chunk_lines("src/new_location.rs", &[("+", "pub fn moved_fn() {}")]),
         ];
-        let findings = scan_breaking_changes_with(&conn, &chunks, project_root(), 10, &[]);
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
         assert!(
             findings.is_empty(),
             "a definition moved between files still exists post-change, got: {:?}",
@@ -790,6 +736,37 @@ mod tests {
     }
 
     // --- should_skip_file tests ---
+
+    #[test]
+    fn scanner_run_from_subdirectory_sees_the_indexed_project() {
+        // Index registered under the workspace root; the review runs from a
+        // member directory. Both must resolve the same project_id, otherwise
+        // the scanner sees an empty project and reports nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let member = root.join("crates/member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/member\"]\n",
+        )
+        .unwrap();
+        std::fs::write(member.join("Cargo.toml"), "[package]\nname = \"member\"\n").unwrap();
+
+        let from_root = index_at_root(&root, "important_api", &[("caller_x", "src/app.rs", 7)]);
+        let (conn, root_pid, _) = from_root.into_strict_parts().unwrap();
+        // Re-open the same connection as if started from the subdirectory.
+        let from_sub = IndexBridge::from_connection(conn, &member).unwrap();
+        assert_eq!(from_sub.project_id(), Some(root_pid));
+
+        let chunks = vec![chunk_lines(
+            "src/lib.rs",
+            &[("-", "pub fn important_api() {}")],
+        )];
+        let findings = scan_breaking_changes(&from_sub, &chunks, 10, &[]);
+        assert_eq!(findings.len(), 1);
+    }
 
     #[test]
     fn skip_empty_patterns() {
