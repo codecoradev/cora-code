@@ -32,9 +32,25 @@ pub use symbols::{SearchResult, SymbolKind, SymbolQuery};
 /// Project isolation is handled via the `project_id` foreign key.
 pub fn open_global_index() -> anyhow::Result<Connection> {
     crate::data_dir::ensure_data_dir()?;
-    let db_path = crate::data_dir::graph_db_path();
+    open_index_at(&crate::data_dir::graph_db_path())
+}
 
-    let conn = Connection::open(&db_path)?;
+/// Open (creating if absent) the index database at `db_path`, apply the
+/// standard PRAGMAs and run migrations.
+///
+/// This is the single place that opens an index connection; the production path
+/// goes through [`open_global_index`], tests may point it at a temp file.
+pub fn open_index_at(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    apply_pragmas(&conn)?;
+    schema::run_migrations(&conn)?;
+
+    debug!("Opened index at {}", db_path.display());
+    Ok(conn)
+}
+
+/// The one PRAGMA set every read-write index connection uses.
+pub fn apply_pragmas(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\
          PRAGMA foreign_keys=ON;\
@@ -43,11 +59,9 @@ pub fn open_global_index() -> anyhow::Result<Connection> {
          PRAGMA mmap_size=268435456;\
          PRAGMA temp_store=MEMORY;",
     )?;
-    schema::run_migrations(&conn)?;
-
-    debug!("Opened global index at {}", db_path.display());
-    Ok(conn)
+    Ok(())
 }
+
 /// Resolve the `project_id` for a given root path, creating the project row if needed.
 pub fn ensure_project(conn: &Connection, root: &Path) -> anyhow::Result<i64> {
     let root_str = root.to_string_lossy().to_string();
@@ -118,17 +132,6 @@ pub fn resolve_project_root(start: &Path) -> Option<std::path::PathBuf> {
         debug!(root = %root.display(), "detected project root");
     }
     fallback
-}
-
-/// Resolve `project_id` from the current directory, using project root detection.
-///
-/// Walks up from CWD to find a project root (`.cora.yaml`, `Cargo.toml`, etc.).
-/// Falls back to CWD if no marker is found.
-pub fn resolve_project_id(conn: &Connection) -> anyhow::Result<(i64, std::path::PathBuf)> {
-    let cwd = std::env::current_dir()?;
-    let root = resolve_project_root(&cwd).unwrap_or_else(|| cwd.clone());
-    let project_id = ensure_project(conn, &root)?;
-    Ok((project_id, root))
 }
 
 #[cfg(test)]
@@ -928,18 +931,6 @@ pub struct AuthService {
                 "should not find project root in empty tmp dir, got {resolved:?}"
             );
         }
-    }
-
-    #[test]
-    fn test_resolve_project_id_uses_project_root() {
-        let conn = mem_conn();
-        // resolve_project_id uses CWD — which is the cora-code crate root.
-        let (pid, root) = resolve_project_id(&conn).unwrap();
-        assert!(pid > 0);
-        assert!(
-            root.join("Cargo.toml").exists(),
-            "resolved root should contain Cargo.toml"
-        );
     }
 
     /// Regression (#522): running `cora index` from inside a workspace member

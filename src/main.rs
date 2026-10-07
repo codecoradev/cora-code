@@ -639,6 +639,22 @@ enum ProfileAction {
 }
 
 /// Format bytes as human-readable string.
+/// Strict open of the index for read-only CLI arms: prints a friendly hint and
+/// exits when no index exists yet.
+fn open_index_strict_or_exit() -> Result<(rusqlite::Connection, i64, std::path::PathBuf)> {
+    match engine::index_bridge::IndexBridge::open_strict_cwd() {
+        Ok(bridge) => bridge.into_strict_parts(),
+        Err(e)
+            if e.downcast_ref::<engine::index_bridge::NoIndexError>()
+                .is_some() =>
+        {
+            eprintln!("{}", "No index found. Run `cora index` first.".yellow());
+            std::process::exit(1);
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -697,10 +713,8 @@ async fn main() -> Result<()> {
             watch,
             verbose,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, project_root) =
+                engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
             if rebuild {
                 // Delete all data for this project via CASCADE
@@ -848,17 +862,7 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             let sym_kind = kind.as_deref().map(index::SymbolKind::from_str);
 
@@ -921,15 +925,7 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
             let callers = index::graph::find_callers(&conn, project_id, &symbol, limit)?;
 
             // Cross-project fallback: if no callers in current project,
@@ -1002,15 +998,7 @@ async fn main() -> Result<()> {
             depth,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run 'cora index' first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
             let impact = index::graph::impact_analysis(&conn, project_id, &symbol, depth)?;
 
             if json {
@@ -1051,15 +1039,7 @@ async fn main() -> Result<()> {
             depth,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             let dir = match direction.as_str() {
                 "incoming" => index::graph::TraceDirection::Incoming,
@@ -1110,15 +1090,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Arch { json } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             let overview = index::graph::arch_overview(&conn, project_id)?;
 
@@ -1160,15 +1132,7 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             // Resolve embedding backend from config for query embedding
             let brain_cfg = crate::config::loader::load_config(
@@ -1221,15 +1185,7 @@ async fn main() -> Result<()> {
             filter,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             // Gather changed files
             let mut changed: Vec<String> = files;
@@ -1584,8 +1540,7 @@ async fn main() -> Result<()> {
             git_only,
             filter,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
+            let project_root = engine::index_bridge::IndexBridge::current_root()?;
             let config_path = cli.global.config.as_deref();
             commands::watch::run_watch(
                 &project_root,
@@ -1627,10 +1582,8 @@ async fn main() -> Result<()> {
         } => {
             // Resolve the project root the same way `cora index` does, so
             // dead-code queries the workspace the index actually built (#522).
-            let cwd = std::env::current_dir().with_context(|| "failed to get cwd")?;
-            let project_root = index::resolve_project_root(&cwd).unwrap_or(cwd.clone());
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) =
+                engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
             // Load config for entry_point_patterns
             let config = crate::config::loader::load_config(

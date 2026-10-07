@@ -33,7 +33,9 @@ pub fn run_watch(
     filter: Option<&str>,
     verbose: bool,
 ) -> Result<()> {
-    let conn = crate::index::open_global_index()?;
+    let (conn, _project_id, _root) =
+        crate::engine::index_bridge::IndexBridge::open_or_create(project_root)?
+            .into_strict_parts()?;
     // Load skip patterns + brain embedding backend from config
     let config =
         crate::config::loader::load_config(config_path, None, None, None, None, false).ok();
