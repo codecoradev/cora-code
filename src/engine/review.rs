@@ -49,6 +49,13 @@ pub fn resolve_system_prompt(inline: Option<&str>, file_path: Option<&str>) -> O
     }
 }
 
+/// Exclusion patterns for review-time index scanners: the exact set the
+/// indexer uses (`ignore.files` + `index_skip_files`), so review and index
+/// never disagree about which files are out of scope.
+pub fn index_skip_patterns(config: &Config) -> Vec<String> {
+    crate::index::skip_patterns_from_config(Some(config)).unwrap_or_default()
+}
+
 /// Run a code review on the given diff string with optional streaming and cache control.
 ///
 /// When `stream` is true, LLM tokens are printed to stdout in real-time.
@@ -180,7 +187,8 @@ async fn review_diff_inner(
     } else {
         index_bridge.root().to_path_buf()
     };
-    let skip_patterns = &config.rules_config.index_skip_files;
+    // Same exclusion set the indexer uses (ignore.files + index_skip_files).
+    let skip_patterns = &index_skip_patterns(config);
     let index_unused_findings = crate::engine::index_scanner::scan_unused_imports(
         &index_bridge,
         &diff_chunks,

@@ -17,8 +17,6 @@ mod index;
 mod mcp;
 mod progress;
 
-use index::schema;
-
 use commands::{
     auth, commit_cmd, completion, config_cmd, debt, hook_cmd, init, profile, providers, review,
     scan, upload,
@@ -713,144 +711,16 @@ async fn main() -> Result<()> {
             watch,
             verbose,
         } => {
-            let (conn, project_id, project_root) =
-                engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
-
-            if rebuild {
-                // Delete all data for this project via CASCADE
-                schema::delete_project(&conn, project_id)?;
-                eprintln!("{}", "Dropped existing index for project.".dimmed());
-                // Re-register the project (gets a fresh project_id)
-                let _fresh_id =
-                    schema::get_or_create_project(&conn, &project_root.to_string_lossy())?;
-            }
-
-            if show_stats {
-                let summary = index::index_stats(&conn, project_id)?;
-                println!("{}", "SYMBOL INDEX".cyan().bold());
-                println!("{}", "────────────────────────────".dimmed());
-                println!("  Total symbols:  {}", summary.total_symbols);
-                println!("  Total files:    {}", summary.total_files);
-                println!("  Database size:  {}", format_bytes(summary.db_size_bytes));
-                println!();
-                println!("  {}", "By Kind".cyan());
-                for (kind, count) in &summary.symbols_by_kind {
-                    println!("    {kind:<16} {count}");
-                }
-                println!();
-                println!("  {}", "By Language".cyan());
-                for (lang, count) in &summary.symbols_by_language {
-                    println!("    {lang:<16} {count}");
-                }
-            } else if prune {
-                let deleted = index::prune_deleted(&conn, project_id, &project_root)?;
-                println!(
-                    "{}",
-                    format!("Pruned {deleted} deleted files from index.").green()
-                );
-            } else if watch {
-                // Initial index
-                eprintln!("{}", "🔍 Initial index...".cyan());
-                let skip_patterns = index::prepare_index_config(cli.global.config.as_deref());
-                let stats = index::index_project_with_skip(
-                    &conn,
-                    &project_root,
-                    verbose || cli.global.verbose,
-                    skip_patterns.as_deref(),
-                )?;
-                eprintln!(
-                    "{}",
-                    format!(
-                        "✅ Indexed {} symbols. Watching for changes... (Ctrl+C to stop)",
-                        stats.symbols_indexed
-                    )
-                    .green()
-                );
-
-                // Poll loop: re-index changed files every 2 seconds
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    let stats = index::index_project_with_skip(
-                        &conn,
-                        &project_root,
-                        false,
-                        skip_patterns.as_deref(),
-                    )?;
-                    if stats.files_indexed > 0 {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "🔄 Updated {} files, {} symbols",
-                                stats.files_indexed, stats.symbols_indexed
-                            )
-                            .cyan()
-                        );
-                    }
-                }
-            } else {
-                // Config-hash invalidation, skip patterns, brain embedding backend.
-                let skip_patterns = index::prepare_index_config(cli.global.config.as_deref());
-
-                eprintln!("{}", "🔍 Indexing project...".cyan());
-                let stats = index::index_project_with_skip(
-                    &conn,
-                    &project_root,
-                    verbose || cli.global.verbose,
-                    skip_patterns.as_deref(),
-                )?;
-                if stats.files_indexed == 0 && stats.errors == 0 {
-                    // Incremental no-op: fingerprints all matched. Report the
-                    // STORED totals instead of a confusing zeros line (#522).
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "✓ Index up to date ({} files unchanged)",
-                            stats.files_skipped
-                        )
-                        .green()
-                    );
-                    if let Ok(summary) = index::index_stats(&conn, project_id) {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "   {} symbols across {} files",
-                                summary.total_symbols, summary.total_files
-                            )
-                            .dimmed()
-                        );
-                    }
-                } else {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "✅ Indexed {} symbols from {} files ({} skipped, {} errors)",
-                            stats.symbols_indexed,
-                            stats.files_indexed,
-                            stats.files_skipped,
-                            stats.errors
-                        )
-                        .green()
-                    );
-                }
-                if stats.files_excluded > 0 {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "   {} files excluded by ignore patterns",
-                            stats.files_excluded
-                        )
-                        .dimmed()
-                    );
-                }
-                eprintln!(
-                    "{}",
-                    format!(
-                        "   Database: {}",
-                        crate::data_dir::graph_db_path().display()
-                    )
-                    .dimmed()
-                );
-            }
+            commands::index_cmd::run_index(
+                &commands::index_cmd::IndexOptions {
+                    stats: show_stats,
+                    prune,
+                    rebuild,
+                    watch,
+                    verbose: verbose || cli.global.verbose,
+                },
+                cli.global.config.as_deref(),
+            )?;
             0
         }
 
@@ -1134,22 +1004,10 @@ async fn main() -> Result<()> {
 
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
-            // Resolve embedding backend from config for query embedding
-            let brain_cfg = crate::config::loader::load_config(
+            // Config → embedding backend → vector store (shared session step).
+            index::session::configure_for_search(index::session::ConfigSource::Full(
                 cli.global.config.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .ok();
-            let brain_mode = brain_cfg
-                .as_ref()
-                .map(|c| c.brain.embedding.to_string())
-                .unwrap_or_else(|| "auto".to_string());
-            crate::embed::resolve_backend(&brain_mode);
-            index::vector::apply_config_store(brain_cfg.as_ref());
+            ));
             let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
 
             if json {
@@ -1455,11 +1313,11 @@ async fn main() -> Result<()> {
             git_only,
             filter,
         } => {
-            let project_root = engine::index_bridge::IndexBridge::current_root()?;
-            let config_path = cli.global.config.as_deref();
+            let session = index::session::IndexSession::open(index::session::ConfigSource::Full(
+                cli.global.config.as_deref(),
+            ))?;
             commands::watch::run_watch(
-                &project_root,
-                config_path,
+                &session,
                 debounce,
                 git_only,
                 filter.as_deref(),
@@ -1552,7 +1410,7 @@ async fn main() -> Result<()> {
             0
         }
         Command::Serve => {
-            commands::serve::execute_serve()?;
+            commands::serve::execute_serve(cli.global.config.as_deref())?;
             0
         }
         Command::Upgrade { yes, check } => commands::upgrade::run(yes, check).await?,
