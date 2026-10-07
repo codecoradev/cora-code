@@ -167,6 +167,43 @@ impl Default for Config {
     }
 }
 
+/// Validate an LLM `base_url`: it must be `https://`, or `http://` only for a
+/// loopback host (`localhost`, `127.0.0.1`, `[::1]`). The API key is sent as a
+/// Bearer token to this URL, so plaintext to a remote host is refused.
+/// An empty string is accepted (means "use the default").
+pub fn check_base_url(url: &str) -> std::result::Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Ok(());
+    }
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        // Drop any userinfo so `http://localhost@evil.com` is judged by `evil.com`.
+        let hostport = authority.rsplit('@').next().unwrap_or("");
+        let host = if let Some(v6) = hostport.strip_prefix('[') {
+            v6.split(']').next().unwrap_or("")
+        } else {
+            hostport.split(':').next().unwrap_or("")
+        };
+        if matches!(
+            host.to_ascii_lowercase().as_str(),
+            "localhost" | "127.0.0.1" | "::1"
+        ) && !authority.contains('@')
+        {
+            return Ok(());
+        }
+        return Err(format!(
+            "plain http:// is only allowed for loopback hosts (localhost, 127.0.0.1, [::1]); use https:// (got: {url})"
+        ));
+    }
+    Err(format!(
+        "must be an https:// URL (http:// allowed for loopback only), got: {url}"
+    ))
+}
+
 impl HookConfig {
     /// Parse the `min_severity` string into a Severity enum.
     pub fn min_severity_level(&self) -> Severity {
@@ -188,17 +225,8 @@ impl Config {
         if self.provider.provider.trim().is_empty() {
             errs.push("provider.provider must not be empty".into());
         }
-        let base = self.provider.base_url.trim();
-        let valid_scheme = base.is_empty()
-            || base.starts_with("http://")
-            || base.starts_with("https://")
-            || base.starts_with("ws://")
-            || base.starts_with("unix:");
-        if !valid_scheme {
-            errs.push(format!(
-                "provider.base_url must be an http(s) URL, got: {}",
-                self.provider.base_url
-            ));
+        if let Err(e) = check_base_url(&self.provider.base_url) {
+            errs.push(format!("provider.base_url: {e}"));
         }
 
         // ── llm ──
@@ -1837,6 +1865,32 @@ bundling:
         cfg.provider.base_url = "api.openai.com".to_string(); // missing scheme
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("base_url"), "err: {err}");
+    }
+
+    #[test]
+    fn base_url_requires_https_except_loopback() {
+        for ok in [
+            "",
+            "https://api.openai.com/v1",
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(check_base_url(ok).is_ok(), "should accept {ok}");
+        }
+        for bad in [
+            "http://evil.example.com/v1",
+            "http://localhost@evil.example.com/v1",
+            "http://localhost.evil.example.com",
+            "ws://localhost:1",
+            "unix:/tmp/x.sock",
+            "api.openai.com",
+        ] {
+            assert!(check_base_url(bad).is_err(), "should reject {bad}");
+        }
+        let mut cfg = Config::default();
+        cfg.provider.base_url = "http://evil.example.com/v1".to_string();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

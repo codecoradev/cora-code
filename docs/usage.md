@@ -158,6 +158,9 @@ Environment variables override configuration file settings:
 | `CORA_MODEL` | Override the model name | No |
 | `CORA_BASE_URL` | Override the API base URL | No |
 | `CORA_CONFIG` | Path to alternative config file | No |
+| `CORA_TRUST_PROJECT_CONFIG` | Set to `1` to honour `provider.base_url` from a discovered project `.cora.yaml` (otherwise ignored with a warning, since it would receive your API key) | No |
+
+> **Security:** `provider.base_url` must be `https://` (plain `http://` only for `localhost`, `127.0.0.1`, `[::1]`). A `base_url` found only in a discovered project `.cora.yaml` is ignored unless `CORA_TRUST_PROJECT_CONFIG=1`; set it via `--base-url`, `CORA_BASE_URL`, an explicit `--config` file, or your global config instead.
 
 Provider-specific keys are auto-detected: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `ZAI_API_KEY`
 

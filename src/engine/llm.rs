@@ -393,7 +393,7 @@ async fn chat_completion(
     if !status.is_success() {
         return Err(CoraError::LlmStatus {
             status: status.as_u16(),
-            body,
+            body: preview_raw(&body),
         });
     }
 
@@ -675,7 +675,7 @@ async fn chat_completion_stream(
         let body = response.text().await.unwrap_or_default();
         return Err(CoraError::LlmStatus {
             status: status.as_u16(),
-            body,
+            body: preview_raw(&body),
         });
     }
 
@@ -2148,6 +2148,15 @@ mod tests {
         assert!(preview.ends_with("… [truncated]"));
         // Hard cap (512 + suffix length).
         assert!(preview.len() < 600);
+    }
+
+    #[test]
+    fn llm_status_body_is_capped() {
+        // Error bodies from an arbitrary host must not be echoed unbounded.
+        let long = "x".repeat(5000);
+        let capped = preview_raw(&long);
+        assert!(capped.len() < 600, "len={}", capped.len());
+        assert!(capped.ends_with("[truncated]"));
     }
 
     #[test]
