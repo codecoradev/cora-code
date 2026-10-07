@@ -93,6 +93,14 @@ fn known_agents(home: &std::path::Path) -> Vec<AgentInfo> {
     ]
 }
 
+/// Names of all agents `cora install` knows how to configure.
+pub fn known_agent_names() -> Vec<&'static str> {
+    known_agents(std::path::Path::new(""))
+        .into_iter()
+        .map(|a| a.name)
+        .collect()
+}
+
 /// Detect which agents are installed by checking if their config paths exist.
 fn detect_agents() -> Result<Vec<AgentInfo>> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
