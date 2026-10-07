@@ -9,6 +9,7 @@ mod ast;
 pub mod brain;
 mod extract;
 pub mod graph;
+pub mod queries;
 pub mod schema;
 mod symbols;
 pub mod vector;

@@ -1218,95 +1218,10 @@ async fn main() -> Result<()> {
                 std::process::exit(0);
             }
 
-            // Default test patterns
-            let patterns: Vec<String> = filter.map(|f| vec![f]).unwrap_or_else(|| {
-                vec![
-                    "test".to_string(),
-                    "spec".to_string(),
-                    "_test".to_string(),
-                    "_spec".to_string(),
-                ]
-            });
-
-            // Find test files that import/reference changed source files
-            let mut affected_tests: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            // Strategy 1: Find symbols in changed files, then find callers that are in test files
-            // Batch: fetch all symbols for all changed files in a single query
-            let all_symbols: Vec<String> = {
-                let placeholders: String =
-                    changed.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let n = changed.len() + 1;
-                let sql = format!(
-                    "SELECT DISTINCT name FROM symbols WHERE file IN ({placeholders}) AND project_id = ?{n}"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = changed
-                    .iter()
-                    .map(|f| Box::new(f.clone()) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                params.push(Box::new(project_id));
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
-                rows.filter_map(|r| r.ok()).collect()
+            let opts = index::queries::AffectedOptions {
+                test_file_markers: filter.map(|f| vec![f]),
             };
-
-            // Deduplicate symbols and resolve callers with a single set-based query
-            {
-                let mut seen_syms: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for sym_name in all_symbols {
-                    if seen_syms.insert(sym_name.clone()) {
-                        let callers =
-                            index::graph::find_callers(&conn, project_id, &sym_name, 100)?;
-                        for caller in callers {
-                            if patterns.iter().any(|p| caller.file.contains(p.as_str())) {
-                                affected_tests.insert(caller.file.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Strategy 2: Direct test file name convention (mod_test.rs, foo_test.go)
-            // Prepare statement once before the loop
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT path FROM files WHERE path LIKE ?1 AND project_id = ?2",
-            )?;
-            for file in &changed {
-                // For Rust: src/foo.rs → tests/foo.rs or src/foo.rs → src/foo_test.rs
-                let stem = file
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(file)
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("");
-                let test_patterns = [
-                    format!("{stem}_test.rs"),
-                    format!("tests/{stem}.rs"),
-                    format!("test_{stem}.rs"),
-                    format!("{stem}_test.go"),
-                    format!("{stem}_test.py"),
-                    format!("test_{stem}.py"),
-                    format!("{stem}.test.ts"),
-                    format!("{stem}.spec.ts"),
-                ];
-                for tp in &test_patterns {
-                    let pattern = format!("%{tp}");
-                    let rows = stmt.query_map(rusqlite::params![pattern, project_id], |row| {
-                        row.get::<_, String>(0)
-                    })?;
-                    for f in rows.map_while(Result::ok) {
-                        affected_tests.insert(f);
-                    }
-                }
-            }
-
-            let mut sorted: Vec<String> = affected_tests.into_iter().collect();
-            sorted.sort();
+            let sorted = index::queries::find_affected_tests(&conn, project_id, &changed, &opts)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&sorted)?);
@@ -1595,15 +1510,12 @@ async fn main() -> Result<()> {
                 false,
             )
             .unwrap_or_default();
-            let entry_point_patterns = config.analysis.entry_point_patterns.clone();
-
-            let opts = index::graph::DeadCodeOptions {
+            let flags = index::queries::DeadCodeFlags {
                 include_tests,
-                min_lines,
-                entry_point_patterns,
                 include_pub_api: include_pub,
+                min_lines,
             };
-            let results = index::graph::find_dead_code(&conn, project_id, &opts)?;
+            let results = index::queries::find_dead_code(&conn, project_id, &config, flags)?;
             if json {
                 let out = serde_json::to_string_pretty(&results)?;
                 println!("{out}");

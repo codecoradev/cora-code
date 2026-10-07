@@ -576,8 +576,6 @@ fn handle_find_impact(params: &serde_json::Value) -> ToolResult {
     }
 }
 
-/// Max entries accepted in `cora.find_affected_tests` `files`.
-const MAX_AFFECTED_FILES: usize = 200;
 /// Upper bounds for caller-supplied numeric parameters.
 const MAX_LIMIT: u64 = 500;
 const MAX_DEPTH: u64 = 10;
@@ -594,41 +592,6 @@ fn clamped_u64(params: &serde_json::Value, key: &str, default: u64, max: u64) ->
         .min(max)
 }
 
-/// Escape `%`, `_` and the escape char itself for use with `LIKE ... ESCAPE '\'`.
-fn escape_like(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '%' | '_' | '\\') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
-/// Conventional test-file name suffixes for the given source files.
-fn test_name_candidates(files: &[String]) -> Vec<String> {
-    let mut names = Vec::new();
-    for file in files {
-        let Some(stem) = std::path::Path::new(file)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        names.extend([
-            format!("{stem}_test.rs"),
-            format!("tests/{stem}.rs"),
-            format!("{stem}_test.go"),
-            format!("test_{stem}.py"),
-            format!("{stem}.test.ts"),
-            format!("{stem}.spec.ts"),
-        ]);
-    }
-    names
-}
-
 fn handle_find_affected_tests(params: &serde_json::Value) -> ToolResult {
     let files: Vec<String> = match params.get("files").and_then(|v| v.as_array()) {
         Some(arr) => arr
@@ -642,11 +605,8 @@ fn handle_find_affected_tests(params: &serde_json::Value) -> ToolResult {
     if files.is_empty() {
         return ToolResult::error("Parameter 'files' must not be empty");
     }
-    if files.len() > MAX_AFFECTED_FILES {
-        return ToolResult::error(format!(
-            "Parameter 'files' has {} entries; maximum is {MAX_AFFECTED_FILES}",
-            files.len()
-        ));
+    if let Err(e) = crate::index::queries::validate_changed_files(&files) {
+        return ToolResult::error(e.to_string());
     }
 
     let (conn, project_id) = match open_index_db() {
@@ -654,85 +614,15 @@ fn handle_find_affected_tests(params: &serde_json::Value) -> ToolResult {
         Err(e) => return ToolResult::error(e.to_string()),
     };
 
-    let patterns = ["test", "spec", "_test", "_spec"];
-    let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Batch fetch all symbols for all files in a single query
-    let all_symbols: Vec<String> = {
-        let placeholders = files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let n = files.len() + 1;
-        let sql = format!(
-            "SELECT DISTINCT name FROM symbols WHERE file IN ({placeholders}) AND project_id = ?{n}"
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => return ToolResult::error(format!("DB error: {e}")),
-        };
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = files
-            .iter()
-            .map(|f| Box::new(f.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        params.push(Box::new(project_id));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let rows = match stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0)) {
-            Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("DB error: {e}")),
-        };
-        rows.filter_map(|r| r.ok()).collect()
+    let sorted = match crate::index::queries::find_affected_tests(
+        &conn,
+        project_id,
+        &files,
+        &crate::index::queries::AffectedOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::error(format!("DB error: {e}")),
     };
-
-    // Deduplicate and traverse call graph once
-    {
-        let mut seen_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for sym_name in &all_symbols {
-            if seen_syms.insert(sym_name.clone()) {
-                if let Ok(callers) =
-                    crate::index::graph::find_callers(&conn, project_id, sym_name, 100)
-                {
-                    for caller in callers {
-                        if patterns.iter().any(|p| caller.file.contains(*p)) {
-                            affected.insert(caller.file.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Strategy 2: naming convention — batch all test name candidates
-    let test_names = test_name_candidates(&files);
-
-    // Query with a single LIKE batch, scoped to project
-    if !test_names.is_empty() {
-        let n = test_names.len() + 1;
-        let sql = format!(
-            "SELECT DISTINCT path FROM files WHERE ({}) AND project_id = ?{n}",
-            (1..=test_names.len())
-                .map(|i| format!("path LIKE '%' || ?{i} ESCAPE '\\'"))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => return ToolResult::error(format!("DB error: {e}")),
-        };
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = test_names
-            .iter()
-            .map(|t| Box::new(escape_like(t)) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        params.push(Box::new(project_id));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0)) {
-            for row in rows.map_while(Result::ok) {
-                affected.insert(row);
-            }
-        }
-    }
-
-    let mut sorted: Vec<String> = affected.into_iter().collect();
-    sorted.sort();
 
     let json = serde_json::json!({
         "affected_tests": sorted,
@@ -1151,14 +1041,16 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         .and_then(|v| v.as_u64())
         .map(|v| v.min(MAX_MIN_LINES) as u32);
 
-    let opts = crate::index::graph::DeadCodeOptions {
+    // Project-level `.cora.yaml` only (no env/global/secrets); entry-point
+    // patterns are plain names, not secrets, so they are honored like the CLI.
+    let config = load_project_config().unwrap_or_default();
+    let flags = crate::index::queries::DeadCodeFlags {
         include_tests,
-        min_lines,
-        entry_point_patterns: vec![],
         include_pub_api,
+        min_lines,
     };
 
-    match crate::index::graph::find_dead_code(&conn, project_id, &opts) {
+    match crate::index::queries::find_dead_code(&conn, project_id, &config, flags) {
         Ok(results) => {
             if results.is_empty() {
                 return ToolResult::text("No dead code found.");
@@ -1414,54 +1306,8 @@ mod tests {
     }
 
     #[test]
-    fn test_name_candidates_use_file_stem_not_extension() {
-        let names = test_name_candidates(&["src/engine/review.rs".to_string()]);
-        assert!(names.contains(&"review_test.rs".to_string()));
-        assert!(names.contains(&"tests/review.rs".to_string()));
-        assert!(names.contains(&"test_review.py".to_string()));
-        assert!(names.contains(&"review.spec.ts".to_string()));
-        assert!(
-            !names
-                .iter()
-                .any(|n| n.contains("rs_test") || n.starts_with("rs"))
-        );
-
-        // Dotted stems keep everything before the last extension.
-        let names = test_name_candidates(&["web/app.config.ts".to_string()]);
-        assert!(names.contains(&"app.config.test.ts".to_string()));
-
-        // No stem -> no candidates (never a bare "_test.rs" matching everything).
-        assert!(test_name_candidates(&["".to_string(), "/".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn escape_like_escapes_wildcards() {
-        assert_eq!(escape_like("a_b%c\\d"), "a\\_b\\%c\\\\d");
-        assert_eq!(escape_like("plain"), "plain");
-    }
-
-    #[test]
-    fn like_escape_matches_literally_in_sqlite() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute("CREATE TABLE f (path TEXT)", []).unwrap();
-        for p in ["a_b_test.rs", "axb_test.rs"] {
-            conn.execute("INSERT INTO f VALUES (?1)", [p]).unwrap();
-        }
-        let names = test_name_candidates(&["src/a_b.rs".to_string()]);
-        let pat = escape_like(&names[0]);
-        let hits: Vec<String> = conn
-            .prepare("SELECT path FROM f WHERE path LIKE '%' || ?1 ESCAPE '\\'")
-            .unwrap()
-            .query_map([pat], |r| r.get(0))
-            .unwrap()
-            .map(|r| r.unwrap())
-            .collect();
-        assert_eq!(hits, vec!["a_b_test.rs".to_string()]);
-    }
-
-    #[test]
     fn find_affected_tests_rejects_too_many_files() {
-        let files: Vec<String> = (0..=MAX_AFFECTED_FILES)
+        let files: Vec<String> = (0..=crate::index::queries::MAX_AFFECTED_FILES)
             .map(|i| format!("f{i}.rs"))
             .collect();
         let result = handle_tool_call(
