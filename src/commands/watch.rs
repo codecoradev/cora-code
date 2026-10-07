@@ -42,7 +42,7 @@ pub fn run_watch(
 
     // Compile glob filter if provided
     let glob_matcher = filter.map(|p| {
-        glob::Pattern::new(p).unwrap_or_else(|e| {
+        crate::engine::path_match::PathPattern::new(p).unwrap_or_else(|e| {
             eprintln!("{} Invalid glob pattern '{p}': {e}", "⚠ ".yellow());
             std::process::exit(1);
         })
@@ -114,7 +114,7 @@ pub fn run_watch(
 fn detect_changes(
     project_root: &Path,
     git_files: &Option<HashSet<PathBuf>>,
-    glob_matcher: Option<&glob::Pattern>,
+    glob_matcher: Option<&crate::engine::path_match::PathPattern>,
 ) -> Result<Vec<PathBuf>> {
     let mut changed = Vec::new();
     let extensions: &[&str] = &[
@@ -150,7 +150,7 @@ fn detect_changes(
 
         // Apply glob filter
         if let Some(pattern) = glob_matcher {
-            if !pattern.matches_path(rel) {
+            if !pattern.matches(&rel.to_string_lossy().replace('\\', "/")) {
                 return;
             }
         }

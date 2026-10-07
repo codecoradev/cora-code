@@ -5,103 +5,105 @@
 /// - Unused imports (needs cross-reference between imports and usages)
 /// - Dead code in changed files (needs caller graph)
 /// - Breaking changes (needs cross-file caller resolution)
+///
+/// The three diff scanners share one preamble, [`scan_changed_files`]: open the
+/// index, walk the diff chunks, drop deleted/skipped files and de-duplicate by
+/// file. Only the per-file query differs.
+use rusqlite::Connection;
 use tracing::debug;
 
 use crate::engine::Severity;
 use crate::engine::diff_parser::{DiffLineType, FileChunk};
 use crate::engine::index_bridge::IndexBridge;
+use crate::engine::path_match::PathMatcher;
 use crate::engine::rules::types::RuleFinding;
 use crate::index::graph;
 
 use std::collections::HashSet;
 
 /// Check if a file path matches any of the skip patterns.
-/// Supports simple glob patterns:
-/// - Exact: `"src/main.ts"` → full path match
-/// - Suffix: `"*.config.ts"` → basename ends with `.config.ts`
-/// - Prefix: `"vite.config.*"` → basename starts with `vite.config.`
-/// - Any-dir name: `"**/something"` → basename or path suffix match
-/// - Any-dir wildcard: `"**/phaser/**"` → any path component equals `phaser`
-/// - Prefix-dir: `"src/engine/**"` → file under `src/engine/`
-/// - Double wildcard ext: `"**/*.test.ts"` → basename ends with `.test.ts`
+///
+/// Thin wrapper over the one shared matcher, [`PathMatcher`]; see its module
+/// docs for the exact semantics (exact/basename, `*`, `**/`, `dir/**`).
+/// Prefer compiling a [`PathMatcher`] once when checking many paths.
+#[cfg(test)]
 pub fn should_skip_file(file_path: &str, skip_patterns: &[String]) -> bool {
-    if skip_patterns.is_empty() {
-        return false;
-    }
+    !skip_patterns.is_empty() && PathMatcher::new(skip_patterns).is_match(file_path)
+}
 
-    let basename = std::path::Path::new(file_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+/// Which diff chunks a scanner wants to see.
+#[derive(Clone, Copy)]
+struct FileSelect {
+    /// Ignore chunks without a `new_path` (deleted files).
+    skip_deleted: bool,
+    /// Ignore chunks with no added lines.
+    require_additions: bool,
+    /// Visit each file path at most once.
+    dedupe: bool,
+}
 
-    for pattern in skip_patterns {
-        // Exact match (e.g. "src/main.ts")
-        if file_path == pattern {
-            return true;
+/// Shared preamble of the diff-based index scanners.
+///
+/// Resolves the index (no index → no findings), walks `chunks` in order,
+/// applies `select` and the skip patterns, calls `per_file` for each surviving
+/// chunk, and stops once `max_findings` is reached. The result is capped at
+/// `max_findings`.
+fn scan_changed_files<F>(
+    bridge: &IndexBridge,
+    what: &str,
+    chunks: &[FileChunk],
+    max_findings: usize,
+    skip_patterns: &[String],
+    select: FileSelect,
+    mut per_file: F,
+) -> Vec<RuleFinding>
+where
+    F: FnMut(&Connection, i64, &str, &FileChunk, &mut Vec<RuleFinding>),
+{
+    let Some((conn, project_id)) = bridge.parts() else {
+        debug!("no project index available — skipping {what} scan");
+        return Vec::new();
+    };
+
+    let skip = PathMatcher::new(skip_patterns);
+    let mut findings = Vec::new();
+    let mut seen_files: HashSet<&str> = HashSet::new();
+
+    for chunk in chunks {
+        let file = chunk
+            .new_path
+            .as_deref()
+            .or(chunk.old_path.as_deref())
+            .unwrap_or("unknown");
+
+        if select.skip_deleted && chunk.new_path.is_none() {
+            continue;
         }
-        // Basename exact match
-        if basename == *pattern {
-            return true;
+        if skip.is_match(file) {
+            continue;
         }
-        if !pattern.contains('*') {
+        if select.require_additions
+            && !chunk
+                .chunks
+                .iter()
+                .any(|h| h.lines.iter().any(|l| l.line_type == DiffLineType::Add))
+        {
+            continue;
+        }
+        if select.dedupe && !seen_files.insert(file) {
             continue;
         }
 
-        // "**/*.ext" → suffix match on basename (any directory)
-        if let Some(rest) = pattern.strip_prefix("**/") {
-            if let Some(ext) = rest.strip_prefix("*.") {
-                if basename.ends_with(ext) {
-                    return true;
-                }
-            }
-        }
+        per_file(conn, project_id, file, chunk, &mut findings);
 
-        // "*.ext" → suffix match on basename
-        if pattern.starts_with("*.") {
-            let suffix = &pattern[1..]; // ".config.ts"
-            if basename.ends_with(suffix) {
-                return true;
-            }
-        }
-
-        // "name.*" → prefix match on basename
-        if pattern.ends_with(".*") {
-            let prefix = &pattern[..pattern.len() - 2]; // "vite.config"
-            if basename.starts_with(prefix) {
-                return true;
-            }
-        }
-
-        // "**/name/**" → any path component equals "name"
-        if let Some(dir) = pattern
-            .strip_prefix("**/")
-            .and_then(|s| s.strip_suffix("/**"))
-        {
-            let components: Vec<&str> = file_path.split('/').collect();
-            if components.contains(&dir) {
-                return true;
-            }
-        }
-
-        // "dir/**" → file under dir/
-        if let Some(dir) = pattern.strip_suffix("/**") {
-            if file_path.starts_with(&format!("{dir}/")) || file_path == dir {
-                return true;
-            }
-        }
-
-        // "**/name" → match basename or path suffix
-        if let Some(rest) = pattern.strip_prefix("**/") {
-            if rest.contains('*') {
-                continue;
-            }
-            if basename == rest || file_path.ends_with(&format!("/{rest}")) {
-                return true;
-            }
+        if findings.len() >= max_findings {
+            break;
         }
     }
 
-    false
+    findings.truncate(max_findings);
+    debug!(count = findings.len(), "{what} scan complete");
+    findings
 }
 
 /// Scan for unused imports across all changed files using the symbol index.
@@ -116,75 +118,42 @@ pub fn scan_unused_imports(
     max_findings: usize,
     skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
-    let Some((conn, project_id)) = bridge.parts() else {
-        debug!("no project index available — skipping unused import scan");
-        return Vec::new();
+    let select = FileSelect {
+        skip_deleted: true,
+        require_additions: true,
+        dedupe: true,
     };
-
-    let mut findings = Vec::new();
-
-    // Collect unique changed files
-    let mut seen_files = std::collections::HashSet::new();
-    for chunk in chunks {
-        let file = chunk
-            .new_path
-            .as_deref()
-            .or(chunk.old_path.as_deref())
-            .unwrap_or("unknown");
-
-        // Skip deleted files (no new_path) and unknown
-        if chunk.new_path.is_none() {
-            continue;
-        }
-
-        // Skip files matching skip patterns
-        if should_skip_file(file, skip_patterns) {
-            continue;
-        }
-
-        // Only check files with actual additions
-        let has_additions = chunk
-            .chunks
-            .iter()
-            .any(|h| h.lines.iter().any(|l| l.line_type == DiffLineType::Add));
-        if !has_additions {
-            continue;
-        }
-
-        if seen_files.insert(file.to_string()) {
-            match graph::find_unused_imports(conn, file, project_id) {
-                Ok(unused) => {
-                    for u in &unused {
-                        findings.push(RuleFinding {
-                            rule_id: "index-unused-import".to_string(),
-                            file: u.file.clone(),
-                            line: u.line,
-                            severity: Severity::Minor,
-                            title: format!("[index-unused-import] Unused import: {}", u.target),
-                            body: format!(
-                                "Import `{}` is never used in this file. \
+    scan_changed_files(
+        bridge,
+        "unused import",
+        chunks,
+        max_findings,
+        skip_patterns,
+        select,
+        |conn, project_id, file, _chunk, findings| match graph::find_unused_imports(
+            conn, file, project_id,
+        ) {
+            Ok(unused) => {
+                for u in &unused {
+                    findings.push(RuleFinding {
+                        rule_id: "index-unused-import".to_string(),
+                        file: u.file.clone(),
+                        line: u.line,
+                        severity: Severity::Minor,
+                        title: format!("[index-unused-import] Unused import: {}", u.target),
+                        body: format!(
+                            "Import `{}` is never used in this file. \
                                  Consider removing it to keep imports clean.",
-                                u.target
-                            ),
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!("unused import scan failed for {}: {}", file, e);
+                            u.target
+                        ),
+                    });
                 }
             }
-        }
-
-        if findings.len() >= max_findings {
-            break;
-        }
-    }
-
-    // Cap findings
-    findings.truncate(max_findings);
-
-    debug!(count = findings.len(), "unused import scan complete");
-    findings
+            Err(e) => {
+                debug!("unused import scan failed for {}: {}", file, e);
+            }
+        },
+    )
 }
 
 /// Scan for dead code (unreachable symbols) in changed files using the symbol index.
@@ -199,70 +168,52 @@ pub fn scan_dead_code_in_review(
     max_findings: usize,
     skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
-    let Some((conn, project_id)) = bridge.parts() else {
-        debug!("no project index available — skipping dead code scan");
-        return Vec::new();
+    let select = FileSelect {
+        skip_deleted: true,
+        require_additions: false,
+        dedupe: true,
     };
-
-    let mut findings = Vec::new();
-
-    let mut seen_files = std::collections::HashSet::new();
-    for chunk in chunks {
-        let file = chunk
-            .new_path
-            .as_deref()
-            .or(chunk.old_path.as_deref())
-            .unwrap_or("unknown");
-
-        if chunk.new_path.is_none() {
-            continue;
-        }
-
-        if should_skip_file(file, skip_patterns) {
-            continue;
-        }
-
-        if seen_files.insert(file.to_string()) {
-            match graph::find_dead_code_in_file(conn, file, project_id, false) {
-                Ok(dead) => {
-                    for d in &dead {
-                        findings.push(RuleFinding {
-                            rule_id: "index-dead-code".to_string(),
-                            file: d.file.clone(),
-                            line: d.line,
-                            severity: Severity::Info,
-                            title: format!("[index-dead-code] Potentially dead code: {}", d.name),
-                            body: format!(
-                                "Function `{}` ({}) has no callers in the \
+    scan_changed_files(
+        bridge,
+        "dead code",
+        chunks,
+        max_findings,
+        skip_patterns,
+        select,
+        |conn, project_id, file, _chunk, findings| match graph::find_dead_code_in_file(
+            conn, file, project_id, false,
+        ) {
+            Ok(dead) => {
+                for d in &dead {
+                    findings.push(RuleFinding {
+                        rule_id: "index-dead-code".to_string(),
+                        file: d.file.clone(),
+                        line: d.line,
+                        severity: Severity::Info,
+                        title: format!("[index-dead-code] Potentially dead code: {}", d.name),
+                        body: format!(
+                            "Function `{}` ({}) has no callers in the \
                                  project. Verify it's not called via reflection, \
                                  trait dispatch, or external entry points.",
-                                d.name, d.kind
-                            ),
-                        });
-                    }
-                }
-                Err(e) => {
-                    debug!("dead code scan failed for {}: {}", file, e);
+                            d.name, d.kind
+                        ),
+                    });
                 }
             }
-        }
-
-        if findings.len() >= max_findings {
-            break;
-        }
-    }
-
-    findings.truncate(max_findings);
-
-    debug!(count = findings.len(), "dead code scan complete");
-    findings
+            Err(e) => {
+                debug!("dead code scan failed for {}: {}", file, e);
+            }
+        },
+    )
 }
 
 /// Scan for potential breaking changes — removed or modified public symbols
 /// that have existing callers in the project.
 ///
 /// Analyzes the diff for removed lines containing public symbol definitions,
-/// then cross-references the index to find callers.
+/// then cross-references the index to find callers. Unlike the other scanners
+/// it also visits deleted files (that is where removals live) and does not
+/// de-duplicate files.
 ///
 /// Returns `Vec<RuleFinding>` with severity `Major` for each breaking change.
 pub fn scan_breaking_changes(
@@ -271,19 +222,12 @@ pub fn scan_breaking_changes(
     max_findings: usize,
     skip_patterns: &[String],
 ) -> Vec<RuleFinding> {
-    let Some((conn, project_id)) = bridge.parts() else {
-        debug!("no project index available — skipping breaking change scan");
-        return Vec::new();
-    };
-
     // Symbol names (re)defined by this very diff — the post-image of the change.
     // A removal candidate whose name still exists post-change is signature
     // drift, a move, or a wording tweak of the definition line, not a removal;
     // reporting it as "removal breaks N callers" against a possibly-stale
     // index is a false positive (#533).
     let added_defs = collect_added_definitions(chunks);
-
-    let mut findings = Vec::new();
 
     // Patterns for public symbol removal across languages.
     // These are heuristic — not all removed lines match, but high-signal ones do.
@@ -298,33 +242,36 @@ pub fn scan_breaking_changes(
         r"(?m)^(?:async\s+)?(?:def|class)\s+(\w+)",
     ];
 
-    let compiled: Vec<std::sync::Arc<regex::Regex>> = removal_patterns
+    let compiled: Vec<regex::Regex> = removal_patterns
         .iter()
         .filter_map(|p| regex::Regex::new(p).ok())
-        .map(std::sync::Arc::new)
         .collect();
 
-    for chunk in chunks {
-        let file = chunk
-            .new_path
-            .as_deref()
-            .or(chunk.old_path.as_deref())
-            .unwrap_or("unknown");
+    let select = FileSelect {
+        skip_deleted: false,
+        require_additions: false,
+        dedupe: false,
+    };
+    scan_changed_files(
+        bridge,
+        "breaking change",
+        chunks,
+        max_findings,
+        skip_patterns,
+        select,
+        |conn, project_id, file, chunk, findings| {
+            for hunk in &chunk.chunks {
+                for line in &hunk.lines {
+                    // Only look at removed lines (old code being deleted)
+                    if line.line_type != DiffLineType::Remove {
+                        continue;
+                    }
 
-        if should_skip_file(file, skip_patterns) {
-            continue;
-        }
-
-        for hunk in &chunk.chunks {
-            for line in &hunk.lines {
-                // Only look at removed lines (old code being deleted)
-                if line.line_type != DiffLineType::Remove {
-                    continue;
-                }
-
-                // Try to match a public symbol definition being removed
-                for re in &compiled {
-                    if let Some(caps) = re.captures(&line.content) {
+                    // Try to match a public symbol definition being removed
+                    for re in &compiled {
+                        let Some(caps) = re.captures(&line.content) else {
+                            continue;
+                        };
                         let symbol_name = &caps[1];
 
                         // Skip trivially short names
@@ -340,51 +287,43 @@ pub fn scan_breaking_changes(
                         let line_no = line.old_line_no.unwrap_or(0);
 
                         // Check if this symbol has callers in the index
-                        match graph::find_callers(conn, project_id, symbol_name, 10) {
-                            Ok(callers) if !callers.is_empty() => {
-                                let caller_list = callers
-                                    .iter()
-                                    .take(3)
-                                    .map(|c| format!("{} ({}:{})", c.caller, c.file, c.line))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-
-                                findings.push(RuleFinding {
-                                    rule_id: "index-breaking-change".to_string(),
-                                    file: file.to_string(),
-                                    line: line_no,
-                                    severity: Severity::Major,
-                                    title: format!(
-                                        "[index-breaking-change] Removing `{}` \
-                                         breaks {} caller(s)",
-                                        symbol_name,
-                                        callers.len()
-                                    ),
-                                    body: format!(
-                                        "Symbol `{}` is being removed but has {} \
-                                         caller(s): {}. This is a breaking change.",
-                                        symbol_name,
-                                        callers.len(),
-                                        caller_list
-                                    ),
-                                });
+                        if let Ok(callers) = graph::find_callers(conn, project_id, symbol_name, 10)
+                        {
+                            if callers.is_empty() {
+                                continue;
                             }
-                            _ => continue,
+                            let caller_list = callers
+                                .iter()
+                                .take(3)
+                                .map(|c| format!("{} ({}:{})", c.caller, c.file, c.line))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+
+                            findings.push(RuleFinding {
+                                rule_id: "index-breaking-change".to_string(),
+                                file: file.to_string(),
+                                line: line_no,
+                                severity: Severity::Major,
+                                title: format!(
+                                    "[index-breaking-change] Removing `{}` \
+                                     breaks {} caller(s)",
+                                    symbol_name,
+                                    callers.len()
+                                ),
+                                body: format!(
+                                    "Symbol `{}` is being removed but has {} \
+                                     caller(s): {}. This is a breaking change.",
+                                    symbol_name,
+                                    callers.len(),
+                                    caller_list
+                                ),
+                            });
                         }
                     }
                 }
             }
-        }
-
-        if findings.len() >= max_findings {
-            break;
-        }
-    }
-
-    findings.truncate(max_findings);
-
-    debug!(count = findings.len(), "breaking change scan complete");
-    findings
+        },
+    )
 }
 
 /// Names of symbol definitions appearing on added lines across the whole diff.
@@ -441,9 +380,10 @@ pub fn scan_project_index(
     };
 
     // Scan for unused imports across all files in the scan set
+    let skip = PathMatcher::new(skip_patterns);
     let mut seen_files = std::collections::HashSet::new();
     for entry in files {
-        if should_skip_file(&entry.path, skip_patterns) {
+        if skip.is_match(&entry.path) {
             continue;
         }
         if seen_files.insert(entry.path.clone()) {
@@ -766,6 +706,124 @@ mod tests {
         )];
         let findings = scan_breaking_changes(&from_sub, &chunks, 10, &[]);
         assert_eq!(findings.len(), 1);
+    }
+
+    // --- shared chunk-iteration preamble (scan_changed_files) ---
+
+    /// Index with an uncalled function `fn_name` in each of `files`.
+    fn index_with_dead_fn(fn_name: &str, files: &[&str]) -> IndexBridge {
+        let root = std::path::Path::new("/fixture/proj");
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        crate::index::schema::run_migrations(&conn).expect("migrations");
+        let pid = crate::index::ensure_project(&conn, root).expect("project");
+        for file in files {
+            conn.execute(
+                "INSERT INTO symbols (name, kind, file, line, signature, language, project_id) \
+                 VALUES (?1, 'function', ?2, 3, 'sig', 'rust', ?3)",
+                rusqlite::params![fn_name, file, pid],
+            )
+            .unwrap();
+        }
+        IndexBridge::from_connection(conn, root).expect("bridge")
+    }
+
+    fn deleted_chunk(path: &str) -> FileChunk {
+        let mut c = chunk_lines(path, &[("-", "fn orphan() {}")]);
+        c.new_path = None;
+        c.is_deleted = true;
+        c
+    }
+
+    #[test]
+    fn preamble_skips_deleted_files() {
+        let bridge = index_with_dead_fn("orphan", &["src/gone.rs", "src/live.rs"]);
+        let chunks = vec![
+            deleted_chunk("src/gone.rs"),
+            chunk_lines("src/live.rs", &[("+", "fn orphan() {}")]),
+        ];
+        let findings = scan_dead_code_in_review(&bridge, &chunks, 10, &[]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].file, "src/live.rs");
+    }
+
+    #[test]
+    fn preamble_respects_skip_patterns() {
+        let bridge = index_with_dead_fn("orphan", &["src/a.rs", "gen/b.rs", "src/c.test.rs"]);
+        let chunks = vec![
+            chunk_lines("src/a.rs", &[("+", "x")]),
+            chunk_lines("gen/b.rs", &[("+", "x")]),
+            chunk_lines("src/c.test.rs", &[("+", "x")]),
+        ];
+        let skip = vec!["gen/**".to_string(), "*.test.rs".to_string()];
+        let findings = scan_dead_code_in_review(&bridge, &chunks, 10, &skip);
+        let files: Vec<_> = findings.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(files, ["src/a.rs"]);
+    }
+
+    #[test]
+    fn preamble_dedupes_by_file() {
+        let bridge = index_with_dead_fn("orphan", &["src/a.rs"]);
+        let chunks = vec![
+            chunk_lines("src/a.rs", &[("+", "x")]),
+            chunk_lines("src/a.rs", &[("+", "y")]),
+        ];
+        assert_eq!(scan_dead_code_in_review(&bridge, &chunks, 10, &[]).len(), 1);
+    }
+
+    #[test]
+    fn preamble_caps_findings_at_max() {
+        let bridge = index_with_dead_fn("orphan", &["src/a.rs", "src/b.rs", "src/c.rs"]);
+        let chunks = vec![
+            chunk_lines("src/a.rs", &[("+", "x")]),
+            chunk_lines("src/b.rs", &[("+", "x")]),
+            chunk_lines("src/c.rs", &[("+", "x")]),
+        ];
+        assert_eq!(scan_dead_code_in_review(&bridge, &chunks, 2, &[]).len(), 2);
+    }
+
+    #[test]
+    fn unused_imports_require_additions() {
+        let root = std::path::Path::new("/fixture/proj");
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        crate::index::schema::run_migrations(&conn).expect("migrations");
+        let pid = crate::index::ensure_project(&conn, root).expect("project");
+        for file in ["src/a.rs", "src/b.rs"] {
+            conn.execute(
+                "INSERT INTO edges (source, kind, target, file, line, project_id) \
+                 VALUES (?1, 'IMPORTS', 'lodash', ?1, 1, ?2)",
+                rusqlite::params![file, pid],
+            )
+            .unwrap();
+        }
+        let bridge = IndexBridge::from_connection(conn, root).expect("bridge");
+        let chunks = vec![
+            chunk_lines("src/a.rs", &[(" ", "context"), ("-", "removed")]),
+            chunk_lines("src/b.rs", &[("+", "added")]),
+        ];
+        let findings = scan_unused_imports(&bridge, &chunks, 10, &[]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].file, "src/b.rs");
+    }
+
+    #[test]
+    fn breaking_changes_visit_deleted_files_and_skip_patterns() {
+        let bridge = index_with_callers("important_api", &[("c", "src/app.rs", 1)]);
+        let mut deleted = chunk_lines("src/lib.rs", &[("-", "pub fn important_api() {}")]);
+        deleted.new_path = None;
+        deleted.is_deleted = true;
+        let findings = scan_breaking_changes(&bridge, &[deleted.clone()], 10, &[]);
+        assert_eq!(findings.len(), 1, "removals live in deleted files");
+        let skip = vec!["src/**".to_string()];
+        assert!(scan_breaking_changes(&bridge, &[deleted], 10, &skip).is_empty());
+    }
+
+    #[test]
+    fn should_skip_file_wrapper_uses_the_shared_matcher() {
+        let patterns = vec!["**/phaser/**".to_string(), "*.config.ts".to_string()];
+        assert!(should_skip_file("a/phaser/b.ts", &patterns));
+        assert!(should_skip_file("x/vite.config.ts", &patterns));
+        assert!(!should_skip_file("src/lib.rs", &patterns));
+        assert!(!should_skip_file("src/lib.rs", &[]));
     }
 
     #[test]

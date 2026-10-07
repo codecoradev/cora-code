@@ -378,6 +378,7 @@ fn index_project_with_id(
     skip_patterns: Option<&[String]>,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
+    let skip_matcher = skip_patterns.map(crate::engine::path_match::PathMatcher::new);
     // Every indexable file seen on disk this run (post language + skip
     // filters). Anything stored for the project but absent here is stale.
     let mut walked: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -412,9 +413,7 @@ fn index_project_with_id(
         // Config-driven exclusion (#521): honor ignore.files /
         // index_skip_files so dead-code, review index scanners, and brain
         // never see these files.
-        if skip_patterns.is_some_and(|patterns| {
-            crate::engine::index_scanner::should_skip_file(&rel_str, patterns)
-        }) {
+        if skip_matcher.as_ref().is_some_and(|m| m.is_match(&rel_str)) {
             stats.files_excluded += 1;
             continue;
         }
