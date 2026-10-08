@@ -5,9 +5,13 @@ use colored::Colorize;
 use tracing::debug;
 
 use crate::config::schema::Config;
+use crate::engine::review::apply_ignore_rules;
 use crate::engine::review_store;
-use crate::engine::scanner::{batch_files, format_batch_for_prompt, walk_project};
+use crate::engine::scanner::{
+    FileEntry, batch_files, files_as_chunks, format_batch_for_prompt, walk_project,
+};
 use crate::engine::types::TokenUsage;
+use crate::engine::{ReviewIssue, inline_suppress, rules, secrets_scanner, security_scanner};
 use crate::formatters::{OutputFormat, formatter_for};
 
 /// Default maximum files per LLM batch when `--batch-files` is not specified.
@@ -247,8 +251,11 @@ pub async fn execute_scan(
         );
     }
 
-    // 5. Build response and format
+    // 5. Merge deterministic + index findings with the LLM findings, then
+    //    apply ignore.rules and inline cora-ignore markers. Deterministic
+    //    findings survive an LLM failure (#595).
     all_issues.extend(index_findings);
+    let all_issues = finalize_issues(config, &files, all_issues);
     let issue_count = all_issues.len();
     let min_severity = config.hook.min_severity_level();
     // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above
@@ -329,6 +336,30 @@ pub async fn execute_scan(
     }
 }
 
+/// Run the deterministic scanners (secrets, security) over whole files and
+/// merge them with `issues` (LLM + index findings); then drop findings matched
+/// by `ignore.rules` and by inline `cora-ignore:` markers. Reuses the review
+/// pipeline's scanners, merge, and filters (#595).
+fn finalize_issues(
+    config: &Config,
+    files: &[FileEntry],
+    issues: Vec<ReviewIssue>,
+) -> Vec<ReviewIssue> {
+    let chunks = files_as_chunks(files);
+    let max = config.rules_config.max_findings;
+    let mut merged = issues;
+    for family in [
+        secrets_scanner::scan_secrets(&chunks, max),
+        security_scanner::scan_security(&chunks, max),
+    ] {
+        if !family.is_empty() {
+            merged = rules::merge_rule_findings(merged, family);
+        }
+    }
+    let merged = apply_ignore_rules(merged, &config.ignore.rules);
+    inline_suppress::apply(merged, &chunks)
+}
+
 /// Compute a short SHA256 hash of a file's content for incremental scanning.
 /// Returns None if the file cannot be read (caller should rescan it).
 #[allow(clippy::format_collect)]
@@ -384,5 +415,102 @@ impl ScanCache {
             .entry(root_key)
             .or_default()
             .insert(file.to_string(), hash.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, content: &str) -> FileEntry {
+        FileEntry {
+            path: path.to_string(),
+            content: content.to_string(),
+            lines: content.lines().count(),
+        }
+    }
+
+    fn secret_file(extra: &str) -> FileEntry {
+        entry(
+            "src/app.py",
+            &format!("import os\npassword = \"hunter2hunter2\"{extra}\nprint(1)\n"),
+        )
+    }
+
+    fn titles(issues: &[ReviewIssue]) -> Vec<&str> {
+        issues.iter().map(|i| i.title.as_str()).collect()
+    }
+
+    fn secret_title() -> String {
+        let out = finalize_issues(&Config::default(), &[secret_file("")], Vec::new());
+        out.iter()
+            .find(|i| i.line == Some(2))
+            .unwrap_or_else(|| panic!("no finding on line 2: {:?}", titles(&out)))
+            .title
+            .clone()
+    }
+
+    #[test]
+    fn finds_hardcoded_secret_without_llm() {
+        let out = finalize_issues(&Config::default(), &[secret_file("")], Vec::new());
+        assert!(
+            out.iter()
+                .any(|i| i.file == "src/app.py" && i.line == Some(2)),
+            "got {:?}",
+            titles(&out)
+        );
+    }
+
+    #[test]
+    fn inline_marker_suppresses_secret() {
+        let title = secret_title();
+        let file = secret_file(&format!("  # cora-ignore: {title}"));
+        let out = finalize_issues(&Config::default(), &[file], Vec::new());
+        assert!(
+            !out.iter().any(|i| i.line == Some(2)),
+            "got {:?}",
+            titles(&out)
+        );
+    }
+
+    #[test]
+    fn ignore_rules_suppress_secret() {
+        let mut config = Config::default();
+        config.ignore.rules = vec![secret_title()];
+        let out = finalize_issues(&config, &[secret_file("")], Vec::new());
+        assert!(
+            !out.iter().any(|i| i.line == Some(2)),
+            "got {:?}",
+            titles(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_failure_still_reports_deterministic_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "password = \"hunter2hunter2\"\n").unwrap();
+        // Nothing listens on port 1: the LLM call fails fast, no real network.
+        let llm = crate::engine::LLMConfig {
+            base_url: "http://127.0.0.1:1".to_string(),
+            api_key: "test".to_string(),
+            timeout: 2,
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.hook.mode = "block".to_string();
+        let opts = ScanOptions {
+            path: Some(dir.path().to_string_lossy().to_string()),
+            include: vec![],
+            exclude: vec![],
+            extensions: vec![],
+            incremental: false,
+            focus: vec![],
+            batch_files: 0,
+            continue_on_batch_error: true,
+        };
+        let code = execute_scan(&config, &llm, &opts, OutputFormat::Json)
+            .await
+            .unwrap();
+        assert_eq!(code, 2, "deterministic finding must survive LLM failure");
     }
 }
