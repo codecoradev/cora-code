@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::Path;
 
+use crate::engine::diff_parser::{DiffHunk, DiffLine, DiffLineType, FileChunk};
 use crate::engine::path_match::PathMatcher;
 use crate::error::CoraError;
 use ignore::WalkBuilder;
@@ -17,6 +18,51 @@ pub struct FileEntry {
     pub content: String,
     /// Number of lines.
     pub lines: usize,
+}
+
+/// View scanned files as synthetic "new file" diff chunks (every line added),
+/// so the diff-based deterministic scanners and the inline `cora-ignore:`
+/// filter can run on a full-file scan unchanged (#595).
+pub fn files_as_chunks(files: &[FileEntry]) -> Vec<FileChunk> {
+    files
+        .iter()
+        .filter(|f| !f.content.is_empty())
+        .map(|f| {
+            let lines: Vec<DiffLine> = f
+                .content
+                .lines()
+                .zip(1u32..)
+                .map(|(text, n)| DiffLine {
+                    line_type: DiffLineType::Add,
+                    content: text.to_string(),
+                    old_line_no: None,
+                    new_line_no: Some(n),
+                })
+                .collect();
+            let count = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+            let language = Path::new(&f.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_string();
+            FileChunk {
+                old_path: None,
+                new_path: Some(f.path.clone()),
+                language,
+                chunks: vec![DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: count,
+                    header: String::new(),
+                    lines,
+                }],
+                is_binary: false,
+                is_deleted: false,
+                is_new: true,
+            }
+        })
+        .collect()
 }
 
 /// File extensions to include in scans by default (source code).

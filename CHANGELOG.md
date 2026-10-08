@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cora scan` no longer reports "No issues found" when the LLM fails.** It now runs the deterministic secrets and security scanners on every scanned file, merges them with LLM findings, and applies `ignore.rules` and inline `cora-ignore:` markers (read from file contents), so a hardcoded secret is reported even on an LLM 502 (#595).
+
 ## [0.16.0] - 2026-10-08
 
 ### Added

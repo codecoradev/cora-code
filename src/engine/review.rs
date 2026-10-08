@@ -563,7 +563,10 @@ fn apply_markdown_code_block_filter(
 }
 
 /// Filter out issues whose `issue_type` matches any ignored rule pattern.
-fn apply_ignore_rules(mut issues: Vec<ReviewIssue>, ignore_rules: &[String]) -> Vec<ReviewIssue> {
+pub(crate) fn apply_ignore_rules(
+    mut issues: Vec<ReviewIssue>,
+    ignore_rules: &[String],
+) -> Vec<ReviewIssue> {
     if ignore_rules.is_empty() {
         return issues;
     }
