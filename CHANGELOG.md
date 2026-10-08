@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-08
+
 ### Added
 
 - **Rule-scoped inline suppression with `cora-ignore:`.** A source comment such as `// cora-ignore: Hardcoded password or secret in variable` (also `#`, `--`, `/* */`, `<!-- -->`; comma-separated rules) suppresses findings with that exact title (case-insensitive) on the same line, or on the next line when the marker line holds only a comment. Applies to both static-scanner and LLM findings; other rules and other lines stay visible, and a bare `cora-ignore` without rules suppresses nothing. Coexists with `ignore.rules` / `ignore.files` (#554).
@@ -936,7 +938,10 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.13.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.16.0...develop
+[0.16.0]: https://github.com/codecoradev/cora-code/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/codecoradev/cora-code/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/codecoradev/cora-code/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/codecoradev/cora-code/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/codecoradev/cora-code/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/codecoradev/cora-code/compare/v0.11.0...v0.11.1
