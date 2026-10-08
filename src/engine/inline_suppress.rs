@@ -25,9 +25,10 @@ use tracing::debug;
 const MARKER: &str = "cora-ignore:";
 
 /// Parse the rule list from a line carrying the marker, lowercased.
+/// The marker is located on an ASCII-lowercased copy so byte offsets stay valid.
 /// Returns an empty vec when there is no marker or no rule after it.
 fn parse_rules(line: &str) -> Vec<String> {
-    let lower = line.to_lowercase();
+    let lower = line.to_ascii_lowercase();
     let Some(idx) = lower.find(MARKER) else {
         return Vec::new();
     };
@@ -39,14 +40,14 @@ fn parse_rules(line: &str) -> Vec<String> {
         }
     }
     rest.split(',')
-        .map(|r| r.trim().to_string())
+        .map(|r| r.trim().to_lowercase())
         .filter(|r| !r.is_empty())
         .collect()
 }
 
 /// True when everything before the marker is comment syntax / whitespace.
 fn is_comment_only(line: &str) -> bool {
-    let lower = line.to_lowercase();
+    let lower = line.to_ascii_lowercase();
     let Some(idx) = lower.find(MARKER) else {
         return false;
     };
@@ -248,6 +249,12 @@ mod tests {
     fn case_insensitive_marker_and_rule() {
         let c = diff_of(&["x(); // CORA-IGNORE: HARDCODED PASSWORD OR SECRET IN VARIABLE"]);
         assert!(apply(vec![issue("f.rs", 1, RULE)], &c).is_empty());
+    }
+
+    #[test]
+    fn non_ascii_before_marker_does_not_panic() {
+        let c = diff_of(&["let s = \"\u{130}\u{130}\"; // cora-ignore: Rule A"]);
+        assert!(apply(vec![issue("f.rs", 1, "Rule A")], &c).is_empty());
     }
 
     #[test]
