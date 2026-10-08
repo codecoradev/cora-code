@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The LLM no longer flags `cora-ignore:` markers themselves** (e.g. "Security scanner findings suppressed instead of remediated"). The hardened system prompt now explains the marker is Cora's own suppression syntax (#596).
+
 ## [0.16.0] - 2026-10-08
 
 ### Added
