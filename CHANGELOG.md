@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Real secrets were missed when the line had a trailing comment containing `:`.** The `hardcoded-secret` false-positive filter treated the first `:` anywhere (even inside a comment or string) as object shorthand, so `password = "..."; // note: fix later` was not flagged, and no scanner finding existed on lines carrying a `cora-ignore: <rule>` marker. The filter now judges only the code, ignoring trailing comments and quoted colons (#603).
+
 ### Added
 
 - **Findings now carry a `rule_id`.** Deterministic scanner findings (rules, secrets, security, index) keep their rule id through the merge; it appears in pretty/compact output, as `rule_id` in JSON (omitted when absent, so older JSON still deserializes), and as `properties.coraRuleId` in SARIF (#597).
