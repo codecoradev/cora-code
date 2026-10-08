@@ -121,10 +121,10 @@ pub fn scan_secrets(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindin
             .or(file.old_path.as_deref())
             .unwrap_or("unknown");
 
-        // Skip test/spec/fixture files
-        if TEST_FIXTURE_RE.is_match(file_path) {
-            continue;
-        }
+        // Test/spec/fixture/mock/example paths skip the generic rules (noisy
+        // there) but still get the shared high-confidence list, since real
+        // credentials are often committed in exactly those places (#579).
+        let is_fixture = TEST_FIXTURE_RE.is_match(file_path);
 
         for hunk in &file.chunks {
             for line in &hunk.lines {
@@ -133,6 +133,30 @@ pub fn scan_secrets(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindin
                 }
 
                 let line_no = line.new_line_no.unwrap_or(0);
+
+                if is_fixture {
+                    if let Some((pat, matched)) =
+                        crate::engine::secret_patterns::find_high_confidence(&line.content)
+                    {
+                        findings.push(RuleFinding {
+                            rule_id: pat.id.to_string(),
+                            file: file_path.to_string(),
+                            line: line_no,
+                            severity: Severity::Critical,
+                            title: format!("[{}] {}", pat.id, pat.name),
+                            body: format!(
+                                "{} detected in a test/fixture path — verify it is a fake, \
+                                 otherwise mask with environment variable. Matched: {}",
+                                pat.name,
+                                mask_secret(matched)
+                            ),
+                        });
+                        if findings.len() >= max_findings {
+                            break;
+                        }
+                    }
+                    continue;
+                }
 
                 for (re, pat) in COMPILED.iter() {
                     if let Some(m) = re.find(&line.content) {
@@ -350,24 +374,107 @@ mod tests {
         assert!(re.is_match(&format!("token = '{prefix2}{suffix}'")));
     }
 
-    #[test]
-    fn skip_test_files() {
-        let chunks = [make_chunk(
-            "test_config.py",
-            &["key = 'AKIAIOSFODNN7EXAMPLE'"],
-        )];
-        let findings = scan_secrets(&chunks, 10);
-        assert!(findings.is_empty(), "test files should be skipped");
+    fn fake_aws() -> String {
+        format!("{}{}", "AKIA", "QWERTYUIOPASDFGH")
+    }
+
+    fn fake_github() -> String {
+        format!("{}{}", "ghp_", "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7cF0hJ3kL6")
+    }
+
+    fn fake_pem() -> String {
+        format!("-----BEGIN {} KEY-----", "RSA PRIVATE")
     }
 
     #[test]
-    fn skip_fixture_files() {
+    fn test_paths_report_high_confidence_secrets() {
+        let aws = format!("key = '{}'", fake_aws());
+        let gh = format!("token = '{}'", fake_github());
+        let pem = fake_pem();
+        for (path, line, rule) in [
+            ("tests/setup.py", &aws, "secrets/aws-access-key"),
+            ("examples/config.py", &gh, "secrets/github-token"),
+            ("spec/keys.rb", &pem, "secrets/private-key"),
+            ("fixtures/data.py", &aws, "secrets/aws-access-key"),
+            ("test_config.py", &gh, "secrets/github-token"),
+            ("pkg/client_test.go", &aws, "secrets/aws-access-key"),
+        ] {
+            let findings = scan_secrets(&[make_chunk(path, &[line.as_str()])], 10);
+            assert_eq!(findings.len(), 1, "{path}");
+            assert_eq!(findings[0].rule_id, rule, "{path}");
+            assert!(!findings[0].body.contains(&fake_aws()), "masked");
+        }
+    }
+
+    #[test]
+    fn test_paths_ignore_placeholders() {
+        let filler = format!("token = '{}{}'", "ghp_", "x".repeat(36));
+        for path in ["tests/a.py", "examples/b.py", "test_c.py"] {
+            let chunks = [make_chunk(
+                path,
+                &["key = 'AKIAIOSFODNN7EXAMPLE'", filler.as_str()],
+            )];
+            assert!(scan_secrets(&chunks, 10).is_empty(), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_paths_keep_generic_rules_suppressed() {
+        let jwt = format!(
+            "t = '{}.{}.{}'",
+            "eyJhbGciOiJIUzI1NiJ9", "eyJzdWIiOiIxMjM0NTY3ODkw", "abcdefghijkl"
+        );
+        let stripe_test = format!("k = '{}{}'", "sk_test_", "a".repeat(24));
         let chunks = [make_chunk(
-            "fixtures/data.py",
-            &["token = 'ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'"],
+            "tests/auth.py",
+            &["password = \"hunter2\"", jwt.as_str(), stripe_test.as_str()],
         )];
-        let findings = scan_secrets(&chunks, 10);
-        assert!(findings.is_empty(), "fixture files should be skipped");
+        assert!(scan_secrets(&chunks, 10).is_empty());
+    }
+
+    #[test]
+    fn source_paths_report_everything_as_before() {
+        let gh = format!("token = '{}'", fake_github());
+        let stripe_test = format!("k = '{}{}'", "sk_test_", "a".repeat(24));
+        let findings = scan_secrets(
+            &[make_chunk(
+                "src/app.py",
+                &[gh.as_str(), stripe_test.as_str()],
+            )],
+            10,
+        );
+        let ids: Vec<_> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"secrets/github-token"));
+        assert!(ids.contains(&"secrets/stripe-key"));
+    }
+
+    #[test]
+    fn scanners_agree_on_shared_patterns() {
+        use crate::engine::secret_patterns::HIGH_CONFIDENCE_PATTERNS;
+        use crate::engine::security_scanner::scan_security;
+        let samples = [
+            fake_aws(),
+            fake_pem(),
+            fake_github(),
+            format!("{}{}", "sk_live_", "b".repeat(24)),
+            format!("{}{}", "xoxb-", "1234567890-abcdef"),
+        ];
+        assert_eq!(samples.len(), HIGH_CONFIDENCE_PATTERNS.len());
+        for path in ["tests/x.rs", "examples/y.py"] {
+            for sample in &samples {
+                let line = format!("v = {sample}");
+                let a = scan_secrets(&[make_chunk(path, &[line.as_str()])], 10);
+                let b = scan_security(&[make_chunk(path, &[line.as_str()])], 10);
+                assert_eq!(a.len(), 1, "secrets_scanner {path} {sample}");
+                assert_eq!(b.len(), 1, "security_scanner {path} {sample}");
+            }
+            for ph in ["AKIAIOSFODNN7EXAMPLE", "password = \"hunter2\""] {
+                let a = scan_secrets(&[make_chunk(path, &[ph])], 10);
+                let b = scan_security(&[make_chunk(path, &[ph])], 10);
+                assert_eq!(a.is_empty(), b.is_empty(), "{path} {ph}");
+                assert!(a.is_empty());
+            }
+        }
     }
 
     #[test]
