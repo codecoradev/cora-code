@@ -146,6 +146,22 @@ impl IndexSession {
         super::index_project_with_skip(&self.conn, &self.root, verbose, self.skip_patterns())
     }
 
+    /// Incremental index limited to files `include` accepts (root-relative
+    /// path). Skip patterns still apply; unrelated stored rows are kept.
+    pub fn index_matching(
+        &self,
+        verbose: bool,
+        include: &dyn Fn(&str) -> bool,
+    ) -> Result<IndexStats> {
+        super::index_project_filtered(
+            &self.conn,
+            &self.root,
+            verbose,
+            self.skip_patterns(),
+            Some(include),
+        )
+    }
+
     /// Stored totals for this project.
     pub fn summary(&self) -> Result<IndexSummary> {
         super::index_stats(&self.conn, self.project_id)
