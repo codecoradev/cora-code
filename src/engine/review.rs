@@ -576,8 +576,14 @@ pub(crate) fn apply_ignore_rules(
         !ignore_rules.iter().any(|pattern| {
             let pattern_lower = pattern.to_lowercase();
             let issue_type_lower = issue.issue_type.clone().unwrap_or_default().to_lowercase();
+            let exact = pattern.trim().to_lowercase();
+            let id_hit = |s: &str| s.trim().to_lowercase() == exact;
             issue_type_lower.contains(&pattern_lower)
                 || issue.title.to_lowercase().contains(&pattern_lower)
+                // Rule ids match exactly, including ids of scanner findings
+                // merged into this issue (#597).
+                || issue.rule_id.as_deref().is_some_and(id_hit)
+                || issue.also_matches.iter().any(|a| id_hit(a))
         })
     });
     let filtered = before - issues.len();
@@ -985,6 +991,8 @@ mod tests {
         }];
 
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "crates/uteke-cli/src/cli.rs".to_string(),
             line: Some(236),
             severity: Severity::Critical,
@@ -1028,6 +1036,8 @@ mod tests {
         }];
 
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/config.rs".to_string(),
             line: Some(15),
             severity: Severity::Critical,
@@ -1068,6 +1078,8 @@ mod tests {
         }];
 
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(1),
             severity: Severity::Minor,
@@ -1089,6 +1101,8 @@ mod tests {
         let diff_chunks: Vec<FileChunk> = vec![];
 
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/config.rs".to_string(),
             line: Some(999),
             severity: Severity::Critical,
@@ -1110,6 +1124,8 @@ mod tests {
     fn ignore_rules_filters_by_title_match() {
         let issues = vec![
             ReviewIssue {
+                rule_id: None,
+                also_matches: Vec::new(),
                 file: "cli.rs".to_string(),
                 line: Some(236),
                 severity: Severity::Critical,
@@ -1119,6 +1135,8 @@ mod tests {
                 suggested_fix: None,
             },
             ReviewIssue {
+                rule_id: None,
+                also_matches: Vec::new(),
                 file: "main.rs".to_string(),
                 line: Some(10),
                 severity: Severity::Major,
@@ -1138,6 +1156,8 @@ mod tests {
     #[test]
     fn ignore_rules_filters_by_issue_type_match() {
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "test.py".to_string(),
             line: Some(50),
             severity: Severity::Minor,
@@ -1155,6 +1175,8 @@ mod tests {
     #[test]
     fn ignore_rules_empty_keeps_all() {
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "f.rs".to_string(),
             line: Some(1),
             severity: Severity::Critical,
@@ -1171,6 +1193,8 @@ mod tests {
     #[test]
     fn ignore_rules_case_insensitive() {
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "f.rs".to_string(),
             line: Some(1),
             severity: Severity::Critical,
@@ -1230,6 +1254,8 @@ mod tests {
         }];
 
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "AGENT.md".to_string(),
             line: Some(168),
             severity: Severity::Critical,
@@ -1288,6 +1314,8 @@ mod tests {
 
         // Finding on line 5 (outside the block, in prose) must survive.
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "doc.md".to_string(),
             line: Some(5),
             severity: Severity::Minor,
@@ -1329,6 +1357,8 @@ mod tests {
         }];
 
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/app.py".to_string(),
             line: Some(42),
             severity: Severity::Critical,
@@ -1343,9 +1373,36 @@ mod tests {
     }
 
     #[test]
+    fn ignore_rules_matches_rule_id_exactly() {
+        let mut a = ReviewIssue {
+            rule_id: Some("sec-hardcoded-secret".to_string()),
+            also_matches: Vec::new(),
+            file: "a.rs".to_string(),
+            line: Some(1),
+            severity: Severity::Major,
+            issue_type: Some("rule".to_string()),
+            title: "Plain title".to_string(),
+            body: String::new(),
+            suggested_fix: None,
+        };
+        let kept = apply_ignore_rules(vec![a.clone()], &["SEC-Hardcoded-Secret".to_string()]);
+        assert!(kept.is_empty());
+        // ids are exact, not substring
+        let kept = apply_ignore_rules(vec![a.clone()], &["hardcoded".to_string()]);
+        assert_eq!(kept.len(), 1);
+        // merged-away scanner id
+        a.rule_id = None;
+        a.also_matches = vec!["sec-hardcoded-secret".to_string()];
+        let kept = apply_ignore_rules(vec![a], &["sec-hardcoded-secret".to_string()]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
     fn markdown_fp_filter_keeps_findings_without_line_number() {
         // Findings with no resolvable line are kept (safe default).
         let issues = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "doc.md".to_string(),
             line: None,
             severity: Severity::Info,

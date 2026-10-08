@@ -568,6 +568,8 @@ mod tests {
 
     fn make_issue(file: &str, line: u32, severity: Severity, title: &str) -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: file.to_string(),
             line: Some(line),
             severity,

@@ -50,6 +50,8 @@ mod tests {
 
     fn sample_issue() -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(42),
             severity: Severity::Critical,
@@ -146,6 +148,8 @@ mod tests {
     fn format_review_multiple_issues() {
         let mut response = sample_response();
         response.issues.push(ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/lib.rs".to_string(),
             line: Some(10),
             severity: Severity::Minor,

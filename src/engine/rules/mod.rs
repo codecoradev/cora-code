@@ -122,7 +122,10 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
 ///
 /// Rule findings are appended after LLM issues (LLM issues take priority).
 /// Duplicates (same file + line) from rules are skipped if the LLM already
-/// reported an issue for that location.
+/// reported an issue for that location. The skipped finding's id and title are
+/// recorded on the surviving issue's `also_matches` (not serialized) so an
+/// inline `cora-ignore:` / `ignore.rules` entry naming the scanner rule still
+/// suppresses that line (#597).
 pub fn merge_rule_findings(
     llm_issues: Vec<ReviewIssue>,
     rule_findings: Vec<RuleFinding>,
@@ -130,14 +133,21 @@ pub fn merge_rule_findings(
     let mut result = llm_issues;
 
     // Build a set of (file, line) pairs from LLM issues to avoid duplicates
-    let llm_locations: std::collections::HashSet<(String, u32)> = result
-        .iter()
-        .filter_map(|issue| issue.line.map(|ln| (issue.file.clone(), ln)))
-        .collect();
+    // (first issue wins as the alias holder).
+    let mut llm_locations: std::collections::HashMap<(String, u32), usize> =
+        std::collections::HashMap::new();
+    for (idx, issue) in result.iter().enumerate() {
+        if let Some(ln) = issue.line {
+            llm_locations.entry((issue.file.clone(), ln)).or_insert(idx);
+        }
+    }
 
     for finding in rule_findings {
         // Skip if LLM already has an issue at the same file+line
-        if llm_locations.contains(&(finding.file.clone(), finding.line)) {
+        if let Some(&idx) = llm_locations.get(&(finding.file.clone(), finding.line)) {
+            let holder = &mut result[idx];
+            holder.also_matches.push(finding.rule_id.clone());
+            holder.also_matches.push(finding.title.clone());
             debug!(
                 rule_id = %finding.rule_id,
                 file = %finding.file,
@@ -148,6 +158,8 @@ pub fn merge_rule_findings(
         }
 
         result.push(ReviewIssue {
+            rule_id: Some(finding.rule_id),
+            also_matches: Vec::new(),
             file: finding.file,
             line: Some(finding.line),
             severity: finding.severity,
@@ -357,6 +369,8 @@ mod tests {
     #[test]
     fn merge_skips_duplicates() {
         let llm = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(5),
             severity: Severity::Minor,
@@ -378,11 +392,21 @@ mod tests {
         let merged = merge_rule_findings(llm, rules);
         // Should have 1 issue (LLM's), not 2 — rule finding at same location skipped
         assert_eq!(merged.len(), 1);
+        // ...but its id and title stay addressable for suppression (#597).
+        assert!(merged[0].also_matches.contains(&"bug-unwrap".to_string()));
+        assert!(
+            merged[0]
+                .also_matches
+                .contains(&"[bug-unwrap] Rule: bug-unwrap".to_string())
+        );
+        assert!(merged[0].rule_id.is_none());
     }
 
     #[test]
     fn merge_appends_unique_rule_findings() {
         let llm = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(5),
             severity: Severity::Minor,

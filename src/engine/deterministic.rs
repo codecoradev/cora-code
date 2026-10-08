@@ -280,6 +280,8 @@ diff --git a/src/api.js b/src/api.js
         let total = report.len();
         let first = report.secrets[0].clone();
         let llm = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: first.file.clone(),
             line: Some(first.line),
             severity: crate::engine::Severity::Major,
