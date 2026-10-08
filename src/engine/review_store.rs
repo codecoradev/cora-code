@@ -60,7 +60,7 @@ pub struct ReviewRecord<'a> {
 pub struct FindingFilter {
     /// Include resolved/dismissed findings (default: open only).
     pub all: bool,
-    /// Exact severity match; compared upper-cased.
+    /// Exact severity match, case-insensitive (stored lowercase).
     pub severity: Option<String>,
     /// Substring match on the file path.
     pub file: Option<String>,
@@ -361,7 +361,7 @@ impl<'a> ReviewStore<'a> {
         }
         if let Some(s) = &filter.severity {
             wheres.push("f.severity = ?");
-            params.push(Box::new(s.to_uppercase()));
+            params.push(Box::new(s.to_lowercase()));
         }
         if let Some(f) = &filter.file {
             wheres.push("f.file_path LIKE ?");
@@ -716,11 +716,16 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].title, "one");
 
-        // Legacy behaviour kept on purpose (refactor, not a fix): severities are
-        // stored lowercase but the filter upper-cases its argument, so
-        // `--severity` never matches. Tracked separately; this pins the status quo.
+        // Severities are stored lowercase; the filter is case-insensitive.
+        for arg in ["minor", "MINOR", "Minor"] {
+            let mut f = filter(true);
+            f.severity = Some(arg.into());
+            assert_eq!(store.list_findings(&f).unwrap().len(), 2, "arg {arg}");
+        }
         let mut f = filter(true);
-        f.severity = Some("minor".into());
+        f.severity = Some("critical".into());
+        assert_eq!(store.list_findings(&f).unwrap().len(), 1);
+        f.severity = Some("bogus".into());
         assert_eq!(store.list_findings(&f).unwrap().len(), 0);
 
         let mut f = filter(true);

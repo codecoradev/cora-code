@@ -1,7 +1,7 @@
 //! `cora findings` subcommand — manage review findings stored in cora.db.
 
 use anyhow::Result;
-use colored::Colorize;
+use colored::{Color, Colorize};
 
 use crate::engine::review_store::{self, FindingFilter, FindingStats, ReviewStore, Transition};
 
@@ -19,7 +19,11 @@ pub enum FindingsAction {
         all: bool,
 
         /// Filter by severity (info, minor, major, critical)
-        #[clap(long)]
+        #[clap(
+            long,
+            value_parser = ["info", "minor", "major", "critical"],
+            ignore_case = true
+        )]
         severity: Option<String>,
 
         /// Filter by file path substring
@@ -107,6 +111,16 @@ pub fn execute_findings(action: &FindingsAction) -> Result<i32> {
     }
 }
 
+/// Colour for a stored severity (matched case-insensitively); `None` = dimmed.
+fn severity_color(severity: &str) -> Option<Color> {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => Some(Color::Red),
+        "major" => Some(Color::Yellow),
+        "minor" => Some(Color::Green),
+        _ => None,
+    }
+}
+
 fn list_findings(store: &ReviewStore<'_>, filter: &FindingFilter, json: bool) -> Result<i32> {
     let rows = store.list_findings(filter)?;
 
@@ -126,10 +140,10 @@ fn list_findings(store: &ReviewStore<'_>, filter: &FindingFilter, json: bool) ->
         rows.len().to_string().bold()
     );
     for r in &rows {
-        let sev = match r.severity.as_str() {
-            "CRITICAL" => r.severity.clone().red().to_string(),
-            "MAJOR" => r.severity.clone().yellow().to_string(),
-            "MINOR" => r.severity.clone().green().to_string(),
+        let sev = match severity_color(&r.severity) {
+            Some(Color::Red) => r.severity.clone().red().to_string(),
+            Some(Color::Yellow) => r.severity.clone().yellow().to_string(),
+            Some(Color::Green) => r.severity.clone().green().to_string(),
             _ => r.severity.clone().dimmed().to_string(),
         };
         let status_tag = match r.status.as_str() {
@@ -220,5 +234,45 @@ fn reopen(store: &ReviewStore<'_>, id: i64) -> Result<i32> {
             println!("{} Finding #{} reopened.", "✓".green(), id);
             Ok(EXIT_OK)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Harness {
+        #[clap(subcommand)]
+        action: FindingsAction,
+    }
+
+    fn parse_severity(arg: &str) -> Result<Option<String>, clap::Error> {
+        let h = Harness::try_parse_from(["t", "list", "--severity", arg])?;
+        match h.action {
+            FindingsAction::List { severity, .. } => Ok(severity),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn severity_arg_accepts_any_case_and_rejects_unknown() {
+        for (arg, want) in [("major", "major"), ("MAJOR", "major"), ("Info", "info")] {
+            // clap keeps the typed case; the store lowercases it.
+            let got = parse_severity(arg).unwrap().unwrap();
+            assert!(got.eq_ignore_ascii_case(want));
+        }
+        assert!(parse_severity("bogus").is_err());
+    }
+
+    #[test]
+    fn severity_color_is_case_insensitive() {
+        assert_eq!(severity_color("critical"), Some(Color::Red));
+        assert_eq!(severity_color("CRITICAL"), Some(Color::Red));
+        assert_eq!(severity_color("major"), Some(Color::Yellow));
+        assert_eq!(severity_color("Minor"), Some(Color::Green));
+        assert_eq!(severity_color("info"), None);
+        assert_eq!(severity_color("weird"), None);
     }
 }
