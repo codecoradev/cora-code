@@ -20,6 +20,7 @@ pub mod quality_gate;
 pub mod review;
 pub mod rules;
 pub mod scanner;
+pub mod secret_patterns;
 pub mod secrets_scanner;
 pub mod security_scanner;
 pub mod static_analysis;

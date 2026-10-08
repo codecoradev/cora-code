@@ -241,15 +241,8 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
     findings
 }
 
-/// Well-known credential shapes that are scanned even in test and doc files.
-static HIGH_CONFIDENCE_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"AKIA[0-9A-Z]{16}|-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{36,}|sk_live_[A-Za-z0-9]{24,}|xox[baprs]-[A-Za-z0-9-]{10,}",
-    )
-    .expect("valid regex")
-});
-
 /// Scan added lines of a (test or doc) file for high-confidence secrets only.
+/// The pattern list is shared with `secrets_scanner` (`secret_patterns`).
 fn scan_high_confidence_secrets(
     chunk: &FileChunk,
     path: &str,
@@ -265,11 +258,8 @@ fn scan_high_confidence_secrets(
             if line_no == 0 {
                 continue;
             }
-            let Some(m) = HIGH_CONFIDENCE_SECRET.find(&line.content) else {
-                continue;
-            };
-            // Published placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are not real.
-            if m.as_str().to_uppercase().contains("EXAMPLE") {
+            // Placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are ignored inside.
+            if crate::engine::secret_patterns::find_high_confidence(&line.content).is_none() {
                 continue;
             }
             findings.push(RuleFinding {
