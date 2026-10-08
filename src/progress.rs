@@ -203,6 +203,23 @@ pub fn diff_stats(diff: &str) -> (usize, usize) {
     (files_changed, lines_changed)
 }
 
+/// [`LlmEvents`](crate::engine::llm::LlmEvents) that streams model output to
+/// stdout as it arrives. The LLM layer itself never prints; commands that want
+/// live token output (`review --stream`, `commit --stream`) pass this in.
+pub struct StdoutStream;
+
+impl crate::engine::llm::LlmEvents for StdoutStream {
+    fn delta(&self, chunk: &str) {
+        print!("{chunk}");
+        let _ = std::io::stdout().flush();
+    }
+
+    fn retry(&self) {
+        // Separate the discarded (unparseable) output from the retried stream.
+        eprintln!("\n[response was not valid JSON - retrying with a stricter prompt]");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
