@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Concurrent index opens could fail with `UNIQUE constraint failed: schema_version.version`.** Schema migrations are now serialised per process, which also removes a flaky test (#604).
+
 ### Added
 
 - **Findings now carry a `rule_id`.** Deterministic scanner findings (rules, secrets, security, index) keep their rule id through the merge; it appears in pretty/compact output, as `rule_id` in JSON (omitted when absent, so older JSON still deserializes), and as `properties.coraRuleId` in SARIF (#597).
