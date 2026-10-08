@@ -310,6 +310,8 @@ async fn review_diff_inner(
                 };
                 fallback.issues = apply_markdown_code_block_filter(fallback.issues, &diff_chunks);
                 fallback.issues = apply_ignore_rules(fallback.issues, &config.ignore.rules);
+                fallback.issues =
+                    crate::engine::inline_suppress::apply(fallback.issues, &diff_chunks);
                 let min_sev = config.hook.min_severity_level();
                 fallback.should_block = fallback
                     .issues
@@ -355,6 +357,10 @@ async fn review_diff_inner(
 
     // Apply ignore rules: filter out issues matching ignored patterns
     response.issues = apply_ignore_rules(response.issues, &config.ignore.rules);
+
+    // Rule-scoped inline suppression (`cora-ignore: <rule>`, #554), shared by
+    // deterministic and LLM findings.
+    response.issues = crate::engine::inline_suppress::apply(response.issues, &diff_chunks);
 
     // Drop low-severity findings on unchanged (context) lines — these are
     // pre-existing code that appeared in the diff due to surrounding changes,

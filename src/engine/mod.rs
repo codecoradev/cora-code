@@ -9,6 +9,7 @@ pub mod diff_parser;
 pub mod enclosing;
 pub mod index_bridge;
 pub mod index_scanner;
+pub mod inline_suppress;
 pub mod language_analyzer;
 pub mod llm;
 pub mod markdown;
