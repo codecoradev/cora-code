@@ -4,6 +4,7 @@
 //! Provides aggregation and trend analysis across multiple reviews.
 
 use crate::engine::quality_gate::GateResult;
+use crate::engine::review_store::ReviewRow;
 use crate::engine::types::{ReviewIssue, Severity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -488,141 +489,57 @@ pub fn aggregate(snapshots: &[DebtSnapshot]) -> DebtReport {
 
 /// Load review snapshots from `cora.db` for the given project root.
 ///
-/// This is the preferred data source (SoT). Falls back gracefully if the DB
-/// doesn't exist or has no reviews.
+/// This is the preferred data source (SoT). Falls back gracefully (empty) if
+/// the DB doesn't exist or has no reviews; the SQL lives in
+/// [`crate::engine::review_store`].
 ///
 /// Converts the DB's 0-100 score to the 0-10 scale used by `DebtSnapshot`.
 pub fn load_snapshots_from_db(project_root: &str) -> Vec<DebtSnapshot> {
-    let Some(conn) = crate::engine::db_writer::open_db_for_read() else {
-        return Vec::new();
-    };
-
-    let canonical = match std::path::Path::new(project_root).canonicalize() {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => project_root.to_string(),
-    };
-
-    // Get project ID
-    let project_id: i64 = match conn.query_row(
-        "SELECT id FROM projects WHERE root_path = ?1",
-        rusqlite::params![canonical],
-        |row| row.get(0),
-    ) {
-        Ok(id) => id,
-        Err(_) => return Vec::new(),
-    };
-
-    // Load all reviews for this project, ordered by created_at
-    let mut stmt = match conn.prepare(
-        "SELECT id, commit_hash, branch, files_scanned, lines_scanned,
-                score, gate_status, created_at
-         FROM reviews WHERE project_id = ?1 ORDER BY created_at ASC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut rows = match stmt.query(rusqlite::params![project_id]) {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut snapshots = Vec::new();
-    while let Some(row) = rows.next().unwrap_or(None) {
-        let review_id: i64 = row.get(0).unwrap_or(0);
-        let commit: Option<String> = row.get(1).unwrap_or(None);
-        let branch: Option<String> = row.get(2).unwrap_or(None);
-        let files_scanned: i64 = row.get(3).unwrap_or(0);
-        let lines_scanned: i64 = row.get(4).unwrap_or(0);
-        let db_score: f64 = row.get(5).unwrap_or(100.0);
-        let gate_status: String = row.get(6).unwrap_or_else(|_| "disabled".to_string());
-        let created_at: String = row.get(7).unwrap_or_default();
-
-        // Parse timestamp
-        let timestamp = DateTime::parse_from_rfc3339(&created_at)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                chrono::NaiveDateTime::parse_from_str(&created_at, "%Y-%m-%d %H:%M:%S")
-                    .map(|ndt| ndt.and_utc())
-            })
-            .unwrap_or_else(|_| Utc::now());
-
-        // Load findings for this review
-        let findings = load_findings_for_review(&conn, review_id);
-        let categories = load_categories_for_review(&conn, review_id);
-
-        // Convert DB score (0-100) to DebtSnapshot scale (0-10)
-        let quality_score = db_score / 10.0;
-
-        snapshots.push(DebtSnapshot {
-            timestamp,
-            commit,
-            branch,
-            files_reviewed: files_scanned as usize,
-            lines_reviewed: if lines_scanned > 0 {
-                Some(lines_scanned as usize)
-            } else {
-                None
-            },
-            findings,
-            categories,
-            quality_score,
-            gate_status,
-            duration_ms: None, // not stored in DB
-        });
-    }
-
-    snapshots
+    snapshots_from_rows(crate::engine::review_store::load_debt_rows(project_root))
 }
 
-/// Load severity → count map for findings of a specific review.
-fn load_findings_for_review(conn: &rusqlite::Connection, review_id: i64) -> HashMap<String, usize> {
-    let mut findings: HashMap<String, usize> = HashMap::new();
-    let mut stmt = match conn.prepare(
-        "SELECT severity, COUNT(*) as cnt FROM findings
-         WHERE review_id = ?1 AND status = 'open'
-         GROUP BY severity",
-    ) {
-        Ok(s) => s,
-        Err(_) => return findings,
-    };
-    let mut rows = match stmt.query(rusqlite::params![review_id]) {
-        Ok(r) => r,
-        Err(_) => return findings,
-    };
-    while let Some(row) = rows.next().unwrap_or(None) {
-        let severity: String = row.get::<_, String>(0).unwrap_or_default().to_lowercase();
-        let count: usize = row.get::<_, i64>(1).unwrap_or(0) as usize;
-        *findings.entry(severity).or_insert(0) += count;
-    }
-    findings
-}
+/// Convert stored review rows into debt snapshots (pure; no I/O).
+pub fn snapshots_from_rows(rows: Vec<ReviewRow>) -> Vec<DebtSnapshot> {
+    rows.into_iter()
+        .map(|row| {
+            // Parse timestamp
+            let timestamp = DateTime::parse_from_rfc3339(&row.created_at)
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(&row.created_at, "%Y-%m-%d %H:%M:%S")
+                        .map(|ndt| ndt.and_utc())
+                })
+                .unwrap_or_else(|_| Utc::now());
 
-/// Load category → count map for findings of a specific review.
-fn load_categories_for_review(
-    conn: &rusqlite::Connection,
-    review_id: i64,
-) -> HashMap<String, usize> {
-    let mut categories: HashMap<String, usize> = HashMap::new();
-    let mut stmt = match conn.prepare(
-        "SELECT issue_type, COUNT(*) as cnt FROM findings
-         WHERE review_id = ?1 AND status = 'open' AND issue_type IS NOT NULL
-         GROUP BY issue_type",
-    ) {
-        Ok(s) => s,
-        Err(_) => return categories,
-    };
-    let mut rows = match stmt.query(rusqlite::params![review_id]) {
-        Ok(r) => r,
-        Err(_) => return categories,
-    };
-    while let Some(row) = rows.next().unwrap_or(None) {
-        let issue_type: String = row.get::<_, String>(0).unwrap_or_default();
-        let count: usize = row.get::<_, i64>(1).unwrap_or(0) as usize;
-        let cat = normalize_category(&issue_type);
-        *categories.entry(cat.to_string()).or_insert(0) += count;
-    }
-    categories
+            let mut findings: HashMap<String, usize> = HashMap::new();
+            for (severity, count) in row.open_by_severity {
+                *findings.entry(severity.to_lowercase()).or_insert(0) += count;
+            }
+            let mut categories: HashMap<String, usize> = HashMap::new();
+            for (issue_type, count) in row.open_by_issue_type {
+                let cat = normalize_category(&issue_type);
+                *categories.entry(cat.to_string()).or_insert(0) += count;
+            }
+
+            DebtSnapshot {
+                timestamp,
+                commit: row.commit_hash,
+                branch: row.branch,
+                files_reviewed: row.files_scanned as usize,
+                lines_reviewed: if row.lines_scanned > 0 {
+                    Some(row.lines_scanned as usize)
+                } else {
+                    None
+                },
+                findings,
+                categories,
+                // Convert DB score (0-100) to DebtSnapshot scale (0-10)
+                quality_score: row.score / 10.0,
+                gate_status: row.gate_status,
+                duration_ms: None, // not stored in DB
+            }
+        })
+        .collect()
 }
 
 // ─── Debt config ───
@@ -865,6 +782,48 @@ mod tests {
         assert_eq!(counts.get("performance"), Some(&1));
         assert_eq!(counts.get("bug_risk"), Some(&1));
         assert_eq!(counts.get("style"), Some(&1));
+    }
+
+    // ─── snapshots from the review store ───
+
+    #[test]
+    fn snapshots_from_store_rows() {
+        use crate::engine::review_store::{ReviewRecord, ReviewStore};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::index::schema::run_migrations(&conn).unwrap();
+        let store = ReviewStore::new(&conn);
+        let issues = vec![
+            make_issue(Severity::Critical, "injection"),
+            make_issue(Severity::Minor, "style"),
+        ];
+        store
+            .record_review(&ReviewRecord {
+                command: "review",
+                project_root: "/nonexistent/debt-proj",
+                commit_hash: Some("abc"),
+                branch: Some("main"),
+                summary: "",
+                gate_status: "failed",
+                files_scanned: 2,
+                lines_scanned: 0,
+                should_block: true,
+                tokens: None,
+                issues: &issues,
+            })
+            .unwrap();
+
+        let snaps = snapshots_from_rows(store.reviews_for_root("/nonexistent/debt-proj").unwrap());
+        assert_eq!(snaps.len(), 1);
+        let s = &snaps[0];
+        assert_eq!(s.commit.as_deref(), Some("abc"));
+        assert_eq!(s.files_reviewed, 2);
+        assert_eq!(s.lines_reviewed, None);
+        assert_eq!(s.gate_status, "failed");
+        assert!((s.quality_score - 7.7).abs() < 1e-9); // 100-20-3 = 77 -> 7.7
+        assert_eq!(s.findings.get("critical"), Some(&1));
+        assert_eq!(s.findings.get("minor"), Some(&1));
+        assert_eq!(s.categories.get("security"), Some(&1));
+        assert_eq!(s.categories.get("style"), Some(&1));
     }
 
     // ─── count_by_severity ───
