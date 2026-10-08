@@ -260,8 +260,10 @@ async fn review_diff_inner(
             &config.response_format,
             review_prompt.as_deref(),
             final_context.as_deref(),
+            &crate::progress::StdoutStream,
         )
         .await
+        .inspect(|_| println!()) // trailing newline after streamed output
     } else {
         llm::review_diff(
             llm_config,
