@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.16.0] - 2026-10-08
 
+### Added
+
+- **Rule-scoped inline suppression with `cora-ignore:`.** A source comment such as `// cora-ignore: Hardcoded password or secret in variable` (also `#`, `--`, `/* */`, `<!-- -->`; comma-separated rules) suppresses findings with that exact title (case-insensitive) on the same line, or on the next line when the marker line holds only a comment. Applies to both static-scanner and LLM findings; other rules and other lines stay visible, and a bare `cora-ignore` without rules suppresses nothing. Coexists with `ignore.rules` / `ignore.files` (#554).
+
 ### Security
 
 - **Project `.cora.yaml` can no longer redirect your API key.** `provider.base_url` from a discovered project config is ignored unless `CORA_TRUST_PROJECT_CONFIG=1`; `base_url` must be `https` (plain `http` only for loopback); LLM error bodies echoed to the terminal are length-capped (#563).

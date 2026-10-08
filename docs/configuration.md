@@ -486,6 +486,24 @@ brain:
 
 > **Note:** If you select `pretrained` but cora was built without the `pretrained-embed` feature, it falls back to `hashing` with a warning.
 
+## Inline Suppression (`cora-ignore`)
+
+`ignore.rules` hides a finding title across the whole project. To suppress one finding at one location, put a marker in a source comment:
+
+```ts
+const bytesPerToken = 4; // cora-ignore: Hardcoded password or secret in variable
+
+// cora-ignore: Rule A, Rule B   (comment-only line: applies to the next line)
+const next = compute();
+```
+
+- Syntax: `cora-ignore: <rule>[, <rule>...]`, matched as a substring of the line, so it works after `//`, `#`, `--`, inside `/* */` or `<!-- -->`, etc. The marker is case-insensitive.
+- `<rule>` is the finding **title**, matched exactly and case-insensitively (not a substring, unlike `ignore.rules`).
+- Scope: the same line; plus the next line when the marker line contains only a comment.
+- A bare `cora-ignore` (no `:` or empty rule list) suppresses nothing, so every suppression names its rule.
+- Applies to both deterministic scanner and LLM findings, in `cora review`. Other rules on the same line and the rest of the project stay visible. Works alongside `ignore.rules` and `ignore.files`.
+- Markers are read from the diff (added and context lines); a marker outside the diff's context window is not seen.
+
 ## Ignore Files
 
 Exclude files or directories from **all** cora operations — review, scan, and indexing. This is the broadest exclusion mechanism.
