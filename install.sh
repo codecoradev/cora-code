@@ -50,7 +50,7 @@ detect_arch() {
 # Fallback: the GitHub REST API (subject to 60 req/hour anonymous limit).
 get_latest_version() {
     # Try the web redirect first — does not count against the API rate limit.
-    VERSION=$(curl -sI "https://github.com/${REPO}/releases/latest" \
+    VERSION=$(curl -sI --connect-timeout 10 --max-time 30 "https://github.com/${REPO}/releases/latest" \
         | grep -i '^location:' \
         | sed -E 's|.*/tag/([^[:space:]]+).*|\1|' \
         | tr -d '\r')
@@ -58,7 +58,7 @@ get_latest_version() {
     # Fallback to the REST API if the redirect didn't yield a tag.
     if [ -z "$VERSION" ]; then
         warn "Redirect lookup failed, falling back to GitHub API..."
-        VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 1048576 "https://api.github.com/repos/${REPO}/releases/latest" \
             | grep '"tag_name":' \
             | sed -E 's/.*"([^"]+)".*/\1/')
     fi
@@ -104,7 +104,7 @@ install() {
     CHECKSUM_FILE="${TEMP_DIR}/checksums-sha256.txt"
 
     info "Downloading from: $DOWNLOAD_URL"
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
+    if ! curl -fsSL --connect-timeout 10 --max-time 600 --max-filesize 268435456 "$DOWNLOAD_URL" -o "$ARCHIVE"; then
         error "Failed to download ${ARCHIVE_NAME}"
     fi
 
@@ -115,7 +115,7 @@ install() {
         warn "CORA_SKIP_CHECKSUM=1 set - checksum verification DISABLED. The binary is NOT verified."
     else
         info "Downloading checksums..."
-        if ! curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUM_FILE"; then
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 1048576 "$CHECKSUMS_URL" -o "$CHECKSUM_FILE"; then
             error "Failed to download checksums. Refusing to install an unverified binary (set CORA_SKIP_CHECKSUM=1 to override, unsafe)."
         fi
         info "Verifying SHA256 checksum..."
