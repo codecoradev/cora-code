@@ -123,6 +123,16 @@ pub struct ReviewIssue {
     pub body: String,
     #[serde(default)]
     pub suggested_fix: Option<String>,
+    /// Id of the deterministic rule/scanner that produced this finding (e.g.
+    /// `sec-hardcoded-secret`); `None` for LLM findings. Lets `cora-ignore:` and
+    /// `ignore.rules` match by id as well as title (#597).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
+    /// Ids/titles of scanner findings dropped in merge because this issue sits
+    /// on the same line. Suppression honors them, so a marker naming the
+    /// scanner rule still hides the surviving issue. Never serialized.
+    #[serde(skip)]
+    pub also_matches: Vec<String>,
 }
 
 #[cfg(test)]
@@ -354,8 +364,36 @@ mod tests {
     // ─── ReviewIssue serde round-trip ───
 
     #[test]
+    fn review_issue_without_rule_id_deserializes() {
+        // JSON written before #597 (cache, history, MCP clients) has no rule_id.
+        let old = r#"{"file":"a.rs","line":1,"severity":"major","issue_type":"rule","title":"T","body":"B","suggested_fix":null}"#;
+        let issue: ReviewIssue = serde_json::from_str(old).unwrap();
+        assert!(issue.rule_id.is_none());
+        assert!(issue.also_matches.is_empty());
+    }
+
+    #[test]
+    fn rule_id_serialized_only_when_present_and_aliases_never() {
+        let mut issue: ReviewIssue = serde_json::from_str(
+            r#"{"file":"a.rs","severity":"major","issue_type":null,"title":"T","body":"B"}"#,
+        )
+        .unwrap();
+        let none = serde_json::to_string(&issue).unwrap();
+        assert!(!none.contains("rule_id"));
+        issue.rule_id = Some("sec-x".into());
+        issue.also_matches = vec!["hidden".into()];
+        let some = serde_json::to_string(&issue).unwrap();
+        assert!(some.contains(r#""rule_id":"sec-x""#));
+        assert!(!some.contains("also_matches") && !some.contains("hidden"));
+        let back: ReviewIssue = serde_json::from_str(&some).unwrap();
+        assert_eq!(back.rule_id.as_deref(), Some("sec-x"));
+    }
+
+    #[test]
     fn review_issue_roundtrip() {
         let issue = ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(42),
             severity: Severity::Critical,

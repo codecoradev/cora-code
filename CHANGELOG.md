@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Findings now carry a `rule_id`.** Deterministic scanner findings (rules, secrets, security, index) keep their rule id through the merge; it appears in pretty/compact output, as `rule_id` in JSON (omitted when absent, so older JSON still deserializes), and as `properties.coraRuleId` in SARIF (#597).
+
+### Changed
+
+- **`cora-ignore:` and `ignore.rules` match rule ids.** `cora-ignore: sec-hardcoded-secret` suppresses by id (exact, case-insensitive) as well as title; `ignore.rules` additionally matches ids exactly. A marker naming a scanner rule now also suppresses the LLM finding that displaced that scanner finding on the same line (#597).
+
 ## [0.16.1] - 2026-10-08
 
 ### Fixed

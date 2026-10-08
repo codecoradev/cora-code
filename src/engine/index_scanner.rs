@@ -391,6 +391,8 @@ pub fn scan_project_index(
                 Ok(unused) => {
                     for u in &unused {
                         findings.push(ReviewIssue {
+                            rule_id: Some("index-unused-import".into()),
+                            also_matches: Vec::new(),
                             file: u.file.clone(),
                             line: Some(u.line),
                             severity: crate::engine::Severity::Minor,
@@ -425,6 +427,8 @@ pub fn scan_project_index(
         Ok(dead) => {
             for func in dead.into_iter().take(max_findings - findings.len()) {
                 findings.push(ReviewIssue {
+                    rule_id: Some("index-dead-code".into()),
+                    also_matches: Vec::new(),
                     file: func.file.clone(),
                     line: Some(func.line),
                     severity: crate::engine::Severity::Info,

@@ -704,6 +704,8 @@ mod tests {
 
     fn make_issue(severity: Severity, issue_type: &str) -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "test.rs".to_string(),
             line: Some(1),
             severity,

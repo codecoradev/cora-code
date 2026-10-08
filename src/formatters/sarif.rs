@@ -71,6 +71,10 @@ fn build_sarif(issues: &[ReviewIssue]) -> Value {
                 }]
             });
 
+            if let Some(ref id) = issue.rule_id {
+                result["properties"] = json!({ "coraRuleId": id });
+            }
+
             // Add line number if available
             if let Some(line) = issue.line {
                 result["locations"][0]["physicalLocation"]["region"] = json!({
@@ -151,6 +155,8 @@ mod tests {
 
     fn sample_issue() -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(42),
             severity: Severity::Critical,
@@ -322,6 +328,8 @@ mod tests {
     #[test]
     fn sarif_issue_without_line_has_no_region() {
         let issue = ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/lib.rs".to_string(),
             line: None,
             severity: Severity::Info,
