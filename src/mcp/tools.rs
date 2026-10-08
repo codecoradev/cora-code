@@ -153,10 +153,7 @@ pub fn list_tools() -> Vec<Tool> {
             description: "Get tech debt report from review history. Returns quality score, finding counts, severity breakdown, and trend.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {
-                    "since": { "type": "string", "description": "Filter since date or git tag (e.g., 'v0.5.0')" },
-                    "branch": { "type": "string", "description": "Filter by branch name" }
-                },
+                "properties": {},
                 "required": []
             }),
         },
@@ -203,7 +200,8 @@ pub fn list_tools() -> Vec<Tool> {
                 "properties": {
                     "list": { "type": "boolean", "description": "List detected agents without installing" },
                     "agents": { "type": "string", "description": "Specific agents to install (comma-separated)" },
-                    "dry_run": { "type": "boolean", "description": "Show what would be changed without writing" }
+                    "dry_run": { "type": "boolean", "description": "Show what would be changed without writing" },
+                    "confirm": { "type": "boolean", "description": "Required to actually write agent config files (unless list or dry_run is set)" }
                 },
                 "required": []
             }),
@@ -256,7 +254,7 @@ pub fn handle_tool_call(name: &str, params: &serde_json::Value) -> ToolResult {
         "cora.index_status" => handle_index_status(),
         // Review Pipeline (Phase 2)
         "cora.review_diff" => handle_review_diff(params),
-        "cora.get_debt" => handle_get_debt(params),
+        "cora.get_debt" => handle_get_debt(),
         // Context Enrichment (Phase 3)
         "cora.get_project_info" => handle_get_project_info(),
         "cora.get_memory" => handle_get_memory(params),
@@ -440,13 +438,17 @@ fn handle_list_profiles() -> ToolResult {
 /// Uses project root detection (walks up from CWD looking for markers).
 /// Returns helpful error if not found.
 fn open_index_db() -> anyhow::Result<(rusqlite::Connection, i64)> {
-    let db_path = crate::data_dir::graph_db_path();
-    if !db_path.exists() {
-        anyhow::bail!("No symbol index found. Run 'cora index' first to build the index.");
+    use crate::engine::index_bridge::{IndexBridge, NoIndexError};
+    match IndexBridge::open_strict_cwd() {
+        Ok(bridge) => {
+            let (conn, project_id, _root) = bridge.into_strict_parts()?;
+            Ok((conn, project_id))
+        }
+        Err(e) if e.downcast_ref::<NoIndexError>().is_some() => {
+            anyhow::bail!("No symbol index found. Run 'cora index' first to build the index.")
+        }
+        Err(e) => Err(e),
     }
-    let conn = crate::index::open_global_index()?;
-    let (project_id, _root) = crate::index::resolve_project_id(&conn)?;
-    Ok((conn, project_id))
 }
 
 fn handle_search_symbols(params: &serde_json::Value) -> ToolResult {
@@ -472,7 +474,7 @@ fn handle_search_symbols(params: &serde_json::Value) -> ToolResult {
         .get("language")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let limit = clamped_u64(params, "limit", 50, MAX_LIMIT) as usize;
 
     let query = crate::index::SymbolQuery {
         text: Some(query_text.to_string()),
@@ -512,7 +514,7 @@ fn handle_find_callers(params: &serde_json::Value) -> ToolResult {
         Some(s) => s,
         None => return ToolResult::error("Missing required parameter: symbol"),
     };
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let limit = clamped_u64(params, "limit", 50, MAX_LIMIT) as usize;
 
     let (conn, project_id) = match open_index_db() {
         Ok((c, pid)) => (c, pid),
@@ -545,7 +547,7 @@ fn handle_find_impact(params: &serde_json::Value) -> ToolResult {
         Some(s) => s,
         None => return ToolResult::error("Missing required parameter: symbol"),
     };
-    let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
+    let depth = clamped_u64(params, "depth", 3, MAX_DEPTH) as u32;
 
     let (conn, project_id) = match open_index_db() {
         Ok((c, pid)) => (c, pid),
@@ -574,6 +576,22 @@ fn handle_find_impact(params: &serde_json::Value) -> ToolResult {
     }
 }
 
+/// Upper bounds for caller-supplied numeric parameters.
+const MAX_LIMIT: u64 = 500;
+const MAX_DEPTH: u64 = 10;
+const MAX_MIN_LINES: u64 = 100_000;
+/// Max size of a diff accepted by `cora.review_diff` (bytes).
+const MAX_DIFF_BYTES: usize = 1024 * 1024;
+
+/// Read an unsigned integer param, defaulting when absent and clamping to `max`.
+fn clamped_u64(params: &serde_json::Value, key: &str, default: u64, max: u64) -> u64 {
+    params
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default)
+        .min(max)
+}
+
 fn handle_find_affected_tests(params: &serde_json::Value) -> ToolResult {
     let files: Vec<String> = match params.get("files").and_then(|v| v.as_array()) {
         Some(arr) => arr
@@ -587,111 +605,24 @@ fn handle_find_affected_tests(params: &serde_json::Value) -> ToolResult {
     if files.is_empty() {
         return ToolResult::error("Parameter 'files' must not be empty");
     }
+    if let Err(e) = crate::index::queries::validate_changed_files(&files) {
+        return ToolResult::error(e.to_string());
+    }
 
     let (conn, project_id) = match open_index_db() {
         Ok((c, pid)) => (c, pid),
         Err(e) => return ToolResult::error(e.to_string()),
     };
 
-    let patterns = ["test", "spec", "_test", "_spec"];
-    let mut affected: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // Batch fetch all symbols for all files in a single query
-    let all_symbols: Vec<String> = {
-        let placeholders = files.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let n = files.len() + 1;
-        let sql = format!(
-            "SELECT DISTINCT name FROM symbols WHERE file IN ({placeholders}) AND project_id = ?{n}"
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => return ToolResult::error(format!("DB error: {e}")),
-        };
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = files
-            .iter()
-            .map(|f| Box::new(f.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        params.push(Box::new(project_id));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let rows = match stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0)) {
-            Ok(r) => r,
-            Err(e) => return ToolResult::error(format!("DB error: {e}")),
-        };
-        rows.filter_map(|r| r.ok()).collect()
+    let sorted = match crate::index::queries::find_affected_tests(
+        &conn,
+        project_id,
+        &files,
+        &crate::index::queries::AffectedOptions::default(),
+    ) {
+        Ok(s) => s,
+        Err(e) => return ToolResult::error(format!("DB error: {e}")),
     };
-
-    // Deduplicate and traverse call graph once
-    {
-        let mut seen_syms: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for sym_name in &all_symbols {
-            if seen_syms.insert(sym_name.clone()) {
-                if let Ok(callers) =
-                    crate::index::graph::find_callers(&conn, project_id, sym_name, 100)
-                {
-                    for caller in callers {
-                        if patterns.iter().any(|p| caller.file.contains(*p)) {
-                            affected.insert(caller.file.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Strategy 2: naming convention — batch all test name candidates
-    let mut test_names: Vec<String> = Vec::new();
-    for file in &files {
-        let stem = file
-            .rsplit('/')
-            .next()
-            .unwrap_or(file)
-            .rsplit('.')
-            .next()
-            .unwrap_or("");
-        test_names.extend_from_slice(&[
-            format!("{stem}_test.rs"),
-            format!("tests/{stem}.rs"),
-            format!("{stem}_test.go"),
-            format!("test_{stem}.py"),
-            format!("{stem}.test.ts"),
-            format!("{stem}.spec.ts"),
-        ]);
-    }
-
-    // Query with a single LIKE batch, scoped to project
-    {
-        let n = test_names.len() + 1;
-        let sql = format!(
-            "SELECT DISTINCT path FROM files WHERE (path LIKE '%' || ?1 OR {}) AND project_id = ?{n}",
-            test_names
-                .iter()
-                .enumerate()
-                .skip(1)
-                .map(|(i, _)| format!("path LIKE '%' || ?{}", i + 1))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => return ToolResult::error(format!("DB error: {e}")),
-        };
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = test_names
-            .iter()
-            .map(|t| Box::new(t.clone()) as Box<dyn rusqlite::types::ToSql>)
-            .collect();
-        params.push(Box::new(project_id));
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        if let Ok(rows) = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0)) {
-            for row in rows.map_while(Result::ok) {
-                affected.insert(row);
-            }
-        }
-    }
-
-    let mut sorted: Vec<String> = affected.into_iter().collect();
-    sorted.sort();
 
     let json = serde_json::json!({
         "affected_tests": sorted,
@@ -782,6 +713,12 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
     if diff.trim().is_empty() {
         return ToolResult::error("Diff is empty");
     }
+    if diff.len() > MAX_DIFF_BYTES {
+        return ToolResult::error(format!(
+            "Diff is too large ({} bytes); maximum is {MAX_DIFF_BYTES} bytes",
+            diff.len()
+        ));
+    }
 
     // Load config + build LLM config
     let config = match load_project_config() {
@@ -839,10 +776,7 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
     }
 }
 
-fn handle_get_debt(params: &serde_json::Value) -> ToolResult {
-    let _since = params.get("since").and_then(|v| v.as_str());
-    let _branch = params.get("branch").and_then(|v| v.as_str());
-
+fn handle_get_debt() -> ToolResult {
     let config = load_project_config().unwrap_or_default();
 
     let snapshots = crate::engine::debt_tracker::load_snapshots(config.debt.history_dir.as_deref());
@@ -994,14 +928,16 @@ fn handle_brain_search(params: &serde_json::Value) -> ToolResult {
         Some(q) => q,
         None => return ToolResult::error("Missing required parameter: query"),
     };
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+    let limit = clamped_u64(params, "limit", 20, MAX_LIMIT) as usize;
 
     let (conn, project_id) = match open_index_db() {
         Ok((c, pid)) => (c, pid),
         Err(e) => return ToolResult::error(e.to_string()),
     };
 
-    crate::index::vector::apply_config_store(load_project_config().ok().as_ref());
+    // Same session step as `cora brain` (backend + vector store), but with
+    // project-only config: no env/global/API keys (#563).
+    crate::index::session::configure_for_search(crate::index::session::ConfigSource::ProjectOnly);
     match crate::index::brain::brain_search(&conn, project_id, query, limit) {
         Ok(results) => {
             if results.is_empty() {
@@ -1043,12 +979,39 @@ fn handle_install(params: &serde_json::Value) -> ToolResult {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let confirm = params
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Validate requested agents against the known set.
+    if let Some(list_str) = &agents {
+        let known = crate::commands::install::known_agent_names();
+        for name in list_str.split(',').map(str::trim) {
+            if !known.contains(&name) {
+                return ToolResult::error(format!(
+                    "Unknown agent '{name}'. Known agents: {}",
+                    known.join(", ")
+                ));
+            }
+        }
+    }
+
+    // Writing agent config files is a side effect on the user's machine:
+    // require explicit confirmation unless this is read-only (list/dry_run).
+    if !list && !dry_run && !confirm {
+        return ToolResult::error(
+            "Refusing to modify agent configs without explicit confirmation. \
+             Re-run with `dry_run: true` to preview, or `confirm: true` to write.",
+        );
+    }
+
     let opts = crate::commands::install::InstallOptions {
         list,
         agents,
         dry_run,
         force: false,
-        yes: true, // MCP is non-interactive
+        yes: true, // MCP is non-interactive; guarded by `confirm` above
         remove: false,
         validate: false,
     };
@@ -1078,16 +1041,18 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
     let min_lines = params
         .get("min_lines")
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|v| v.min(MAX_MIN_LINES) as u32);
 
-    let opts = crate::index::graph::DeadCodeOptions {
+    // Project-level `.cora.yaml` only (no env/global/secrets); entry-point
+    // patterns are plain names, not secrets, so they are honored like the CLI.
+    let config = load_project_config().unwrap_or_default();
+    let flags = crate::index::queries::DeadCodeFlags {
         include_tests,
-        min_lines,
-        entry_point_patterns: vec![],
         include_pub_api,
+        min_lines,
     };
 
-    match crate::index::graph::find_dead_code(&conn, project_id, &opts) {
+    match crate::index::queries::find_dead_code(&conn, project_id, &config, flags) {
         Ok(results) => {
             if results.is_empty() {
                 return ToolResult::text("No dead code found.");
@@ -1117,7 +1082,7 @@ fn handle_query(params: &serde_json::Value) -> ToolResult {
         Some(q) => q,
         None => return ToolResult::error("Missing required parameter: query"),
     };
-    let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+    let limit = clamped_u64(params, "limit", 50, MAX_LIMIT) as usize;
 
     match crate::commands::query::execute_query_cli(query, true, limit) {
         Ok(output) => ToolResult::text(output),
@@ -1340,6 +1305,59 @@ mod tests {
     fn handle_get_memory_missing_query() {
         let result = handle_tool_call("cora.get_memory", &serde_json::json!({}));
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn find_affected_tests_rejects_too_many_files() {
+        let files: Vec<String> = (0..=crate::index::queries::MAX_AFFECTED_FILES)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
+        let result = handle_tool_call(
+            "cora.find_affected_tests",
+            &serde_json::json!({ "files": files }),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("maximum"));
+    }
+
+    #[test]
+    fn numeric_params_are_clamped() {
+        let p = serde_json::json!({"limit": 1_000_000, "depth": 99});
+        assert_eq!(clamped_u64(&p, "limit", 50, MAX_LIMIT), MAX_LIMIT);
+        assert_eq!(clamped_u64(&p, "depth", 3, MAX_DEPTH), MAX_DEPTH);
+        assert_eq!(clamped_u64(&p, "missing", 7, MAX_LIMIT), 7);
+    }
+
+    #[test]
+    fn review_diff_rejects_oversized_diff() {
+        let diff = "x".repeat(MAX_DIFF_BYTES + 1);
+        let result = handle_tool_call("cora.review_diff", &serde_json::json!({ "diff": diff }));
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("too large"));
+    }
+
+    #[test]
+    fn install_requires_confirm_to_write() {
+        let result = handle_tool_call("cora.install", &serde_json::json!({}));
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("confirm"));
+    }
+
+    #[test]
+    fn install_rejects_unknown_agents() {
+        let result = handle_tool_call(
+            "cora.install",
+            &serde_json::json!({"agents": "cursor,../../etc", "confirm": true}),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("Unknown agent"));
+    }
+
+    #[test]
+    fn get_debt_schema_advertises_no_unused_params() {
+        let tools = list_tools();
+        let t = tools.iter().find(|t| t.name == "cora.get_debt").unwrap();
+        assert!(t.input_schema["properties"].as_object().unwrap().is_empty());
     }
 
     #[test]

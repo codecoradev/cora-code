@@ -236,6 +236,48 @@ pub fn resolve_max_tokens_param(provider: &str, config_value: &str) -> String {
     }
 }
 
+/// Env var that opts in to honouring `provider.base_url` from a discovered
+/// project `.cora.yaml`.
+pub const TRUST_PROJECT_CONFIG_ENV: &str = "CORA_TRUST_PROJECT_CONFIG";
+
+/// Whether `CORA_TRUST_PROJECT_CONFIG` is set to a truthy value (`1`/`true`/`yes`).
+fn project_config_trusted() -> bool {
+    std::env::var(TRUST_PROJECT_CONFIG_ENV)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Drop `provider.base_url` from a discovered project config unless trusted.
+///
+/// Returns `true` if a value was removed. A value equal to the already-resolved
+/// `current` base URL is harmless and left alone. Falls back to whatever the
+/// global config / presets / env resolve to.
+fn strip_untrusted_project_base_url(
+    cora: &mut CoraFile,
+    path: &Path,
+    current: &str,
+    trusted: bool,
+) -> bool {
+    if trusted {
+        return false;
+    }
+    let Some(p) = cora.provider.as_mut() else {
+        return false;
+    };
+    match p.base_url.as_deref() {
+        Some(u) if u.trim() != current.trim() => {
+            eprintln!(
+                "⚠️  Ignoring provider.base_url ({u}) from {}: project config is untrusted and would receive your API key. \
+                 Set it via --base-url, CORA_BASE_URL or your global config, or set {TRUST_PROJECT_CONFIG_ENV}=1 to trust this repo.",
+                path.display()
+            );
+            p.base_url = None;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Load the full resolved config: defaults ← global config ← .cora.yaml ← CLI overrides.
 ///
 /// `cli_provider`, `cli_model`, `cli_api_key`, and `cli_format` are `None`
@@ -275,7 +317,16 @@ pub fn load_config(
         })?;
         cora.merge_into(&mut config)?;
         debug!(path = %path.display(), "loaded explicit config");
-    } else if let Some((path, cora)) = find_cora_file(&std::env::current_dir()?)? {
+    } else if let Some((path, mut cora)) = find_cora_file(&std::env::current_dir()?)? {
+        // A discovered .cora.yaml is repo-controlled (anyone who can land a file
+        // in the checkout, e.g. a PR author). Its base_url would receive the API
+        // key as a Bearer token, so only honour it when explicitly trusted.
+        strip_untrusted_project_base_url(
+            &mut cora,
+            &path,
+            &config.provider.base_url,
+            project_config_trusted(),
+        );
         cora.merge_into(&mut config)?;
         debug!(path = %path.display(), "loaded discovered config");
     } else {
@@ -393,6 +444,10 @@ pub fn build_llm_config(
             }
         })
         .unwrap_or_else(|| config.provider.base_url.clone());
+
+    // The final URL may come from env / presets, which `Config::validate` never saw.
+    crate::config::schema::check_base_url(&base_url)
+        .map_err(|e| CoraError::ConfigParse(format!("invalid provider.base_url: {e}")))?;
 
     let max_tokens_param = resolve_max_tokens_param(&provider, &config.max_tokens_param);
 
@@ -841,6 +896,51 @@ pub fn remove_provider_info() -> std::result::Result<(), CoraError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_file(base_url: &str) -> CoraFile {
+        CoraFile::from_str(&format!("provider:\n  base_url: {base_url}\n")).unwrap()
+    }
+
+    #[test]
+    fn project_only_base_url_is_ignored_when_untrusted() {
+        let mut cora = project_file("https://evil.example.com/v1");
+        let removed = strip_untrusted_project_base_url(
+            &mut cora,
+            Path::new(".cora.yaml"),
+            "https://api.openai.com/v1",
+            false,
+        );
+        assert!(removed);
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.provider.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn project_base_url_is_used_when_trusted() {
+        let mut cora = project_file("https://proxy.corp.example/v1");
+        let removed = strip_untrusted_project_base_url(
+            &mut cora,
+            Path::new(".cora.yaml"),
+            "https://api.openai.com/v1",
+            true,
+        );
+        assert!(!removed);
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.provider.base_url, "https://proxy.corp.example/v1");
+    }
+
+    #[test]
+    fn project_base_url_matching_resolved_value_is_kept_silently() {
+        let mut cora = project_file("https://api.openai.com/v1");
+        assert!(!strip_untrusted_project_base_url(
+            &mut cora,
+            Path::new(".cora.yaml"),
+            "https://api.openai.com/v1",
+            false,
+        ));
+    }
 
     #[test]
     fn resolve_max_tokens_param_auto_gemini() {

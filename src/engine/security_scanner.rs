@@ -167,17 +167,21 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
             .or(chunk.old_path.as_deref())
             .unwrap_or("unknown");
 
-        // Skip test/spec/fixture/mock/example files
-        if is_test_file(path) {
-            debug!(file = path, "skipping test file in security scan");
-            continue;
-        }
-
-        // Skip documentation and non-code files — security patterns are designed
-        // for source code, not prose. Prevents false positives like flagging
-        // "CORS" in a markdown config guide (#483).
-        if is_doc_file(path) {
-            debug!(file = path, "skipping documentation file in security scan");
+        // Skip the noisy general rules for test/spec/fixture/mock/example files
+        // and for documentation (security patterns are designed for source code,
+        // not prose; #483). Naming a file `tests/x.rs` or `foo.md` must not be a
+        // blanket bypass though, so high-confidence secret shapes are still
+        // scanned there.
+        if is_test_file(path) || is_doc_file(path) {
+            debug!(
+                file = path,
+                "test/doc file: only high-confidence secret scan"
+            );
+            scan_high_confidence_secrets(chunk, path, &mut findings, max_findings);
+            if findings.len() >= max_findings {
+                findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+                return findings;
+            }
             continue;
         }
 
@@ -235,6 +239,45 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
 
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
     findings
+}
+
+/// Scan added lines of a (test or doc) file for high-confidence secrets only.
+/// The pattern list is shared with `secrets_scanner` (`secret_patterns`).
+fn scan_high_confidence_secrets(
+    chunk: &FileChunk,
+    path: &str,
+    findings: &mut Vec<RuleFinding>,
+    max_findings: usize,
+) {
+    for hunk in &chunk.chunks {
+        for line in &hunk.lines {
+            if line.line_type != DiffLineType::Add {
+                continue;
+            }
+            let line_no = line.new_line_no.unwrap_or(0);
+            if line_no == 0 {
+                continue;
+            }
+            // Placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are ignored inside.
+            if crate::engine::secret_patterns::find_high_confidence(&line.content).is_none() {
+                continue;
+            }
+            findings.push(RuleFinding {
+                rule_id: "secrets/high-confidence-in-test-or-doc".to_string(),
+                file: path.to_string(),
+                line: line_no,
+                severity: Severity::Major,
+                title: "Credential-like secret in test/doc file".to_string(),
+                body: format!(
+                    "Static security scanner detected a credential-like value in {path}:{line_no}. \
+                     Test/doc paths are not exempt from secret scanning; verify it is a fake."
+                ),
+            });
+            if findings.len() >= max_findings {
+                return;
+            }
+        }
+    }
 }
 
 /// Check if a file path looks like a test/spec/fixture/mock/example file.
@@ -318,6 +361,41 @@ mod tests {
             is_deleted: false,
             is_new: false,
         }
+    }
+
+    #[test]
+    fn test_and_doc_paths_still_scan_high_confidence_secrets() {
+        let key = format!("{}{}", "AKIA", "QWERTYUIOPASDFGH");
+        let line = format!("key = {key}");
+        for path in [
+            "tests/x.rs",
+            "src/__tests__/a.ts",
+            "foo.md",
+            "docs/notes.txt",
+        ] {
+            let chunks = vec![make_chunk(path, &[line.as_str()])];
+            let findings = scan_security(&chunks, 10);
+            assert_eq!(findings.len(), 1, "{path} should be scanned for secrets");
+            assert_eq!(
+                findings[0].rule_id,
+                "secrets/high-confidence-in-test-or-doc"
+            );
+        }
+        let pk = vec![make_chunk(
+            "tests/k.rs",
+            &["-----BEGIN RSA PRIVATE KEY-----"],
+        )];
+        assert_eq!(scan_security(&pk, 10).len(), 1);
+    }
+
+    #[test]
+    fn test_and_doc_paths_stay_quiet_for_noisy_rules_and_placeholders() {
+        let chunks = vec![
+            make_chunk("tests/auth.rs", &["let password = supersecret123;"]),
+            make_chunk("README.md", &["Set CORS to * and debug = true"]),
+            make_chunk("tests/aws.rs", &["AKIAIOSFODNN7EXAMPLE"]),
+        ];
+        assert!(scan_security(&chunks, 10).is_empty());
     }
 
     #[test]

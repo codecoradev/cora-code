@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-08
+
+### Added
+
+- **Rule-scoped inline suppression with `cora-ignore:`.** A source comment such as `// cora-ignore: Hardcoded password or secret in variable` (also `#`, `--`, `/* */`, `<!-- -->`; comma-separated rules) suppresses findings with that exact title (case-insensitive) on the same line, or on the next line when the marker line holds only a comment. Applies to both static-scanner and LLM findings; other rules and other lines stay visible, and a bare `cora-ignore` without rules suppresses nothing. Coexists with `ignore.rules` / `ignore.files` (#554).
+
+### Security
+
+- **Project `.cora.yaml` can no longer redirect your API key.** `provider.base_url` from a discovered project config is ignored unless `CORA_TRUST_PROJECT_CONFIG=1`; `base_url` must be `https` (plain `http` only for loopback); LLM error bodies echoed to the terminal are length-capped (#563).
+- **Hardened `cora upgrade` and `install.sh`.** Checksums are matched by exact filename; downloads go to a random 0700 temp dir; only the single `cora` binary entry is extracted (symlink/hardlink entries are rejected); every request has a timeout and a size cap; the version probe does not follow redirects and the tag is validated. `CORA_UPGRADE_SKIP_CHECKSUM` now also requires `CORA_UPGRADE_I_UNDERSTAND=1`. `install.sh` fails closed when the checksums file or entry is missing (opt out with `CORA_SKIP_CHECKSUM=1`) and falls back to `shasum -a 256` (#572).
+- **`install.sh` requests now have timeouts and size caps.** Every `curl` call sets `--connect-timeout`, `--max-time` and `--max-filesize` (256 MiB archive, 1 MiB checksums/API JSON), matching `cora upgrade`, so a stalled or hostile server cannot hang or flood the installer (#580).
+- **Hardened LLM response handling.** Review and scan system prompts tell the model to treat diff content as untrusted data; the diff fence is longer than any backtick run in the diff; the SSE stream errors on a line over 1 MiB or more than 16 MiB of content (#573).
+- **Secrets in test and doc files are no longer invisible to the static security scanner.** Test and doc paths still skip the noisy general rules but now run high-confidence checks (AWS keys, private-key headers, GitHub/Slack/Stripe live tokens; values containing `EXAMPLE` are ignored) (#573).
+
+### Fixed
+
+- **`cora watch` reindexed every source file on each cycle.** Change detection now reindexes only files that changed, and `--filter` restricts what is indexed instead of only gating the trigger (#578, #584).
+- **Secrets in test, fixture and example files were skipped entirely by the secrets scanner.** High-confidence secrets are now reported in those paths too (#579, #583).
+- **`cora findings list --severity` never matched, and severity colouring never applied.** Both are now case-insensitive (#586, #588).
+- **Unit tests wrote to the real data directory and could block on the global vector index lock.** Tests are isolated from the real data dir, and the lock wait is bounded (#587, #589).
+- **`cora affected` never matched naming-convention tests.** The CLI took the file extension (`rs`) as the file stem. CLI and MCP now share one query, with escaped `LIKE` wildcards, batched queries and one deduplicated pattern list (`{stem}_test`, `test_{stem}`, `{stem}.test`, `{stem}.spec`, `tests/{stem}`, `__tests__/{stem}`). MCP dead-code now honors `analysis.entry_point_patterns` like the CLI (#575).
+- **`cora --config <file> serve` ignored `--config`.** The global option is now passed through (#576).
+- **MCP `brain_search` ignored the configured embedding backend.** It now resolves the backend from the project config (#576).
+- **Review and indexing disagreed about which files to skip.** Review-time scanners now use the same patterns as the indexer (`ignore.files` + `index.skip_files`) (#576).
+- **Review scanners could resolve a different project than indexing** when run from a subdirectory or workspace member. Every entry point now resolves the project root the same way, and review no longer creates an empty `cora.db` when no index exists (#574).
+- **Files from different projects overwrote each other's fingerprints** (perpetual reindex). Files are keyed by `(project_id, path)` (schema v8). `callers`/`callees`/`trace` match names exactly instead of by substring (`run` no longer matches `rerun`), and index runs prune stale files and their edges (#565).
+- **MCP server robustness.** Stdin is framed as bytes and decoded as UTF-8; garbage input yields a `-32700` parse error; notifications get no response and `notifications/cancelled` no longer stops the server; `tools/call` without a name returns `-32602`; `limit`/`depth`/`min_lines` are clamped; `cora.install` requires `confirm: true` (#564).
+- **Chunked review printed "No issues found" while reporting issues** when chunks returned empty summaries (#562).
+- **CI:** the CLA check works for fork PRs (#553); `rustls` pinned to 0.23.45 for RUSTSEC-2026-0285 and a deprecated `f32` import removed so clippy passes on rustc 1.99 (#561).
+
+### Changed
+
+- **Ignore patterns now use a single matcher** for the index walk, review scanners, `cora scan --include/--exclude` and `watch --filter`. Behavior changes you may notice in `ignore.files` and related options:
+  - `**/*.test.ts` no longer matches `footest.ts`, and `vite.config.*` no longer matches `vite.configx`.
+  - Patterns with a wildcard in the middle (`src/*.rs`, `*.gen.*`) now match; they were silently ignored before, so files you thought were excluded may now actually be excluded.
+  - Patterns without a `/` also match by basename, in `cora scan --include/--exclude` and `watch --filter` too.
+  - An invalid glob matches literally instead of being dropped (#577).
+- **`cora index --watch` now runs the same watcher as `cora watch`.** It checks every 500 ms (was 2 s), skips hidden directories, and prints `Reindexed: ...` (#576).
+- **Internal refactors with no CLI change:** one seam for opening the index (`IndexBridge`, #574), one index-session module (#576), and review split into a deterministic stage testable without an LLM (#577), LLM parse/repair/retry policy unified behind one `Transport` seam (#582), and review-history SQL owned by a single `review_store` module (#585).
+
 ## [0.15.0] - 2026-08-31
 
 ### Added
@@ -898,7 +938,10 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.13.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.16.0...develop
+[0.16.0]: https://github.com/codecoradev/cora-code/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/codecoradev/cora-code/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/codecoradev/cora-code/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/codecoradev/cora-code/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/codecoradev/cora-code/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/codecoradev/cora-code/compare/v0.11.0...v0.11.1

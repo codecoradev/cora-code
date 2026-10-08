@@ -231,7 +231,13 @@ async fn generate_commit_message(
     let system_prompt = COMMIT_SYSTEM_PROMPT;
 
     let raw = if stream {
-        llm::chat_completion_stream_raw(llm_config, system_prompt, &user_prompt).await?
+        llm::chat_completion_stream_raw(
+            llm_config,
+            system_prompt,
+            &user_prompt,
+            &crate::progress::StdoutStream,
+        )
+        .await?
     } else {
         llm::chat_completion_raw(llm_config, system_prompt, &user_prompt).await?
     };

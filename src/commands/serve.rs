@@ -1,16 +1,15 @@
 //! `cora serve` — start MCP server with automatic reindex on startup.
 
+use crate::index::session::{ConfigSource, IndexSession};
+
 /// Execute the serve command: auto-reindex the current project, then start the MCP server.
-pub fn execute_serve() -> anyhow::Result<()> {
+///
+/// `config_path` is the global `--config` flag; the session honors it.
+pub fn execute_serve(config_path: Option<&str>) -> anyhow::Result<()> {
     // 1. Auto-reindex current project (incremental — skips unchanged files)
-    let project_root = std::env::current_dir()?;
-    let project_root =
-        crate::index::resolve_project_root(&project_root).unwrap_or(project_root.clone());
-
-    let conn = crate::index::open_global_index()?;
-    let _project_id = crate::index::ensure_project(&conn, &project_root)?;
-
-    let stats = crate::index::index_project(&conn, &project_root, false)?;
+    let session = IndexSession::open(ConfigSource::Full(config_path))?;
+    let stats = session.index(false)?;
+    drop(session);
 
     if stats.files_indexed > 0 {
         eprintln!(

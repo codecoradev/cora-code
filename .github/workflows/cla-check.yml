@@ -7,7 +7,6 @@ on:
 permissions:
   pull-requests: write
   contents: read
-  statuses: write
 
 jobs:
   cla-check:
@@ -46,9 +45,10 @@ jobs:
         env:
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
 
-      - name: Comment on PR (unsigned only)
-        if: steps.check.outputs.signed != 'true'
-        uses: actions/github-script@v7
+      - name: Comment on PR (same-repo, best effort)
+        if: steps.check.outputs.signed != 'true' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        uses: actions/github-script@v9
         with:
           script: |
             const author = '${{ github.event.pull_request.user.login }}';
@@ -96,27 +96,9 @@ jobs:
               });
             }
 
-      - name: Set commit status
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const signed = '${{ steps.check.outputs.signed }}' === 'true';
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.pull_request.head.sha }}',
-              state: signed ? 'success' : 'failure',
-              context: 'CLA Check',
-              description: signed
-                ? '✅ CLA signed'
-                : '❌ CLA not signed — sign at https://codecoradev.github.io/cla',
-              target_url: signed
-                ? 'https://github.com/codecoradev/.github/blob/main/.cla/signatures.json'
-                : 'https://codecoradev.github.io/cla',
-            });
-
       - name: Fail if not signed
         if: steps.check.outputs.signed != 'true'
         run: |
+          echo "::error title=CLA not signed::Sign the CodeCoraDev CLA at https://codecoradev.github.io/cla — once the signature PR is merged, this check turns green automatically (re-run it or wait ~1 hour)."
           echo "❌ CLA not signed by ${{ github.event.pull_request.user.login }}"
           exit 1

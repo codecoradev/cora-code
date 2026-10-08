@@ -9,7 +9,9 @@ mod ast;
 pub mod brain;
 mod extract;
 pub mod graph;
+pub mod queries;
 pub mod schema;
+pub mod session;
 mod symbols;
 pub mod vector;
 
@@ -32,9 +34,25 @@ pub use symbols::{SearchResult, SymbolKind, SymbolQuery};
 /// Project isolation is handled via the `project_id` foreign key.
 pub fn open_global_index() -> anyhow::Result<Connection> {
     crate::data_dir::ensure_data_dir()?;
-    let db_path = crate::data_dir::graph_db_path();
+    open_index_at(&crate::data_dir::graph_db_path())
+}
 
-    let conn = Connection::open(&db_path)?;
+/// Open (creating if absent) the index database at `db_path`, apply the
+/// standard PRAGMAs and run migrations.
+///
+/// This is the single place that opens an index connection; the production path
+/// goes through [`open_global_index`], tests may point it at a temp file.
+pub fn open_index_at(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open(db_path)?;
+    apply_pragmas(&conn)?;
+    schema::run_migrations(&conn)?;
+
+    debug!("Opened index at {}", db_path.display());
+    Ok(conn)
+}
+
+/// The one PRAGMA set every read-write index connection uses.
+pub fn apply_pragmas(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\
          PRAGMA foreign_keys=ON;\
@@ -43,11 +61,9 @@ pub fn open_global_index() -> anyhow::Result<Connection> {
          PRAGMA mmap_size=268435456;\
          PRAGMA temp_store=MEMORY;",
     )?;
-    schema::run_migrations(&conn)?;
-
-    debug!("Opened global index at {}", db_path.display());
-    Ok(conn)
+    Ok(())
 }
+
 /// Resolve the `project_id` for a given root path, creating the project row if needed.
 pub fn ensure_project(conn: &Connection, root: &Path) -> anyhow::Result<i64> {
     let root_str = root.to_string_lossy().to_string();
@@ -120,17 +136,6 @@ pub fn resolve_project_root(start: &Path) -> Option<std::path::PathBuf> {
     fallback
 }
 
-/// Resolve `project_id` from the current directory, using project root detection.
-///
-/// Walks up from CWD to find a project root (`.cora.yaml`, `Cargo.toml`, etc.).
-/// Falls back to CWD if no marker is found.
-pub fn resolve_project_id(conn: &Connection) -> anyhow::Result<(i64, std::path::PathBuf)> {
-    let cwd = std::env::current_dir()?;
-    let root = resolve_project_root(&cwd).unwrap_or_else(|| cwd.clone());
-    let project_id = ensure_project(conn, &root)?;
-    Ok((project_id, root))
-}
-
 #[cfg(test)]
 /// Index a single file: extract symbols and store in the database.
 /// Test-only — production uses `index_project_with_id` with batch fingerprinting.
@@ -183,12 +188,11 @@ fn index_file_in_tx(
     tx.execute(
         "INSERT INTO files (path, fingerprint, last_indexed, language, symbol_count, project_id)
          VALUES (?1, ?2, datetime('now'), ?3, ?4, ?5)
-         ON CONFLICT(path) DO UPDATE SET
+         ON CONFLICT(project_id, path) DO UPDATE SET
            fingerprint = excluded.fingerprint,
            last_indexed = excluded.last_indexed,
            language = excluded.language,
-           symbol_count = excluded.symbol_count,
-           project_id = excluded.project_id",
+           symbol_count = excluded.symbol_count",
         rusqlite::params![
             file_path,
             fingerprint,
@@ -282,11 +286,26 @@ fn load_all_fingerprints(
     Ok(map)
 }
 
-/// Index a project directory, respecting .gitignore.
-///
-/// Returns summary stats.
+/// Exclusion patterns for indexing = review's `ignore.files` plus
+/// `index.skip_files`, so every index entry point (index, watch, serve) honors
+/// the same ignores (#521). `None` when no config could be loaded.
+pub fn skip_patterns_from_config(
+    config: Option<&crate::config::schema::Config>,
+) -> Option<Vec<String>> {
+    config.map(|c| {
+        let mut pats = c.ignore.files.clone();
+        pats.extend(c.rules_config.index_skip_files.iter().cloned());
+        pats.dedup();
+        pats
+    })
+}
+
+/// Index a project directory with NO skip patterns, respecting .gitignore.
+/// Test-only: production entry points must go through
+/// `index_project_with_skip` with the resolved config.
+#[cfg(test)]
 pub fn index_project(conn: &Connection, root: &Path, verbose: bool) -> anyhow::Result<IndexStats> {
-    index_project_with_id(conn, ensure_project(conn, root)?, root, verbose, None)
+    index_project_with_id(conn, ensure_project(conn, root)?, root, verbose, None, None)
 }
 
 /// Index a project directory, honoring skip patterns (glob `*`/`**`, matched
@@ -302,6 +321,20 @@ pub fn index_project_with_skip(
     root: &Path,
     verbose: bool,
     skip_patterns: Option<&[String]>,
+) -> anyhow::Result<IndexStats> {
+    index_project_filtered(conn, root, verbose, skip_patterns, None)
+}
+
+/// [`index_project_with_skip`] restricted to files for which `include`
+/// (called with the root-relative path) returns true. Files that fail the
+/// predicate are neither read nor re-indexed, but still count as present on
+/// disk, so their stored rows are not pruned. `None` means every file.
+pub fn index_project_filtered(
+    conn: &Connection,
+    root: &Path,
+    verbose: bool,
+    skip_patterns: Option<&[String]>,
+    include: Option<&dyn Fn(&str) -> bool>,
 ) -> anyhow::Result<IndexStats> {
     let project_id = ensure_project(conn, root)?;
 
@@ -347,7 +380,7 @@ pub fn index_project_with_skip(
         }
     }
 
-    index_project_with_id(conn, project_id, root, verbose, skip_patterns)
+    index_project_with_id(conn, project_id, root, verbose, skip_patterns, include)
 }
 
 /// Internal: index a project with an already-resolved `project_id`.
@@ -357,8 +390,13 @@ fn index_project_with_id(
     root: &Path,
     verbose: bool,
     skip_patterns: Option<&[String]>,
+    include: Option<&dyn Fn(&str) -> bool>,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
+    let skip_matcher = skip_patterns.map(crate::engine::path_match::PathMatcher::new);
+    // Every indexable file seen on disk this run (post language + skip
+    // filters). Anything stored for the project but absent here is stale.
+    let mut walked: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Collect files to index
     let mut files_to_index: Vec<(String, String, String, String)> = Vec::new(); // (rel_str, content, language, cheap_fp)
@@ -390,14 +428,18 @@ fn index_project_with_id(
         // Config-driven exclusion (#521): honor ignore.files /
         // index_skip_files so dead-code, review index scanners, and brain
         // never see these files.
-        if skip_patterns.is_some_and(|patterns| {
-            crate::engine::index_scanner::should_skip_file(&rel_str, patterns)
-        }) {
+        if skip_matcher.as_ref().is_some_and(|m| m.is_match(&rel_str)) {
             stats.files_excluded += 1;
             continue;
         }
 
         stats.files_scanned += 1;
+        walked.insert(rel_str.clone());
+
+        // Caller-supplied restriction (watch --filter / changed files only).
+        if include.is_some_and(|f| !f(&rel_str)) {
+            continue;
+        }
 
         // Compute mtime:size fingerprint — cheap, no file read needed.
         // metadata() is a stat() call, ~microseconds per file.
@@ -520,6 +562,15 @@ fn index_project_with_id(
         );
     }
 
+    // Drop rows for files deleted, gitignored, or newly excluded since the
+    // last run so symbols/call graph/edges never outlive their source file.
+    let stale: Vec<String> = stored_fingerprints
+        .keys()
+        .filter(|p| !walked.contains(*p))
+        .cloned()
+        .collect();
+    stats.files_pruned = prune_paths(conn, project_id, &stale)?;
+
     // Update project's last_indexed timestamp
     conn.execute(
         "UPDATE projects SET last_indexed = datetime('now') WHERE id = ?1",
@@ -536,7 +587,7 @@ fn index_project_with_id(
     // (legacy pre-0.3.0 vecq file, vecq #542: if all files are unchanged this
     // would be the only chance to re-embed — without it the vector signal
     // stays dead until a file actually changes).
-    if stats.files_indexed > 0 || brain::vector_index_needs_rebuild() {
+    if stats.files_indexed > 0 || stats.files_pruned > 0 || brain::vector_index_needs_rebuild() {
         match brain::embed_project(conn, project_id) {
             Ok(n) => {
                 stats.embedded_symbols = Some(n);
@@ -619,44 +670,44 @@ pub fn index_stats(conn: &Connection, project_id: i64) -> anyhow::Result<IndexSu
 
 /// Remove symbols for files that no longer exist on disk, scoped to a project.
 pub fn prune_deleted(conn: &Connection, project_id: i64, root: &Path) -> anyhow::Result<usize> {
-    let mut deleted = 0;
-
     let mut stmt = conn.prepare("SELECT path FROM files WHERE project_id = ?1")?;
     let paths: Vec<String> = stmt
         .query_map(rusqlite::params![project_id], |row| row.get::<_, String>(0))?
         .filter_map(|r| r.ok())
         .collect();
 
-    let to_prune: Vec<&String> = paths
-        .iter()
+    let to_prune: Vec<String> = paths
+        .into_iter()
         .filter(|path| !root.join(path).exists())
         .collect();
 
-    if !to_prune.is_empty() {
-        let tx = conn.unchecked_transaction()?;
-        for path in &to_prune {
+    prune_paths(conn, project_id, &to_prune)
+}
+
+/// Delete all index data (symbols, call graph, edges, file row) for the given
+/// project-relative paths in a single transaction. Returns the number of files.
+fn prune_paths(conn: &Connection, project_id: i64, paths: &[String]) -> anyhow::Result<usize> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    for path in paths {
+        for table in ["symbols", "call_graph", "edges"] {
             tx.execute(
-                "DELETE FROM symbols WHERE file = ?1 AND project_id = ?2",
-                rusqlite::params![path, project_id],
-            )?;
-            tx.execute(
-                "DELETE FROM call_graph WHERE file = ?1 AND project_id = ?2",
-                rusqlite::params![path, project_id],
-            )?;
-            tx.execute(
-                "DELETE FROM files WHERE path = ?1 AND project_id = ?2",
+                &format!("DELETE FROM {table} WHERE file = ?1 AND project_id = ?2"),
                 rusqlite::params![path, project_id],
             )?;
         }
-        tx.commit()?;
-        deleted = to_prune.len();
+        tx.execute(
+            "DELETE FROM files WHERE path = ?1 AND project_id = ?2",
+            rusqlite::params![path, project_id],
+        )?;
     }
+    tx.commit()?;
 
-    if deleted > 0 {
-        info!("Pruned {deleted} deleted files from index");
-    }
-
-    Ok(deleted)
+    info!("Pruned {} deleted files from index", paths.len());
+    Ok(paths.len())
 }
 
 #[cfg(test)]
@@ -675,6 +726,8 @@ pub struct IndexStats {
     pub files_skipped: usize,
     /// Files excluded by config skip patterns (ignore.files / index.skip_files).
     pub files_excluded: usize,
+    /// Stale files (deleted / ignored / newly excluded) removed from the index.
+    pub files_pruned: usize,
     pub symbols_indexed: usize,
     pub errors: usize,
     pub embedded_symbols: Option<usize>,
@@ -887,18 +940,6 @@ pub struct AuthService {
         }
     }
 
-    #[test]
-    fn test_resolve_project_id_uses_project_root() {
-        let conn = mem_conn();
-        // resolve_project_id uses CWD — which is the cora-code crate root.
-        let (pid, root) = resolve_project_id(&conn).unwrap();
-        assert!(pid > 0);
-        assert!(
-            root.join("Cargo.toml").exists(),
-            "resolved root should contain Cargo.toml"
-        );
-    }
-
     /// Regression (#522): running `cora index` from inside a workspace member
     /// crate must resolve to the WORKSPACE root (the member's plain
     /// `Cargo.toml` is not the project root), so CLI and MCP agree on one
@@ -1000,5 +1041,133 @@ pub struct AuthService {
             "stored symbols must survive an incremental no-op re-run"
         );
         assert_eq!(summary.total_files, 1);
+    }
+
+    /// Regression: `files` was keyed by `path` alone, so two projects with
+    /// the same relative path overwrote each other's row (fingerprint +
+    /// project_id) and both re-indexed forever.
+    #[test]
+    fn test_same_relative_path_in_two_projects() {
+        let conn = mem_conn();
+        let mut roots = Vec::new();
+        for body in ["pub fn alpha() {}\n", "pub fn beta() {}\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("lib.rs"), body).unwrap();
+            roots.push(tmp);
+        }
+
+        for tmp in &roots {
+            let s = index_project(&conn, tmp.path(), false).unwrap();
+            assert_eq!(s.files_indexed, 1);
+        }
+        // Both projects must now be fully up to date.
+        for tmp in &roots {
+            let s = index_project(&conn, tmp.path(), false).unwrap();
+            assert_eq!(s.files_indexed, 0, "unchanged project must not re-index");
+            assert_eq!(s.files_skipped, 1);
+            let pid = ensure_project(&conn, tmp.path()).unwrap();
+            assert_eq!(index_stats(&conn, pid).unwrap().total_files, 1);
+        }
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE path = 'lib.rs'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    fn count_for_file(conn: &Connection, table: &str, project_id: i64, file: &str) -> i64 {
+        let col = if table == "files" { "path" } else { "file" };
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?1 AND project_id = ?2"),
+            rusqlite::params![file, project_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Regression: stale files were only pruned via `--prune`; a normal index
+    /// run must drop symbols, call_graph, edges and the file row.
+    #[test]
+    fn test_index_run_auto_prunes_deleted_files() {
+        let conn = mem_conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("keep.rs"), "pub fn keep() { helper(); }\n").unwrap();
+        std::fs::write(root.join("gone.rs"), "pub fn gone() { helper(); }\n").unwrap();
+
+        index_project(&conn, root, false).unwrap();
+        let pid = ensure_project(&conn, root).unwrap();
+        // Seed an edge row directly so the check holds without tree-sitter.
+        for f in ["keep.rs", "gone.rs"] {
+            conn.execute(
+                "INSERT INTO edges (source, kind, target, file, line, project_id)
+                 VALUES ('a', 'CALLS', 'b', ?1, 1, ?2)",
+                rusqlite::params![f, pid],
+            )
+            .unwrap();
+        }
+        assert!(count_for_file(&conn, "symbols", pid, "gone.rs") > 0);
+        assert!(count_for_file(&conn, "call_graph", pid, "gone.rs") > 0);
+
+        std::fs::remove_file(root.join("gone.rs")).unwrap();
+        let stats = index_project(&conn, root, false).unwrap();
+        assert_eq!(stats.files_pruned, 1);
+
+        for table in ["symbols", "call_graph", "edges", "files"] {
+            assert_eq!(count_for_file(&conn, table, pid, "gone.rs"), 0, "{table}");
+        }
+        assert!(count_for_file(&conn, "symbols", pid, "keep.rs") > 0);
+        assert_eq!(count_for_file(&conn, "edges", pid, "keep.rs"), 1);
+    }
+
+    /// `prune_deleted` (the `--prune` path) must also clear `edges`.
+    #[test]
+    fn test_prune_deleted_clears_edges() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        index_file(&conn, pid, "gone.rs", "fn removed() {}", "rs").unwrap();
+        conn.execute(
+            "INSERT INTO edges (source, kind, target, file, line, project_id)
+             VALUES ('a', 'CALLS', 'b', 'gone.rs', 1, ?1)",
+            [pid],
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(prune_deleted(&conn, pid, tmp.path()).unwrap(), 1);
+        assert_eq!(count_for_file(&conn, "edges", pid, "gone.rs"), 0);
+    }
+
+    /// Regression: serve/watch called the no-skip entry point, undoing
+    /// `ignore.files` / `index.skip_files`. Patterns come from one shared
+    /// resolver and the skip-aware entry point must keep excluded files out.
+    #[test]
+    fn test_skip_patterns_from_config_and_exclusion() {
+        let mut config = crate::config::schema::Config::default();
+        config.ignore.files = vec!["examples/**".to_string()];
+        config.rules_config.index_skip_files = vec!["vendor/**".to_string()];
+        let pats = skip_patterns_from_config(Some(&config)).unwrap();
+        assert!(pats.contains(&"examples/**".to_string()));
+        assert!(pats.contains(&"vendor/**".to_string()));
+        assert!(skip_patterns_from_config(None).is_none());
+
+        let conn = mem_conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("examples")).unwrap();
+        std::fs::write(
+            root.join("examples").join("demo.py"),
+            "def demo():\n    pass\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("core.py"), "def core_fn():\n    pass\n").unwrap();
+
+        let stats = index_project_with_skip(&conn, root, false, Some(&pats)).unwrap();
+        assert_eq!(stats.files_excluded, 1);
+        let pid = ensure_project(&conn, root).unwrap();
+        assert_eq!(count_for_file(&conn, "files", pid, "examples/demo.py"), 0);
+        assert_eq!(count_for_file(&conn, "files", pid, "core.py"), 1);
     }
 }

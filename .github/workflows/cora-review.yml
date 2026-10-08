@@ -20,6 +20,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # SECURITY: this job checks out untrusted PR code while holding
+      # CORA_API_KEY (pull_request_target). A PR-supplied .cora.yaml could set
+      # provider.base_url and exfiltrate the key. CORA_BASE_URL (env) always
+      # takes precedence over project config, so require it to be pinned.
+      - name: Require pinned CORA_BASE_URL
+        env:
+          CORA_BASE_URL: ${{ secrets.CORA_BASE_URL }}
+        run: |
+          if [ -z "$CORA_BASE_URL" ]; then
+            echo "::error::Secret CORA_BASE_URL must be set so a PR-supplied .cora.yaml cannot redirect the API key."
+            exit 1
+          fi
+
       - name: Checkout PR head
         uses: actions/checkout@v4
         with:

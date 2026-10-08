@@ -1,7 +1,9 @@
 //! `cora findings` subcommand — manage review findings stored in cora.db.
 
 use anyhow::Result;
-use colored::Colorize;
+use colored::{Color, Colorize};
+
+use crate::engine::review_store::{self, FindingFilter, FindingStats, ReviewStore, Transition};
 
 /// Exit codes.
 const EXIT_OK: i32 = 0;
@@ -17,7 +19,11 @@ pub enum FindingsAction {
         all: bool,
 
         /// Filter by severity (info, minor, major, critical)
-        #[clap(long)]
+        #[clap(
+            long,
+            value_parser = ["info", "minor", "major", "critical"],
+            ignore_case = true
+        )]
         severity: Option<String>,
 
         /// Filter by file path substring
@@ -63,13 +69,11 @@ pub fn execute_findings(action: &FindingsAction) -> Result<i32> {
     // Write actions (dismiss, reopen) use a read-write connection.
     match action {
         FindingsAction::List { .. } | FindingsAction::Stats { .. } => {
-            let conn = match crate::engine::db_writer::open_db_for_read() {
-                Some(c) => c,
-                None => {
-                    eprintln!("{}", "Error: could not open cora.db".red());
-                    return Ok(EXIT_NOT_FOUND);
-                }
+            let Ok(conn) = review_store::open_read() else {
+                eprintln!("{}", "Error: could not open cora.db".red());
+                return Ok(EXIT_NOT_FOUND);
             };
+            let store = ReviewStore::new(&conn);
             match action {
                 FindingsAction::List {
                     all,
@@ -77,90 +81,48 @@ pub fn execute_findings(action: &FindingsAction) -> Result<i32> {
                     file,
                     json,
                     limit,
-                } => list_findings(&conn, *all, severity, file, *json, *limit),
-                FindingsAction::Stats { json } => stats(&conn, *json),
+                } => {
+                    let filter = FindingFilter {
+                        all: *all,
+                        severity: severity.clone(),
+                        file: file.clone(),
+                        limit: *limit,
+                    };
+                    list_findings(&store, &filter, *json)
+                }
+                FindingsAction::Stats { json } => stats(&store, *json),
                 _ => unreachable!(),
             }
         }
         FindingsAction::Dismiss { id, reason } => {
-            let conn = match crate::engine::db_writer::open_db_for_write() {
-                Some(c) => c,
-                None => {
-                    eprintln!("{}", "Error: could not open cora.db for writing".red());
-                    return Ok(EXIT_NOT_FOUND);
-                }
+            let Ok(conn) = review_store::open_write() else {
+                eprintln!("{}", "Error: could not open cora.db for writing".red());
+                return Ok(EXIT_NOT_FOUND);
             };
-            dismiss(&conn, *id, reason)
+            dismiss(&ReviewStore::new(&conn), *id, reason.as_deref())
         }
         FindingsAction::Reopen { id } => {
-            let conn = match crate::engine::db_writer::open_db_for_write() {
-                Some(c) => c,
-                None => {
-                    eprintln!("{}", "Error: could not open cora.db for writing".red());
-                    return Ok(EXIT_NOT_FOUND);
-                }
+            let Ok(conn) = review_store::open_write() else {
+                eprintln!("{}", "Error: could not open cora.db for writing".red());
+                return Ok(EXIT_NOT_FOUND);
             };
-            reopen(&conn, *id)
+            reopen(&ReviewStore::new(&conn), *id)
         }
     }
 }
 
-fn list_findings(
-    conn: &rusqlite::Connection,
-    all: bool,
-    severity: &Option<String>,
-    file: &Option<String>,
-    json: bool,
-    limit: usize,
-) -> Result<i32> {
-    let mut sql = String::from(
-        "SELECT f.id, f.severity, f.file_path, f.line_number, f.title, f.status,
-               f.fingerprint, r.created_at
-        FROM findings f
-        JOIN reviews r ON f.review_id = r.id",
-    );
-
-    // Build WHERE clause with parameterized placeholders to prevent SQL injection.
-    let mut wheres: Vec<&str> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-
-    if !all {
-        wheres.push("f.status = 'open'");
+/// Colour for a stored severity (matched case-insensitively); `None` = dimmed.
+fn severity_color(severity: &str) -> Option<Color> {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => Some(Color::Red),
+        "major" => Some(Color::Yellow),
+        "minor" => Some(Color::Green),
+        _ => None,
     }
-    if let Some(s) = severity {
-        wheres.push("f.severity = ?");
-        params.push(Box::new(s.to_uppercase()));
-    }
-    if let Some(f) = file {
-        wheres.push("f.file_path LIKE ?");
-        params.push(Box::new(format!("%{f}%")));
-    }
+}
 
-    if !wheres.is_empty() {
-        sql.push_str(" WHERE ");
-        sql.push_str(&wheres.join(" AND "));
-    }
-    sql.push_str(" ORDER BY f.id DESC LIMIT ?");
-    params.push(Box::new(limit as i64));
-
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<ListRow> = stmt
-        .query(param_refs.as_slice())?
-        .mapped(|r| {
-            Ok(ListRow {
-                id: r.get(0)?,
-                severity: r.get(1)?,
-                file_path: r.get(2)?,
-                line_number: r.get(3)?,
-                title: r.get(4)?,
-                status: r.get(5)?,
-                fingerprint: r.get(6)?,
-                created_at: r.get(7)?,
-            })
-        })
-        .filter_map(|r| r.ok())
-        .collect();
+fn list_findings(store: &ReviewStore<'_>, filter: &FindingFilter, json: bool) -> Result<i32> {
+    let rows = store.list_findings(filter)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -178,10 +140,10 @@ fn list_findings(
         rows.len().to_string().bold()
     );
     for r in &rows {
-        let sev = match r.severity.as_str() {
-            "CRITICAL" => r.severity.clone().red().to_string(),
-            "MAJOR" => r.severity.clone().yellow().to_string(),
-            "MINOR" => r.severity.clone().green().to_string(),
+        let sev = match severity_color(&r.severity) {
+            Some(Color::Red) => r.severity.clone().red().to_string(),
+            Some(Color::Yellow) => r.severity.clone().yellow().to_string(),
+            Some(Color::Green) => r.severity.clone().green().to_string(),
             _ => r.severity.clone().dimmed().to_string(),
         };
         let status_tag = match r.status.as_str() {
@@ -208,38 +170,14 @@ fn list_findings(
     Ok(EXIT_OK)
 }
 
-fn stats(conn: &rusqlite::Connection, json: bool) -> Result<i32> {
-    let total: i64 = conn
-        .query_row("SELECT count(*) FROM findings", [], |r| r.get(0))
-        .unwrap_or(0);
-
-    let open: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM findings WHERE status = 'open'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let resolved: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM findings WHERE status = 'resolved'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let dismissed: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM findings WHERE status = 'dismissed'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let reviews: i64 = conn
-        .query_row("SELECT count(*) FROM reviews", [], |r| r.get(0))
-        .unwrap_or(0);
+fn stats(store: &ReviewStore<'_>, json: bool) -> Result<i32> {
+    let FindingStats {
+        total,
+        open,
+        resolved,
+        dismissed,
+        reviews,
+    } = store.stats()?;
 
     if json {
         let stats = serde_json::json!({
@@ -269,78 +207,72 @@ fn stats(conn: &rusqlite::Connection, json: bool) -> Result<i32> {
     Ok(EXIT_OK)
 }
 
-fn dismiss(conn: &rusqlite::Connection, id: i64, reason: &Option<String>) -> Result<i32> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT status FROM findings WHERE id = ?1",
-            rusqlite::params![id],
-            |r| r.get::<_, String>(0),
-        )
-        .is_ok();
-
-    if !exists {
-        eprintln!("{}", format!("Finding #{} not found.", id).red());
-        return Ok(EXIT_NOT_FOUND);
-    }
-
-    conn.execute(
-        "UPDATE findings SET status = 'dismissed' WHERE id = ?1",
-        rusqlite::params![id],
-    )?;
-
-    let note = reason.as_deref().unwrap_or("Manually dismissed via CLI");
-    conn.execute(
-        "INSERT INTO finding_events (finding_id, event_type, note) VALUES (?1, 'dismissed', ?2)",
-        rusqlite::params![id, note],
-    )?;
-
-    println!("{} Finding #{} dismissed.", "✓".green(), id);
-    Ok(EXIT_OK)
-}
-
-fn reopen(conn: &rusqlite::Connection, id: i64) -> Result<i32> {
-    let status: Option<String> = conn
-        .query_row(
-            "SELECT status FROM findings WHERE id = ?1",
-            rusqlite::params![id],
-            |r| r.get(0),
-        )
-        .ok();
-
-    match status.as_deref() {
-        Some("open") => {
-            println!("{}", format!("Finding #{} is already open.", id).yellow());
-            return Ok(EXIT_OK);
-        }
-        None => {
+fn dismiss(store: &ReviewStore<'_>, id: i64, reason: Option<&str>) -> Result<i32> {
+    match store.dismiss(id, reason)? {
+        Transition::NotFound => {
             eprintln!("{}", format!("Finding #{} not found.", id).red());
-            return Ok(EXIT_NOT_FOUND);
+            Ok(EXIT_NOT_FOUND)
         }
-        _ => {}
+        _ => {
+            println!("{} Finding #{} dismissed.", "✓".green(), id);
+            Ok(EXIT_OK)
+        }
     }
-
-    conn.execute(
-        "UPDATE findings SET status = 'open' WHERE id = ?1",
-        rusqlite::params![id],
-    )?;
-
-    conn.execute(
-        "INSERT INTO finding_events (finding_id, event_type, note) VALUES (?1, 'reopened', 'Manually reopened via CLI')",
-        rusqlite::params![id],
-    )?;
-
-    println!("{} Finding #{} reopened.", "✓".green(), id);
-    Ok(EXIT_OK)
 }
 
-#[derive(serde::Serialize)]
-struct ListRow {
-    id: i64,
-    severity: String,
-    file_path: String,
-    line_number: Option<i64>,
-    title: String,
-    status: String,
-    fingerprint: Option<String>,
-    created_at: String,
+fn reopen(store: &ReviewStore<'_>, id: i64) -> Result<i32> {
+    match store.reopen(id)? {
+        Transition::Unchanged => {
+            println!("{}", format!("Finding #{} is already open.", id).yellow());
+            Ok(EXIT_OK)
+        }
+        Transition::NotFound => {
+            eprintln!("{}", format!("Finding #{} not found.", id).red());
+            Ok(EXIT_NOT_FOUND)
+        }
+        Transition::Applied => {
+            println!("{} Finding #{} reopened.", "✓".green(), id);
+            Ok(EXIT_OK)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    struct Harness {
+        #[clap(subcommand)]
+        action: FindingsAction,
+    }
+
+    fn parse_severity(arg: &str) -> Result<Option<String>, clap::Error> {
+        let h = Harness::try_parse_from(["t", "list", "--severity", arg])?;
+        match h.action {
+            FindingsAction::List { severity, .. } => Ok(severity),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn severity_arg_accepts_any_case_and_rejects_unknown() {
+        for (arg, want) in [("major", "major"), ("MAJOR", "major"), ("Info", "info")] {
+            // clap keeps the typed case; the store lowercases it.
+            let got = parse_severity(arg).unwrap().unwrap();
+            assert!(got.eq_ignore_ascii_case(want));
+        }
+        assert!(parse_severity("bogus").is_err());
+    }
+
+    #[test]
+    fn severity_color_is_case_insensitive() {
+        assert_eq!(severity_color("critical"), Some(Color::Red));
+        assert_eq!(severity_color("CRITICAL"), Some(Color::Red));
+        assert_eq!(severity_color("major"), Some(Color::Yellow));
+        assert_eq!(severity_color("Minor"), Some(Color::Green));
+        assert_eq!(severity_color("info"), None);
+        assert_eq!(severity_color("weird"), None);
+    }
 }

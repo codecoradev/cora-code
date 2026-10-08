@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::Path;
 
+use crate::engine::path_match::PathMatcher;
 use crate::error::CoraError;
-use glob::Pattern;
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tracing::debug;
@@ -52,15 +52,8 @@ pub fn walk_project(
         extensions.insert(ext.trim_start_matches('.').to_lowercase());
     }
 
-    let include_globs: Vec<Pattern> = include_patterns
-        .iter()
-        .filter_map(|p| Pattern::new(p).ok())
-        .collect();
-
-    let exclude_globs: Vec<Pattern> = exclude_patterns
-        .iter()
-        .filter_map(|p| Pattern::new(p).ok())
-        .collect();
+    let include_globs = PathMatcher::new(include_patterns);
+    let exclude_globs = PathMatcher::new(exclude_patterns);
 
     let mut entries = Vec::new();
 
@@ -110,13 +103,12 @@ pub fn walk_project(
             .to_string();
 
         // Check exclude patterns
-        if exclude_globs.iter().any(|g| g.matches(&relative)) {
+        if exclude_globs.is_match(&relative) {
             continue;
         }
 
         // Check include patterns (if any specified)
-        let has_include = !include_globs.is_empty();
-        if has_include && !include_globs.iter().any(|g| g.matches(&relative)) {
+        if !include_globs.is_empty() && !include_globs.is_match(&relative) {
             continue;
         }
 

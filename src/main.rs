@@ -17,8 +17,6 @@ mod index;
 mod mcp;
 mod progress;
 
-use index::schema;
-
 use commands::{
     auth, commit_cmd, completion, config_cmd, debt, hook_cmd, init, profile, providers, review,
     scan, upload,
@@ -639,6 +637,22 @@ enum ProfileAction {
 }
 
 /// Format bytes as human-readable string.
+/// Strict open of the index for read-only CLI arms: prints a friendly hint and
+/// exits when no index exists yet.
+fn open_index_strict_or_exit() -> Result<(rusqlite::Connection, i64, std::path::PathBuf)> {
+    match engine::index_bridge::IndexBridge::open_strict_cwd() {
+        Ok(bridge) => bridge.into_strict_parts(),
+        Err(e)
+            if e.downcast_ref::<engine::index_bridge::NoIndexError>()
+                .is_some() =>
+        {
+            eprintln!("{}", "No index found. Run `cora index` first.".yellow());
+            std::process::exit(1);
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -697,160 +711,16 @@ async fn main() -> Result<()> {
             watch,
             verbose,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
-
-            if rebuild {
-                // Delete all data for this project via CASCADE
-                schema::delete_project(&conn, project_id)?;
-                eprintln!("{}", "Dropped existing index for project.".dimmed());
-                // Re-register the project (gets a fresh project_id)
-                let _fresh_id =
-                    schema::get_or_create_project(&conn, &project_root.to_string_lossy())?;
-            }
-
-            if show_stats {
-                let summary = index::index_stats(&conn, project_id)?;
-                println!("{}", "SYMBOL INDEX".cyan().bold());
-                println!("{}", "────────────────────────────".dimmed());
-                println!("  Total symbols:  {}", summary.total_symbols);
-                println!("  Total files:    {}", summary.total_files);
-                println!("  Database size:  {}", format_bytes(summary.db_size_bytes));
-                println!();
-                println!("  {}", "By Kind".cyan());
-                for (kind, count) in &summary.symbols_by_kind {
-                    println!("    {kind:<16} {count}");
-                }
-                println!();
-                println!("  {}", "By Language".cyan());
-                for (lang, count) in &summary.symbols_by_language {
-                    println!("    {lang:<16} {count}");
-                }
-            } else if prune {
-                let deleted = index::prune_deleted(&conn, project_id, &project_root)?;
-                println!(
-                    "{}",
-                    format!("Pruned {deleted} deleted files from index.").green()
-                );
-            } else if watch {
-                // Initial index
-                eprintln!("{}", "🔍 Initial index...".cyan());
-                let stats =
-                    index::index_project(&conn, &project_root, verbose || cli.global.verbose)?;
-                eprintln!(
-                    "{}",
-                    format!(
-                        "✅ Indexed {} symbols. Watching for changes... (Ctrl+C to stop)",
-                        stats.symbols_indexed
-                    )
-                    .green()
-                );
-
-                // Poll loop: re-index changed files every 2 seconds
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    let stats = index::index_project(&conn, &project_root, false)?;
-                    if stats.files_indexed > 0 {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "🔄 Updated {} files, {} symbols",
-                                stats.files_indexed, stats.symbols_indexed
-                            )
-                            .cyan()
-                        );
-                    }
-                }
-            } else {
-                // Load config for config-hash invalidation + brain embedding backend
-                let config = crate::config::loader::load_config(
-                    cli.global.config.as_deref(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                )
-                .ok();
-                // Exclusion patterns = review's ignore.files + index.skip_files
-                // so dead-code/index scanners respect the same ignores (#521).
-                let skip_patterns: Option<Vec<String>> = config.as_ref().map(|c| {
-                    let mut pats = c.ignore.files.clone();
-                    pats.extend(c.rules_config.index_skip_files.iter().cloned());
-                    pats.dedup();
-                    pats
-                });
-
-                // Resolve embedding backend from brain config
-                let brain_mode = config
-                    .as_ref()
-                    .map(|c| c.brain.embedding.to_string())
-                    .unwrap_or_else(|| "auto".to_string());
-                crate::embed::resolve_backend(&brain_mode);
-                index::vector::apply_config_store(config.as_ref());
-
-                eprintln!("{}", "🔍 Indexing project...".cyan());
-                let stats = index::index_project_with_skip(
-                    &conn,
-                    &project_root,
-                    verbose || cli.global.verbose,
-                    skip_patterns.as_deref(),
-                )?;
-                if stats.files_indexed == 0 && stats.errors == 0 {
-                    // Incremental no-op: fingerprints all matched. Report the
-                    // STORED totals instead of a confusing zeros line (#522).
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "✓ Index up to date ({} files unchanged)",
-                            stats.files_skipped
-                        )
-                        .green()
-                    );
-                    if let Ok(summary) = index::index_stats(&conn, project_id) {
-                        eprintln!(
-                            "{}",
-                            format!(
-                                "   {} symbols across {} files",
-                                summary.total_symbols, summary.total_files
-                            )
-                            .dimmed()
-                        );
-                    }
-                } else {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "✅ Indexed {} symbols from {} files ({} skipped, {} errors)",
-                            stats.symbols_indexed,
-                            stats.files_indexed,
-                            stats.files_skipped,
-                            stats.errors
-                        )
-                        .green()
-                    );
-                }
-                if stats.files_excluded > 0 {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "   {} files excluded by ignore patterns",
-                            stats.files_excluded
-                        )
-                        .dimmed()
-                    );
-                }
-                eprintln!(
-                    "{}",
-                    format!(
-                        "   Database: {}",
-                        crate::data_dir::graph_db_path().display()
-                    )
-                    .dimmed()
-                );
-            }
+            commands::index_cmd::run_index(
+                &commands::index_cmd::IndexOptions {
+                    stats: show_stats,
+                    prune,
+                    rebuild,
+                    watch,
+                    verbose: verbose || cli.global.verbose,
+                },
+                cli.global.config.as_deref(),
+            )?;
             0
         }
 
@@ -862,17 +732,7 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             let sym_kind = kind.as_deref().map(index::SymbolKind::from_str);
 
@@ -935,15 +795,7 @@ async fn main() -> Result<()> {
             limit,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
             let callers = index::graph::find_callers(&conn, project_id, &symbol, limit)?;
 
             // Cross-project fallback: if no callers in current project,
@@ -1016,15 +868,7 @@ async fn main() -> Result<()> {
             depth,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run 'cora index' first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
             let impact = index::graph::impact_analysis(&conn, project_id, &symbol, depth)?;
 
             if json {
@@ -1065,15 +909,7 @@ async fn main() -> Result<()> {
             depth,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             let dir = match direction.as_str() {
                 "incoming" => index::graph::TraceDirection::Incoming,
@@ -1124,15 +960,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Arch { json } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             let overview = index::graph::arch_overview(&conn, project_id)?;
 
@@ -1174,32 +1002,12 @@ async fn main() -> Result<()> {
                 std::process::exit(1);
             }
 
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
-            // Resolve embedding backend from config for query embedding
-            let brain_cfg = crate::config::loader::load_config(
+            // Config → embedding backend → vector store (shared session step).
+            index::session::configure_for_search(index::session::ConfigSource::Full(
                 cli.global.config.as_deref(),
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .ok();
-            let brain_mode = brain_cfg
-                .as_ref()
-                .map(|c| c.brain.embedding.to_string())
-                .unwrap_or_else(|| "auto".to_string());
-            crate::embed::resolve_backend(&brain_mode);
-            index::vector::apply_config_store(brain_cfg.as_ref());
+            ));
             let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
 
             if json {
@@ -1235,15 +1043,7 @@ async fn main() -> Result<()> {
             filter,
             json,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let db_path = crate::data_dir::graph_db_path();
-            if !db_path.exists() {
-                eprintln!("{}", "No index found. Run `cora index` first.".yellow());
-                std::process::exit(1);
-            }
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
             // Gather changed files
             let mut changed: Vec<String> = files;
@@ -1276,95 +1076,10 @@ async fn main() -> Result<()> {
                 std::process::exit(0);
             }
 
-            // Default test patterns
-            let patterns: Vec<String> = filter.map(|f| vec![f]).unwrap_or_else(|| {
-                vec![
-                    "test".to_string(),
-                    "spec".to_string(),
-                    "_test".to_string(),
-                    "_spec".to_string(),
-                ]
-            });
-
-            // Find test files that import/reference changed source files
-            let mut affected_tests: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            // Strategy 1: Find symbols in changed files, then find callers that are in test files
-            // Batch: fetch all symbols for all changed files in a single query
-            let all_symbols: Vec<String> = {
-                let placeholders: String =
-                    changed.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let n = changed.len() + 1;
-                let sql = format!(
-                    "SELECT DISTINCT name FROM symbols WHERE file IN ({placeholders}) AND project_id = ?{n}"
-                );
-                let mut stmt = conn.prepare(&sql)?;
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = changed
-                    .iter()
-                    .map(|f| Box::new(f.clone()) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                params.push(Box::new(project_id));
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
-                rows.filter_map(|r| r.ok()).collect()
+            let opts = index::queries::AffectedOptions {
+                test_file_markers: filter.map(|f| vec![f]),
             };
-
-            // Deduplicate symbols and resolve callers with a single set-based query
-            {
-                let mut seen_syms: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for sym_name in all_symbols {
-                    if seen_syms.insert(sym_name.clone()) {
-                        let callers =
-                            index::graph::find_callers(&conn, project_id, &sym_name, 100)?;
-                        for caller in callers {
-                            if patterns.iter().any(|p| caller.file.contains(p.as_str())) {
-                                affected_tests.insert(caller.file.clone());
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Strategy 2: Direct test file name convention (mod_test.rs, foo_test.go)
-            // Prepare statement once before the loop
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT path FROM files WHERE path LIKE ?1 AND project_id = ?2",
-            )?;
-            for file in &changed {
-                // For Rust: src/foo.rs → tests/foo.rs or src/foo.rs → src/foo_test.rs
-                let stem = file
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(file)
-                    .rsplit('.')
-                    .next()
-                    .unwrap_or("");
-                let test_patterns = [
-                    format!("{stem}_test.rs"),
-                    format!("tests/{stem}.rs"),
-                    format!("test_{stem}.rs"),
-                    format!("{stem}_test.go"),
-                    format!("{stem}_test.py"),
-                    format!("test_{stem}.py"),
-                    format!("{stem}.test.ts"),
-                    format!("{stem}.spec.ts"),
-                ];
-                for tp in &test_patterns {
-                    let pattern = format!("%{tp}");
-                    let rows = stmt.query_map(rusqlite::params![pattern, project_id], |row| {
-                        row.get::<_, String>(0)
-                    })?;
-                    for f in rows.map_while(Result::ok) {
-                        affected_tests.insert(f);
-                    }
-                }
-            }
-
-            let mut sorted: Vec<String> = affected_tests.into_iter().collect();
-            sorted.sort();
+            let sorted = index::queries::find_affected_tests(&conn, project_id, &changed, &opts)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&sorted)?);
@@ -1598,12 +1313,11 @@ async fn main() -> Result<()> {
             git_only,
             filter,
         } => {
-            let project_root = std::env::current_dir()?;
-            let project_root = index::resolve_project_root(&project_root).unwrap_or(project_root);
-            let config_path = cli.global.config.as_deref();
+            let session = index::session::IndexSession::open(index::session::ConfigSource::Full(
+                cli.global.config.as_deref(),
+            ))?;
             commands::watch::run_watch(
-                &project_root,
-                config_path,
+                &session,
                 debounce,
                 git_only,
                 filter.as_deref(),
@@ -1641,10 +1355,8 @@ async fn main() -> Result<()> {
         } => {
             // Resolve the project root the same way `cora index` does, so
             // dead-code queries the workspace the index actually built (#522).
-            let cwd = std::env::current_dir().with_context(|| "failed to get cwd")?;
-            let project_root = index::resolve_project_root(&cwd).unwrap_or(cwd.clone());
-            let conn = index::open_global_index()?;
-            let project_id = index::ensure_project(&conn, &project_root)?;
+            let (conn, project_id, _project_root) =
+                engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
             // Load config for entry_point_patterns
             let config = crate::config::loader::load_config(
@@ -1656,15 +1368,12 @@ async fn main() -> Result<()> {
                 false,
             )
             .unwrap_or_default();
-            let entry_point_patterns = config.analysis.entry_point_patterns.clone();
-
-            let opts = index::graph::DeadCodeOptions {
+            let flags = index::queries::DeadCodeFlags {
                 include_tests,
-                min_lines,
-                entry_point_patterns,
                 include_pub_api: include_pub,
+                min_lines,
             };
-            let results = index::graph::find_dead_code(&conn, project_id, &opts)?;
+            let results = index::queries::find_dead_code(&conn, project_id, &config, flags)?;
             if json {
                 let out = serde_json::to_string_pretty(&results)?;
                 println!("{out}");
@@ -1701,7 +1410,7 @@ async fn main() -> Result<()> {
             0
         }
         Command::Serve => {
-            commands::serve::execute_serve()?;
+            commands::serve::execute_serve(cli.global.config.as_deref())?;
             0
         }
         Command::Upgrade { yes, check } => commands::upgrade::run(yes, check).await?,

@@ -7,7 +7,6 @@ use std::io::{self, Read, Write};
 
 use tracing::{debug, error, info};
 
-#[allow(unused_imports)]
 use super::protocol::{
     InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId, ServerCapabilities,
     ServerInfo,
@@ -18,129 +17,307 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "cora-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Run the MCP server, reading from stdin and writing to stdout.
-pub fn run_server() -> anyhow::Result<()> {
-    info!("Starting cora MCP server on stdio");
+/// Maximum size of a single JSON-RPC message (bytes). Larger messages are
+/// discarded with a parse error instead of growing memory without bound.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
-    let stdout = io::stdout();
-    let mut stdout_lock = stdout.lock();
-    let mut buffer = String::new();
+/// Result of feeding bytes to the [`Framer`].
+#[derive(Debug, PartialEq, Eq)]
+enum Frame {
+    /// A complete, UTF-8 decoded top-level JSON object.
+    Message(String),
+    /// Framing failed; the framer has already reset and recovered.
+    Error(String),
+}
 
-    // Read stdin byte-by-byte to handle multi-line JSON-RPC messages.
-    // Line-based parsing breaks on pretty-printed JSON.
-    // MCP spec: each message is a complete JSON object, optionally followed by newline.
-    let mut brace_depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
+/// Incremental stdin framer.
+///
+/// Accumulates raw bytes (never `byte as char`) and decodes UTF-8 once a
+/// top-level `{ ... }` object is balanced. Supports both newline-delimited and
+/// pretty-printed multi-line objects. Multi-byte UTF-8 sequences consist solely
+/// of bytes >= 0x80, so they can never be confused with the ASCII structural
+/// characters tracked here.
+struct Framer {
+    buf: Vec<u8>,
+    depth: usize,
+    in_string: bool,
+    escape: bool,
+    /// Current message exceeded the size cap; keep tracking depth, drop bytes.
+    overflow: bool,
+    /// After a framing error outside an object, ignore input up to next newline.
+    skip_line: bool,
+    max_bytes: usize,
+}
 
-    for b in io::BufReader::new(io::stdin()).bytes() {
-        let byte = b?;
-        let ch = byte as char;
-
-        if escape_next {
-            escape_next = false;
-            buffer.push(ch);
-            continue;
-        }
-
-        if ch == '\\' && in_string {
-            escape_next = true;
-            buffer.push(ch);
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = !in_string;
-            buffer.push(ch);
-            continue;
-        }
-
-        if !in_string {
-            if ch == '{' {
-                brace_depth += 1;
-            } else if ch == '}' {
-                brace_depth -= 1;
-            }
-        }
-
-        buffer.push(ch);
-
-        // Complete JSON object found when braces are balanced and buffer is non-empty
-        if brace_depth == 0 && !buffer.trim().is_empty() {
-            let trimmed = buffer.trim().to_string();
-            buffer.clear();
-
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            debug!(input = %trimmed, "received request");
-
-            let request: JsonRpcRequest = match serde_json::from_str(&trimmed) {
-                Ok(req) => req,
-                Err(e) => {
-                    error!(error = %e, "failed to parse request");
-                    let err_resp = JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: None,
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32700,
-                            message: format!("Parse error: {e}"),
-                            data: None,
-                        }),
-                    };
-                    write_response(&mut stdout_lock, &err_resp)?;
-                    continue;
-                }
-            };
-
-            let response = handle_request(&request);
-            write_response(&mut stdout_lock, &response)?;
-            stdout_lock.flush()?;
-
-            // Exit on shutdown notification
-            if request.method == "notifications/cancelled" || request.method == "shutdown" {
-                info!("Shutting down MCP server");
-                break;
-            }
+impl Framer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            depth: 0,
+            in_string: false,
+            escape: false,
+            overflow: false,
+            skip_line: false,
+            max_bytes,
         }
     }
 
+    fn reset(&mut self) {
+        self.buf.clear();
+        self.depth = 0;
+        self.in_string = false;
+        self.escape = false;
+        self.overflow = false;
+    }
+
+    fn push(&mut self, bytes: &[u8], out: &mut Vec<Frame>) {
+        for &b in bytes {
+            self.push_byte(b, out);
+        }
+    }
+
+    fn push_byte(&mut self, b: u8, out: &mut Vec<Frame>) {
+        if self.skip_line {
+            if b == b'\n' {
+                self.skip_line = false;
+            }
+            return;
+        }
+
+        if self.depth == 0 {
+            // Between messages.
+            match b {
+                b' ' | b'\t' | b'\r' | b'\n' => {}
+                b'{' => {
+                    self.depth = 1;
+                    self.buf.push(b);
+                }
+                other => {
+                    let shown = if other.is_ascii_graphic() {
+                        format!("'{}'", other as char)
+                    } else {
+                        format!("0x{other:02x}")
+                    };
+                    out.push(Frame::Error(format!(
+                        "unexpected {shown} outside of a JSON object"
+                    )));
+                    self.reset();
+                    self.skip_line = true;
+                }
+            }
+            return;
+        }
+
+        // Inside an object.
+        if !self.overflow {
+            if self.buf.len() >= self.max_bytes {
+                out.push(Frame::Error(format!(
+                    "message exceeds maximum size of {} bytes",
+                    self.max_bytes
+                )));
+                self.buf.clear();
+                self.buf.shrink_to_fit();
+                self.overflow = true;
+            } else {
+                self.buf.push(b);
+            }
+        }
+
+        if self.in_string {
+            if self.escape {
+                self.escape = false;
+            } else if b == b'\\' {
+                self.escape = true;
+            } else if b == b'"' {
+                self.in_string = false;
+            }
+            return;
+        }
+
+        match b {
+            b'"' => self.in_string = true,
+            b'{' => self.depth += 1,
+            b'}' => {
+                self.depth -= 1;
+                if self.depth == 0 {
+                    if !self.overflow {
+                        let bytes = std::mem::take(&mut self.buf);
+                        match String::from_utf8(bytes) {
+                            Ok(s) => out.push(Frame::Message(s)),
+                            Err(e) => out.push(Frame::Error(format!("invalid UTF-8: {e}"))),
+                        }
+                    }
+                    self.reset();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Signal EOF. Reports a truncated message, if any.
+    fn finish(&mut self, out: &mut Vec<Frame>) {
+        if self.depth > 0 && !self.overflow {
+            out.push(Frame::Error("unexpected end of input".to_string()));
+        }
+        self.reset();
+    }
+}
+
+fn error_response(id: Option<RequestId>, code: i64, message: String) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message,
+            data: None,
+        }),
+    }
+}
+
+/// Outcome of processing one framed message.
+struct Processed {
+    response: Option<JsonRpcResponse>,
+    shutdown: bool,
+}
+
+/// Parse and dispatch a single JSON-RPC message.
+fn process_message(text: &str) -> Processed {
+    let value: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "failed to parse request");
+            return Processed {
+                response: Some(error_response(None, -32700, format!("Parse error: {e}"))),
+                shutdown: false,
+            };
+        }
+    };
+
+    let request: JsonRpcRequest = match serde_json::from_value(value.clone()) {
+        Ok(req) => req,
+        Err(e) => {
+            // Valid JSON, but not a valid request (e.g. a stray response).
+            // Only answer if it carried an id; otherwise it is notification-like.
+            let id = value
+                .get("id")
+                .and_then(|v| serde_json::from_value::<RequestId>(v.clone()).ok());
+            let response = id
+                .is_some()
+                .then(|| error_response(id, -32600, format!("Invalid Request: {e}")));
+            return Processed {
+                response,
+                shutdown: false,
+            };
+        }
+    };
+
+    debug!(method = %request.method, "received request");
+
+    // Notifications (no id) never get a response. Only an explicit
+    // `shutdown` (or EOF) stops the server; `notifications/cancelled` only
+    // cancels an in-flight request and must not terminate the session.
+    if request.id.is_none() {
+        handle_notification(&request);
+        return Processed {
+            response: None,
+            shutdown: request.method == "shutdown",
+        };
+    }
+
+    Processed {
+        shutdown: request.method == "shutdown",
+        response: Some(handle_request(&request)),
+    }
+}
+
+fn handle_notification(request: &JsonRpcRequest) {
+    match request.method.as_str() {
+        "notifications/initialized" | "initialized" => debug!("client initialized"),
+        "notifications/cancelled" => debug!("request cancelled by client"),
+        m => debug!(method = m, "ignoring notification"),
+    }
+}
+
+/// Drive the server loop over arbitrary reader/writer (stdio in production).
+fn serve<R: Read, W: Write>(
+    mut input: R,
+    output: &mut W,
+    max_message_bytes: usize,
+) -> anyhow::Result<()> {
+    let mut framer = Framer::new(max_message_bytes);
+    let mut chunk = [0u8; 8192];
+    let mut frames = Vec::new();
+
+    loop {
+        let n = match input.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        framer.push(&chunk[..n], &mut frames);
+        if dispatch_frames(&mut frames, output)? {
+            return Ok(());
+        }
+    }
+
+    framer.finish(&mut frames);
+    dispatch_frames(&mut frames, output)?;
     Ok(())
+}
+
+/// Handle queued frames. Returns true when the server should shut down.
+fn dispatch_frames<W: Write>(frames: &mut Vec<Frame>, output: &mut W) -> anyhow::Result<bool> {
+    for frame in std::mem::take(frames) {
+        match frame {
+            Frame::Error(msg) => {
+                error!(error = %msg, "framing error");
+                write_response(
+                    output,
+                    &error_response(None, -32700, format!("Parse error: {msg}")),
+                )?;
+            }
+            Frame::Message(text) => {
+                let processed = process_message(&text);
+                if let Some(resp) = processed.response {
+                    write_response(output, &resp)?;
+                }
+                if processed.shutdown {
+                    info!("Shutting down MCP server");
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Run the MCP server, reading from stdin and writing to stdout.
+pub fn run_server() -> anyhow::Result<()> {
+    info!("Starting cora MCP server on stdio");
+    let stdout = io::stdout();
+    let mut stdout_lock = stdout.lock();
+    serve(io::stdin().lock(), &mut stdout_lock, MAX_MESSAGE_BYTES)
 }
 
 fn handle_request(request: &JsonRpcRequest) -> JsonRpcResponse {
     match request.method.as_str() {
         "initialize" => handle_initialize(request),
-        "initialized" => {
-            // Notification — no response needed, but we send empty for JSON-RPC
-            debug!("client initialized");
-            JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id.clone(),
-                result: Some(serde_json::json!({})),
-                error: None,
-            }
-        }
         "tools/list" => handle_tools_list(request),
         "tools/call" => handle_tools_call(request),
-        "ping" => JsonRpcResponse {
+        "ping" | "shutdown" => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             id: request.id.clone(),
             result: Some(serde_json::json!({})),
             error: None,
         },
-        _ => JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id.clone(),
-            result: None,
-            error: Some(JsonRpcError {
-                code: -32601,
-                message: format!("Method not found: {}", request.method),
-                data: None,
-            }),
-        },
+        _ => error_response(
+            request.id.clone(),
+            -32601,
+            format!("Method not found: {}", request.method),
+        ),
     }
 }
 
@@ -181,6 +358,14 @@ fn handle_tools_call(request: &JsonRpcRequest) -> JsonRpcResponse {
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    if tool_name.trim().is_empty() {
+        return error_response(
+            request.id.clone(),
+            -32602,
+            "Invalid params: missing or empty tool 'name'".to_string(),
+        );
+    }
+
     let args = request
         .params
         .get("arguments")
@@ -197,16 +382,31 @@ fn handle_tools_call(request: &JsonRpcRequest) -> JsonRpcResponse {
     }
 }
 
-fn write_response(stdout: &mut io::StdoutLock, response: &JsonRpcResponse) -> anyhow::Result<()> {
+fn write_response<W: Write>(out: &mut W, response: &JsonRpcResponse) -> anyhow::Result<()> {
     let json = serde_json::to_string(response)?;
     debug!(output = %json, "sending response");
-    writeln!(stdout, "{json}")?;
+    writeln!(out, "{json}")?;
+    out.flush()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run(input: &[u8]) -> Vec<serde_json::Value> {
+        run_with_cap(input, MAX_MESSAGE_BYTES)
+    }
+
+    fn run_with_cap(input: &[u8], cap: usize) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        serve(input, &mut out, cap).unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
 
     #[test]
     fn handle_initialize_response() {
@@ -279,5 +479,164 @@ mod tests {
         let resp = handle_request(&req);
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn utf8_multibyte_roundtrips_intact() {
+        // Japanese + emoji inside a string, delivered one byte at a time so
+        // multi-byte sequences are split across reads.
+        let msg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"cora.check_snippet\",\"arguments\":{\"code\":\"let s = \\\"日本語🦀\\\";\"}}}\n";
+        let mut framer = Framer::new(MAX_MESSAGE_BYTES);
+        let mut frames = Vec::new();
+        for b in msg.as_bytes() {
+            framer.push(std::slice::from_ref(b), &mut frames);
+        }
+        assert_eq!(frames.len(), 1);
+        match &frames[0] {
+            Frame::Message(s) => {
+                assert!(s.contains("日本語🦀"));
+                assert!(serde_json::from_str::<serde_json::Value>(s).is_ok());
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let out = run(msg.as_bytes());
+        assert_eq!(out.len(), 1);
+        assert!(out[0]["error"].is_null());
+    }
+
+    #[test]
+    fn braces_inside_strings_do_not_break_framing() {
+        let msg =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"x\":\"}{ \\\" }\"}}\n";
+        let out = run(msg.as_bytes());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 1);
+    }
+
+    #[test]
+    fn pretty_printed_multiline_json() {
+        let msg = "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 7,\n  \"method\": \"ping\",\n  \"params\": {\n    \"a\": {\n      \"b\": 1\n    }\n  }\n}\n";
+        let out = run(msg.as_bytes());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 7);
+        assert!(out[0]["result"].is_object());
+    }
+
+    #[test]
+    fn two_messages_back_to_back() {
+        let msg = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let out = run(msg.as_bytes());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1]["id"], 2);
+    }
+
+    #[test]
+    fn stray_closing_brace_recovers() {
+        let input = "}\n{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"ping\"}\n";
+        let out = run(input.as_bytes());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["error"]["code"], -32700);
+        assert_eq!(out[1]["id"], 5);
+        assert!(out[1]["result"].is_object());
+    }
+
+    #[test]
+    fn garbage_line_recovers_with_single_error() {
+        let input = "not json at all }}}\n{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"ping\"}\n";
+        let out = run(input.as_bytes());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["error"]["code"], -32700);
+        assert_eq!(out[1]["id"], 6);
+    }
+
+    #[test]
+    fn invalid_json_object_returns_parse_error_then_recovers() {
+        let input = "{\"jsonrpc\": oops}\n{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"ping\"}\n";
+        let out = run(input.as_bytes());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["error"]["code"], -32700);
+        assert_eq!(out[1]["id"], 8);
+    }
+
+    #[test]
+    fn invalid_utf8_returns_parse_error() {
+        let mut input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"p\xff\"}\n".to_vec();
+        input.extend_from_slice(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n");
+        let out = run(&input);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["error"]["code"], -32700);
+        assert_eq!(out[1]["id"], 2);
+    }
+
+    #[test]
+    fn truncated_message_at_eof_reports_parse_error() {
+        let out = run(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"meth");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["error"]["code"], -32700);
+    }
+
+    #[test]
+    fn oversized_message_rejected_and_stream_recovers() {
+        let big = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{{\"pad\":\"{}\"}}}}\n",
+            "x".repeat(500)
+        );
+        let input = format!("{big}{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}}\n");
+        let out = run_with_cap(input.as_bytes(), 128);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0]["error"]["code"], -32700);
+        assert!(
+            out[0]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("maximum size")
+        );
+        assert_eq!(out[1]["id"], 2);
+    }
+
+    #[test]
+    fn notification_without_id_gets_no_response() {
+        let input = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\
+                     {\"jsonrpc\":\"2.0\",\"method\":\"notifications/whatever\",\"params\":{}}\n\
+                     {\"jsonrpc\":\"2.0\",\"method\":\"unknown/notification\"}\n";
+        let out = run(input.as_bytes());
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn cancelled_notification_does_not_shut_down() {
+        let input = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n";
+        let out = run(input.as_bytes());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 9);
+    }
+
+    #[test]
+    fn shutdown_request_responds_then_stops() {
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\"}\n\
+                     {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n";
+        let out = run(input.as_bytes());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["id"], 1);
+    }
+
+    #[test]
+    fn tools_call_missing_name_is_invalid_params() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"name": ""}),
+            serde_json::json!({"name": 5}),
+        ] {
+            let req = JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                id: Some(RequestId::Number(1)),
+                method: "tools/call".to_string(),
+                params,
+            };
+            let resp = handle_request(&req);
+            assert_eq!(resp.error.unwrap().code, -32602);
+        }
     }
 }

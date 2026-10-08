@@ -5,7 +5,7 @@ use colored::Colorize;
 use tracing::debug;
 
 use crate::config::schema::Config;
-use crate::engine::db_writer;
+use crate::engine::review_store;
 use crate::engine::scanner::{batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
 use crate::formatters::{OutputFormat, formatter_for};
@@ -121,8 +121,9 @@ pub async fn execute_scan(
     let mut index_skip = config.ignore.files.clone();
     index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
     index_skip.dedup();
+    let index_bridge = crate::engine::index_bridge::IndexBridge::open(&root_abs);
     let index_findings = crate::engine::index_scanner::scan_project_index(
-        &root_abs,
+        &index_bridge,
         &files,
         config.rules_config.max_findings,
         &index_skip,
@@ -154,7 +155,7 @@ pub async fn execute_scan(
         crate::engine::review::build_scan_brain_context(
             &files,
             config.context_chain.impact_depth,
-            &root_abs,
+            &index_bridge,
         )
     } else {
         None
@@ -304,7 +305,7 @@ pub async fn execute_scan(
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let record = db_writer::ReviewRecord {
+        let record = review_store::ReviewRecord {
             command: "scan",
             project_root: &cwd,
             commit_hash: commit.as_deref(),
@@ -317,20 +318,8 @@ pub async fn execute_scan(
             tokens: response.tokens_used.as_ref(),
             issues: &response.issues,
         };
-        if db_writer::save_review_to_db(&record).is_none() {
-            debug!("Failed to save scan to cora.db");
-        }
-
-        // Auto-resolve findings that no longer appear in this scan.
-        let fps: Vec<String> = response
-            .issues
-            .iter()
-            .map(db_writer::compute_fingerprint_pub)
-            .collect();
-        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
-        if resolved > 0 {
-            debug!(resolved, "auto-resolved stale findings");
-        }
+        // Best-effort: a history-write failure never fails the run.
+        review_store::persist_review_best_effort(&record);
     }
 
     if response.should_block && config.hook.mode == "block" {

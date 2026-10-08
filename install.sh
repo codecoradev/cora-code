@@ -50,7 +50,7 @@ detect_arch() {
 # Fallback: the GitHub REST API (subject to 60 req/hour anonymous limit).
 get_latest_version() {
     # Try the web redirect first — does not count against the API rate limit.
-    VERSION=$(curl -sI "https://github.com/${REPO}/releases/latest" \
+    VERSION=$(curl -sI --connect-timeout 10 --max-time 30 "https://github.com/${REPO}/releases/latest" \
         | grep -i '^location:' \
         | sed -E 's|.*/tag/([^[:space:]]+).*|\1|' \
         | tr -d '\r')
@@ -58,7 +58,7 @@ get_latest_version() {
     # Fallback to the REST API if the redirect didn't yield a tag.
     if [ -z "$VERSION" ]; then
         warn "Redirect lookup failed, falling back to GitHub API..."
-        VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 1048576 "https://api.github.com/repos/${REPO}/releases/latest" \
             | grep '"tag_name":' \
             | sed -E 's/.*"([^"]+)".*/\1/')
     fi
@@ -104,26 +104,37 @@ install() {
     CHECKSUM_FILE="${TEMP_DIR}/checksums-sha256.txt"
 
     info "Downloading from: $DOWNLOAD_URL"
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$ARCHIVE"; then
+    if ! curl -fsSL --connect-timeout 10 --max-time 600 --max-filesize 268435456 "$DOWNLOAD_URL" -o "$ARCHIVE"; then
         error "Failed to download ${ARCHIVE_NAME}"
     fi
 
     # Verify SHA256 checksum (prevents MITM / corrupted download).
-    info "Downloading checksums..."
-    if curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUM_FILE"; then
-        info "Verifying SHA256 checksum..."
-        EXPECTED=$(grep -F "$ARCHIVE_NAME" "$CHECKSUM_FILE" | awk '{print $1}')
-        if [ -n "$EXPECTED" ]; then
-            ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
-            if [ "$ACTUAL" != "$EXPECTED" ]; then
-                error "Checksum mismatch! Expected: ${EXPECTED}, got: ${ACTUAL}"
-            fi
-            info "Checksum verified: $EXPECTED"
-        else
-            warn "Checksum for ${ARCHIVE_NAME} not found in checksums file — skipping verification"
-        fi
+    # Mandatory: a missing checksums file or entry is fatal unless the user
+    # explicitly opts out with CORA_SKIP_CHECKSUM=1.
+    if [ "${CORA_SKIP_CHECKSUM:-}" = "1" ]; then
+        warn "CORA_SKIP_CHECKSUM=1 set - checksum verification DISABLED. The binary is NOT verified."
     else
-        warn "Failed to download checksums — skipping verification"
+        info "Downloading checksums..."
+        if ! curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 1048576 "$CHECKSUMS_URL" -o "$CHECKSUM_FILE"; then
+            error "Failed to download checksums. Refusing to install an unverified binary (set CORA_SKIP_CHECKSUM=1 to override, unsafe)."
+        fi
+        info "Verifying SHA256 checksum..."
+        # Exact filename match (optionally prefixed with '*' or './').
+        EXPECTED=$(awk -v n="$ARCHIVE_NAME" '{f=$2; sub(/^\*/, "", f); sub(/^\.\//, "", f); if (f == n) {print $1; exit}}' "$CHECKSUM_FILE")
+        if [ -z "$EXPECTED" ]; then
+            error "Checksum for ${ARCHIVE_NAME} not found in checksums file. Refusing to install (set CORA_SKIP_CHECKSUM=1 to override, unsafe)."
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL=$(sha256sum "$ARCHIVE" | awk '{print $1}')
+        elif command -v shasum >/dev/null 2>&1; then
+            ACTUAL=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+        else
+            error "Neither sha256sum nor shasum found; cannot verify checksum (set CORA_SKIP_CHECKSUM=1 to override, unsafe)."
+        fi
+        if [ "$ACTUAL" != "$EXPECTED" ]; then
+            error "Checksum mismatch! Expected: ${EXPECTED}, got: ${ACTUAL}"
+        fi
+        info "Checksum verified: $EXPECTED"
     fi
 
     # Verify archive contents before extraction (CWE-22 path traversal).
@@ -133,8 +144,17 @@ install() {
         error "Archive contains unsafe paths (absolute or directory traversal) — refusing to extract"
     fi
 
+    # Reject symlink/hardlink entries (first char of the verbose mode string:
+    # 'l' = symlink; bsdtar lists hardlinks with 'h').
+    if tar -tvzf "$ARCHIVE" | grep -qE '^[lh]'; then
+        error "Archive contains symlink/hardlink entries - refusing to extract"
+    fi
+
     info "Extracting..."
-    tar -xzf "$ARCHIVE" -C "$TEMP_DIR"
+    # Extract only the single binary entry (tolerate an optional ./ prefix).
+    tar -xzf "$ARCHIVE" -C "$TEMP_DIR" "${BINARY_NAME}" 2>/dev/null \
+        || tar -xzf "$ARCHIVE" -C "$TEMP_DIR" "./${BINARY_NAME}" \
+        || error "Binary '${BINARY_NAME}' not found in archive"
 
     mkdir -p "$INSTALL_DIR"
     mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/"
