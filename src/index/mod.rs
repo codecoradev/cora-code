@@ -305,7 +305,7 @@ pub fn skip_patterns_from_config(
 /// `index_project_with_skip` with the resolved config.
 #[cfg(test)]
 pub fn index_project(conn: &Connection, root: &Path, verbose: bool) -> anyhow::Result<IndexStats> {
-    index_project_with_id(conn, ensure_project(conn, root)?, root, verbose, None)
+    index_project_with_id(conn, ensure_project(conn, root)?, root, verbose, None, None)
 }
 
 /// Index a project directory, honoring skip patterns (glob `*`/`**`, matched
@@ -321,6 +321,20 @@ pub fn index_project_with_skip(
     root: &Path,
     verbose: bool,
     skip_patterns: Option<&[String]>,
+) -> anyhow::Result<IndexStats> {
+    index_project_filtered(conn, root, verbose, skip_patterns, None)
+}
+
+/// [`index_project_with_skip`] restricted to files for which `include`
+/// (called with the root-relative path) returns true. Files that fail the
+/// predicate are neither read nor re-indexed, but still count as present on
+/// disk, so their stored rows are not pruned. `None` means every file.
+pub fn index_project_filtered(
+    conn: &Connection,
+    root: &Path,
+    verbose: bool,
+    skip_patterns: Option<&[String]>,
+    include: Option<&dyn Fn(&str) -> bool>,
 ) -> anyhow::Result<IndexStats> {
     let project_id = ensure_project(conn, root)?;
 
@@ -366,7 +380,7 @@ pub fn index_project_with_skip(
         }
     }
 
-    index_project_with_id(conn, project_id, root, verbose, skip_patterns)
+    index_project_with_id(conn, project_id, root, verbose, skip_patterns, include)
 }
 
 /// Internal: index a project with an already-resolved `project_id`.
@@ -376,6 +390,7 @@ fn index_project_with_id(
     root: &Path,
     verbose: bool,
     skip_patterns: Option<&[String]>,
+    include: Option<&dyn Fn(&str) -> bool>,
 ) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
     let skip_matcher = skip_patterns.map(crate::engine::path_match::PathMatcher::new);
@@ -420,6 +435,11 @@ fn index_project_with_id(
 
         stats.files_scanned += 1;
         walked.insert(rel_str.clone());
+
+        // Caller-supplied restriction (watch --filter / changed files only).
+        if include.is_some_and(|f| !f(&rel_str)) {
+            continue;
+        }
 
         // Compute mtime:size fingerprint — cheap, no file read needed.
         // metadata() is a stat() call, ~microseconds per file.
