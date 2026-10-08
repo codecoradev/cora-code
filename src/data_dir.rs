@@ -16,13 +16,41 @@ pub const CODECORA_HOME_ENV: &str = "CODECORA_HOME";
 /// (not set)              → $HOME/.codecora/
 /// ```
 pub fn codecora_home() -> PathBuf {
-    if let Ok(home) = std::env::var(CODECORA_HOME_ENV) {
-        PathBuf::from(home)
-    } else {
-        dirs::home_dir()
-            .expect("Cannot determine home directory. Set CODECORA_HOME or HOME.")
-            .join(".codecora")
+    let override_dir = std::env::var_os(CODECORA_HOME_ENV);
+    // Unit tests must never read or write the developer's real `~/.codecora`
+    // (the global vector index there is flock-ed by any running `cora`, #587).
+    // Without an explicit override they get one process-wide scratch dir.
+    #[cfg(test)]
+    if override_dir.is_none() {
+        return test_home().to_path_buf();
     }
+    resolve_home(override_dir, dirs::home_dir())
+}
+
+/// Pure resolution rule behind [`codecora_home`] (no env/FS access).
+fn resolve_home(override_dir: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PathBuf {
+    match override_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => home
+            .expect("Cannot determine home directory. Set CODECORA_HOME or HOME.")
+            .join(".codecora"),
+    }
+}
+
+/// Process-wide scratch data root for unit tests. One dir per test process
+/// matches the process-global vector cache, and needs no env mutation, so
+/// parallel tests cannot race on it. It is not removed at process exit; it
+/// is small and lives under the OS temp dir.
+#[cfg(test)]
+fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::LazyLock<PathBuf> = std::sync::LazyLock::new(|| {
+        tempfile::Builder::new()
+            .prefix("cora-test-home-")
+            .tempdir()
+            .expect("create test data dir")
+            .keep()
+    });
+    &HOME
 }
 
 /// Returns the data directory for a specific CodeCora product.
@@ -78,68 +106,47 @@ pub fn ensure_data_dir() -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Ensure tests that mutate CODECORA_HOME don't run concurrently.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_codecora_home_returns_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var(CODECORA_HOME_ENV);
-        }
-        let path = codecora_home();
-        assert!(path.ends_with(".codecora"));
-    }
-
-    #[test]
-    fn test_product_data_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var(CODECORA_HOME_ENV);
-        }
-        let path = product_data_dir("cora-code");
-        assert!(path.ends_with(".codecora/cora-code"));
-    }
-
-    #[test]
-    fn test_graph_db_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var(CODECORA_HOME_ENV);
-        }
-        let path = graph_db_path();
-        assert!(
-            path.ends_with(".codecora/cora-code/cora.db")
-                || path.ends_with(".codecora/cora-code/graph.db"),
-            "graph_db_path should end with cora.db (or graph.db on migration failure), got: {path:?}"
+    fn resolve_home_uses_override_then_home() {
+        assert_eq!(
+            resolve_home(Some("/custom".into()), Some(PathBuf::from("/h"))),
+            PathBuf::from("/custom")
+        );
+        assert_eq!(
+            resolve_home(None, Some(PathBuf::from("/h"))),
+            PathBuf::from("/h/.codecora")
         );
     }
 
     #[test]
-    fn test_cora_data_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::remove_var(CODECORA_HOME_ENV);
+    fn unit_tests_never_resolve_into_the_real_home() {
+        if std::env::var_os(CODECORA_HOME_ENV).is_some() {
+            return; // explicit override in the developer's shell: honoured
         }
-        let path = cora_data_dir();
-        assert!(path.ends_with(".codecora/cora-code"));
-        // Should not have trailing slash
-        let s = path.to_string_lossy();
-        assert!(!s.ends_with('/'));
+        let real = dirs::home_dir().unwrap().join(".codecora");
+        for p in [
+            codecora_home(),
+            cora_data_dir(),
+            product_data_dir("x"),
+            graph_db_path(),
+        ] {
+            assert!(!p.starts_with(&real), "{p:?} is under the real home");
+            assert!(p.starts_with(test_home()), "{p:?} is not under test home");
+        }
     }
 
     #[test]
-    fn test_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        unsafe {
-            std::env::set_var(CODECORA_HOME_ENV, "/tmp/test-codecora");
-        }
-        let path = codecora_home();
-        assert_eq!(path, PathBuf::from("/tmp/test-codecora"));
-        unsafe {
-            std::env::remove_var(CODECORA_HOME_ENV);
-        }
+    fn product_dirs_are_nested_under_home() {
+        assert_eq!(
+            product_data_dir("cora-code"),
+            codecora_home().join("cora-code")
+        );
+        assert_eq!(cora_data_dir(), product_data_dir("cora-code"));
+        let db = graph_db_path();
+        assert!(
+            db.ends_with("cora.db") || db.ends_with("graph.db"),
+            "{db:?}"
+        );
     }
 }
