@@ -5,8 +5,8 @@ use tracing::debug;
 use crate::config::schema::Config;
 use crate::engine::Severity;
 use crate::engine::chunker;
-use crate::engine::db_writer;
 use crate::engine::quality_gate;
+use crate::engine::review_store;
 use crate::engine::types::ReviewResponse;
 use crate::formatters::{OutputFormat, formatter_for};
 use crate::git;
@@ -317,7 +317,7 @@ pub async fn execute_review(
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let record = db_writer::ReviewRecord {
+        let record = review_store::ReviewRecord {
             command: cmd,
             project_root: &cwd,
             commit_hash: commit.as_deref(),
@@ -330,20 +330,8 @@ pub async fn execute_review(
             tokens,
             issues: &filtered_response.issues,
         };
-        if db_writer::save_review_to_db(&record).is_none() {
-            debug!("Failed to save review to cora.db");
-        }
-
-        // Auto-resolve findings that no longer appear in this review.
-        let fps: Vec<String> = filtered_response
-            .issues
-            .iter()
-            .map(db_writer::compute_fingerprint_pub)
-            .collect();
-        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
-        if resolved > 0 {
-            debug!(resolved, "auto-resolved stale findings");
-        }
+        // Best-effort: a history-write failure never fails the run.
+        review_store::persist_review_best_effort(&record);
     }
     let exit_code = if gate_result
         .as_ref()
@@ -717,7 +705,7 @@ async fn execute_chunked_review(
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let record = db_writer::ReviewRecord {
+        let record = review_store::ReviewRecord {
             command: cmd,
             project_root: &cwd,
             commit_hash: commit.as_deref(),
@@ -730,20 +718,8 @@ async fn execute_chunked_review(
             tokens,
             issues: &filtered_response.issues,
         };
-        if db_writer::save_review_to_db(&record).is_none() {
-            debug!("Failed to save review to cora.db");
-        }
-
-        // Auto-resolve findings that no longer appear in this review.
-        let fps: Vec<String> = filtered_response
-            .issues
-            .iter()
-            .map(db_writer::compute_fingerprint_pub)
-            .collect();
-        let resolved = db_writer::resolve_stale_findings(&cwd, &fps);
-        if resolved > 0 {
-            debug!(resolved, "auto-resolved stale findings");
-        }
+        // Best-effort: a history-write failure never fails the run.
+        review_store::persist_review_best_effort(&record);
     }
     let exit_code = compute_exit_code(
         gate_result.as_ref().map(|g| g.status),
