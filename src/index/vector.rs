@@ -592,21 +592,52 @@ pub fn cosine_distance_to_similarity(distance: f32) -> f32 {
     (1.0 - distance).clamp(0.0, 1.0)
 }
 
+/// How long [`acquire_file_lock`] waits for another process to release the
+/// index lock before giving up. The lock is held for the lifetime of any
+/// `cora` process that loaded the index, so an unbounded wait would hang
+/// forever behind a long-running scan (#587).
+const FILE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Poll interval while waiting for a busy lock.
+const FILE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn acquire_file_lock(path: &Path) -> Result<File> {
+    acquire_file_lock_within(path, FILE_LOCK_TIMEOUT)
+}
+
+/// Take the exclusive lock on `path`, polling until `timeout` elapses.
+/// Returns a descriptive error instead of blocking indefinitely.
+fn acquire_file_lock_within(path: &Path, timeout: std::time::Duration) -> Result<File> {
     let file = File::options()
         .read(true)
         .write(true)
         .open(path)
         .with_context(|| format!("open usearch file for locking: {}", path.display()))?;
 
-    if file.try_lock_exclusive().is_ok() {
-        tracing::debug!("usearch file lock acquired: {}", path.display());
-    } else {
-        tracing::debug!("usearch file lock busy, waiting...");
-        file.lock_exclusive()
-            .context("acquire exclusive file lock on usearch")?;
+    let start = std::time::Instant::now();
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                tracing::debug!("usearch file lock acquired: {}", path.display());
+                return Ok(file);
+            }
+            Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
+                if start.elapsed() >= timeout {
+                    anyhow::bail!(
+                        "timed out after {}s waiting for the vector index lock at {}; \
+                         another cora process may be holding it",
+                        timeout.as_secs_f32(),
+                        path.display()
+                    );
+                }
+                std::thread::sleep(FILE_LOCK_POLL);
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("acquire exclusive file lock on {}", path.display()));
+            }
+        }
     }
-    Ok(file)
 }
 
 fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<()> {
@@ -634,6 +665,29 @@ mod tests {
 
     fn with_store_lock() -> std::sync::MutexGuard<'static, ()> {
         STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn locked_index_errors_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.usearch");
+        std::fs::write(&path, []).unwrap();
+        let holder = acquire_file_lock_within(&path, std::time::Duration::from_secs(1)).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = acquire_file_lock_within(&path, std::time::Duration::from_millis(200))
+            .expect_err("second lock must time out while the first is held");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("another cora process may be holding it"),
+            "{msg}"
+        );
+        assert!(msg.contains("held.usearch"), "{msg}");
+
+        drop(holder);
+        acquire_file_lock_within(&path, std::time::Duration::from_secs(1))
+            .expect("lock is acquirable once released");
     }
 
     #[test]
