@@ -6,8 +6,32 @@ use rusqlite::Connection;
 #[allow(dead_code)]
 const SCHEMA_VERSION: i32 = 8;
 
-/// Run database migrations (creates tables if not exist).
+/// Serialises index opening (PRAGMAs + migrations) within a process: several
+/// connections to the same database file (parallel tests, concurrent sessions)
+/// used to race between reading the version and applying a migration
+/// (`UNIQUE constraint failed: schema_version.version`) or switch the journal
+/// mode at the same time (`database is locked`) (#604).
+static MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the open/migrate lock. A poisoned lock only means another opener
+/// panicked; the schema version is re-read after locking, so continuing is safe.
+pub(crate) fn open_lock() -> std::sync::MutexGuard<'static, ()> {
+    MIGRATION_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Run database migrations (creates tables if not exist). Production opens go
+/// through `index::open_index_at`, which holds [`open_lock`] and calls
+/// [`run_migrations_locked`]; this self-locking form is for tests.
+#[cfg(test)]
 pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
+    let _guard = open_lock();
+    run_migrations_locked(conn)
+}
+
+/// [`run_migrations`] for callers that already hold [`open_lock`].
+pub(crate) fn run_migrations_locked(conn: &Connection) -> anyhow::Result<()> {
     // Schema version tracking
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (
@@ -491,6 +515,39 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         run_migrations(&conn).unwrap();
         conn
+    }
+
+    /// Many connections migrating one fresh database file at once must all
+    /// succeed (#604).
+    #[test]
+    fn concurrent_migrations_on_one_file_do_not_race() {
+        // Repeat with fresh files: the race window is small.
+        for round in 0..40 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join(format!("race{round}.db"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let db = db.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let conn = Connection::open(&db).unwrap();
+                        conn.busy_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        barrier.wait();
+                        run_migrations(&conn)
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap().unwrap();
+            }
+            let conn = Connection::open(&db).unwrap();
+            let v: i32 = conn
+                .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+        }
     }
 
     #[test]
