@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-10-09
+
 ### Fixed
 
 - **Hardcoded secrets in Go short declarations, YAML/JSON keys and SQL `PASSWORD` literals are now detected.** Go `password := "..."` (with or without a trailing comment) and `var apiKey string = "..."` (#618); unquoted YAML `password: hunter2hunter2` and JSON quoted keys `"password": "..."` / `"apiKey": "..."` (#619); SQL `CREATE USER app WITH PASSWORD '<literal>'` and `IDENTIFIED BY '<literal>'` (#620). References stay quiet: `${VAR}`/`$VAR`, `!tag`, `*alias`, `&anchor`, paths, `null`/`required`-style bare words, and SQL placeholders (`PASSWORD '%s'`). The LLM secret cross-check uses the same pattern, so LLM findings on these shapes are no longer dropped.
@@ -978,7 +980,8 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.1...develop
+[0.17.1]: https://github.com/codecoradev/cora-code/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/codecoradev/cora-code/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/codecoradev/cora-code/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/codecoradev/cora-code/compare/v0.15.0...v0.16.0
