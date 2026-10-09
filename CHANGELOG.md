@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Documented what the hardcoded-secret check flags and its one known limit** (all-letter unquoted YAML values), and closed that item as not planned (#625, #635).
+
+### Fixed
+
+- **A `rules_engine:` section without `enabled: true` no longer disables the built-in rules.** `enabled` now defaults to `true` when the section is present, so `rules_engine: { max_findings: 0 }` only changes the cap; set `enabled: false` to turn the engine off (#638).
+
 ### Security
 
 - **Release checksums are signed with cosign keyless and verified by `install.sh` and `cora upgrade` (#591).** `release.yml` now signs `checksums-sha256.txt` (which covers every archive) via Sigstore/GitHub OIDC before creating the release and uploads `checksums-sha256.txt.sigstore.json`; a signing failure aborts the job so no unsigned release is published. `install.sh` and `cora upgrade` verify the bundle with `cosign verify-blob` (identity: this repo's `release.yml` on a `v*` tag, issuer `token.actions.githubusercontent.com`) when `cosign` is on `PATH`; an invalid signature aborts. Without `cosign`, or for releases without a bundle, they print a notice and fall back to checksum-only. `CORA_REQUIRE_SIGNATURE=1` makes a missing `cosign` or bundle fatal. See `docs/installation.md`.

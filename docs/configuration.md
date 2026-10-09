@@ -371,6 +371,14 @@ cora runs a static security scan on added lines before the AI review. 11 built-i
 
 Test files are automatically skipped. Findings are injected into the LLM prompt as additional context.
 
+#### What the hardcoded-secret check does (and does not) flag
+
+The check looks for a secret-named key (`password`, `secret`, `token`, `api_key`, ...) assigned a **literal** value, and ignores values that are references:
+
+- **Flagged:** quoted literals (`password = "..."`, typed declarations, Go `:=`, JSON `"password": "..."`), SQL `PASSWORD '...'`, literal defaults inside env reads (`os.getenv("X", "literal")`, `process.env.X || "literal"`), shell `${VAR:-literal}`, bare values in `.env` / `.properties` / `.ini` / shell / YAML files when they look like a secret.
+- **Not flagged:** env reads and other expressions (`process.env.X`, `os.getenv("X")`), identifiers and member accesses, `${VAR}` / `$VAR` interpolation, empty strings, UI bindings, placeholders such as `%s` / `$1` / `{{ x }}`.
+- **Known limit:** an unquoted YAML value made only of letters (`password: correcthorsebattery`) is not flagged. It cannot be told apart from a reference to another key (`secret: kubernetes`, `token: optional`) without flooding Kubernetes/Compose files with false positives. Quote the value, or give it a digit or symbol, and it is detected. Use `cora-ignore: <rule>` (see below) for a finding you accept.
+
 ## Language-Specific Analyzers
 
 cora detects the languages in your diff and injects tailored review guidance:
