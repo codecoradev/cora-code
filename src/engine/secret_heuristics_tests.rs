@@ -359,7 +359,7 @@ const CASES: &[Row] = &[
 /// the ideal result in the trailing comment). Move a row into [`CASES`] with
 /// the ideal expectation when its issue is fixed.
 const KNOWN_GAPS: &[Row] = &[
-    // KNOWN GAP (no issue yet) - FN: an unquoted RHS in source code is treated as an expression, so a real literal default inside a call is missed (ideal: flagged)
+    // KNOWN GAP #628 - FN: an unquoted RHS in source code is treated as an expression, so a real literal default inside a call is missed (ideal: flagged)
     (
         "py",
         r#"password = os.environ.get("DB_PASSWORD", "hunter2hunter2xx")"#,
@@ -375,13 +375,13 @@ const KNOWN_GAPS: &[Row] = &[
         r#"const password = process.env.DB_PASSWORD || "hunter2hunter2xx";"#,
         false,
     ),
-    // KNOWN GAP (no issue yet) - FN: the scanner regex needs a >= 8 char token after `=`, so `new String("lit")` and other short-prefixed constructors are never matched (ideal: flagged)
+    // KNOWN GAP #630 - FN: the scanner regex needs a >= 8 char token after `=`, so `new String("lit")` and other short-prefixed constructors are never matched (ideal: flagged)
     (
         "java",
         r#"String password = new String("hunter2hunter2xx");"#,
         false,
     ),
-    // KNOWN GAP (no issue yet) - FN: shell `${VAR:-literal}` default with a real literal is treated as interpolation (ideal: flagged)
+    // KNOWN GAP #629 - FN: shell `${VAR:-literal}` default with a real literal is treated as interpolation (ideal: flagged)
     ("sh", "DB_PASSWORD=${DB_PASSWORD:-hunter2hunter2xx}", false),
 ];
 
