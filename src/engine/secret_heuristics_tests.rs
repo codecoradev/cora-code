@@ -193,7 +193,7 @@ const CASES: &[Row] = &[
 /// the ideal result in the trailing comment). Move a row into [`CASES`] with
 /// the ideal expectation when its issue is fixed.
 const KNOWN_GAPS: &[Row] = &[
-    // KNOWN GAP #xxx - FP: env-var reads and call expressions on the RHS are reported as hardcoded secrets (ideal: not flagged)
+    // KNOWN GAP #616 - FP: env-var reads and call expressions on the RHS are reported as hardcoded secrets (ideal: not flagged)
     ("js", "const token = process.env.API_TOKEN;", true),
     (
         "js",
@@ -216,19 +216,19 @@ const KNOWN_GAPS: &[Row] = &[
         true,
     ),
     ("kt", r#"val password = System.getenv("DB_PASSWORD")"#, true),
-    // KNOWN GAP #xxx - FP: shell-style `${VAR}`/`$VAR` interpolation in env, .properties and shell files (ideal: not flagged)
+    // KNOWN GAP #617 - FP: shell-style `${VAR}`/`$VAR` interpolation in env, .properties and shell files (ideal: not flagged)
     ("env", "DB_PASSWORD=${DB_PASSWORD_FROM_VAULT}", true),
     ("properties", "db.password=${DB_PASSWORD}", true),
     ("sh", r#"export DB_PASSWORD="$VAULT_DB_PASSWORD""#, true),
-    // KNOWN GAP #xxx - FN: Go `:=` short declarations are never matched by the regexes (ideal: flagged)
+    // KNOWN GAP #618 - FN: Go `:=` short declarations are never matched by the regexes (ideal: flagged)
     ("go", r#"password := "hunter2hunter2""#, false),
     ("go", r#"var apiKey string = "abcd1234efgh5678""#, false),
     ("go", r#"password := "hunter2hunter2" // note: temp"#, false),
-    // KNOWN GAP #xxx - FN: unquoted YAML scalar is mistaken for object shorthand; quoted JSON keys never match (ideal: flagged)
+    // KNOWN GAP #619 - FN: unquoted YAML scalar is mistaken for object shorthand; quoted JSON keys never match (ideal: flagged)
     ("yaml", "password: hunter2hunter2", false),
     ("json", r#"  "password": "hunter2hunter2","#, false),
     ("json", r#"  "apiKey": "abcd1234efgh5678""#, false),
-    // KNOWN GAP #xxx - FN: SQL `PASSWORD '<literal>'` (no `=`) is not matched (ideal: flagged)
+    // KNOWN GAP #620 - FN: SQL `PASSWORD '<literal>'` (no `=`) is not matched (ideal: flagged)
     (
         "sql",
         "CREATE USER app WITH PASSWORD 'hunter2hunter2';",
