@@ -46,10 +46,13 @@ pub static PATTERNS: &[SecurityPattern] = &[
         id: "crypto/hardcoded-secret",
         name: "Hardcoded password or secret in variable",
         // Alternatives: (1) `name [: type] =|:` value, `:=` only before a quoted
-        // literal (Go `password := "..."`, never `:= os.Getenv(..)`, #618), key
-        // may be quoted (JSON, #619); (2) Go `var name type = value`; (3) SQL
-        // `PASSWORD '<literal>'` / `IDENTIFIED BY '<literal>'` (#620).
-        regex: r#"(?i)(?:password|passwd|pwd|secret|api_key|apikey|token)["']?(?:\s*:\s*[&\w<>\[\].?|]+)?\s*(?:[=:]|:=\s*["'`])\s*\S{8,}|(?:password|passwd|pwd|secret|api_key|apikey|token)["']?\s+[&*\w<>\[\].?|]+\s*=\s*["'`]\S{7,}|\b(?:password|identified\s+by)\s+'[^']+'"#,
+        // literal (Go `password := "..."`, never `:= os.Getenv(..)` and never an
+        // unspaced `password:=os.Getenv(..)`, #618/#625), key may be quoted (JSON,
+        // #619), or a quoted literal inside a constructor call such as
+        // `new String("...")` whose callee is too short for the 8-char token (#630);
+        // (2) Go `var name type = value`; (3) SQL `PASSWORD '<literal>'` /
+        // `IDENTIFIED BY "<literal>"` (#620, #625).
+        regex: r#"(?i)(?:password|passwd|pwd|secret|api_key|apikey|token)["']?(?:\s*:\s*[&\w<>\[\].?|]+)?\s*(?:(?:=|:=\s*["'`])\s*\S{8,}|:\s*[^=\s]\S{7,}|(?:=|:=)\s*(?:new\s+)?[A-Za-z_][\w:.]*\s*\(\s*["'`][^"'`]+["'`])|(?:password|passwd|pwd|secret|api_key|apikey|token)["']?\s+[&*\w<>\[\].?|]+\s*=\s*["'`]\S{7,}|\b(?:password|identified\s+by)\s+\\?["'][^"']+["']"#,
         severity: Severity::Critical,
     },
     // ── Injection ──
