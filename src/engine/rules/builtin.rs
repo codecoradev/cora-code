@@ -155,13 +155,13 @@ static SECRET_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Does `line` show a hardcoded secret literal the deterministic detectors
 /// report? Used by the LLM cross-check so LLM findings on the same shapes are
 /// kept. A SQL placeholder (`PASSWORD '%s'`) is not a literal.
-pub(crate) fn has_secret_literal(line: &str) -> bool {
+pub(crate) fn has_secret_literal(line: &str, path: &str) -> bool {
     if let Some(c) = SQL_PASSWORD_RE.captures(line)
         && is_sql_placeholder(&c[1])
     {
         return false;
     }
-    if quoted_placeholder_value(line) {
+    if quoted_placeholder_value(line) || non_literal_rhs(strip_trailing_comment(line), path) {
         return false;
     }
     SECRET_LITERAL_RE.is_match(line) || plain_scalar_secret(strip_trailing_comment(line))
@@ -253,11 +253,139 @@ fn quoted_placeholder_value(line: &str) -> bool {
     seen
 }
 
+/// How a bare (unquoted) right-hand side of `name = value` reads in a file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RhsStyle {
+    /// `.env`, `.properties`, `.ini`, `.toml`, shell, YAML...: a bare token IS
+    /// the literal value (`DB_PASSWORD=hunter2hunter2`).
+    Assignment,
+    /// Source code: a bare RHS is an expression (identifier, member access,
+    /// call, env read), never a literal.
+    Code,
+    /// Path unknown or not classified: keep the legacy behaviour (flag).
+    Unknown,
+}
+
+fn rhs_style(path: &str) -> RhsStyle {
+    let file = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    if file == ".env"
+        || file.starts_with(".env.")
+        || matches!(
+            file.as_str(),
+            "dockerfile" | "makefile" | ".npmrc" | ".envrc"
+        )
+    {
+        return RhsStyle::Assignment;
+    }
+    let Some((_, ext)) = file.rsplit_once('.') else {
+        return RhsStyle::Unknown;
+    };
+    match ext {
+        "env" | "properties" | "ini" | "cfg" | "conf" | "toml" | "sh" | "bash" | "zsh" | "ksh"
+        | "envrc" | "yaml" | "yml" | "tfvars" | "mk" | "service" | "dockerfile" => {
+            RhsStyle::Assignment
+        }
+        "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "svelte" | "vue" | "py"
+        | "rs" | "go" | "java" | "kt" | "kts" | "scala" | "groovy" | "gradle" | "c" | "h"
+        | "cc" | "cpp" | "hpp" | "cs" | "php" | "rb" | "swift" | "dart" | "lua" | "pl" | "ex"
+        | "exs" | "erl" | "hs" | "clj" | "jl" | "r" | "sql" | "zig" | "nim" | "m" | "mm" => {
+            RhsStyle::Code
+        }
+        _ => RhsStyle::Unknown,
+    }
+}
+
+/// Right-hand side of the first `<secret word> [: type] =|:= <rhs>` on the line
+/// (`==` comparisons are not assignments).
+fn secret_assign_rhs(line: &str) -> Option<&str> {
+    static ASSIGN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)(?:password|passwd|pwd|secret|api_?key|token)["']?(?:\s*:\s*[&*\w<>\[\].?|]+|\s+[&*\w<>\[\].?|]+)?\s*(?::=|=)"#,
+        )
+        .expect("assign regex must compile")
+    });
+    let rest = &line[ASSIGN_RE.find(line)?.end()..];
+    if rest.starts_with('=') {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+/// A quoted value that is nothing but a reference: `${X}`, `$X`, `$(cmd)`.
+fn is_pure_reference(inner: &str) -> bool {
+    (inner.starts_with("${") && inner.ends_with('}') && inner.matches("${").count() == 1)
+        || (inner.starts_with("$(") && inner.ends_with(')'))
+        || (inner.starts_with('$')
+            && inner.len() > 1
+            && inner[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+}
+
+/// Does the RHS start with a quoted literal (`"x"`, `'x'`, `` `x` ``, `b"x"`,
+/// `r#"x"#`, `f'x'`) or a literal wrapped by a constructor (`String::from("x")`)?
+fn starts_with_literal(rhs: &str) -> bool {
+    static LIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"^(?:[A-Za-z]{0,2}#*["'`]|(?:String::from|Some|Secret(?:String)?::(?:new|from)|new\s+String)\s*\(\s*[A-Za-z]{0,2}#*["'`])"#,
+        )
+        .expect("literal-start regex must compile")
+    });
+    LIT_RE.is_match(rhs)
+}
+
+/// Is the right-hand side of a secret-named assignment provably NOT a literal
+/// value (#616, #617)?
+///
+/// - Quoted RHS: a literal, unless the whole value is a reference (`"${X}"`,
+///   `"$VAULT_X"`, `"$(cmd)"`). Concatenations (`"a" + "b"`) stay literals.
+/// - Unquoted RHS starting with `$` or containing `${..}` / `$(..)` / a backtick
+///   is shell-style interpolation or command substitution, in any file.
+/// - Other unquoted RHS: in source code it is an expression (`process.env.X`,
+///   `os.getenv("X")`, `get_pw()`, `std::env::var("X")?`, `cfg.token`, `userInput`)
+///   so not a secret; in assignment-style files (.env, .properties, shell, YAML)
+///   a bare token is the literal value, so it is kept as a finding; in unknown
+///   files nothing changes.
+fn non_literal_rhs(line: &str, path: &str) -> bool {
+    let Some(rhs) = secret_assign_rhs(line) else {
+        return false;
+    };
+    let rhs = rhs.trim_end_matches([';', ',']).trim_end();
+    if rhs.is_empty() {
+        return false;
+    }
+    if let Some(q) = rhs.chars().next().filter(|c| matches!(c, '"' | '\'')) {
+        // Whole-value quote: `"..."` with nothing after the closing quote.
+        return rhs.len() >= 2
+            && rhs.ends_with(q)
+            && !rhs[1..rhs.len() - 1].contains(q)
+            && is_pure_reference(&rhs[1..rhs.len() - 1]);
+    }
+    if starts_with_literal(rhs) {
+        return false;
+    }
+    if rhs.starts_with('$') || rhs.contains("${") || rhs.contains("$(") || rhs.contains('`') {
+        return true;
+    }
+    rhs_style(path) == RhsStyle::Code
+}
+
 /// Post-match filter for rules that need additional validation after regex match.
 /// Returns `true` to suppress a finding that the regex matched but should be ignored.
+#[cfg(test)]
 pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
+    post_match_filter_for_path(rule_id, line, "")
+}
+
+/// [`post_match_filter`] with the file path, which lets the hardcoded-secret
+/// filter tell source code from assignment-style config files (#616, #617).
+pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool {
     match rule_id {
-        "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line),
+        "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line, path),
         "sec-hardcoded-url" => is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
         "injection/sql-concat" => is_false_positive_sql_concat(line),
@@ -395,11 +523,17 @@ fn first_unquoted_colon(line: &str) -> Option<usize> {
 ///
 /// Suppresses: empty string values, variable references (no literal secret),
 /// and UI binding patterns (Svelte $state, bind:value, form fields).
-fn is_false_positive_secret(line: &str) -> bool {
+fn is_false_positive_secret(line: &str, path: &str) -> bool {
     // Judge the code only: a trailing comment ("// note: fix later") must not
     // turn a real secret into an "object shorthand" false positive (#603).
     let line = strip_trailing_comment(line);
     let lower = line.to_lowercase();
+
+    // Env reads, call/member expressions, bare identifiers and `${VAR}`
+    // interpolation on the RHS are not literals (#616, #617).
+    if non_literal_rhs(line, path) {
+        return true;
+    }
 
     // Empty string or empty-ish values: = ''  = ""  = $state('')
     if lower.contains("= ''") || lower.contains("= \"\"") || lower.contains("= $state('')") {
