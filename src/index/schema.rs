@@ -6,19 +6,32 @@ use rusqlite::Connection;
 #[allow(dead_code)]
 const SCHEMA_VERSION: i32 = 8;
 
-/// Serialises migrations within a process: several connections to the same
-/// database file (parallel tests, concurrent sessions) used to race between
-/// reading the version and applying a migration, failing with
-/// `UNIQUE constraint failed: schema_version.version` (#604).
+/// Serialises index opening (PRAGMAs + migrations) within a process: several
+/// connections to the same database file (parallel tests, concurrent sessions)
+/// used to race between reading the version and applying a migration
+/// (`UNIQUE constraint failed: schema_version.version`) or switch the journal
+/// mode at the same time (`database is locked`) (#604).
 static MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Run database migrations (creates tables if not exist).
-pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
-    // A poisoned lock only means another migration panicked; the version row
-    // is re-read below, so it is safe to continue.
-    let _guard = MIGRATION_LOCK
+/// Take the open/migrate lock. A poisoned lock only means another opener
+/// panicked; the schema version is re-read after locking, so continuing is safe.
+pub(crate) fn open_lock() -> std::sync::MutexGuard<'static, ()> {
+    MIGRATION_LOCK
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Run database migrations (creates tables if not exist). Production opens go
+/// through `index::open_index_at`, which holds [`open_lock`] and calls
+/// [`run_migrations_locked`]; this self-locking form is for tests.
+#[cfg(test)]
+pub fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
+    let _guard = open_lock();
+    run_migrations_locked(conn)
+}
+
+/// [`run_migrations`] for callers that already hold [`open_lock`].
+pub(crate) fn run_migrations_locked(conn: &Connection) -> anyhow::Result<()> {
     // Schema version tracking
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_version (

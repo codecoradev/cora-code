@@ -44,8 +44,11 @@ pub fn open_global_index() -> anyhow::Result<Connection> {
 /// goes through [`open_global_index`], tests may point it at a temp file.
 pub fn open_index_at(db_path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(db_path)?;
+    // One opener at a time per process: PRAGMA journal_mode and migrations on
+    // the same file must not interleave (#604).
+    let _guard = schema::open_lock();
     apply_pragmas(&conn)?;
-    schema::run_migrations(&conn)?;
+    schema::run_migrations_locked(&conn)?;
 
     debug!("Opened index at {}", db_path.display());
     Ok(conn)
@@ -53,6 +56,9 @@ pub fn open_index_at(db_path: &Path) -> anyhow::Result<Connection> {
 
 /// The one PRAGMA set every read-write index connection uses.
 pub fn apply_pragmas(conn: &Connection) -> anyhow::Result<()> {
+    // First: wait for a competing connection instead of failing with
+    // "database is locked" while switching the journal mode.
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;\
          PRAGMA foreign_keys=ON;\
