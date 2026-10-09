@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Release checksums are signed with cosign keyless and verified by `install.sh` and `cora upgrade` (#591).** `release.yml` now signs `checksums-sha256.txt` (which covers every archive) via Sigstore/GitHub OIDC before creating the release and uploads `checksums-sha256.txt.sigstore.json`; a signing failure aborts the job so no unsigned release is published. `install.sh` and `cora upgrade` verify the bundle with `cosign verify-blob` (identity: this repo's `release.yml` on a `v*` tag, issuer `token.actions.githubusercontent.com`) when `cosign` is on `PATH`; an invalid signature aborts. Without `cosign`, or for releases without a bundle, they print a notice and fall back to checksum-only. `CORA_REQUIRE_SIGNATURE=1` makes a missing `cosign` or bundle fatal. See `docs/installation.md`.
+
 ### Fixed
 
 - **Secret-detection edge cases (#625, #628, #629, #630).** A string literal inside a constructor wrapper is now a literal: Java `new String("..")`, `Cow::Owned`, `Box::from`, `Secret::new`, Python `str("..")` (plain calls such as `get_password()` stay quiet) (#630). A literal default in the default position of an env read is flagged in code files: `os.environ.get("X", "lit")`, `os.getenv`, `process.env.X || "lit"` / `?? "lit"`, Rust `env::var("X").unwrap_or("lit".into())` / `unwrap_or_else(|_| "lit".to_string())`, Ruby `ENV.fetch`, PHP `getenv() ?:`; the env var name and name-only reads stay quiet (#628). Shell `${VAR:-literal}` / `${VAR:=literal}` is flagged, while `${VAR}`, `${VAR:-}` and `${VAR:?msg}` stay quiet (#629). The unquoted-YAML rule no longer applies to source code (`secret: Secret1Type` in `.ts`/`.py`), YAML flow-style `{ password: hunter2hunter2 }` is flagged, unspaced `password:=os.Getenv("X")` is no longer matched, and SQL `PASSWORD "..."` with double quotes is detected (#625). All-alphabetic unquoted YAML values (`password: correcthorsebattery`) remain undetected, tracked in #635. The LLM secret cross-check uses the same classification.

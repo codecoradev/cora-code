@@ -89,6 +89,63 @@ get_target() {
     esac
 }
 
+# Keyless cosign (Sigstore) identity that must have signed the release (#591).
+COSIGN_IDENTITY_REGEXP="^https://github.com/${REPO}/\\.github/workflows/release\\.yml@refs/tags/v"
+COSIGN_OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+# Is CORA_REQUIRE_SIGNATURE on? Sets REQUIRE_SIG=1|0. Unknown values are an
+# error rather than a silent "off" so a requested verification is never lost.
+parse_require_signature() {
+    case "${CORA_REQUIRE_SIGNATURE:-}" in
+        ""|0|false) REQUIRE_SIG=0;;
+        1|true)     REQUIRE_SIG=1;;
+        *)          error "CORA_REQUIRE_SIGNATURE must be 1 or 0 (got '${CORA_REQUIRE_SIGNATURE}')";;
+    esac
+}
+
+# Verify the cosign keyless signature over the checksums file.
+# Policy (see docs/installation.md):
+#   bundle present + cosign present -> verify; failure is fatal (fail closed)
+#   cosign missing                  -> notice (checksum-only); fatal if REQUIRE_SIG=1
+#   bundle absent (HTTP 404)        -> notice (older release); fatal if REQUIRE_SIG=1
+#   any other bundle download error -> fatal
+verify_signature() {
+    BUNDLE_URL="${CHECKSUMS_URL}.sigstore.json"
+    BUNDLE_FILE="${CHECKSUM_FILE}.sigstore.json"
+
+    HTTP_CODE=$(curl -sSL --connect-timeout 10 --max-time 30 --max-filesize 1048576 \
+        -w '%{http_code}' "$BUNDLE_URL" -o "$BUNDLE_FILE") || HTTP_CODE="000"
+    case "$HTTP_CODE" in
+        200) ;;
+        404)
+            if [ "$REQUIRE_SIG" = "1" ]; then
+                error "No signature bundle published for ${VERSION} but CORA_REQUIRE_SIGNATURE=1. Refusing to install."
+            fi
+            warn "No cosign signature published for ${VERSION}; verified by SHA-256 checksum only."
+            return 0
+            ;;
+        *) error "Failed to download signature bundle (HTTP ${HTTP_CODE}). Refusing to install (set CORA_SKIP_CHECKSUM=1 to bypass all verification, unsafe).";;
+    esac
+
+    if ! command -v cosign >/dev/null 2>&1; then
+        if [ "$REQUIRE_SIG" = "1" ]; then
+            error "cosign not found but CORA_REQUIRE_SIGNATURE=1. Install cosign: https://docs.sigstore.dev/cosign/system_config/installation/"
+        fi
+        warn "Signature NOT verified (checksum-only): cosign not found. Install it to verify: https://docs.sigstore.dev/cosign/system_config/installation/"
+        return 0
+    fi
+
+    info "Verifying cosign signature..."
+    if ! cosign verify-blob \
+        --bundle "$BUNDLE_FILE" \
+        --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" \
+        --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+        "$CHECKSUM_FILE" >/dev/null 2>&1; then
+        error "cosign signature verification FAILED for checksums of ${VERSION}. Refusing to install."
+    fi
+    info "Signature verified (cosign keyless, GitHub Actions release workflow)"
+}
+
 # Download and install
 install() {
     info "Detected: $OS $ARCH"
@@ -111,13 +168,18 @@ install() {
     # Verify SHA256 checksum (prevents MITM / corrupted download).
     # Mandatory: a missing checksums file or entry is fatal unless the user
     # explicitly opts out with CORA_SKIP_CHECKSUM=1.
+    parse_require_signature
     if [ "${CORA_SKIP_CHECKSUM:-}" = "1" ]; then
+        if [ "$REQUIRE_SIG" = "1" ]; then
+            error "CORA_SKIP_CHECKSUM=1 conflicts with CORA_REQUIRE_SIGNATURE=1 (the signature covers the checksums file). Unset one."
+        fi
         warn "CORA_SKIP_CHECKSUM=1 set - checksum verification DISABLED. The binary is NOT verified."
     else
         info "Downloading checksums..."
         if ! curl -fsSL --connect-timeout 10 --max-time 30 --max-filesize 1048576 "$CHECKSUMS_URL" -o "$CHECKSUM_FILE"; then
             error "Failed to download checksums. Refusing to install an unverified binary (set CORA_SKIP_CHECKSUM=1 to override, unsafe)."
         fi
+        verify_signature
         info "Verifying SHA256 checksum..."
         # Exact filename match (optionally prefixed with '*' or './').
         EXPECTED=$(awk -v n="$ARCHIVE_NAME" '{f=$2; sub(/^\*/, "", f); sub(/^\.\//, "", f); if (f == n) {print $1; exit}}' "$CHECKSUM_FILE")

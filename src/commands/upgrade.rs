@@ -22,6 +22,8 @@ const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SMALL_BYTES: u64 = 1024 * 1024;
 /// Maximum accepted size for the extracted binary.
 const MAX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+/// OIDC issuer that must appear in the signing certificate (GitHub Actions).
+const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -150,6 +152,22 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
         }
     };
 
+    let require_sig =
+        match parse_require_signature(std::env::var("CORA_REQUIRE_SIGNATURE").ok().as_deref()) {
+            Ok(v) => v,
+            Err(msg) => {
+                eprintln!("{} {msg}", "[ERROR]".red());
+                return Ok(1);
+            }
+        };
+    if skip_checksum && require_sig {
+        eprintln!(
+            "{} CORA_UPGRADE_SKIP_CHECKSUM conflicts with CORA_REQUIRE_SIGNATURE=1 (the signature covers the checksums file). Unset one.",
+            "[ERROR]".red()
+        );
+        return Ok(1);
+    }
+
     if skip_checksum {
         eprintln!(
             "{} !!! CHECKSUM VERIFICATION DISABLED (CORA_UPGRADE_SKIP_CHECKSUM + CORA_UPGRADE_I_UNDERSTAND) !!!",
@@ -160,8 +178,8 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
             "[WARN]".yellow().bold()
         );
     } else {
-        let checksums_text = match download_async(&checksums_url, MAX_SMALL_BYTES).await {
-            Ok(b) => String::from_utf8_lossy(&b).to_string(),
+        let checksums_bytes = match download_async(&checksums_url, MAX_SMALL_BYTES).await {
+            Ok(b) => b,
             Err(e) => {
                 eprintln!("{} Failed to download checksums: {e}", "[ERROR]".red());
                 eprintln!(
@@ -170,6 +188,35 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
                 return Ok(1);
             }
         };
+
+        let checksums_text = String::from_utf8_lossy(&checksums_bytes).to_string();
+
+        // Keyless cosign signature over the checksums file (#591).
+        let checksums_path = temp_dir.join("checksums-sha256.txt");
+        fs::write(&checksums_path, &checksums_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to write checksums: {e}"))?;
+        let bundle_state =
+            match download_optional_async(&bundle_url(&latest_version), MAX_SMALL_BYTES).await {
+                Ok(Some(b)) => BundleState::Present(b),
+                Ok(None) => BundleState::Absent,
+                Err(e) => BundleState::Error(e.to_string()),
+            };
+        match verify_signature_policy(
+            require_sig,
+            bundle_state,
+            &SystemCosign,
+            &temp_dir,
+            &checksums_path,
+        ) {
+            Ok(SigOutcome::Verified) => {
+                println!("{} Signature verified (cosign keyless)", "[INFO]".green())
+            }
+            Ok(SigOutcome::Unverified(note)) => eprintln!("{} {note}", "[WARN]".yellow()),
+            Err(msg) => {
+                eprintln!("{} {msg}", "[ERROR]".red());
+                return Ok(1);
+            }
+        }
 
         let expected = match parse_checksum(&checksums_text, &archive_name) {
             Some(h) => h,
@@ -272,12 +319,22 @@ fn http_client(follow_redirects: bool) -> anyhow::Result<reqwest::Client> {
 
 /// Download a URL with timeouts and a hard cap on the body size.
 async fn download_async(url: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    download_optional_async(url, max_bytes)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("HTTP 404 Not Found"))
+}
+
+/// Like [`download_async`] but maps HTTP 404 to `Ok(None)`.
+async fn download_optional_async(url: &str, max_bytes: u64) -> anyhow::Result<Option<Vec<u8>>> {
     let mut resp = http_client(true)?
         .get(url)
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("HTTP request failed: {e}"))?;
 
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
     if !resp.status().is_success() {
         anyhow::bail!("HTTP {}", resp.status());
     }
@@ -298,7 +355,130 @@ async fn download_async(url: &str, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf)
+    Ok(Some(buf))
+}
+
+/// URL of the cosign bundle published next to the checksums file.
+fn bundle_url(tag: &str) -> String {
+    format!("https://github.com/{REPO}/releases/download/{tag}/checksums-sha256.txt.sigstore.json")
+}
+
+/// Regexp the signing certificate identity must match: the release workflow of
+/// this repository, run from a `v*` tag. (`.` is escaped so only the real file matches.)
+fn cosign_identity_regexp() -> String {
+    format!("^https://github.com/{REPO}/\\.github/workflows/release\\.yml@refs/tags/v")
+}
+
+/// Parse `CORA_REQUIRE_SIGNATURE`. Unknown values are an error, never a silent "off".
+fn parse_require_signature(v: Option<&str>) -> Result<bool, String> {
+    match v {
+        None | Some("") | Some("0") | Some("false") => Ok(false),
+        Some("1") | Some("true") => Ok(true),
+        Some(o) => Err(format!("CORA_REQUIRE_SIGNATURE must be 1 or 0 (got '{o}')")),
+    }
+}
+
+/// Result of fetching the signature bundle.
+enum BundleState {
+    Present(Vec<u8>),
+    /// HTTP 404: release predates signing.
+    Absent,
+    Error(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SigOutcome {
+    Verified,
+    /// Proceeding on checksum-only; the string is the notice to show.
+    Unverified(String),
+}
+
+/// Seam over the external `cosign` binary so the policy is unit-testable.
+trait CosignRunner {
+    fn available(&self) -> bool;
+    fn verify(&self, bundle: &std::path::Path, blob: &std::path::Path) -> Result<(), String>;
+}
+
+struct SystemCosign;
+
+impl CosignRunner for SystemCosign {
+    fn available(&self) -> bool {
+        std::process::Command::new("cosign")
+            .arg("version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    }
+
+    fn verify(&self, bundle: &std::path::Path, blob: &std::path::Path) -> Result<(), String> {
+        let out = std::process::Command::new("cosign")
+            .arg("verify-blob")
+            .arg("--bundle")
+            .arg(bundle)
+            .arg("--certificate-identity-regexp")
+            .arg(cosign_identity_regexp())
+            .arg("--certificate-oidc-issuer")
+            .arg(COSIGN_OIDC_ISSUER)
+            .arg(blob)
+            .output()
+            .map_err(|e| format!("failed to run cosign: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+}
+
+const COSIGN_INSTALL_HINT: &str = "https://docs.sigstore.dev/cosign/system_config/installation/";
+
+/// Signature policy (same as install.sh):
+/// bundle + cosign => verify, failure fatal; cosign missing or bundle absent =>
+/// notice, fatal when `require`; any other bundle fetch error => fatal.
+fn verify_signature_policy(
+    require: bool,
+    bundle: BundleState,
+    runner: &dyn CosignRunner,
+    dir: &std::path::Path,
+    checksums_path: &std::path::Path,
+) -> Result<SigOutcome, String> {
+    let bytes = match bundle {
+        BundleState::Present(b) => b,
+        BundleState::Absent if require => {
+            return Err(
+                "No signature bundle published for this release but CORA_REQUIRE_SIGNATURE=1. Refusing to upgrade."
+                    .into(),
+            )
+        }
+        BundleState::Absent => {
+            return Ok(SigOutcome::Unverified(
+                "No cosign signature published for this release; verified by SHA-256 checksum only."
+                    .into(),
+            ))
+        }
+        BundleState::Error(e) => {
+            return Err(format!(
+                "Failed to download signature bundle: {e}. Refusing to upgrade."
+            ))
+        }
+    };
+    if !runner.available() {
+        if require {
+            return Err(format!(
+                "cosign not found but CORA_REQUIRE_SIGNATURE=1. Install cosign: {COSIGN_INSTALL_HINT}"
+            ));
+        }
+        return Ok(SigOutcome::Unverified(format!(
+            "Signature NOT verified (checksum-only): cosign not found. Install it to verify: {COSIGN_INSTALL_HINT}"
+        )));
+    }
+    let bundle_path = dir.join("checksums-sha256.txt.sigstore.json");
+    fs::write(&bundle_path, bytes).map_err(|e| format!("Failed to write bundle: {e}"))?;
+    runner
+        .verify(&bundle_path, checksums_path)
+        .map(|()| SigOutcome::Verified)
+        .map_err(|e| format!("cosign signature verification FAILED: {e}. Refusing to upgrade."))
 }
 
 /// Decide whether checksum verification may be skipped.
@@ -605,5 +785,107 @@ mod tests {
         let tgz = build_tar(&[("other", tar::EntryType::Regular, b"x", None)]);
         let a = write_archive(d.path(), &tgz);
         assert!(extract_binary(&a, out.path()).is_err());
+    }
+
+    struct FakeCosign {
+        available: bool,
+        ok: bool,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl CosignRunner for FakeCosign {
+        fn available(&self) -> bool {
+            self.available
+        }
+        fn verify(&self, bundle: &std::path::Path, _blob: &std::path::Path) -> Result<(), String> {
+            self.calls.set(self.calls.get() + 1);
+            assert!(bundle.exists());
+            if self.ok {
+                Ok(())
+            } else {
+                Err("bad sig".into())
+            }
+        }
+    }
+
+    fn policy(
+        require: bool,
+        b: BundleState,
+        available: bool,
+        ok: bool,
+    ) -> (Result<SigOutcome, String>, u32) {
+        let d = tempfile::tempdir().unwrap();
+        let blob = d.path().join("checksums-sha256.txt");
+        fs::write(&blob, b"x").unwrap();
+        let f = FakeCosign {
+            available,
+            ok,
+            calls: std::cell::Cell::new(0),
+        };
+        let r = verify_signature_policy(require, b, &f, d.path(), &blob);
+        (r, f.calls.get())
+    }
+
+    #[test]
+    fn signature_policy_matrix() {
+        let present = || BundleState::Present(b"{}".to_vec());
+        assert_eq!(
+            policy(false, present(), true, true),
+            (Ok(SigOutcome::Verified), 1)
+        );
+        assert_eq!(
+            policy(true, present(), true, true),
+            (Ok(SigOutcome::Verified), 1)
+        );
+        // cosign rejects => fatal regardless of require
+        for req in [false, true] {
+            let (r, calls) = policy(req, present(), true, false);
+            assert!(r.unwrap_err().contains("FAILED"));
+            assert_eq!(calls, 1);
+        }
+        // cosign missing
+        let (r, calls) = policy(false, present(), false, true);
+        assert!(matches!(r, Ok(SigOutcome::Unverified(ref m)) if m.contains("cosign not found")));
+        assert_eq!(calls, 0);
+        assert!(policy(true, present(), false, true).0.is_err());
+        // bundle absent (older release)
+        assert!(matches!(
+            policy(false, BundleState::Absent, true, true).0,
+            Ok(SigOutcome::Unverified(_))
+        ));
+        assert!(policy(true, BundleState::Absent, true, true).0.is_err());
+        // other fetch errors are always fatal
+        for req in [false, true] {
+            assert!(
+                policy(req, BundleState::Error("HTTP 500".into()), true, true)
+                    .0
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn require_signature_parsing() {
+        assert_eq!(parse_require_signature(None), Ok(false));
+        assert_eq!(parse_require_signature(Some("0")), Ok(false));
+        assert_eq!(parse_require_signature(Some("1")), Ok(true));
+        assert_eq!(parse_require_signature(Some("true")), Ok(true));
+        assert!(parse_require_signature(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn signature_constants() {
+        assert_eq!(
+            bundle_url("v1.2.3"),
+            "https://github.com/codecoradev/cora-code/releases/download/v1.2.3/checksums-sha256.txt.sigstore.json"
+        );
+        assert_eq!(
+            cosign_identity_regexp(),
+            "^https://github.com/codecoradev/cora-code/\\.github/workflows/release\\.yml@refs/tags/v"
+        );
+        assert_eq!(
+            COSIGN_OIDC_ISSUER,
+            "https://token.actions.githubusercontent.com"
+        );
     }
 }

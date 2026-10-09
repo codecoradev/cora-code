@@ -135,8 +135,13 @@ jobs:
     name: Create GitHub Release
     needs: [build-release]
     runs-on: ubuntu-latest
+    # Least privilege, scoped to this job only:
+    #   contents: write  -> create the GitHub Release and upload assets
+    #   id-token: write  -> mint the GitHub OIDC token cosign exchanges for a
+    #                       short-lived Sigstore (Fulcio) signing certificate (#591)
     permissions:
       contents: write
+      id-token: write
 
     steps:
       - uses: actions/checkout@v6
@@ -155,6 +160,36 @@ jobs:
           cd release-artifacts
           sha256sum * > checksums-sha256.txt
           cat checksums-sha256.txt
+
+      # Keyless signing (#591). Ordering matters: sign BEFORE creating the
+      # release. If signing fails the job stops here and no release is
+      # published, so we never ship a release that lacks its signature.
+      # One signature over the checksums file covers every archive, because
+      # install.sh / `cora upgrade` verify each archive against that file.
+      # sigstore/cosign-installer v3.10.1, pinned by commit SHA.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5
+        with:
+          cosign-release: 'v2.6.5'
+
+      - name: Sign checksums with cosign (keyless)
+        working-directory: release-artifacts
+        run: |
+          cosign sign-blob --yes \
+            --bundle checksums-sha256.txt.sigstore.json \
+            checksums-sha256.txt
+          test -s checksums-sha256.txt.sigstore.json
+
+      # Fail the job (before publishing) if the bundle does not verify against
+      # this exact workflow identity.
+      - name: Verify the fresh signature
+        working-directory: release-artifacts
+        run: |
+          cosign verify-blob \
+            --bundle checksums-sha256.txt.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            checksums-sha256.txt
 
       - name: Extract version from tag
         id: version
