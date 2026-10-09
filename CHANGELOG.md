@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Release checksums are signed with cosign keyless and verified by `install.sh` and `cora upgrade` (#591).** `release.yml` now signs `checksums-sha256.txt` (which covers every archive) via Sigstore/GitHub OIDC before creating the release and uploads `checksums-sha256.txt.sigstore.json`; a signing failure aborts the job so no unsigned release is published. `install.sh` and `cora upgrade` verify the bundle with `cosign verify-blob` (identity: this repo's `release.yml` on a `v*` tag, issuer `token.actions.githubusercontent.com`) when `cosign` is on `PATH`; an invalid signature aborts. Without `cosign`, or for releases without a bundle, they print a notice and fall back to checksum-only. `CORA_REQUIRE_SIGNATURE=1` makes a missing `cosign` or bundle fatal. See `docs/installation.md`.
+
 ### Fixed
 
 - **`rules_engine.max_findings` is applied after suppression and truncation is reported (#624).** The cap (default 5) used to be applied inside each scanner, before `ignore.rules` / `cora-ignore`, so suppressed findings consumed slots and pushed real findings out, and the rest were dropped silently. Scanners now run uncapped and the cap is enforced once in post-processing on deterministic findings only (LLM issues are never capped), highest severity first. `cora scan` and `cora review` print `⚠ N more deterministic findings not shown (...)` on stderr when findings are cut, and the `cora scan` summary mentions it; stdout formats are unchanged. `max_findings: 0` or `null` now means unlimited (previously `0` hid every finding).

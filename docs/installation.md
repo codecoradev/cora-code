@@ -88,6 +88,55 @@ $ echo 'source ~/.cora/completion.zsh' >> ~/.zshrc
 $ cora completion fish > ~/.config/fish/completions/cora.fish
 ```
 
+## Verify Release Signatures
+
+Every release (from the first signed release onward) publishes
+`checksums-sha256.txt.sigstore.json`, a [Sigstore](https://www.sigstore.dev/)
+bundle produced by the release workflow with **cosign keyless signing** (GitHub
+OIDC, no long-lived key). One signature over `checksums-sha256.txt` covers every
+archive, because each archive is verified against that file.
+
+Verify manually (requires [cosign](https://docs.sigstore.dev/cosign/system_config/installation/)):
+
+```bash
+TAG=vX.Y.Z
+BASE=https://github.com/codecoradev/cora-code/releases/download/$TAG
+curl -fsSLO $BASE/checksums-sha256.txt
+curl -fsSLO $BASE/checksums-sha256.txt.sigstore.json
+cosign verify-blob \
+  --bundle checksums-sha256.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/codecoradev/cora-code/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums-sha256.txt
+sha256sum -c --ignore-missing checksums-sha256.txt   # shasum -a 256 -c on macOS
+```
+
+`install.sh` and `cora upgrade` perform the same check automatically when
+`cosign` is on your `PATH`:
+
+| Situation | Default | `CORA_REQUIRE_SIGNATURE=1` |
+|-----------|---------|----------------------------|
+| Bundle present, `cosign` installed, signature valid | install | install |
+| Bundle present, `cosign` installed, signature invalid | **abort** | **abort** |
+| Bundle present, `cosign` not installed | install, prints a "checksum-only" notice | **abort** |
+| No bundle published (release predates signing) | install, prints a notice | **abort** |
+| Bundle download fails (not a 404) | **abort** | **abort** |
+
+`CORA_REQUIRE_SIGNATURE=1` also conflicts with `CORA_SKIP_CHECKSUM=1`
+(`CORA_UPGRADE_SKIP_CHECKSUM` for `cora upgrade`): skipping the checksum file
+would silently skip the signature, so the combination is rejected.
+
+**What this covers:** the checksums file (and therefore the archives) was
+produced by this repository's `release.yml` workflow on a `v*` tag, and is
+recorded in the Sigstore transparency log. A compromised release page or CDN
+cannot forge it without also compromising the workflow.
+
+**What it does not cover:** a compromised repository or workflow itself,
+releases published before signing was introduced, and installs where `cosign`
+is absent and `CORA_REQUIRE_SIGNATURE` is not set (those fall back to
+checksum-only, which protects against corruption but not a tampered release).
+`cargo install` is verified by crates.io, not by this mechanism.
+
 ## Verify Installation
 
 Confirm cora is installed correctly:

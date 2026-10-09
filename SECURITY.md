@@ -45,6 +45,15 @@ Security-related areas of the codebase:
 - `src/hook/` — Pre-commit hook integration
 - `src/index/` — File access and SQLite storage
 
+## Release Artifact Signing
+
+Release checksums are signed with cosign keyless (Sigstore, GitHub OIDC) by the
+`release.yml` workflow, and `install.sh` / `cora upgrade` verify the signature
+when `cosign` is installed (`CORA_REQUIRE_SIGNATURE=1` makes it mandatory).
+Manual verification, the exact `cosign verify-blob` flags, and the scope and
+limits of this guarantee are documented in
+[docs/installation.md](docs/installation.md#verify-release-signatures).
+
 ## Threat Model: Adversarial Source-Code Comments (ALIBI)
 
 LLM-based reviewers are vulnerable to adversarial comments in the code under
