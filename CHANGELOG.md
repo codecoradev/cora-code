@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `cora-ignore:` naming a scanner rule could hide an unrelated LLM finding on the same line.** A scanner finding is now merged into an LLM issue on the same line only when they share a topic word (the secret family — password, key, token, credential — counts as one topic); otherwise both are reported and the marker suppresses only the finding it names (#609).
+
+### Fixed
+
 - **Real secrets in typed declarations were missed.** `const password: string = "..."` (TypeScript), `password: str = "..."` (Python) and `let password: &str = "..."` (Rust) matched none of the secret patterns (they required the value right after `password =`/`password:`), and `cora review` also dropped the LLM's finding on them (and on single-quoted literals) as a false positive. The scanner, the built-in rule and the LLM cross-check now allow an optional type annotation, and the cross-check accepts single-quoted literals. The `bare identifier` check in the object-shorthand filter, which was always true, now rejects values containing a string literal (#607).
 
 ### Fixed

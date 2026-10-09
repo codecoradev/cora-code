@@ -286,12 +286,15 @@ diff --git a/src/api.js b/src/api.js
             line: Some(first.line),
             severity: crate::engine::Severity::Major,
             issue_type: None,
-            title: "llm".into(),
+            title: "Hardcoded secret committed to the repository".into(),
             body: String::new(),
             suggested_fix: None,
         }];
         let merged = report.merge_into(llm);
-        assert_eq!(merged[0].title, "llm");
+        assert_eq!(
+            merged[0].title,
+            "Hardcoded secret committed to the repository"
+        );
         assert!(merged.len() < total + 1, "covered location is skipped");
         assert!(merged.len() > 1);
     }

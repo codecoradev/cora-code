@@ -325,7 +325,7 @@ mod tests {
             title: RULE.to_string(),
             body: String::new(),
         };
-        let llm = || issue("f.rs", 1, "LLM wording of the same problem");
+        let llm = || issue("f.rs", 1, "Hardcoded password stored in source code");
         let merged = merge_rule_findings(vec![llm()], vec![scanner()]);
         assert_eq!(merged.len(), 1, "scanner finding is deduped away");
 
@@ -336,6 +336,28 @@ mod tests {
         // An unrelated marker still leaves it.
         let c = diff_of(&["x(); // cora-ignore: something-else"]);
         assert_eq!(apply(merged, &c).len(), 1);
+    }
+
+    /// #609: a marker naming a scanner rule must not hide an unrelated LLM
+    /// finding on the same line.
+    #[test]
+    fn marker_naming_scanner_rule_does_not_hide_unrelated_llm_issue() {
+        use crate::engine::rules::{merge_rule_findings, types::RuleFinding};
+        let scanner = RuleFinding {
+            rule_id: "sec-hardcoded-secret".to_string(),
+            file: "f.rs".to_string(),
+            line: 1,
+            severity: Severity::Major,
+            title: RULE.to_string(),
+            body: String::new(),
+        };
+        let sqli = issue("f.rs", 1, "SQL injection via string concatenation");
+        let merged = merge_rule_findings(vec![sqli], vec![scanner]);
+        assert_eq!(merged.len(), 2, "unrelated findings stay separate");
+        let c = diff_of(&["q(\"..\" + pw); // cora-ignore: sec-hardcoded-secret"]);
+        let left = apply(merged, &c);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "SQL injection via string concatenation");
     }
 
     /// Real scanner output flows through the same filter (#554).
