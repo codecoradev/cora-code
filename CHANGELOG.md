@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-10-09
+
 ### Fixed
 
 - **Env reads, call expressions and shell interpolation are no longer reported as hardcoded secrets.** `process.env.X`, `os.environ["X"]`, `os.getenv("X")`, `std::env::var("X")?`, `System.getenv("X")`, `get_password_from_vault()`, `String::new()` and bare identifiers/member accesses (`const password = userInput;`) are expressions, not literals, in source files (#616). `DB_PASSWORD=${VAR}`, `db.password=${DB_PASSWORD}`, `export X="$VAULT_X"` and `$(cmd)` are references (#617). Real values stay flagged: quoted or concatenated literals in code, and bare tokens in `.env`/`.properties`/`.ini`/`.toml`/shell/YAML files (`DB_PASSWORD=hunter2hunter2xx`). The LLM secret cross-check uses the same classification.
@@ -984,7 +986,8 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.1...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.2...develop
+[0.17.2]: https://github.com/codecoradev/cora-code/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/codecoradev/cora-code/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/codecoradev/cora-code/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/codecoradev/cora-code/compare/v0.16.0...v0.16.1
