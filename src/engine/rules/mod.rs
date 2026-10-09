@@ -118,36 +118,133 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
     findings
 }
 
+/// Words that carry no topic (generic review vocabulary).
+const STOPWORDS: &[&str] = &[
+    "the",
+    "and",
+    "for",
+    "with",
+    "via",
+    "from",
+    "that",
+    "this",
+    "use",
+    "using",
+    "used",
+    "rule",
+    "bug",
+    "sec",
+    "possible",
+    "potential",
+    "detected",
+    "found",
+    "issue",
+    "source",
+    "code",
+    "line",
+    "file",
+    "variable",
+    "value",
+    "committed",
+    "missing",
+    "unsafe",
+    "should",
+    "not",
+    "are",
+    "can",
+    "may",
+    "into",
+    "stored",
+    "exposed",
+    "in",
+    "of",
+    "or",
+    "an",
+    "to",
+    "is",
+];
+
+/// Topic words of a title / rule id: lowercase alphanumeric runs, plural `s`
+/// dropped, generic vocabulary removed, and the secret family (password, key,
+/// token, credential, secret) folded into one word, since reviewers and
+/// scanners name the same hardcoded-secret problem differently.
+fn topic_words(text: &str) -> std::collections::HashSet<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .map(|w| w.strip_suffix('s').filter(|t| t.len() >= 3).unwrap_or(w))
+        .filter(|w| !STOPWORDS.contains(w))
+        .map(|w| match w {
+            "password" | "passwd" | "pwd" | "credential" | "token" | "apikey" | "api_key"
+            | "key" | "secret" => "secret".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// True when an LLM issue plausibly describes the same problem as a scanner
+/// finding: they share at least one topic word (#609).
+fn same_topic(issue: &ReviewIssue, finding: &RuleFinding) -> bool {
+    let mut issue_words = topic_words(&issue.title);
+    if let Some(kind) = &issue.issue_type {
+        issue_words.extend(topic_words(kind));
+    }
+    let finding_words = topic_words(&format!("{} {}", finding.title, finding.rule_id));
+    issue_words.iter().any(|w| finding_words.contains(w))
+}
+
 /// Merge rule-based findings with LLM-produced issues into a single list.
 ///
-/// Rule findings are appended after LLM issues (LLM issues take priority).
-/// Duplicates (same file + line) from rules are skipped if the LLM already
-/// reported an issue for that location.
+/// Rule findings are appended after LLM issues (LLM issues take priority). A
+/// rule finding is skipped as a duplicate only when an LLM issue on the same
+/// file+line is about the same topic (see [`same_topic`]); its id and title are
+/// then recorded on that issue's `also_matches` (not serialized) so an inline
+/// `cora-ignore:` / `ignore.rules` entry naming the scanner rule still
+/// suppresses it (#597). An unrelated LLM issue on the same line is neither
+/// aliased nor allowed to absorb the rule finding, so a marker naming one rule
+/// cannot hide a different problem (#609).
 pub fn merge_rule_findings(
     llm_issues: Vec<ReviewIssue>,
     rule_findings: Vec<RuleFinding>,
 ) -> Vec<ReviewIssue> {
     let mut result = llm_issues;
 
-    // Build a set of (file, line) pairs from LLM issues to avoid duplicates
-    let llm_locations: std::collections::HashSet<(String, u32)> = result
-        .iter()
-        .filter_map(|issue| issue.line.map(|ln| (issue.file.clone(), ln)))
-        .collect();
+    // (file, line) -> indexes of the pre-existing issues at that location.
+    let mut at_location: std::collections::HashMap<(String, u32), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (idx, issue) in result.iter().enumerate() {
+        if let Some(ln) = issue.line {
+            at_location
+                .entry((issue.file.clone(), ln))
+                .or_default()
+                .push(idx);
+        }
+    }
 
     for finding in rule_findings {
-        // Skip if LLM already has an issue at the same file+line
-        if llm_locations.contains(&(finding.file.clone(), finding.line)) {
+        let holder = at_location
+            .get(&(finding.file.clone(), finding.line))
+            .and_then(|idxs| {
+                idxs.iter()
+                    .copied()
+                    .find(|&i| same_topic(&result[i], &finding))
+            });
+        if let Some(idx) = holder {
+            let holder = &mut result[idx];
+            holder.also_matches.push(finding.rule_id.clone());
+            holder.also_matches.push(finding.title.clone());
             debug!(
                 rule_id = %finding.rule_id,
                 file = %finding.file,
                 line = finding.line,
-                "skipping rule finding (LLM already reported issue at this location)"
+                "skipping rule finding (LLM already reported the same problem at this location)"
             );
             continue;
         }
 
         result.push(ReviewIssue {
+            rule_id: Some(finding.rule_id),
+            also_matches: Vec::new(),
             file: finding.file,
             line: Some(finding.line),
             severity: finding.severity,
@@ -354,9 +451,89 @@ mod tests {
         assert!(findings.len() <= 2, "should cap findings at max_findings");
     }
 
+    fn llm_issue(line: u32, title: &str, kind: Option<&str>) -> ReviewIssue {
+        ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
+            file: "src/a.rs".to_string(),
+            line: Some(line),
+            severity: Severity::Major,
+            issue_type: kind.map(str::to_string),
+            title: title.to_string(),
+            body: String::new(),
+            suggested_fix: None,
+        }
+    }
+
+    fn secret_finding(line: u32) -> RuleFinding {
+        RuleFinding {
+            rule_id: "crypto/hardcoded-secret".to_string(),
+            file: "src/a.rs".to_string(),
+            line,
+            severity: Severity::Critical,
+            title: "Hardcoded password or secret in variable".to_string(),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn same_topic_matches_secret_family_wording() {
+        for t in [
+            "Hardcoded password stored in source code",
+            "Hardcoded API key committed",
+            "Plaintext credentials in config",
+            "Weak, low-entropy secret",
+            "Token exposed in source",
+        ] {
+            assert!(
+                same_topic(&llm_issue(1, t, None), &secret_finding(1)),
+                "{t}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_llm_issue_neither_absorbs_nor_aliases_rule_finding() {
+        // #609: SQL injection on the same line as a hardcoded secret.
+        let merged = merge_rule_findings(
+            vec![llm_issue(
+                5,
+                "SQL injection via string concatenation",
+                Some("security"),
+            )],
+            vec![secret_finding(5)],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged[0].also_matches.is_empty());
+        assert_eq!(
+            merged[1].rule_id.as_deref(),
+            Some("crypto/hardcoded-secret")
+        );
+    }
+
+    #[test]
+    fn alias_goes_to_the_related_issue_not_the_first_one() {
+        let merged = merge_rule_findings(
+            vec![
+                llm_issue(5, "SQL injection via string concatenation", None),
+                llm_issue(5, "Hardcoded password stored in source code", None),
+            ],
+            vec![secret_finding(5)],
+        );
+        assert_eq!(merged.len(), 2);
+        assert!(merged[0].also_matches.is_empty());
+        assert!(
+            merged[1]
+                .also_matches
+                .contains(&"crypto/hardcoded-secret".to_string())
+        );
+    }
+
     #[test]
     fn merge_skips_duplicates() {
         let llm = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(5),
             severity: Severity::Minor,
@@ -378,11 +555,21 @@ mod tests {
         let merged = merge_rule_findings(llm, rules);
         // Should have 1 issue (LLM's), not 2 — rule finding at same location skipped
         assert_eq!(merged.len(), 1);
+        // ...but its id and title stay addressable for suppression (#597).
+        assert!(merged[0].also_matches.contains(&"bug-unwrap".to_string()));
+        assert!(
+            merged[0]
+                .also_matches
+                .contains(&"[bug-unwrap] Rule: bug-unwrap".to_string())
+        );
+        assert!(merged[0].rule_id.is_none());
     }
 
     #[test]
     fn merge_appends_unique_rule_findings() {
         let llm = vec![ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(5),
             severity: Severity::Minor,

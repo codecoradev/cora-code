@@ -507,7 +507,7 @@ brain:
 
 ## Inline Suppression (`cora-ignore`)
 
-`ignore.rules` hides a finding title across the whole project. To suppress one finding at one location, put a marker in a source comment:
+`ignore.rules` hides a finding across the whole project (substring match on title or type, plus exact match on rule id). To suppress one finding at one location, put a marker in a source comment:
 
 ```ts
 const bytesPerToken = 4; // cora-ignore: Hardcoded password or secret in variable
@@ -517,7 +517,9 @@ const next = compute();
 ```
 
 - Syntax: `cora-ignore: <rule>[, <rule>...]`, matched as a substring of the line, so it works after `//`, `#`, `--`, inside `/* */` or `<!-- -->`, etc. The marker is case-insensitive.
-- `<rule>` is the finding **title**, matched exactly and case-insensitively (not a substring, unlike `ignore.rules`).
+- `<rule>` is the finding **title** or its **rule id** (e.g. `sec-hardcoded-secret`, `index-dead-code`), matched exactly and case-insensitively (not a substring, unlike `ignore.rules`). Ids are stable, so prefer them over titles.
+- Finding a rule's id: deterministic findings carry a `rule_id`, shown as `(rule: <id>)` in pretty output, `(<id>)` at the end of compact lines, as `rule_id` in JSON, and as `properties.coraRuleId` in SARIF. LLM findings have no id; use their title.
+- If an LLM finding and a scanner finding on the same line describe the same problem (they share a topic word, e.g. both are about a hardcoded password/secret), only the LLM finding is reported, and a marker (or `ignore.rules` entry) naming the scanner rule's id or title still suppresses it. If the LLM finding is about something else (say SQL injection next to a hardcoded secret), both are reported and a marker only suppresses the one it names.
 - Scope: the same line; plus the next line when the marker line contains only a comment.
 - A bare `cora-ignore` (no `:` or empty rule list) suppresses nothing, so every suppression names its rule.
 - Applies to both deterministic scanner and LLM findings, in both `cora review` and `cora scan`. Other rules on the same line and the rest of the project stay visible. Works alongside `ignore.rules` and `ignore.files`.

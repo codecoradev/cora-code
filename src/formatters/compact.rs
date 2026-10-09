@@ -76,7 +76,10 @@ fn format_issue_compact(issue: &ReviewIssue) -> String {
         None => issue.file.clone(),
     };
 
-    format!("[{sev}] {loc}: {}\n", issue.title)
+    match issue.rule_id {
+        Some(ref id) => format!("[{sev}] {loc}: {} ({id})\n", issue.title),
+        None => format!("[{sev}] {loc}: {}\n", issue.title),
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +89,8 @@ mod tests {
 
     fn sample_issue() -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(42),
             severity: Severity::Critical,
@@ -179,6 +184,8 @@ mod tests {
     #[test]
     fn format_issue_compact_no_line() {
         let issue = ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "README.md".to_string(),
             line: None,
             severity: Severity::Info,

@@ -208,10 +208,15 @@ fn format_issue_pretty(issue: &ReviewIssue, num: usize) -> String {
 
     // Title
     out.push_str(&format!(
-        "  {} {}\n",
+        "  {} {}",
         format!("#{num}").dimmed(),
         issue.title.bold()
     ));
+    // Rule id, usable in `cora-ignore:` / `ignore.rules` (#597).
+    if let Some(ref id) = issue.rule_id {
+        out.push_str(&format!(" {}", format!("(rule: {id})").dimmed()));
+    }
+    out.push('\n');
 
     // Body
     if !issue.body.is_empty() {
@@ -238,6 +243,8 @@ mod tests {
 
     fn sample_issue() -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(42),
             severity: Severity::Critical,
@@ -376,6 +383,8 @@ mod tests {
     #[test]
     fn format_issue_pretty_no_line() {
         let issue = ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "README.md".to_string(),
             line: None,
             severity: Severity::Info,

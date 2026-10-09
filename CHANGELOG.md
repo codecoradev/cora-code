@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-09
+
+### Fixed
+
+- **A `cora-ignore:` naming a scanner rule could hide an unrelated LLM finding on the same line.** A scanner finding is now merged into an LLM issue on the same line only when they share a topic word (the secret family — password, key, token, credential — counts as one topic); otherwise both are reported and the marker suppresses only the finding it names (#609).
+
+### Fixed
+
+- **Real secrets in typed declarations were missed.** `const password: string = "..."` (TypeScript), `password: str = "..."` (Python) and `let password: &str = "..."` (Rust) matched none of the secret patterns (they required the value right after `password =`/`password:`), and `cora review` also dropped the LLM's finding on them (and on single-quoted literals) as a false positive. The scanner, the built-in rule and the LLM cross-check now allow an optional type annotation, and the cross-check accepts single-quoted literals. The `bare identifier` check in the object-shorthand filter, which was always true, now rejects values containing a string literal (#607).
+
+### Fixed
+
+- **Real secrets were missed when the line had a trailing comment containing `:`.** The `hardcoded-secret` false-positive filter treated the first `:` anywhere (even inside a comment or string) as object shorthand, so `password = "..."; // note: fix later` was not flagged, and no scanner finding existed on lines carrying a `cora-ignore: <rule>` marker. The filter now judges only the code, ignoring trailing comments and quoted colons (#603).
+- **Concurrent index opens could fail with `UNIQUE constraint failed: schema_version.version`.** Schema migrations are now serialised per process, which also removes a flaky test (#604).
+
+### Added
+
+- **Findings now carry a `rule_id`.** Deterministic scanner findings (rules, secrets, security, index) keep their rule id through the merge; it appears in pretty/compact output, as `rule_id` in JSON (omitted when absent, so older JSON still deserializes), and as `properties.coraRuleId` in SARIF (#597).
+
+### Changed
+
+- **`cora-ignore:` and `ignore.rules` match rule ids.** `cora-ignore: sec-hardcoded-secret` suppresses by id (exact, case-insensitive) as well as title; `ignore.rules` additionally matches ids exactly. A marker naming a scanner rule now also suppresses the LLM finding that displaced that scanner finding on the same line (#597).
+
 ## [0.16.1] - 2026-10-08
 
 ### Fixed
@@ -945,7 +968,8 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.16.1...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.0...develop
+[0.17.0]: https://github.com/codecoradev/cora-code/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/codecoradev/cora-code/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/codecoradev/cora-code/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/codecoradev/cora-code/compare/v0.14.0...v0.15.0

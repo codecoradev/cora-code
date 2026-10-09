@@ -11,7 +11,7 @@ pub fn builtin_rules() -> Vec<CustomRule> {
         // --- Security ---
         CustomRule {
             id: "sec-hardcoded-secret".to_string(),
-            pattern: r#"(?i)(?:password|api_?key|token|secret)\s*=\s*"[^"]+""#
+            pattern: r#"(?i)(?:password|api_?key|token|secret)(?:\s*:\s*[&\w<>\[\].?|]+)?\s*=\s*(?:"[^"]+"|'[^']+')"#
                 .to_string(),
             severity: Severity::Critical,
             message: "Possible hardcoded secret/credential detected. Use environment variables or a secrets manager.".to_string(),
@@ -202,11 +202,76 @@ fn is_false_positive_url(line: &str) -> bool {
     false
 }
 
+/// Cut a trailing line comment (`//`, `#`, `--`) or block-comment start (`/*`)
+/// that is outside string literals. `#` and `--` only count at the start of the
+/// line or after whitespace so `a#b` / `x--` inside code are left alone.
+fn strip_trailing_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                let at_boundary = i == 0 || bytes[i - 1].is_ascii_whitespace();
+                if c == b'"' || c == b'\'' || c == b'`' {
+                    quote = Some(c);
+                } else if (c == b'/' && matches!(bytes.get(i + 1), Some(b'/') | Some(b'*')))
+                    || (c == b'#' && at_boundary)
+                    || (c == b'-' && bytes.get(i + 1) == Some(&b'-') && at_boundary)
+                {
+                    return &line[..i];
+                }
+            }
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Byte index of the first `:` that is outside string literals.
+fn first_unquoted_colon(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == b'"' || c == b'\'' || c == b'`' {
+                    quote = Some(c);
+                } else if c == b':' {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Check if a `hardcoded-secret` match is a false positive.
 ///
 /// Suppresses: empty string values, variable references (no literal secret),
 /// and UI binding patterns (Svelte $state, bind:value, form fields).
 fn is_false_positive_secret(line: &str) -> bool {
+    // Judge the code only: a trailing comment ("// note: fix later") must not
+    // turn a real secret into an "object shorthand" false positive (#603).
+    let line = strip_trailing_comment(line);
     let lower = line.to_lowercase();
 
     // Empty string or empty-ish values: = ''  = ""  = $state('')
@@ -223,7 +288,7 @@ fn is_false_positive_secret(line: &str) -> bool {
     // Object shorthand where the value is a variable reference, not a literal
     // e.g., { app_secret: formAppSecret } — RHS is a variable name, not a secret value
     // Variable references: no quotes, no digits mixed with special chars
-    if let Some(colon_pos) = line.find(':') {
+    if let Some(colon_pos) = first_unquoted_colon(line) {
         let after_colon = line[colon_pos + 1..].trim();
         // If the RHS is a bare identifier (variable reference), it's not a hardcoded secret
         if !after_colon.is_empty()
@@ -235,15 +300,10 @@ fn is_false_positive_secret(line: &str) -> bool {
                 .next()
                 .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
         {
-            // Check that the rest is also identifier-like (no string literals)
-            let is_bare_identifier = after_colon
-                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '$')
-                .all(|part| {
-                    part.is_empty()
-                        || part
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '$')
-                });
+            // The rest must not contain a string literal. Type annotations followed
+            // by a literal (`password: string = "..."`, `password: str = "..."`,
+            // `let password: &str = "..."`) are real secrets, not shorthand (#607).
+            let is_bare_identifier = !after_colon.contains(['"', '\'', '`']);
             if is_bare_identifier {
                 return true;
             }
@@ -690,6 +750,80 @@ mod tests {
             "crypto/hardcoded-secret",
             "const API_KEY = \"***\""
         ));
+    }
+
+    // ─── #603: trailing comments / quoted colons must not hide real secrets ───
+
+    #[test]
+    fn secret_with_trailing_comment_containing_colon_is_real_finding() {
+        for l in [
+            "const api_password = \"hunter2hunter2xx\"; // note: fix later",
+            "password = \"hunter2hunter2xx\"  # TODO: rotate",
+            "const password = \"hunter2hunter2xx\"; // cora-ignore: crypto/hardcoded-secret",
+            "password = \"hunter2hunter2xx\" /* see: docs */",
+        ] {
+            assert!(!post_match_filter("crypto/hardcoded-secret", l), "{l}");
+        }
+    }
+
+    #[test]
+    fn secret_with_colon_inside_string_is_real_finding() {
+        assert!(!post_match_filter(
+            "crypto/hardcoded-secret",
+            "const password = \"user:hunter2hunter2\";"
+        ));
+    }
+
+    #[test]
+    fn object_shorthand_with_trailing_comment_is_still_false_positive() {
+        assert!(post_match_filter(
+            "crypto/hardcoded-secret",
+            "{ app_secret: formAppSecret } // note: from the form"
+        ));
+        assert!(post_match_filter(
+            "sec-hardcoded-secret",
+            "{ app_secret: formAppSecret }"
+        ));
+    }
+
+    #[test]
+    fn comment_stripping_ignores_markers_inside_strings() {
+        assert_eq!(
+            strip_trailing_comment("a = \"x // y\"; // c"),
+            "a = \"x // y\"; "
+        );
+        assert_eq!(
+            strip_trailing_comment("url = 'http://x#y'"),
+            "url = 'http://x#y'"
+        );
+        assert_eq!(strip_trailing_comment("x # c"), "x ");
+    }
+
+    // ─── #607: typed declarations with a literal are real secrets ───
+
+    #[test]
+    fn typed_declaration_with_literal_is_real_finding() {
+        for l in [
+            "const password: string = \"hunter2hunter2xx\";",
+            "password: str = \"hunter2hunter2xx\"",
+            "let password: &str = \"hunter2hunter2xx\";",
+            "private val apiSecret: String = \"hunter2hunter2xx\"",
+            "const password: string = 'hunter2hunter2xx'; // note: ok",
+        ] {
+            assert!(!post_match_filter("crypto/hardcoded-secret", l), "{l}");
+            assert!(!post_match_filter("sec-hardcoded-secret", l), "{l}");
+        }
+    }
+
+    #[test]
+    fn shorthand_without_literal_stays_false_positive() {
+        for l in [
+            "{ app_secret: formAppSecret }",
+            "...(formAppSecret && { app_secret: formAppSecret })",
+            "{ password: input.password, secret: cfg.secret }",
+        ] {
+            assert!(post_match_filter("crypto/hardcoded-secret", l), "{l}");
+        }
     }
 
     // ─── sec-hardcoded-secret (builtin rule ID) false positive tests ───

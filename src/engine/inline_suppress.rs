@@ -1,9 +1,11 @@
 //! Rule-scoped inline suppression of findings (#554).
 //!
 //! A source comment containing `cora-ignore: <rule>[, <rule>...]` suppresses
-//! findings whose title equals one of the listed rules (case-insensitive,
-//! trimmed — the same identity `ignore.rules` uses for titles, but exact match
-//! rather than substring so a marker cannot hide more than it names).
+//! findings whose title **or rule id** equals one of the listed rules
+//! (case-insensitive, trimmed, exact match rather than substring so a marker
+//! cannot hide more than it names). A finding also answers to the ids/titles in
+//! its `also_matches`: scanner findings dropped in merge because an LLM issue
+//! sat on the same line (#597).
 //!
 //! * The marker applies to the line it is on, and, when the line contains only
 //!   a comment (nothing but the comment syntax before the marker), also to the
@@ -61,6 +63,15 @@ fn is_comment_only(line: &str) -> bool {
         })
 }
 
+/// True when the finding's title, rule id, or merged-away alias is in `rules`
+/// (lowercased set).
+fn matches_any(issue: &ReviewIssue, rules: &HashSet<String>) -> bool {
+    let hit = |s: &str| rules.contains(s.trim().to_lowercase().as_str());
+    hit(&issue.title)
+        || issue.rule_id.as_deref().is_some_and(hit)
+        || issue.also_matches.iter().any(|a| hit(a))
+}
+
 /// Drop findings suppressed by an inline `cora-ignore:` marker.
 pub fn apply(mut issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<ReviewIssue> {
     // (file, line) -> lowercased rules suppressed there.
@@ -109,7 +120,7 @@ pub fn apply(mut issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<ReviewIs
     issues.retain(|issue| {
         let Some(ln) = issue.line else { return true };
         match suppressed.get(&(issue.file.clone(), ln)) {
-            Some(rules) => !rules.contains(issue.title.trim().to_lowercase().as_str()),
+            Some(rules) => !matches_any(issue, rules),
             None => true,
         }
     });
@@ -130,6 +141,8 @@ mod tests {
 
     fn issue(file: &str, line: u32, title: &str) -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: file.to_string(),
             line: Some(line),
             severity: Severity::Major,
@@ -261,6 +274,90 @@ mod tests {
     fn exact_title_not_substring() {
         let c = diff_of(&["x(); // cora-ignore: Hardcoded password"]);
         assert_eq!(apply(vec![issue("f.rs", 1, RULE)], &c).len(), 1);
+    }
+
+    fn with_id(mut i: ReviewIssue, id: &str) -> ReviewIssue {
+        i.rule_id = Some(id.to_string());
+        i
+    }
+
+    #[test]
+    fn marker_matches_rule_id() {
+        let c = diff_of(&["x(); // cora-ignore: sec-hardcoded-secret"]);
+        let i = with_id(issue("f.rs", 1, RULE), "sec-hardcoded-secret");
+        assert!(apply(vec![i], &c).is_empty());
+    }
+
+    #[test]
+    fn marker_matches_title_when_rule_id_present() {
+        let c = diff_of(&["x(); // cora-ignore: Hardcoded password or secret in variable"]);
+        let i = with_id(issue("f.rs", 1, RULE), "sec-hardcoded-secret");
+        assert!(apply(vec![i], &c).is_empty());
+    }
+
+    #[test]
+    fn rule_id_match_is_case_insensitive_and_exact() {
+        let c = diff_of(&["x(); // cora-ignore:  SEC-Hardcoded-Secret "]);
+        let i = with_id(issue("f.rs", 1, RULE), "sec-hardcoded-secret");
+        assert!(apply(vec![i], &c).is_empty());
+        let c = diff_of(&["x(); // cora-ignore: sec-hardcoded"]);
+        let i = with_id(issue("f.rs", 1, RULE), "sec-hardcoded-secret");
+        assert_eq!(apply(vec![i], &c).len(), 1);
+    }
+
+    #[test]
+    fn other_rule_id_does_not_suppress() {
+        let c = diff_of(&["x(); // cora-ignore: sec-other"]);
+        let i = with_id(issue("f.rs", 1, RULE), "sec-hardcoded-secret");
+        assert_eq!(apply(vec![i], &c).len(), 1);
+    }
+
+    /// A scanner finding dropped in merge (LLM issue on the same line) must
+    /// still be addressable by its id and title (#597).
+    #[test]
+    fn marker_naming_merged_away_scanner_rule_suppresses_llm_issue() {
+        use crate::engine::rules::{merge_rule_findings, types::RuleFinding};
+        let scanner = || RuleFinding {
+            rule_id: "sec-hardcoded-secret".to_string(),
+            file: "f.rs".to_string(),
+            line: 1,
+            severity: Severity::Major,
+            title: RULE.to_string(),
+            body: String::new(),
+        };
+        let llm = || issue("f.rs", 1, "Hardcoded password stored in source code");
+        let merged = merge_rule_findings(vec![llm()], vec![scanner()]);
+        assert_eq!(merged.len(), 1, "scanner finding is deduped away");
+
+        for marker in ["sec-hardcoded-secret", RULE] {
+            let c = diff_of(&[&format!("x(); // cora-ignore: {marker}")]);
+            assert!(apply(merged.clone(), &c).is_empty(), "{marker}");
+        }
+        // An unrelated marker still leaves it.
+        let c = diff_of(&["x(); // cora-ignore: something-else"]);
+        assert_eq!(apply(merged, &c).len(), 1);
+    }
+
+    /// #609: a marker naming a scanner rule must not hide an unrelated LLM
+    /// finding on the same line.
+    #[test]
+    fn marker_naming_scanner_rule_does_not_hide_unrelated_llm_issue() {
+        use crate::engine::rules::{merge_rule_findings, types::RuleFinding};
+        let scanner = RuleFinding {
+            rule_id: "sec-hardcoded-secret".to_string(),
+            file: "f.rs".to_string(),
+            line: 1,
+            severity: Severity::Major,
+            title: RULE.to_string(),
+            body: String::new(),
+        };
+        let sqli = issue("f.rs", 1, "SQL injection via string concatenation");
+        let merged = merge_rule_findings(vec![sqli], vec![scanner]);
+        assert_eq!(merged.len(), 2, "unrelated findings stay separate");
+        let c = diff_of(&["q(\"..\" + pw); // cora-ignore: sec-hardcoded-secret"]);
+        let left = apply(merged, &c);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].title, "SQL injection via string concatenation");
     }
 
     /// Real scanner output flows through the same filter (#554).

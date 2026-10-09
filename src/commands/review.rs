@@ -793,6 +793,8 @@ mod tests {
 
     fn issue(severity: Severity) -> ReviewIssue {
         ReviewIssue {
+            rule_id: None,
+            also_matches: Vec::new(),
             file: "src/main.rs".to_string(),
             line: Some(1),
             severity,

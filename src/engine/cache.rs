@@ -187,6 +187,8 @@ mod tests {
     fn make_response() -> ReviewResponse {
         ReviewResponse {
             issues: vec![ReviewIssue {
+                rule_id: None,
+                also_matches: Vec::new(),
                 file: "src/main.rs".to_string(),
                 line: Some(10),
                 severity: Severity::Major,
