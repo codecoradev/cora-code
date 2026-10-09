@@ -223,24 +223,34 @@ fn plain_scalar_secret(line: &str) -> bool {
 /// Quoted `key: "value"` entry whose value is empty or an interpolation /
 /// template placeholder (`${X}`, `$X`, `{{ x }}`): a reference, not a secret.
 fn quoted_placeholder_value(line: &str) -> bool {
-    let Some(v) = secret_kv_value(line) else {
-        return false;
-    };
-    let (Some(q), Some(last)) = (v.chars().next(), v.chars().last()) else {
-        return false;
-    };
-    if !matches!(q, '"' | '\'') || last != q || v.len() < 2 {
-        return false;
+    // Unanchored on purpose: inline JSON (`{"password": "${X}", "apiKey": ""}`)
+    // and call arguments carry the pair in the middle of the line. Every quoted
+    // secret pair on the line must be a placeholder to suppress the finding, so a
+    // real literal next to a placeholder is still reported.
+    static PAIR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)["']?[\w.\-]*(?:password|passwd|pwd|secret|api_?key|token)["']?\s*:\s*("[^"]*"|'[^']*')"#,
+        )
+        .expect("pair regex must compile")
+    });
+    let mut seen = false;
+    for cap in PAIR_RE.captures_iter(line) {
+        let v = &cap[1];
+        let inner = &v[1..v.len() - 1];
+        let placeholder = inner.is_empty()
+            || (inner.starts_with("${") && inner.ends_with('}'))
+            || (inner.starts_with("{{") && inner.ends_with("}}"))
+            || (inner.starts_with('$')
+                && inner.len() > 1
+                && inner[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        if !placeholder {
+            return false;
+        }
+        seen = true;
     }
-    let inner = &v[1..v.len() - 1];
-    inner.is_empty()
-        || (inner.starts_with("${") && inner.ends_with('}'))
-        || (inner.starts_with("{{") && inner.ends_with("}}"))
-        || (inner.starts_with('$')
-            && inner.len() > 1
-            && inner[1..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    seen
 }
 
 /// Post-match filter for rules that need additional validation after regex match.

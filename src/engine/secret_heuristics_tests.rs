@@ -201,6 +201,16 @@ const CASES: &[Row] = &[
     ("json", r#"  "password": null,"#, false),
     ("json", r#"  "password": "","#, false),
     ("json", r#"  "password": "${DB_PASSWORD}","#, false),
+    // inline JSON: placeholders stay quiet, a real literal beside one is still flagged
+    ("json", r#"{"password": "${X}"}"#, false),
+    ("json", r#"{"password": "${X}", "apiKey": ""}"#, false),
+    ("json", r#"{"password": "", "token": "${T}"}"#, false),
+    (
+        "json",
+        r#"{"password": "${X}", "token": "hunter2hunter2xx"}"#,
+        true,
+    ),
+    ("json", r#"{"password": "hunter2hunter2xx"}"#, true),
     // ── env / .properties ──
     ("env", "DB_PASSWORD=hunter2hunter2", true),
     ("env", "API_KEY=abcd1234efgh5678", true),
