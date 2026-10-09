@@ -45,11 +45,18 @@ pub fn skip_patterns(config: &Config) -> Vec<String> {
 
 /// Run every deterministic check on a parsed diff.
 pub fn run(chunks: &[FileChunk], config: &Config, bridge: &IndexBridge) -> DeterministicReport {
-    let max = config.rules_config.max_findings;
+    // Scanners run uncapped: `rules_engine.max_findings` is enforced by
+    // `postprocess` AFTER suppression, so suppressed findings never consume
+    // slots and truncation can be reported (#624).
+    let max = usize::MAX;
     let skip = skip_patterns(config);
+    let uncapped_rules = crate::engine::rules::types::RulesConfig {
+        max_findings: 0,
+        ..config.rules_config.clone()
+    };
 
     DeterministicReport {
-        rules: rules::run_rules(chunks, &config.rules_config),
+        rules: rules::run_rules(chunks, &uncapped_rules),
         secrets: secrets_scanner::scan_secrets(chunks, max),
         security: security_scanner::scan_security(chunks, max),
         index_unused: index_scanner::scan_unused_imports(bridge, chunks, max, &skip),

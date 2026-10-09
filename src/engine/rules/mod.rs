@@ -108,7 +108,7 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
     findings.dedup_by(|a, b| a.rule_id == b.rule_id && a.file == b.file && a.line == b.line);
 
     // Cap at max_findings
-    let capped = findings.len().min(config.max_findings);
+    let capped = findings.len().min(config.finding_cap());
     if findings.len() > capped {
         debug!(total = findings.len(), capped, "capping rule findings");
         findings.truncate(capped);

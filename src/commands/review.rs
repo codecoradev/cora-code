@@ -254,6 +254,8 @@ pub async fn execute_review(
         }
     };
 
+    warn_dropped(response.dropped_findings, config, opts.quiet);
+
     // 6. Filter by severity if specified
     let min_severity = if let Some(ref sev) = opts.severity {
         Severity::from_str_lossy(sev)
@@ -505,6 +507,7 @@ async fn execute_chunked_review(
     let mut any_error = false;
     let mut any_success = false;
     let mut should_block = false;
+    let mut dropped_findings = 0usize;
 
     for chunk in &chunks {
         if !opts.quiet {
@@ -565,6 +568,7 @@ async fn execute_chunked_review(
                     ));
                 }
 
+                dropped_findings += resp.dropped_findings;
                 all_issues.extend(resp.issues);
                 if resp.should_block {
                     should_block = true;
@@ -629,11 +633,14 @@ async fn execute_chunked_review(
     // Build merged response
     let merged_summary = merged_chunk_summary(&summaries, all_issues.len(), any_error);
 
+    warn_dropped(dropped_findings, config, opts.quiet);
+
     let merged_response = ReviewResponse {
         issues: all_issues,
         summary: merged_summary,
         tokens_used: Some(total_tokens),
         should_block,
+        dropped_findings,
     };
 
     // 6. Filter by severity if specified
@@ -784,6 +791,16 @@ fn compute_exit_code(
     }
 }
 
+/// Print the one-line "findings not shown" warning to stderr (#624).
+fn warn_dropped(dropped: usize, config: &Config, quiet: bool) {
+    if quiet {
+        return;
+    }
+    if let Some(w) = crate::engine::postprocess::dropped_warning(dropped, config) {
+        eprintln!("{}", w.yellow());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -803,6 +820,7 @@ mod tests {
             summary: String::new(),
             tokens_used: None,
             should_block,
+            dropped_findings: 0,
         }
     }
 

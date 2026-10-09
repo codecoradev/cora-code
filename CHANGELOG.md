@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rules_engine.max_findings` is applied after suppression and truncation is reported (#624).** The cap (default 5) used to be applied inside each scanner, before `ignore.rules` / `cora-ignore`, so suppressed findings consumed slots and pushed real findings out, and the rest were dropped silently. Scanners now run uncapped and the cap is enforced once in post-processing on deterministic findings only (LLM issues are never capped), highest severity first. `cora scan` and `cora review` print `⚠ N more deterministic findings not shown (...)` on stderr when findings are cut, and the `cora scan` summary mentions it; stdout formats are unchanged. `max_findings: 0` or `null` now means unlimited (previously `0` hid every finding).
+
 ## [0.17.2] - 2026-10-09
 
 ### Fixed
