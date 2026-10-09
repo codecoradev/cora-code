@@ -45,7 +45,7 @@ pub static PATTERNS: &[SecurityPattern] = &[
     SecurityPattern {
         id: "crypto/hardcoded-secret",
         name: "Hardcoded password or secret in variable",
-        regex: r"(?i)(?:password|passwd|pwd|secret|api_key|apikey|token)\s*[=:]\s*\S{8,}",
+        regex: r"(?i)(?:password|passwd|pwd|secret|api_key|apikey|token)(?:\s*:\s*[&\w<>\[\].?|]+)?\s*[=:]\s*\S{8,}",
         severity: Severity::Critical,
     },
     // ── Injection ──
@@ -360,6 +360,39 @@ mod tests {
             is_binary: false,
             is_deleted: false,
             is_new: false,
+        }
+    }
+
+    #[test]
+    fn typed_declarations_with_literal_secrets_are_flagged() {
+        // #607: an optional type annotation between the name and `=` must not
+        // hide a hardcoded literal.
+        for line in [
+            r#"const password: string = "hunter2hunter2xx";"#,
+            r#"password: str = "hunter2hunter2xx""#,
+            r#"let password: &str = "hunter2hunter2xx";"#,
+            r#"private val apiSecret: String = "hunter2hunter2xx""#,
+        ] {
+            let found = scan_security(&[make_chunk("src/app.ts", &[line])], 50);
+            assert!(
+                found.iter().any(|f| f.line == 1),
+                "typed secret not flagged: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_declaration_without_literal_is_not_flagged() {
+        for line in [
+            "const password: string = process.env.PASSWORD_VALUE;",
+            "password: str",
+        ] {
+            let found = scan_security(&[make_chunk("src/app.ts", &[line])], 50);
+            assert!(
+                !found.iter().any(|f| f.title.contains("Hardcoded")),
+                "false positive: {line} -> {:?}",
+                found.iter().map(|f| f.title.clone()).collect::<Vec<_>>()
+            );
         }
     }
 

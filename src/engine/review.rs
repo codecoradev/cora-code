@@ -419,7 +419,7 @@ fn apply_llm_secret_fp_filter(
     // Lazy-compiled regex matching the built-in sec-hardcoded-secret pattern.
     // Only triggers for actual value assignments like `api_key = "sk-..."`.
     static RE_SECRET_LITERAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)(?:password|api_?key|token|secret)\s*=\s*"[^"]+""#)
+        regex::Regex::new(r#"(?i)(?:password|api_?key|token|secret)(?:\s*:\s*[&\w<>\[\].?|]+)?\s*=\s*(?:"[^"]+"|'[^']+')"#)
             .expect("hardcoded secret regex must compile")
     });
 
@@ -1370,6 +1370,57 @@ mod tests {
 
         let result = apply_markdown_code_block_filter(issues, &diff_chunks);
         assert_eq!(result.len(), 1, "non-markdown files are unaffected");
+    }
+
+    #[test]
+    fn llm_secret_filter_keeps_typed_and_single_quoted_literals() {
+        use crate::engine::diff_parser::{DiffHunk, DiffLine, DiffLineType, FileChunk};
+        for (n, line) in [
+            "const password: string = \"hunter2hunter2xx\";",
+            "password: str = 'hunter2hunter2xx'",
+            "let api_key = 'sk-hunter2hunter2xx';",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let chunks = vec![FileChunk {
+                old_path: None,
+                new_path: Some("src/a.ts".to_string()),
+                language: "ts".to_string(),
+                chunks: vec![DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 1,
+                    header: String::new(),
+                    lines: vec![DiffLine {
+                        line_type: DiffLineType::Add,
+                        content: line.to_string(),
+                        old_line_no: None,
+                        new_line_no: Some(1),
+                    }],
+                }],
+                is_binary: false,
+                is_deleted: false,
+                is_new: true,
+            }];
+            let issues = vec![ReviewIssue {
+                rule_id: None,
+                also_matches: Vec::new(),
+                file: "src/a.ts".to_string(),
+                line: Some(1),
+                severity: Severity::Critical,
+                issue_type: Some("security".to_string()),
+                title: "Hardcoded password in source code".to_string(),
+                body: String::new(),
+                suggested_fix: None,
+            }];
+            assert_eq!(
+                apply_llm_secret_fp_filter(issues, &chunks).len(),
+                1,
+                "case {n}: {line}"
+            );
+        }
     }
 
     #[test]
