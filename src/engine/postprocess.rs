@@ -99,13 +99,6 @@ fn apply_llm_secret_fp_filter(
 ) -> Vec<ReviewIssue> {
     use crate::engine::diff_parser::DiffLineType;
 
-    // Lazy-compiled regex matching the built-in sec-hardcoded-secret pattern.
-    // Only triggers for actual value assignments like `api_key = "sk-..."`.
-    static RE_SECRET_LITERAL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"(?i)(?:password|api_?key|token|secret)(?:\s*:\s*[&\w<>\[\].?|]+)?\s*=\s*(?:"[^"]+"|'[^']+')"#)
-            .expect("hardcoded secret regex must compile")
-    });
-
     // Keywords that indicate an LLM finding is about hardcoded secrets.
     static SECRET_KEYWORDS: &[&str] = &[
         "hardcoded password",
@@ -156,7 +149,7 @@ fn apply_llm_secret_fp_filter(
         let line_num = issue.line.unwrap_or(0);
         let key = (issue.file.clone(), line_num);
         if let Some(actual_line) = added_lines.get(&key) {
-            if !RE_SECRET_LITERAL.is_match(actual_line) {
+            if !crate::engine::rules::builtin::has_secret_literal(actual_line) {
                 debug!(
                     file = %issue.file,
                     line = line_num,
@@ -444,6 +437,58 @@ mod tests {
 
         let result = apply_llm_secret_fp_filter(issues, &diff_chunks);
         assert_eq!(result.len(), 1, "actual hardcoded secret should be kept");
+    }
+
+    /// LLM findings on the shapes added in #618-#620 are kept; SQL placeholders
+    /// and references are still dropped.
+    #[test]
+    fn secret_fp_filter_matches_go_yaml_json_sql_shapes() {
+        use crate::engine::diff_parser::*;
+
+        let cases: &[(&str, bool)] = &[
+            (r#"password := "hunter2hunter2""#, true),
+            (r#"var apiKey string = "abcd1234efgh5678""#, true),
+            ("password: hunter2hunter2", true),
+            (r#"  "password": "hunter2hunter2","#, true),
+            ("CREATE USER app WITH PASSWORD 'hunter2hunter2';", true),
+            ("CREATE USER app WITH PASSWORD '%s';", false),
+            ("password: required", false),
+            (r#"  "password": "${DB_PASSWORD}","#, false),
+        ];
+        for (line, keep) in cases {
+            let chunks = vec![FileChunk {
+                old_path: None,
+                new_path: Some("src/x.txt".to_string()),
+                language: "txt".to_string(),
+                chunks: vec![DiffHunk {
+                    old_start: 0,
+                    old_count: 0,
+                    new_start: 1,
+                    new_count: 1,
+                    header: "".to_string(),
+                    lines: vec![DiffLine {
+                        line_type: DiffLineType::Add,
+                        content: line.to_string(),
+                        old_line_no: None,
+                        new_line_no: Some(1),
+                    }],
+                }],
+                is_binary: false,
+                is_deleted: false,
+                is_new: false,
+            }];
+            let issues = vec![
+                ReviewIssue::new(
+                    "src/x.txt",
+                    Some(1),
+                    Severity::Critical,
+                    "Hardcoded password in config",
+                )
+                .with_type("security"),
+            ];
+            let kept = apply_llm_secret_fp_filter(issues, &chunks).len() == 1;
+            assert_eq!(kept, *keep, "{line}");
+        }
     }
 
     #[test]
