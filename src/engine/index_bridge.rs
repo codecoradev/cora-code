@@ -108,6 +108,14 @@ impl IndexBridge {
         Self::from_connection(conn, start)
     }
 
+    /// [`Self::open_or_create`] against an explicit database file instead of
+    /// the process-global data dir (tests: a per-test temp DB, #610).
+    #[cfg(test)]
+    pub fn open_or_create_at(db_path: &Path, start: &Path) -> anyhow::Result<Self> {
+        let conn = crate::index::open_index_at(db_path)?;
+        Self::from_connection(conn, start)
+    }
+
     /// [`Self::open_or_create`] for the current working directory.
     pub fn open_or_create_cwd() -> anyhow::Result<Self> {
         Self::open_or_create(&std::env::current_dir()?)

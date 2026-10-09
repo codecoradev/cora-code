@@ -6,8 +6,9 @@ pub mod types;
 
 use tracing::debug;
 
-use crate::engine::diff_parser::{DiffLineType, FileChunk, parse_diff};
+use crate::engine::diff_parser::{FileChunk, parse_diff};
 use crate::engine::rules::types::{RuleFinding, RulesConfig};
+use crate::engine::scan_input::{self, ScanFile};
 use crate::engine::types::{ReviewIssue, Severity};
 
 /// Map severity to a numeric rank for sorting (Critical=4, Major=3, Minor=2, Info=1).
@@ -20,10 +21,17 @@ fn severity_rank(sev: Severity) -> u8 {
     }
 }
 
-/// Run all rules (built-in + custom) against parsed diff chunks.
+/// Run all rules (built-in + custom) against the added lines of parsed diff
+/// chunks (diff adapter over [`run_rules_in`]).
 ///
 /// Returns findings capped by `config.max_findings`.
 pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding> {
+    run_rules_in(&scan_input::from_chunks(chunks), config)
+}
+
+/// Run all rules (built-in + custom) against file lines. The one implementation
+/// behind both the diff and the whole-file entry points.
+pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFinding> {
     if !config.enabled {
         debug!("rule engine is disabled");
         return Vec::new();
@@ -44,52 +52,39 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
 
     let mut findings = Vec::new();
 
-    for file in chunks {
-        let file_path = file
-            .new_path
-            .as_deref()
-            .or(file.old_path.as_deref())
-            .unwrap_or("unknown");
+    for file in files {
+        let file_path = file.path;
 
-        for hunk in &file.chunks {
-            for line in &hunk.lines {
-                // Only check added lines (new code being introduced)
-                if line.line_type != DiffLineType::Add {
+        for &(line_no, content) in &file.lines {
+            for rule in &all_rules {
+                // Check language filter
+                if !matching::matches_language(rule, file.language) {
                     continue;
                 }
 
-                for rule in &all_rules {
-                    // Check language filter
-                    if !matching::matches_language(rule, &file.language) {
-                        continue;
-                    }
-
-                    // Check exclude filter
-                    if matching::matches_exclude(rule, file_path) {
-                        continue;
-                    }
-
-                    // Check pattern match
-                    if !matching::match_rule_against_line(rule, &line.content) {
-                        continue;
-                    }
-
-                    // Post-match filter (e.g., allow localhost URLs)
-                    if builtin::post_match_filter_for_path(&rule.id, &line.content, file_path) {
-                        continue;
-                    }
-
-                    let line_no = line.new_line_no.unwrap_or(0);
-
-                    findings.push(RuleFinding {
-                        rule_id: rule.id.clone(),
-                        file: file_path.to_string(),
-                        line: line_no,
-                        severity: rule.severity,
-                        title: format!("[{}] Rule: {}", rule.id, rule.id),
-                        body: rule.message.clone(),
-                    });
+                // Check exclude filter
+                if matching::matches_exclude(rule, file_path) {
+                    continue;
                 }
+
+                // Check pattern match
+                if !matching::match_rule_against_line(rule, content) {
+                    continue;
+                }
+
+                // Post-match filter (e.g., allow localhost URLs)
+                if builtin::post_match_filter_for_path(&rule.id, content, file_path) {
+                    continue;
+                }
+
+                findings.push(RuleFinding {
+                    rule_id: rule.id.clone(),
+                    file: file_path.to_string(),
+                    line: line_no,
+                    severity: rule.severity,
+                    title: format!("[{}] Rule: {}", rule.id, rule.id),
+                    body: rule.message.clone(),
+                });
             }
         }
     }
