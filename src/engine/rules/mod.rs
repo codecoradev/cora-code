@@ -242,17 +242,17 @@ pub fn merge_rule_findings(
             continue;
         }
 
-        result.push(ReviewIssue {
-            rule_id: Some(finding.rule_id),
-            also_matches: Vec::new(),
-            file: finding.file,
-            line: Some(finding.line),
-            severity: finding.severity,
-            issue_type: Some("rule".to_string()),
-            title: finding.title,
-            body: finding.body,
-            suggested_fix: None,
-        });
+        result.push(
+            ReviewIssue::new(
+                finding.file,
+                Some(finding.line),
+                finding.severity,
+                finding.title,
+            )
+            .with_type("rule")
+            .with_body(finding.body)
+            .with_rule_id(finding.rule_id),
+        );
     }
 
     result
@@ -452,16 +452,10 @@ mod tests {
     }
 
     fn llm_issue(line: u32, title: &str, kind: Option<&str>) -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/a.rs".to_string(),
-            line: Some(line),
-            severity: Severity::Major,
-            issue_type: kind.map(str::to_string),
-            title: title.to_string(),
-            body: String::new(),
-            suggested_fix: None,
+        let issue = ReviewIssue::new("src/a.rs", Some(line), Severity::Major, title);
+        match kind {
+            Some(k) => issue.with_type(k),
+            None => issue,
         }
     }
 
@@ -531,17 +525,16 @@ mod tests {
 
     #[test]
     fn merge_skips_duplicates() {
-        let llm = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(5),
-            severity: Severity::Minor,
-            issue_type: Some("bug".to_string()),
-            title: "Unnecessary unwrap".to_string(),
-            body: "Use proper error handling".to_string(),
-            suggested_fix: None,
-        }];
+        let llm = vec![
+            ReviewIssue::new(
+                "src/main.rs",
+                Some(5),
+                Severity::Minor,
+                "Unnecessary unwrap",
+            )
+            .with_type("bug")
+            .with_body("Use proper error handling"),
+        ];
 
         let rules = vec![RuleFinding {
             rule_id: "bug-unwrap".to_string(),
@@ -567,17 +560,11 @@ mod tests {
 
     #[test]
     fn merge_appends_unique_rule_findings() {
-        let llm = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(5),
-            severity: Severity::Minor,
-            issue_type: Some("bug".to_string()),
-            title: "Some issue".to_string(),
-            body: "Details".to_string(),
-            suggested_fix: None,
-        }];
+        let llm = vec![
+            ReviewIssue::new("src/main.rs", Some(5), Severity::Minor, "Some issue")
+                .with_type("bug")
+                .with_body("Details"),
+        ];
 
         let rules = vec![RuleFinding {
             rule_id: "bug-todo".to_string(),

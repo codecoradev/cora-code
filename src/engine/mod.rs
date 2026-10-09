@@ -15,12 +15,15 @@ pub mod llm;
 pub mod markdown;
 pub mod memory;
 pub mod path_match;
+pub mod postprocess;
 pub mod profiles;
 pub mod quality_gate;
 pub mod review;
 pub mod review_store;
 pub mod rules;
 pub mod scanner;
+#[cfg(test)]
+mod secret_heuristics_tests;
 pub mod secret_patterns;
 pub mod secrets_scanner;
 pub mod security_scanner;
