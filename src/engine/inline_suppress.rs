@@ -20,7 +20,8 @@
 //! the diff (more than the context window away from the finding) is not seen.
 
 use crate::engine::ReviewIssue;
-use crate::engine::diff_parser::{DiffLineType, FileChunk};
+use crate::engine::diff_parser::FileChunk;
+use crate::engine::scan_input::ScanFile;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
@@ -72,43 +73,41 @@ fn matches_any(issue: &ReviewIssue, rules: &HashSet<String>) -> bool {
         || issue.also_matches.iter().any(|a| hit(a))
 }
 
-/// Drop findings suppressed by an inline `cora-ignore:` marker.
-pub fn apply(mut issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<ReviewIssue> {
+/// Drop findings suppressed by an inline `cora-ignore:` marker, reading the
+/// post-change lines of a diff (diff adapter over [`apply_lines`]).
+pub fn apply(issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<ReviewIssue> {
+    let files: Vec<ScanFile<'_>> = chunks.iter().map(ScanFile::post_image).collect();
+    apply_lines(issues, &files)
+}
+
+/// Drop findings suppressed by an inline `cora-ignore:` marker found in
+/// `files`' lines.
+pub fn apply_lines(mut issues: Vec<ReviewIssue>, files: &[ScanFile<'_>]) -> Vec<ReviewIssue> {
     // (file, line) -> lowercased rules suppressed there.
     let mut suppressed: HashMap<(String, u32), HashSet<String>> = HashMap::new();
-    for chunk in chunks {
-        let path = chunk
-            .new_path
-            .as_deref()
-            .or(chunk.old_path.as_deref())
-            .unwrap_or("");
-        for hunk in &chunk.chunks {
-            for line in &hunk.lines {
-                if line.line_type == DiffLineType::Remove {
-                    continue;
+    for file in files {
+        let path = file.path;
+        for &(ln, content) in &file.lines {
+            let rules = parse_rules(content);
+            if rules.is_empty() {
+                if content.to_lowercase().contains("cora-ignore") {
+                    debug!(
+                        file = path,
+                        line = ln,
+                        "bare cora-ignore ignored: rule list required"
+                    );
                 }
-                let Some(ln) = line.new_line_no else { continue };
-                let rules = parse_rules(&line.content);
-                if rules.is_empty() {
-                    if line.content.to_lowercase().contains("cora-ignore") {
-                        debug!(
-                            file = path,
-                            line = ln,
-                            "bare cora-ignore ignored: rule list required"
-                        );
-                    }
-                    continue;
-                }
+                continue;
+            }
+            suppressed
+                .entry((path.to_string(), ln))
+                .or_default()
+                .extend(rules.iter().cloned());
+            if is_comment_only(content) {
                 suppressed
-                    .entry((path.to_string(), ln))
+                    .entry((path.to_string(), ln + 1))
                     .or_default()
-                    .extend(rules.iter().cloned());
-                if is_comment_only(&line.content) {
-                    suppressed
-                        .entry((path.to_string(), ln + 1))
-                        .or_default()
-                        .extend(rules);
-                }
+                    .extend(rules);
             }
         }
     }

@@ -12,9 +12,14 @@ fn cora_cmd() -> Command {
 }
 
 /// Isolated CODECORA_HOME + tiny project, so tests never touch real data.
-fn sandbox(name: &str) -> (PathBuf, PathBuf) {
-    let root = std::env::temp_dir().join(format!("cora-545-{name}"));
-    let _ = std::fs::remove_dir_all(&root);
+/// Each call gets a unique temp dir (dropped with the returned guard), so two
+/// concurrent `cargo test` runs cannot delete each other's sandbox.
+fn sandbox(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let guard = tempfile::Builder::new()
+        .prefix(&format!("cora-545-{name}-"))
+        .tempdir()
+        .unwrap();
+    let root = guard.path().to_path_buf();
     let proj = root.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::write(
@@ -29,7 +34,7 @@ fn sandbox(name: &str) -> (PathBuf, PathBuf) {
     .unwrap();
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    (proj, home)
+    (guard, proj, home)
 }
 
 fn run(cora: &mut Command) -> String {
@@ -39,7 +44,7 @@ fn run(cora: &mut Command) -> String {
 
 #[test]
 fn brain_fresh_process_emits_vector_signal() {
-    let (proj, home) = sandbox("usearch");
+    let (_guard, proj, home) = sandbox("usearch");
 
     // 1. Index in one process (default usearch backend).
     run(cora_cmd()
@@ -67,7 +72,7 @@ fn brain_fresh_process_emits_vector_signal() {
 
 #[test]
 fn brain_vecq_backend_uses_own_extension() {
-    let (proj, home) = sandbox("vecq");
+    let (_guard, proj, home) = sandbox("vecq");
 
     std::fs::write(proj.join(".cora.yaml"), "brain:\n  vector_store: vecq\n").unwrap();
 

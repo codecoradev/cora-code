@@ -21,6 +21,7 @@ pub mod quality_gate;
 pub mod review;
 pub mod review_store;
 pub mod rules;
+pub mod scan_input;
 pub mod scanner;
 #[cfg(test)]
 mod secret_heuristics_tests;

@@ -9,9 +9,10 @@ use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::engine::Severity;
-use crate::engine::diff_parser::{DiffLineType, FileChunk};
+use crate::engine::diff_parser::FileChunk;
 use crate::engine::rules::builtin::post_match_filter_for_path;
 use crate::engine::rules::types::RuleFinding;
+use crate::engine::scan_input::{self, ScanFile};
 
 // ─── Security patterns ───
 
@@ -160,19 +161,22 @@ static COMPILED_PATTERNS: LazyLock<Vec<(String, String, Regex, Severity)>> = Laz
         .collect()
 });
 
-/// Run static security scan on diff chunks.
+/// Run static security scan on the added lines of diff chunks (diff adapter
+/// over [`scan_security_in`]).
 ///
 /// Only scans added lines (not removed/context) to reduce false positives.
 /// Returns findings sorted by severity (worst first).
 pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFinding> {
+    scan_security_in(&scan_input::from_chunks(chunks), max_findings)
+}
+
+/// Run the static security scan over file lines. The one implementation behind
+/// both the diff and the whole-file entry points.
+pub fn scan_security_in(files: &[ScanFile<'_>], max_findings: usize) -> Vec<RuleFinding> {
     let mut findings = Vec::new();
 
-    for chunk in chunks {
-        let path = chunk
-            .new_path
-            .as_deref()
-            .or(chunk.old_path.as_deref())
-            .unwrap_or("unknown");
+    for file in files {
+        let path = file.path;
 
         // Skip the noisy general rules for test/spec/fixture/mock/example files
         // and for documentation (security patterns are designed for source code,
@@ -184,7 +188,7 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
                 file = path,
                 "test/doc file: only high-confidence secret scan"
             );
-            scan_high_confidence_secrets(chunk, path, &mut findings, max_findings);
+            scan_high_confidence_secrets(file, &mut findings, max_findings);
             if findings.len() >= max_findings {
                 findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
                 return findings;
@@ -192,52 +196,45 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
             continue;
         }
 
-        for hunk in &chunk.chunks {
-            for line in &hunk.lines {
-                if line.line_type != DiffLineType::Add {
-                    continue;
-                }
+        for &(line_no, content) in &file.lines {
+            if line_no == 0 {
+                continue;
+            }
 
-                let line_no = line.new_line_no.unwrap_or(0);
-                if line_no == 0 {
-                    continue;
-                }
-
-                for (rule_id, name, regex, severity) in COMPILED_PATTERNS.iter() {
-                    if regex.is_match(&line.content) {
-                        // Apply post-match filter to suppress known false positives
-                        if post_match_filter_for_path(rule_id, &line.content, path) {
-                            debug!(
-                                rule = %rule_id,
-                                file = path,
-                                line = line_no,
-                                "security pattern suppressed by post-match filter"
-                            );
-                            continue;
-                        }
-
+            for (rule_id, name, regex, severity) in COMPILED_PATTERNS.iter() {
+                if regex.is_match(content) {
+                    // Apply post-match filter to suppress known false positives
+                    if post_match_filter_for_path(rule_id, content, path) {
                         debug!(
                             rule = %rule_id,
                             file = path,
                             line = line_no,
-                            "security pattern match"
+                            "security pattern suppressed by post-match filter"
                         );
-                        findings.push(RuleFinding {
-                            rule_id: rule_id.clone(),
-                            file: path.to_string(),
-                            line: line_no,
-                            severity: *severity,
-                            title: name.clone(),
-                            body: format!(
-                                "Static security scanner detected: {} in {}:{}",
-                                name, path, line_no
-                            ),
-                        });
+                        continue;
+                    }
 
-                        if findings.len() >= max_findings {
-                            findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
-                            return findings;
-                        }
+                    debug!(
+                        rule = %rule_id,
+                        file = path,
+                        line = line_no,
+                        "security pattern match"
+                    );
+                    findings.push(RuleFinding {
+                        rule_id: rule_id.clone(),
+                        file: path.to_string(),
+                        line: line_no,
+                        severity: *severity,
+                        title: name.clone(),
+                        body: format!(
+                            "Static security scanner detected: {} in {}:{}",
+                            name, path, line_no
+                        ),
+                    });
+
+                    if findings.len() >= max_findings {
+                        findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+                        return findings;
                     }
                 }
             }
@@ -248,41 +245,35 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
     findings
 }
 
-/// Scan added lines of a (test or doc) file for high-confidence secrets only.
+/// Scan the lines of a (test or doc) file for high-confidence secrets only.
 /// The pattern list is shared with `secrets_scanner` (`secret_patterns`).
 fn scan_high_confidence_secrets(
-    chunk: &FileChunk,
-    path: &str,
+    file: &ScanFile<'_>,
     findings: &mut Vec<RuleFinding>,
     max_findings: usize,
 ) {
-    for hunk in &chunk.chunks {
-        for line in &hunk.lines {
-            if line.line_type != DiffLineType::Add {
-                continue;
-            }
-            let line_no = line.new_line_no.unwrap_or(0);
-            if line_no == 0 {
-                continue;
-            }
-            // Placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are ignored inside.
-            if crate::engine::secret_patterns::find_high_confidence(&line.content).is_none() {
-                continue;
-            }
-            findings.push(RuleFinding {
-                rule_id: "secrets/high-confidence-in-test-or-doc".to_string(),
-                file: path.to_string(),
-                line: line_no,
-                severity: Severity::Major,
-                title: "Credential-like secret in test/doc file".to_string(),
-                body: format!(
-                    "Static security scanner detected a credential-like value in {path}:{line_no}. \
-                     Test/doc paths are not exempt from secret scanning; verify it is a fake."
-                ),
-            });
-            if findings.len() >= max_findings {
-                return;
-            }
+    let path = file.path;
+    for &(line_no, content) in &file.lines {
+        if line_no == 0 {
+            continue;
+        }
+        // Placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are ignored inside.
+        if crate::engine::secret_patterns::find_high_confidence(content).is_none() {
+            continue;
+        }
+        findings.push(RuleFinding {
+            rule_id: "secrets/high-confidence-in-test-or-doc".to_string(),
+            file: path.to_string(),
+            line: line_no,
+            severity: Severity::Major,
+            title: "Credential-like secret in test/doc file".to_string(),
+            body: format!(
+                "Static security scanner detected a credential-like value in {path}:{line_no}. \
+                 Test/doc paths are not exempt from secret scanning; verify it is a fake."
+            ),
+        });
+        if findings.len() >= max_findings {
+            return;
         }
     }
 }
@@ -342,7 +333,7 @@ mod tests {
     use super::*;
 
     fn make_chunk(file: &str, added_lines: &[&str]) -> FileChunk {
-        use crate::engine::diff_parser::{DiffHunk, DiffLine};
+        use crate::engine::diff_parser::{DiffHunk, DiffLine, DiffLineType};
         FileChunk {
             old_path: None,
             new_path: Some(file.to_string()),

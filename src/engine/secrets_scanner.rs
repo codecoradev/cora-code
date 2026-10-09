@@ -5,8 +5,9 @@ use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::engine::Severity;
-use crate::engine::diff_parser::{DiffLineType, FileChunk};
+use crate::engine::diff_parser::FileChunk;
 use crate::engine::rules::types::RuleFinding;
+use crate::engine::scan_input::{self, ScanFile};
 
 // ─── Built-in secret patterns ───
 
@@ -107,79 +108,71 @@ static TEST_FIXTURE_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 // ─── Public API ───
 
-/// Scan diff chunks for known secret patterns.
+/// Scan the added lines of diff chunks for known secret patterns (diff adapter
+/// over [`scan_secrets_in`]).
 ///
 /// Returns findings capped at `max_findings`. Secret values are masked in the
 /// message body.
 pub fn scan_secrets(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFinding> {
+    scan_secrets_in(&scan_input::from_chunks(chunks), max_findings)
+}
+
+/// Scan file lines for known secret patterns. The one implementation behind
+/// both the diff and the whole-file entry points.
+pub fn scan_secrets_in(files: &[ScanFile<'_>], max_findings: usize) -> Vec<RuleFinding> {
     let mut findings = Vec::new();
 
-    for file in chunks {
-        let file_path = file
-            .new_path
-            .as_deref()
-            .or(file.old_path.as_deref())
-            .unwrap_or("unknown");
+    for file in files {
+        let file_path = file.path;
 
         // Test/spec/fixture/mock/example paths skip the generic rules (noisy
         // there) but still get the shared high-confidence list, since real
         // credentials are often committed in exactly those places (#579).
         let is_fixture = TEST_FIXTURE_RE.is_match(file_path);
 
-        for hunk in &file.chunks {
-            for line in &hunk.lines {
-                if line.line_type != DiffLineType::Add {
-                    continue;
-                }
-
-                let line_no = line.new_line_no.unwrap_or(0);
-
-                if is_fixture {
-                    if let Some((pat, matched)) =
-                        crate::engine::secret_patterns::find_high_confidence(&line.content)
-                    {
-                        findings.push(RuleFinding {
-                            rule_id: pat.id.to_string(),
-                            file: file_path.to_string(),
-                            line: line_no,
-                            severity: Severity::Critical,
-                            title: format!("[{}] {}", pat.id, pat.name),
-                            body: format!(
-                                "{} detected in a test/fixture path — verify it is a fake, \
-                                 otherwise mask with environment variable. Matched: {}",
-                                pat.name,
-                                mask_secret(matched)
-                            ),
-                        });
-                        if findings.len() >= max_findings {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                for (re, pat) in COMPILED.iter() {
-                    if let Some(m) = re.find(&line.content) {
-                        let matched = m.as_str();
-                        findings.push(RuleFinding {
-                            rule_id: pat.id.to_string(),
-                            file: file_path.to_string(),
-                            line: line_no,
-                            severity: pat.severity,
-                            title: format!("[{}] {}", pat.id, pat.name),
-                            body: format!(
-                                "{} detected — mask with environment variable. Matched: {}",
-                                pat.name,
-                                mask_secret(matched)
-                            ),
-                        });
-                        if findings.len() >= max_findings {
-                            break;
-                        }
+        for &(line_no, content) in &file.lines {
+            if is_fixture {
+                if let Some((pat, matched)) =
+                    crate::engine::secret_patterns::find_high_confidence(content)
+                {
+                    findings.push(RuleFinding {
+                        rule_id: pat.id.to_string(),
+                        file: file_path.to_string(),
+                        line: line_no,
+                        severity: Severity::Critical,
+                        title: format!("[{}] {}", pat.id, pat.name),
+                        body: format!(
+                            "{} detected in a test/fixture path — verify it is a fake, \
+                             otherwise mask with environment variable. Matched: {}",
+                            pat.name,
+                            mask_secret(matched)
+                        ),
+                    });
+                    if findings.len() >= max_findings {
+                        break;
                     }
                 }
-                if findings.len() >= max_findings {
-                    break;
+                continue;
+            }
+
+            for (re, pat) in COMPILED.iter() {
+                if let Some(m) = re.find(content) {
+                    let matched = m.as_str();
+                    findings.push(RuleFinding {
+                        rule_id: pat.id.to_string(),
+                        file: file_path.to_string(),
+                        line: line_no,
+                        severity: pat.severity,
+                        title: format!("[{}] {}", pat.id, pat.name),
+                        body: format!(
+                            "{} detected — mask with environment variable. Matched: {}",
+                            pat.name,
+                            mask_secret(matched)
+                        ),
+                    });
+                    if findings.len() >= max_findings {
+                        break;
+                    }
                 }
             }
             if findings.len() >= max_findings {
@@ -229,7 +222,7 @@ fn floor_boundary(s: &str, target: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::diff_parser::{DiffHunk, DiffLine};
+    use crate::engine::diff_parser::{DiffHunk, DiffLine, DiffLineType};
 
     fn make_chunk(file: &str, added_lines: &[&str]) -> FileChunk {
         FileChunk {

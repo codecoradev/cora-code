@@ -121,6 +121,14 @@ impl IndexSession {
         Self::from_bridge(bridge, load_config(source).as_ref())
     }
 
+    /// [`Self::open_at`] against an explicit database file instead of the
+    /// process-global data dir (tests: a per-test temp DB, #610).
+    #[cfg(test)]
+    pub fn open_at_db(db_path: &Path, start: &Path, source: ConfigSource<'_>) -> Result<Self> {
+        let bridge = IndexBridge::open_or_create_at(db_path, start)?;
+        Self::from_bridge(bridge, load_config(source).as_ref())
+    }
+
     /// Build a session from an already-open bridge and loaded config.
     pub fn from_bridge(bridge: IndexBridge, config: Option<&Config>) -> Result<Self> {
         let (conn, project_id, root) = bridge.into_strict_parts()?;

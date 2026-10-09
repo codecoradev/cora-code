@@ -39,7 +39,8 @@ use tracing::debug;
 
 use crate::config::schema::Config;
 use crate::engine::diff_parser::FileChunk;
-use crate::engine::scanner::{FileEntry, files_as_chunks};
+use crate::engine::scan_input;
+use crate::engine::scanner::FileEntry;
 use crate::engine::types::{ReviewIssue, Severity};
 use crate::engine::{inline_suppress, rules, secrets_scanner, security_scanner};
 
@@ -91,20 +92,20 @@ pub fn postprocess_report(
             apply_context_line_filter(issues, chunks)
         }
         Source::Files(files) => {
-            let chunks = files_as_chunks(files);
+            let scan_files = scan_input::from_entries(files);
             // Scanners run uncapped; the cap is enforced below, after
             // suppression (#624).
             let mut merged = issues;
             for family in [
-                secrets_scanner::scan_secrets(&chunks, usize::MAX),
-                security_scanner::scan_security(&chunks, usize::MAX),
+                secrets_scanner::scan_secrets_in(&scan_files, usize::MAX),
+                security_scanner::scan_security_in(&scan_files, usize::MAX),
             ] {
                 if !family.is_empty() {
                     merged = rules::merge_rule_findings(merged, family);
                 }
             }
             let merged = apply_ignore_rules(merged, &config.ignore.rules);
-            inline_suppress::apply(merged, &chunks)
+            inline_suppress::apply_lines(merged, &scan_files)
         }
     };
     let (issues, dropped) = cap_deterministic(issues, config.rules_config.finding_cap());
