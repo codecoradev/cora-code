@@ -23,6 +23,9 @@ use crate::engine::index_bridge::IndexBridge;
 use crate::engine::rules::{self, types::RuleFinding};
 use crate::engine::{index_scanner, secrets_scanner, security_scanner};
 
+/// Max findings per family listed in the LLM prompt context.
+const PROMPT_FINDINGS_PER_FAMILY: usize = 20;
+
 /// Findings of every deterministic scanner family, in contract order.
 #[derive(Debug, Default)]
 pub struct DeterministicReport {
@@ -102,8 +105,18 @@ impl DeterministicReport {
             parts.push(warning);
         }
         for family in self.families() {
-            let text = rules::format_rule_context(family);
+            // Scanners run uncapped (the user-facing cap is applied after
+            // suppression in `postprocess`), so bound what is sent to the model:
+            // families are severity-sorted, keep the worst PROMPT_FINDINGS_PER_FAMILY.
+            let shown = &family[..family.len().min(PROMPT_FINDINGS_PER_FAMILY)];
+            let mut text = rules::format_rule_context(shown);
             if !text.is_empty() {
+                if family.len() > shown.len() {
+                    text.push_str(&format!(
+                        "({} more findings of this kind not listed here)\n",
+                        family.len() - shown.len()
+                    ));
+                }
                 parts.push(text);
             }
         }
@@ -212,6 +225,26 @@ diff --git a/src/api.js b/src/api.js
                 + report.index_dead.len()
                 + report.index_breaking.len()
         );
+    }
+
+    #[test]
+    fn prompt_context_is_bounded_per_family() {
+        let report = DeterministicReport {
+            secrets: (1..=(PROMPT_FINDINGS_PER_FAMILY as u32 + 7))
+                .map(|line| RuleFinding {
+                    rule_id: "secrets/x".to_string(),
+                    file: "a.rs".to_string(),
+                    line,
+                    severity: crate::engine::Severity::Critical,
+                    title: "t".to_string(),
+                    body: "b".to_string(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let ctx = report.context(None).expect("context");
+        assert_eq!(ctx.matches("secrets/x").count(), PROMPT_FINDINGS_PER_FAMILY);
+        assert!(ctx.contains("(7 more findings of this kind not listed here)"));
     }
 
     #[test]
