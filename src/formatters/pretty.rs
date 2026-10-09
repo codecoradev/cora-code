@@ -242,17 +242,10 @@ mod tests {
     use crate::engine::{ReviewIssue, ScanResponse, Severity};
 
     fn sample_issue() -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(42),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "SQL Injection".to_string(),
-            body: "User input is concatenated directly into SQL query.".to_string(),
-            suggested_fix: Some("Use parameterized queries.".to_string()),
-        }
+        ReviewIssue::new("src/main.rs", Some(42), Severity::Critical, "SQL Injection")
+            .with_type("security")
+            .with_body("User input is concatenated directly into SQL query.")
+            .with_fix("Use parameterized queries.")
     }
 
     fn sample_response() -> ReviewResponse {
@@ -382,17 +375,7 @@ mod tests {
 
     #[test]
     fn format_issue_pretty_no_line() {
-        let issue = ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "README.md".to_string(),
-            line: None,
-            severity: Severity::Info,
-            issue_type: None,
-            title: "Typo".to_string(),
-            body: String::new(),
-            suggested_fix: None,
-        };
+        let issue = ReviewIssue::new("README.md", None, Severity::Info, "Typo");
         let out = format_issue_pretty(&issue, 1);
         assert!(out.contains("README.md"));
         assert!(!out.contains("README.md:"));

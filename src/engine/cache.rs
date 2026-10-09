@@ -186,17 +186,12 @@ mod tests {
 
     fn make_response() -> ReviewResponse {
         ReviewResponse {
-            issues: vec![ReviewIssue {
-                rule_id: None,
-                also_matches: Vec::new(),
-                file: "src/main.rs".to_string(),
-                line: Some(10),
-                severity: Severity::Major,
-                issue_type: Some("bugs".to_string()),
-                title: "Null pointer".to_string(),
-                body: "Could be null here".to_string(),
-                suggested_fix: Some("Add a check".to_string()),
-            }],
+            issues: vec![
+                ReviewIssue::new("src/main.rs", Some(10), Severity::Major, "Null pointer")
+                    .with_type("bugs")
+                    .with_body("Could be null here")
+                    .with_fix("Add a check"),
+            ],
             summary: "Found 1 issue.".to_string(),
             tokens_used: None,
             should_block: false,

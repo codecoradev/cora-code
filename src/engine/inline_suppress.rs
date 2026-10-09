@@ -140,17 +140,13 @@ mod tests {
     const RULE: &str = "Hardcoded password or secret in variable";
 
     fn issue(file: &str, line: u32, title: &str) -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: file.to_string(),
-            line: Some(line),
-            severity: Severity::Major,
-            issue_type: Some("rule".to_string()),
-            title: title.to_string(),
-            body: String::new(),
-            suggested_fix: None,
-        }
+        ReviewIssue::new(
+            file.to_string(),
+            Some(line),
+            Severity::Major,
+            title.to_string(),
+        )
+        .with_type("rule")
     }
 
     /// Diff adding `lines` to `f.rs` starting at line 1.

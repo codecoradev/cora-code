@@ -792,17 +792,9 @@ mod tests {
     use crate::engine::types::ReviewIssue;
 
     fn issue(severity: Severity) -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(1),
-            severity,
-            issue_type: Some("bug".to_string()),
-            title: "test".to_string(),
-            body: "body".to_string(),
-            suggested_fix: None,
-        }
+        ReviewIssue::new("src/main.rs", Some(1), severity, "test")
+            .with_type("bug")
+            .with_body("body")
     }
 
     fn response(issues: Vec<ReviewIssue>, should_block: bool) -> ReviewResponse {

@@ -135,6 +135,55 @@ pub struct ReviewIssue {
     pub also_matches: Vec<String>,
 }
 
+impl ReviewIssue {
+    /// Minimal issue: no type, empty body, no fix, no rule id. Chain the
+    /// `with_*` setters for the rest. Construction sites go through this so a
+    /// new field is added in one place (#610).
+    pub fn new(
+        file: impl Into<String>,
+        line: Option<u32>,
+        severity: Severity,
+        title: impl Into<String>,
+    ) -> Self {
+        Self {
+            file: file.into(),
+            line,
+            severity,
+            issue_type: None,
+            title: title.into(),
+            body: String::new(),
+            suggested_fix: None,
+            rule_id: None,
+            also_matches: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_type(mut self, issue_type: impl Into<String>) -> Self {
+        self.issue_type = Some(issue_type.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_body(mut self, body: impl Into<String>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_fix(mut self, fix: impl Into<String>) -> Self {
+        self.suggested_fix = Some(fix.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_rule_id(mut self, id: impl Into<String>) -> Self {
+        self.rule_id = Some(id.into());
+        self
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
@@ -391,17 +440,10 @@ mod tests {
 
     #[test]
     fn review_issue_roundtrip() {
-        let issue = ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(42),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "SQL Injection".to_string(),
-            body: "Details here".to_string(),
-            suggested_fix: Some("Use params".to_string()),
-        };
+        let issue = ReviewIssue::new("src/main.rs", Some(42), Severity::Critical, "SQL Injection")
+            .with_type("security")
+            .with_body("Details here")
+            .with_fix("Use params");
         let json = serde_json::to_string(&issue).unwrap();
         let back: ReviewIssue = serde_json::from_str(&json).unwrap();
         assert_eq!(back.file, issue.file);

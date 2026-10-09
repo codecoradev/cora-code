@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **One shared post-processing module for `cora review` and `cora scan`.** The finding filter pipeline (LLM secret false-positive cross-check, Markdown code blocks, `ignore.rules`, inline `cora-ignore:`, context-line filter, scanner merge for scans) now lives in `engine::postprocess`, so a fix lands in one place. Internal refactor with no CLI or output change (#610).
 
+- **`ReviewIssue::new` constructor and table-driven hardcoded-secret tests.** `ReviewIssue` is now built through `ReviewIssue::new(..)` plus `with_*` setters, so adding a field touches one place instead of every construction site. One end-to-end table covers the hardcoded-secret heuristics across languages; known false positives/negatives are pinned in a separate table. Internal change with no CLI or output change (#610).
+
 ## [0.17.0] - 2026-10-09
 
 ### Fixed

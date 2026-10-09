@@ -390,21 +390,21 @@ pub fn scan_project_index(
             match graph::find_unused_imports(conn, &entry.path, project_id) {
                 Ok(unused) => {
                     for u in &unused {
-                        findings.push(ReviewIssue {
-                            rule_id: Some("index-unused-import".into()),
-                            also_matches: Vec::new(),
-                            file: u.file.clone(),
-                            line: Some(u.line),
-                            severity: crate::engine::Severity::Minor,
-                            issue_type: Some("index".into()),
-                            title: format!("[index-unused-import] Unused import: {}", u.target),
-                            body: format!(
+                        findings.push(
+                            ReviewIssue::new(
+                                u.file.clone(),
+                                Some(u.line),
+                                crate::engine::Severity::Minor,
+                                format!("[index-unused-import] Unused import: {}", u.target),
+                            )
+                            .with_type("index")
+                            .with_body(format!(
                                 "Import `{}` is never used in this file. \
                                  Consider removing it to keep imports clean.",
                                 u.target
-                            ),
-                            suggested_fix: None,
-                        });
+                            ))
+                            .with_rule_id("index-unused-import"),
+                        );
                     }
                 }
                 Err(e) => {
@@ -426,22 +426,22 @@ pub fn scan_project_index(
     match graph::find_dead_code(conn, project_id, &opts) {
         Ok(dead) => {
             for func in dead.into_iter().take(max_findings - findings.len()) {
-                findings.push(ReviewIssue {
-                    rule_id: Some("index-dead-code".into()),
-                    also_matches: Vec::new(),
-                    file: func.file.clone(),
-                    line: Some(func.line),
-                    severity: crate::engine::Severity::Info,
-                    issue_type: Some("index".into()),
-                    title: format!("[index-dead-code] Potentially dead code: {}", func.name),
-                    body: format!(
+                findings.push(
+                    ReviewIssue::new(
+                        func.file.clone(),
+                        Some(func.line),
+                        crate::engine::Severity::Info,
+                        format!("[index-dead-code] Potentially dead code: {}", func.name),
+                    )
+                    .with_type("index")
+                    .with_body(format!(
                         "Function `{}` ({}) has no callers in the \
                          project. Verify it's not called via reflection, \
                          trait dispatch, or external entry points.",
                         func.name, func.kind
-                    ),
-                    suggested_fix: None,
-                });
+                    ))
+                    .with_rule_id("index-dead-code"),
+                );
             }
         }
         Err(e) => {

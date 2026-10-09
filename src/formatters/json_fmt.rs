@@ -49,17 +49,10 @@ mod tests {
     use crate::engine::{ReviewIssue, Severity, TokenUsage};
 
     fn sample_issue() -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(42),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "SQL Injection".to_string(),
-            body: "User input concatenated into query.".to_string(),
-            suggested_fix: Some("Use parameterized queries.".to_string()),
-        }
+        ReviewIssue::new("src/main.rs", Some(42), Severity::Critical, "SQL Injection")
+            .with_type("security")
+            .with_body("User input concatenated into query.")
+            .with_fix("Use parameterized queries.")
     }
 
     fn sample_response() -> ReviewResponse {
@@ -147,17 +140,11 @@ mod tests {
     #[test]
     fn format_review_multiple_issues() {
         let mut response = sample_response();
-        response.issues.push(ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/lib.rs".to_string(),
-            line: Some(10),
-            severity: Severity::Minor,
-            issue_type: Some("style".to_string()),
-            title: "Naming".to_string(),
-            body: "Use snake_case.".to_string(),
-            suggested_fix: None,
-        });
+        response.issues.push(
+            ReviewIssue::new("src/lib.rs", Some(10), Severity::Minor, "Naming")
+                .with_type("style")
+                .with_body("Use snake_case."),
+        );
         let fmt = JsonFormatter;
         let output = fmt.format_review(&response).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
