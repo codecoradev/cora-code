@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Real secrets were missed when the line had a trailing comment containing `:`.** The `hardcoded-secret` false-positive filter treated the first `:` anywhere (even inside a comment or string) as object shorthand, so `password = "..."; // note: fix later` was not flagged, and no scanner finding existed on lines carrying a `cora-ignore: <rule>` marker. The filter now judges only the code, ignoring trailing comments and quoted colons (#603).
+- **Concurrent index opens could fail with `UNIQUE constraint failed: schema_version.version`.** Schema migrations are now serialised per process, which also removes a flaky test (#604).
 
 ### Added
 
