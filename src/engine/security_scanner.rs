@@ -10,7 +10,7 @@ use tracing::debug;
 
 use crate::engine::Severity;
 use crate::engine::diff_parser::{DiffLineType, FileChunk};
-use crate::engine::rules::builtin::post_match_filter;
+use crate::engine::rules::builtin::post_match_filter_for_path;
 use crate::engine::rules::types::RuleFinding;
 
 // ─── Security patterns ───
@@ -203,7 +203,7 @@ pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFindi
                 for (rule_id, name, regex, severity) in COMPILED_PATTERNS.iter() {
                     if regex.is_match(&line.content) {
                         // Apply post-match filter to suppress known false positives
-                        if post_match_filter(rule_id, &line.content) {
+                        if post_match_filter_for_path(rule_id, &line.content, path) {
                             debug!(
                                 rule = %rule_id,
                                 file = path,
@@ -439,11 +439,21 @@ mod tests {
     fn detects_hardcoded_password() {
         let chunks = vec![make_chunk(
             "src/auth.rs",
-            &["let password = supersecret123;"],
+            &["let password = \"supersecret123\";"],
         )];
         let findings = scan_security(&chunks, 10);
         assert!(!findings.is_empty());
         assert!(findings[0].rule_id.contains("hardcoded-secret"));
+    }
+
+    #[test]
+    fn bare_identifier_rhs_in_code_is_not_a_hardcoded_password() {
+        // #616: an unquoted RHS in source code is an expression, not a literal.
+        let chunks = vec![make_chunk(
+            "src/auth.rs",
+            &["let password = supersecret123;"],
+        )];
+        assert!(scan_security(&chunks, 10).is_empty());
     }
 
     #[test]

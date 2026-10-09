@@ -75,7 +75,7 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
                     }
 
                     // Post-match filter (e.g., allow localhost URLs)
-                    if builtin::post_match_filter(&rule.id, &line.content) {
+                    if builtin::post_match_filter_for_path(&rule.id, &line.content, file_path) {
                         continue;
                     }
 

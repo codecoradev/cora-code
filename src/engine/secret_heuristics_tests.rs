@@ -263,6 +263,95 @@ const CASES: &[Row] = &[
         r#"q = f"CREATE USER app WITH PASSWORD '{pw}'""#,
         false,
     ),
+    // ── #616: env reads / call / member expressions / identifiers are not literals ──
+    ("js", "const token = process.env.API_TOKEN;", false),
+    (
+        "js",
+        "const secret = process.env.SESSION_SECRET || fallbackValue;",
+        false,
+    ),
+    ("py", r#"password = os.environ["DB_PASSWORD"]"#, false),
+    ("py", r#"password = os.getenv("DB_PASSWORD")"#, false),
+    ("py", "password = get_password_from_vault()", false),
+    ("rs", r#"let token = std::env::var("API_TOKEN")?;"#, false),
+    (
+        "rs",
+        r#"let token = std::env::var("API_TOKEN").unwrap_or_default();"#,
+        false,
+    ),
+    ("rs", r#"let password = String::new();"#, false),
+    (
+        "java",
+        r#"String password = System.getenv("DB_PASSWORD");"#,
+        false,
+    ),
+    (
+        "kt",
+        r#"val password = System.getenv("DB_PASSWORD")"#,
+        false,
+    ),
+    ("js", "const password = userInput;", false),
+    ("rs", "let token = cfg.token_value_here;", false),
+    ("ts", "const apiKey: string = config.apiKeyValue;", false),
+    ("rb", r#"password = ENV["DB_PASSWORD"]"#, false),
+    ("php", r#"$password = $_ENV['DB_PASSWORD'];"#, false),
+    (
+        "cs",
+        "var token = Environment.GetEnvironmentVariable(name);",
+        false,
+    ),
+    // a quoted or concatenated literal in code is still a secret
+    ("js", r#"password = "abc" + "defgh12345";"#, true),
+    ("py", r#"password = b"hunter2hunter2xx""#, true),
+    ("py", r#"password = f"hunter2hunter2xx""#, true),
+    ("rs", r##"let password = r#"hunter2hunter2xx"#;"##, true),
+    (
+        "rs",
+        r#"let password = String::from("hunter2hunter2xx");"#,
+        true,
+    ),
+    (
+        "rs",
+        r#"let password = "hunter2hunter2xx".to_string();"#,
+        true,
+    ),
+    // ── #617: shell-style interpolation is a reference, a real value is not ──
+    ("env", "DB_PASSWORD=${DB_PASSWORD_FROM_VAULT}", false),
+    ("properties", "db.password=${DB_PASSWORD}", false),
+    ("sh", r#"export DB_PASSWORD="$VAULT_DB_PASSWORD""#, false),
+    ("env", "DB_PASSWORD=$VAULT_DB_PASSWORD", false),
+    (
+        "sh",
+        "export API_KEY=$(vault read -field=key secret/api)",
+        false,
+    ),
+    (
+        "sh",
+        r#"export API_KEY="$(vault read -field=key secret/api)""#,
+        false,
+    ),
+    (
+        "sh",
+        r#"export DB_PASSWORD="${DB_PASSWORD_FROM_VAULT}""#,
+        false,
+    ),
+    ("ini", "password=${DB_PASSWORD}", false),
+    ("yaml", "      - DB_PASSWORD=${DB_PASSWORD}", false),
+    // real values in assignment-style files stay flagged
+    ("env", "DB_PASSWORD=hunter2hunter2xx", true),
+    ("sh", "export API_KEY=abcd1234efgh5678", true),
+    ("properties", "password=hunter2hunter2xx", true),
+    ("sh", r#"export X_SECRET="hunter2hunter2xx""#, true),
+    ("env", "DB_PASSWORD=hunter2hunter2xx # prod", true),
+    ("toml", "api_key = abcd1234efgh5678", true),
+    ("ini", "password = hunter2hunter2xx", true),
+    ("yaml", "      - DB_PASSWORD=hunter2hunter2xx", true),
+    // a literal mixed into an interpolation is not a pure reference
+    (
+        "sh",
+        r#"export DB_PASSWORD="${PREFIX}hunter2hunter2xx""#,
+        true,
+    ),
 ];
 
 /// Rows exposing a real false negative/positive that is not fixed yet. Each
@@ -270,33 +359,30 @@ const CASES: &[Row] = &[
 /// the ideal result in the trailing comment). Move a row into [`CASES`] with
 /// the ideal expectation when its issue is fixed.
 const KNOWN_GAPS: &[Row] = &[
-    // KNOWN GAP #616 - FP: env-var reads and call expressions on the RHS are reported as hardcoded secrets (ideal: not flagged)
-    ("js", "const token = process.env.API_TOKEN;", true),
+    // KNOWN GAP #628 - FN: an unquoted RHS in source code is treated as an expression, so a real literal default inside a call is missed (ideal: flagged)
     (
-        "js",
-        "const secret = process.env.SESSION_SECRET || fallbackValue;",
-        true,
+        "py",
+        r#"password = os.environ.get("DB_PASSWORD", "hunter2hunter2xx")"#,
+        false,
     ),
-    ("py", r#"password = os.environ["DB_PASSWORD"]"#, true),
-    ("py", r#"password = os.getenv("DB_PASSWORD")"#, true),
-    ("py", "password = get_password_from_vault()", true),
-    ("rs", r#"let token = std::env::var("API_TOKEN")?;"#, true),
     (
         "rs",
-        r#"let token = std::env::var("API_TOKEN").unwrap_or_default();"#,
-        true,
+        r#"let password = std::env::var("DB_PASSWORD").unwrap_or("hunter2hunter2xx".into());"#,
+        false,
     ),
-    ("rs", r#"let password = String::new();"#, true),
+    (
+        "js",
+        r#"const password = process.env.DB_PASSWORD || "hunter2hunter2xx";"#,
+        false,
+    ),
+    // KNOWN GAP #630 - FN: the scanner regex needs a >= 8 char token after `=`, so `new String("lit")` and other short-prefixed constructors are never matched (ideal: flagged)
     (
         "java",
-        r#"String password = System.getenv("DB_PASSWORD");"#,
-        true,
+        r#"String password = new String("hunter2hunter2xx");"#,
+        false,
     ),
-    ("kt", r#"val password = System.getenv("DB_PASSWORD")"#, true),
-    // KNOWN GAP #617 - FP: shell-style `${VAR}`/`$VAR` interpolation in env, .properties and shell files (ideal: not flagged)
-    ("env", "DB_PASSWORD=${DB_PASSWORD_FROM_VAULT}", true),
-    ("properties", "db.password=${DB_PASSWORD}", true),
-    ("sh", r#"export DB_PASSWORD="$VAULT_DB_PASSWORD""#, true),
+    // KNOWN GAP #629 - FN: shell `${VAR:-literal}` default with a real literal is treated as interpolation (ideal: flagged)
+    ("sh", "DB_PASSWORD=${DB_PASSWORD:-hunter2hunter2xx}", false),
 ];
 
 #[test]

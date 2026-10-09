@@ -149,7 +149,7 @@ fn apply_llm_secret_fp_filter(
         let line_num = issue.line.unwrap_or(0);
         let key = (issue.file.clone(), line_num);
         if let Some(actual_line) = added_lines.get(&key) {
-            if !crate::engine::rules::builtin::has_secret_literal(actual_line) {
+            if !crate::engine::rules::builtin::has_secret_literal(actual_line, &issue.file) {
                 debug!(
                     file = %issue.file,
                     line = line_num,
