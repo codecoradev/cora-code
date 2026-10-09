@@ -22,6 +22,8 @@ pub mod review;
 pub mod review_store;
 pub mod rules;
 pub mod scanner;
+#[cfg(test)]
+mod secret_heuristics_tests;
 pub mod secret_patterns;
 pub mod secrets_scanner;
 pub mod security_scanner;

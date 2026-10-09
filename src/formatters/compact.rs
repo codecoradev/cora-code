@@ -88,17 +88,9 @@ mod tests {
     use crate::engine::{ReviewIssue, ScanResponse, Severity};
 
     fn sample_issue() -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(42),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "SQL Injection".to_string(),
-            body: "Details here.".to_string(),
-            suggested_fix: None,
-        }
+        ReviewIssue::new("src/main.rs", Some(42), Severity::Critical, "SQL Injection")
+            .with_type("security")
+            .with_body("Details here.")
     }
 
     fn sample_response() -> ReviewResponse {
@@ -183,17 +175,7 @@ mod tests {
 
     #[test]
     fn format_issue_compact_no_line() {
-        let issue = ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "README.md".to_string(),
-            line: None,
-            severity: Severity::Info,
-            issue_type: None,
-            title: "Typo".to_string(),
-            body: String::new(),
-            suggested_fix: None,
-        };
+        let issue = ReviewIssue::new("README.md", None, Severity::Info, "Typo");
         let line = format_issue_compact(&issue);
         assert!(line.contains("README.md"));
         // When no line, file is directly followed by ": title" not "file:N: title"

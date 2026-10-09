@@ -387,17 +387,16 @@ mod tests {
             is_new: false,
         }];
 
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "crates/uteke-cli/src/cli.rs".to_string(),
-            line: Some(236),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "Hardcoded password or secret in variable".to_string(),
-            body: "Static security scanner detected...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new(
+                "crates/uteke-cli/src/cli.rs",
+                Some(236),
+                Severity::Critical,
+                "Hardcoded password or secret in variable",
+            )
+            .with_type("security")
+            .with_body("Static security scanner detected..."),
+        ];
 
         let result = apply_llm_secret_fp_filter(issues, &diff_chunks);
         assert!(
@@ -432,17 +431,16 @@ mod tests {
             is_new: false,
         }];
 
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/config.rs".to_string(),
-            line: Some(15),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "Hardcoded password or secret in variable".to_string(),
-            body: "API key hardcoded...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new(
+                "src/config.rs",
+                Some(15),
+                Severity::Critical,
+                "Hardcoded password or secret in variable",
+            )
+            .with_type("security")
+            .with_body("API key hardcoded..."),
+        ];
 
         let result = apply_llm_secret_fp_filter(issues, &diff_chunks);
         assert_eq!(result.len(), 1, "actual hardcoded secret should be kept");
@@ -474,17 +472,11 @@ mod tests {
             is_new: false,
         }];
 
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(1),
-            severity: Severity::Minor,
-            issue_type: Some("bugs".to_string()),
-            title: "Use of unwrap()".to_string(),
-            body: "This can panic".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new("src/main.rs", Some(1), Severity::Minor, "Use of unwrap()")
+                .with_type("bugs")
+                .with_body("This can panic"),
+        ];
 
         let result = apply_llm_secret_fp_filter(issues, &diff_chunks);
         assert_eq!(result.len(), 1, "non-security findings should pass through");
@@ -497,17 +489,16 @@ mod tests {
         // Empty diff — finding references a line not in the diff
         let diff_chunks: Vec<FileChunk> = vec![];
 
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/config.rs".to_string(),
-            line: Some(999),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "Hardcoded password or secret in variable".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new(
+                "src/config.rs",
+                Some(999),
+                Severity::Critical,
+                "Hardcoded password or secret in variable",
+            )
+            .with_type("security")
+            .with_body("..."),
+        ];
 
         let result = apply_llm_secret_fp_filter(issues, &diff_chunks);
         assert_eq!(
@@ -520,28 +511,22 @@ mod tests {
     #[test]
     fn ignore_rules_filters_by_title_match() {
         let issues = vec![
-            ReviewIssue {
-                rule_id: None,
-                also_matches: Vec::new(),
-                file: "cli.rs".to_string(),
-                line: Some(236),
-                severity: Severity::Critical,
-                issue_type: Some("rule".to_string()),
-                title: "Command injection via exec/system with dynamic input".to_string(),
-                body: "Static security scanner detected...".to_string(),
-                suggested_fix: None,
-            },
-            ReviewIssue {
-                rule_id: None,
-                also_matches: Vec::new(),
-                file: "main.rs".to_string(),
-                line: Some(10),
-                severity: Severity::Major,
-                issue_type: Some("security".to_string()),
-                title: "SQL injection via string concatenation".to_string(),
-                body: "...".to_string(),
-                suggested_fix: None,
-            },
+            ReviewIssue::new(
+                "cli.rs",
+                Some(236),
+                Severity::Critical,
+                "Command injection via exec/system with dynamic input",
+            )
+            .with_type("rule")
+            .with_body("Static security scanner detected..."),
+            ReviewIssue::new(
+                "main.rs",
+                Some(10),
+                Severity::Major,
+                "SQL injection via string concatenation",
+            )
+            .with_type("security")
+            .with_body("..."),
         ];
 
         let rules = vec!["Command injection via exec/system with dynamic input".to_string()];
@@ -552,17 +537,11 @@ mod tests {
 
     #[test]
     fn ignore_rules_filters_by_issue_type_match() {
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "test.py".to_string(),
-            line: Some(50),
-            severity: Severity::Minor,
-            issue_type: Some("style".to_string()),
-            title: "Some style issue".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new("test.py", Some(50), Severity::Minor, "Some style issue")
+                .with_type("style")
+                .with_body("..."),
+        ];
 
         let rules = vec!["style".to_string()];
         let result = apply_ignore_rules(issues, &rules);
@@ -571,17 +550,11 @@ mod tests {
 
     #[test]
     fn ignore_rules_empty_keeps_all() {
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "f.rs".to_string(),
-            line: Some(1),
-            severity: Severity::Critical,
-            issue_type: Some("rule".to_string()),
-            title: "Any finding".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new("f.rs", Some(1), Severity::Critical, "Any finding")
+                .with_type("rule")
+                .with_body("..."),
+        ];
 
         let result = apply_ignore_rules(issues, &[]);
         assert_eq!(result.len(), 1);
@@ -589,17 +562,16 @@ mod tests {
 
     #[test]
     fn ignore_rules_case_insensitive() {
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "f.rs".to_string(),
-            line: Some(1),
-            severity: Severity::Critical,
-            issue_type: Some("rule".to_string()),
-            title: "HARDCODED password or SECRET in variable".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new(
+                "f.rs",
+                Some(1),
+                Severity::Critical,
+                "HARDCODED password or SECRET in variable",
+            )
+            .with_type("rule")
+            .with_body("..."),
+        ];
 
         let rules = vec!["Hardcoded Password Or Secret".to_string()];
         let result = apply_ignore_rules(issues, &rules);
@@ -650,17 +622,16 @@ mod tests {
             is_new: false,
         }];
 
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "AGENT.md".to_string(),
-            line: Some(168),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "SQL injection via string concatenation".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new(
+                "AGENT.md",
+                Some(168),
+                Severity::Critical,
+                "SQL injection via string concatenation",
+            )
+            .with_type("security")
+            .with_body("..."),
+        ];
 
         let result = apply_markdown_code_block_filter(issues, &diff_chunks);
         assert!(
@@ -710,17 +681,11 @@ mod tests {
         }];
 
         // Finding on line 5 (outside the block, in prose) must survive.
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "doc.md".to_string(),
-            line: Some(5),
-            severity: Severity::Minor,
-            issue_type: Some("style".to_string()),
-            title: "typo".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new("doc.md", Some(5), Severity::Minor, "typo")
+                .with_type("style")
+                .with_body("..."),
+        ];
 
         let result = apply_markdown_code_block_filter(issues, &diff_chunks);
         assert_eq!(result.len(), 1, "finding outside a code block must be kept");
@@ -753,17 +718,11 @@ mod tests {
             is_new: false,
         }];
 
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/app.py".to_string(),
-            line: Some(42),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "eval injection".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues = vec![
+            ReviewIssue::new("src/app.py", Some(42), Severity::Critical, "eval injection")
+                .with_type("security")
+                .with_body("..."),
+        ];
 
         let result = apply_markdown_code_block_filter(issues, &diff_chunks);
         assert_eq!(result.len(), 1, "non-markdown files are unaffected");
@@ -801,17 +760,15 @@ mod tests {
                 is_deleted: false,
                 is_new: true,
             }];
-            let issues = vec![ReviewIssue {
-                rule_id: None,
-                also_matches: Vec::new(),
-                file: "src/a.ts".to_string(),
-                line: Some(1),
-                severity: Severity::Critical,
-                issue_type: Some("security".to_string()),
-                title: "Hardcoded password in source code".to_string(),
-                body: String::new(),
-                suggested_fix: None,
-            }];
+            let issues = vec![
+                ReviewIssue::new(
+                    "src/a.ts",
+                    Some(1),
+                    Severity::Critical,
+                    "Hardcoded password in source code",
+                )
+                .with_type("security"),
+            ];
             assert_eq!(
                 apply_llm_secret_fp_filter(issues, &chunks).len(),
                 1,
@@ -822,17 +779,9 @@ mod tests {
 
     #[test]
     fn ignore_rules_matches_rule_id_exactly() {
-        let mut a = ReviewIssue {
-            rule_id: Some("sec-hardcoded-secret".to_string()),
-            also_matches: Vec::new(),
-            file: "a.rs".to_string(),
-            line: Some(1),
-            severity: Severity::Major,
-            issue_type: Some("rule".to_string()),
-            title: "Plain title".to_string(),
-            body: String::new(),
-            suggested_fix: None,
-        };
+        let mut a = ReviewIssue::new("a.rs", Some(1), Severity::Major, "Plain title")
+            .with_type("rule")
+            .with_rule_id("sec-hardcoded-secret");
         let kept = apply_ignore_rules(vec![a.clone()], &["SEC-Hardcoded-Secret".to_string()]);
         assert!(kept.is_empty());
         // ids are exact, not substring
@@ -848,17 +797,8 @@ mod tests {
     #[test]
     fn markdown_fp_filter_keeps_findings_without_line_number() {
         // Findings with no resolvable line are kept (safe default).
-        let issues = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "doc.md".to_string(),
-            line: None,
-            severity: Severity::Info,
-            issue_type: None,
-            title: "vague".to_string(),
-            body: "...".to_string(),
-            suggested_fix: None,
-        }];
+        let issues =
+            vec![ReviewIssue::new("doc.md", None, Severity::Info, "vague").with_body("...")];
 
         let result = apply_markdown_code_block_filter(issues, &[]);
         assert_eq!(result.len(), 1);
@@ -869,17 +809,7 @@ mod tests {
     use crate::engine::diff_parser::parse_diff;
 
     fn issue(file: &str, line: Option<u32>, sev: Severity, ty: &str, title: &str) -> ReviewIssue {
-        ReviewIssue {
-            file: file.to_string(),
-            line,
-            severity: sev,
-            issue_type: Some(ty.to_string()),
-            title: title.to_string(),
-            body: String::new(),
-            suggested_fix: None,
-            rule_id: None,
-            also_matches: Vec::new(),
-        }
+        ReviewIssue::new(file.to_string(), line, sev, title.to_string()).with_type(ty.to_string())
     }
 
     fn file_entry(path: &str, content: &str) -> FileEntry {

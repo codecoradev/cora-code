@@ -154,17 +154,10 @@ mod tests {
     use crate::engine::{ReviewIssue, Severity};
 
     fn sample_issue() -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/main.rs".to_string(),
-            line: Some(42),
-            severity: Severity::Critical,
-            issue_type: Some("security".to_string()),
-            title: "SQL Injection".to_string(),
-            body: "User input concatenated into query.".to_string(),
-            suggested_fix: Some("Use parameterized queries.".to_string()),
-        }
+        ReviewIssue::new("src/main.rs", Some(42), Severity::Critical, "SQL Injection")
+            .with_type("security")
+            .with_body("User input concatenated into query.")
+            .with_fix("Use parameterized queries.")
     }
 
     fn sample_response() -> ReviewResponse {
@@ -327,17 +320,8 @@ mod tests {
 
     #[test]
     fn sarif_issue_without_line_has_no_region() {
-        let issue = ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "src/lib.rs".to_string(),
-            line: None,
-            severity: Severity::Info,
-            issue_type: None,
-            title: "No line".to_string(),
-            body: "No line info.".to_string(),
-            suggested_fix: None,
-        };
+        let issue = ReviewIssue::new("src/lib.rs", None, Severity::Info, "No line")
+            .with_body("No line info.");
         let response = ReviewResponse {
             issues: vec![issue],
             summary: String::new(),

@@ -567,17 +567,10 @@ mod tests {
     }
 
     fn make_issue(file: &str, line: u32, severity: Severity, title: &str) -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: file.to_string(),
-            line: Some(line),
-            severity,
-            issue_type: Some("security".to_string()),
-            title: title.to_string(),
-            body: "test body".to_string(),
-            suggested_fix: Some("fix it".to_string()),
-        }
+        ReviewIssue::new(file.to_string(), Some(line), severity, title.to_string())
+            .with_type("security")
+            .with_body("test body")
+            .with_fix("fix it")
     }
 
     fn record<'a>(root: &'a str, issues: &'a [ReviewIssue]) -> ReviewRecord<'a> {

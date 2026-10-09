@@ -279,17 +279,12 @@ diff --git a/src/api.js b/src/api.js
         let report = run(&chunks, &Config::default(), &fixture_bridge());
         let total = report.len();
         let first = report.secrets[0].clone();
-        let llm = vec![ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: first.file.clone(),
-            line: Some(first.line),
-            severity: crate::engine::Severity::Major,
-            issue_type: None,
-            title: "Hardcoded secret committed to the repository".into(),
-            body: String::new(),
-            suggested_fix: None,
-        }];
+        let llm = vec![ReviewIssue::new(
+            first.file.clone(),
+            Some(first.line),
+            crate::engine::Severity::Major,
+            "Hardcoded secret committed to the repository",
+        )];
         let merged = report.merge_into(llm);
         assert_eq!(
             merged[0].title,

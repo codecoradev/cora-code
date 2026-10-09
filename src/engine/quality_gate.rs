@@ -362,17 +362,8 @@ mod tests {
     use super::*;
 
     fn make_issue(severity: Severity, issue_type: &str) -> ReviewIssue {
-        ReviewIssue {
-            rule_id: None,
-            also_matches: Vec::new(),
-            file: "test.rs".to_string(),
-            line: Some(1),
-            severity,
-            issue_type: Some(issue_type.to_string()),
-            title: "test issue".to_string(),
-            body: String::new(),
-            suggested_fix: None,
-        }
+        ReviewIssue::new("test.rs", Some(1), severity, "test issue")
+            .with_type(issue_type.to_string())
     }
 
     fn default_config() -> QualityGateConfig {
