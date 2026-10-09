@@ -11,7 +11,7 @@ pub fn builtin_rules() -> Vec<CustomRule> {
         // --- Security ---
         CustomRule {
             id: "sec-hardcoded-secret".to_string(),
-            pattern: r#"(?i)(?:password|api_?key|token|secret)\s*=\s*"[^"]+""#
+            pattern: r#"(?i)(?:password|api_?key|token|secret)(?:\s*:\s*[&\w<>\[\].?|]+)?\s*=\s*(?:"[^"]+"|'[^']+')"#
                 .to_string(),
             severity: Severity::Critical,
             message: "Possible hardcoded secret/credential detected. Use environment variables or a secrets manager.".to_string(),
@@ -300,15 +300,10 @@ fn is_false_positive_secret(line: &str) -> bool {
                 .next()
                 .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
         {
-            // Check that the rest is also identifier-like (no string literals)
-            let is_bare_identifier = after_colon
-                .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-' && c != '$')
-                .all(|part| {
-                    part.is_empty()
-                        || part
-                            .chars()
-                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '$')
-                });
+            // The rest must not contain a string literal. Type annotations followed
+            // by a literal (`password: string = "..."`, `password: str = "..."`,
+            // `let password: &str = "..."`) are real secrets, not shorthand (#607).
+            let is_bare_identifier = !after_colon.contains(['"', '\'', '`']);
             if is_bare_identifier {
                 return true;
             }
@@ -802,6 +797,33 @@ mod tests {
             "url = 'http://x#y'"
         );
         assert_eq!(strip_trailing_comment("x # c"), "x ");
+    }
+
+    // ─── #607: typed declarations with a literal are real secrets ───
+
+    #[test]
+    fn typed_declaration_with_literal_is_real_finding() {
+        for l in [
+            "const password: string = \"hunter2hunter2xx\";",
+            "password: str = \"hunter2hunter2xx\"",
+            "let password: &str = \"hunter2hunter2xx\";",
+            "private val apiSecret: String = \"hunter2hunter2xx\"",
+            "const password: string = 'hunter2hunter2xx'; // note: ok",
+        ] {
+            assert!(!post_match_filter("crypto/hardcoded-secret", l), "{l}");
+            assert!(!post_match_filter("sec-hardcoded-secret", l), "{l}");
+        }
+    }
+
+    #[test]
+    fn shorthand_without_literal_stays_false_positive() {
+        for l in [
+            "{ app_secret: formAppSecret }",
+            "...(formAppSecret && { app_secret: formAppSecret })",
+            "{ password: input.password, secret: cfg.secret }",
+        ] {
+            assert!(post_match_filter("crypto/hardcoded-secret", l), "{l}");
+        }
     }
 
     // ─── sec-hardcoded-secret (builtin rule ID) false positive tests ───
