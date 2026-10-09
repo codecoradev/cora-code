@@ -15,6 +15,7 @@ pub mod llm;
 pub mod markdown;
 pub mod memory;
 pub mod path_match;
+pub mod postprocess;
 pub mod profiles;
 pub mod quality_gate;
 pub mod review;

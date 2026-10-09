@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **One shared post-processing module for `cora review` and `cora scan`.** The finding filter pipeline (LLM secret false-positive cross-check, Markdown code blocks, `ignore.rules`, inline `cora-ignore:`, context-line filter, scanner merge for scans) now lives in `engine::postprocess`, so a fix lands in one place. Internal refactor with no CLI or output change (#610).
+
 ## [0.17.0] - 2026-10-09
 
 ### Fixed

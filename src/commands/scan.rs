@@ -5,13 +5,11 @@ use colored::Colorize;
 use tracing::debug;
 
 use crate::config::schema::Config;
-use crate::engine::review::apply_ignore_rules;
+use crate::engine::ReviewIssue;
+use crate::engine::postprocess::{Source, postprocess};
 use crate::engine::review_store;
-use crate::engine::scanner::{
-    FileEntry, batch_files, files_as_chunks, format_batch_for_prompt, walk_project,
-};
+use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
-use crate::engine::{ReviewIssue, inline_suppress, rules, secrets_scanner, security_scanner};
 use crate::formatters::{OutputFormat, formatter_for};
 
 /// Default maximum files per LLM batch when `--batch-files` is not specified.
@@ -345,19 +343,7 @@ fn finalize_issues(
     files: &[FileEntry],
     issues: Vec<ReviewIssue>,
 ) -> Vec<ReviewIssue> {
-    let chunks = files_as_chunks(files);
-    let max = config.rules_config.max_findings;
-    let mut merged = issues;
-    for family in [
-        secrets_scanner::scan_secrets(&chunks, max),
-        security_scanner::scan_security(&chunks, max),
-    ] {
-        if !family.is_empty() {
-            merged = rules::merge_rule_findings(merged, family);
-        }
-    }
-    let merged = apply_ignore_rules(merged, &config.ignore.rules);
-    inline_suppress::apply(merged, &chunks)
+    postprocess(issues, &Source::Files(files), config)
 }
 
 /// Compute a short SHA256 hash of a file's content for incremental scanning.
