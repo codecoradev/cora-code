@@ -11,8 +11,7 @@ pub fn builtin_rules() -> Vec<CustomRule> {
         // --- Security ---
         CustomRule {
             id: "sec-hardcoded-secret".to_string(),
-            pattern: r#"(?i)(?:password|api_?key|token|secret)(?:\s*:\s*[&\w<>\[\].?|]+)?\s*=\s*(?:"[^"]+"|'[^']+')"#
-                .to_string(),
+            pattern: secret_literal_pattern(),
             severity: Severity::Critical,
             message: "Possible hardcoded secret/credential detected. Use environment variables or a secrets manager.".to_string(),
             languages: vec!["all".to_string()],
@@ -124,6 +123,124 @@ pub fn builtin_rules() -> Vec<CustomRule> {
             ..Default::default()
         },
     ]
+}
+
+/// Regex source shared by the `sec-hardcoded-secret` rule and the LLM secret
+/// cross-check in `postprocess`, so a shape detected here is never dropped
+/// there as a false positive (#607, #618-#620). Alternatives:
+///
+/// 1. `name [: type] = "lit"` / `name := "lit"` (Go) / `"name": "lit"` (JSON
+///    quoted key); the key may be quoted.
+/// 2. Go `var name type = "lit"` (colon-free type between name and `=`).
+/// 3. SQL `PASSWORD '<lit>'` / `IDENTIFIED BY '<lit>'` (no `=`).
+pub(crate) fn secret_literal_pattern() -> String {
+    let kw = r"(?:password|api_?key|token|secret)";
+    let ty = r"[&*\w<>\[\].?|]+";
+    let lit = r#"(?:"[^"]+"|'[^']+')"#;
+    format!(
+        r#"(?i){kw}["']?(?:\s*:\s*{ty})?\s*(?::=|=|["']\s*:)\s*{lit}|(?i){kw}["']?\s+{ty}\s*=\s*{lit}|{SQL_PASSWORD_PATTERN}"#
+    )
+}
+
+/// SQL password literal without `=`: `... WITH PASSWORD 'x'`, `IDENTIFIED BY 'x'`.
+const SQL_PASSWORD_PATTERN: &str = r"(?i)\b(?:password|identified\s+by)\s+'([^']+)'";
+
+static SQL_PASSWORD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(SQL_PASSWORD_PATTERN).expect("sql password regex must compile"));
+
+static SECRET_LITERAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&secret_literal_pattern()).expect("hardcoded secret regex must compile")
+});
+
+/// Does `line` show a hardcoded secret literal the deterministic detectors
+/// report? Used by the LLM cross-check so LLM findings on the same shapes are
+/// kept. A SQL placeholder (`PASSWORD '%s'`) is not a literal.
+pub(crate) fn has_secret_literal(line: &str) -> bool {
+    if let Some(c) = SQL_PASSWORD_RE.captures(line)
+        && is_sql_placeholder(&c[1])
+    {
+        return false;
+    }
+    if quoted_placeholder_value(line) {
+        return false;
+    }
+    SECRET_LITERAL_RE.is_match(line) || plain_scalar_secret(strip_trailing_comment(line))
+}
+
+/// A SQL literal that is a bind/format placeholder, not a password:
+/// `%s`, `%v`, `$1`, `?`, `:name`, `@name`, `{}` / `{pw}` / `${PW}`, `<password>`.
+fn is_sql_placeholder(lit: &str) -> bool {
+    let lit = lit.trim();
+    lit.starts_with(['$', ':', '@', '?'])
+        || lit.contains('%')
+        || (lit.contains('{') && lit.contains('}'))
+        || (lit.starts_with('<') && lit.ends_with('>'))
+}
+
+/// Value of a whole-line `key: value` entry (YAML, JSON, `- key: value`) whose
+/// key ends in a secret word. The line must be nothing but the entry (an
+/// optional `- ` bullet, an optional trailing comma), so object shorthand inside
+/// code (`{ password: formPassword }`, `pub password: String,`) never qualifies.
+fn secret_kv_value(line: &str) -> Option<&str> {
+    static KV_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)^\s*(?:-\s+)?["']?[\w.\-]*(?:password|passwd|pwd|secret|api_?key|token)["']?\s*:\s+(\S.*?)\s*,?\s*$"#,
+        )
+        .expect("kv regex must compile")
+    });
+    KV_RE
+        .captures(line)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+}
+
+/// Unquoted YAML scalar that looks like a real secret (#619). Conservative:
+/// a single token of >= 8 chars with a digit or symbol in it, so bare words
+/// (`required`, `formPassword`, `vault_db_password`) stay "references". Never
+/// a YAML tag/anchor/alias/block indicator, `${..}`/`$VAR`, a path, or a
+/// keyword (`true`, `null`, ...).
+fn plain_scalar_secret(line: &str) -> bool {
+    let Some(v) = secret_kv_value(line) else {
+        return false;
+    };
+    let lower = v.to_ascii_lowercase();
+    v.len() >= 8
+        && !v.contains(char::is_whitespace)
+        && !v.starts_with([
+            '"', '\'', '`', '$', '!', '&', '*', '|', '>', '%', '@', '{', '[', '/', '~', '<', '.',
+            '?', '-',
+        ])
+        && !v.contains("://")
+        && !v.contains(['{', '}', '(', ')', ';', '#'])
+        && !matches!(
+            lower.as_str(),
+            "true" | "false" | "null" | "none" | "nil" | "yes" | "no"
+        )
+        && v.chars()
+            .any(|c| c.is_ascii_digit() || "!@#%^&*+=".contains(c))
+}
+
+/// Quoted `key: "value"` entry whose value is empty or an interpolation /
+/// template placeholder (`${X}`, `$X`, `{{ x }}`): a reference, not a secret.
+fn quoted_placeholder_value(line: &str) -> bool {
+    let Some(v) = secret_kv_value(line) else {
+        return false;
+    };
+    let (Some(q), Some(last)) = (v.chars().next(), v.chars().last()) else {
+        return false;
+    };
+    if !matches!(q, '"' | '\'') || last != q || v.len() < 2 {
+        return false;
+    }
+    let inner = &v[1..v.len() - 1];
+    inner.is_empty()
+        || (inner.starts_with("${") && inner.ends_with('}'))
+        || (inner.starts_with("{{") && inner.ends_with("}}"))
+        || (inner.starts_with('$')
+            && inner.len() > 1
+            && inner[1..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
 }
 
 /// Post-match filter for rules that need additional validation after regex match.
@@ -283,6 +400,29 @@ fn is_false_positive_secret(line: &str) -> bool {
     // that are form state, not actual credentials
     if lower.contains("$state(") || lower.contains("bind:") {
         return true;
+    }
+
+    // SQL placeholders in format strings: PASSWORD '%s', IDENTIFIED BY '$1' (#620)
+    if let Some(c) = SQL_PASSWORD_RE.captures(line)
+        && is_sql_placeholder(&c[1])
+    {
+        return true;
+    }
+
+    // `"password": "${X}"` / `password: "{{ x }}"`: a reference, not a secret (#619)
+    if quoted_placeholder_value(line) {
+        return true;
+    }
+
+    // YAML alias / anchor / tag / path / `~` reference (`password: *dbpass`,
+    // `password: /run/secrets/db`): points at another value, not a secret (#619)
+    if secret_kv_value(line).is_some_and(|v| v.starts_with(['*', '&', '!', '/', '~'])) {
+        return true;
+    }
+
+    // Unquoted YAML `password: hunter2hunter2` is a real secret, not shorthand (#619)
+    if plain_scalar_secret(line) {
+        return false;
     }
 
     // Object shorthand where the value is a variable reference, not a literal

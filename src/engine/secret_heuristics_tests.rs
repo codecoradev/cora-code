@@ -141,6 +141,17 @@ const CASES: &[Row] = &[
     ("go", "const token = `abcd1234efgh5678`", true),
     ("go", r#"password := os.Getenv("DB_PASSWORD")"#, false),
     ("go", r#"password := """#, false),
+    // #618: short declarations and colon-free types
+    ("go", r#"password := "hunter2hunter2""#, true),
+    ("go", r#"var apiKey string = "abcd1234efgh5678""#, true),
+    ("go", r#"password := "hunter2hunter2" // note: temp"#, true),
+    (
+        "go",
+        r#"password := "hunter2hunter2" // cora-ignore: crypto/hardcoded-secret"#,
+        false,
+    ),
+    ("go", r#"var apiKey string = """#, false),
+    ("go", r#"var apiKey string = os.Getenv("API_KEY")"#, false),
     // ── java / kotlin ──
     (
         "java",
@@ -162,6 +173,32 @@ const CASES: &[Row] = &[
     ("yaml", "api_key: 'abcd1234efgh5678'", true),
     ("yaml", "password: ${DB_PASSWORD}", false),
     ("yaml", "password: \"\"", false),
+    // #619: unquoted YAML scalars
+    ("yaml", "password: hunter2hunter2", true),
+    ("yaml", "  db_password: hunter2hunter2", true),
+    ("yaml", "- token: abcd1234efgh5678", true),
+    ("yaml", "password: hunter2hunter2 # prod db", true),
+    ("yaml", "password: !secret db", false),
+    ("yaml", "password: !vault db_password_1", false),
+    ("yaml", "password: null", false),
+    ("yaml", "password: ~", false),
+    ("yaml", "password: required", false),
+    ("yaml", "password: *dbpass1", false),
+    ("yaml", "password: &dbpass1 hunter2", false),
+    ("yaml", "password: $DB_PASSWORD_1", false),
+    ("yaml", "password: \"${DB_PASSWORD}\"", false),
+    ("yaml", "password_file: /run/secrets/db_password", false),
+    ("yaml", "password: /run/secrets/db_password", false),
+    ("yaml", "secretName: db-credentials-secret", false),
+    ("ts", "  secret: Secret1Type", true),
+    // #619: quoted JSON keys
+    ("json", r#"  "password": "hunter2hunter2","#, true),
+    ("json", r#"  "apiKey": "abcd1234efgh5678""#, true),
+    ("json", r#"  "password": "hunter2hunter2" "#, true),
+    ("json", r#"  "apiKey": "${API_KEY}""#, false),
+    ("json", r#"  "password": "$DB_PASSWORD","#, false),
+    ("json", r#"  "password": "{{ db_password }}","#, false),
+    ("json", r#"  "password": null,"#, false),
     ("json", r#"  "password": "","#, false),
     ("json", r#"  "password": "${DB_PASSWORD}","#, false),
     // ── env / .properties ──
@@ -186,6 +223,36 @@ const CASES: &[Row] = &[
         true,
     ),
     ("sql", "ALTER ROLE app SET password = '';", false),
+    // #620: PASSWORD '<literal>' without `=`
+    (
+        "sql",
+        "CREATE USER app WITH PASSWORD 'hunter2hunter2';",
+        true,
+    ),
+    ("sql", "ALTER USER app PASSWORD 'hunter2hunter2';", true),
+    (
+        "sql",
+        "CREATE USER app IDENTIFIED BY 'hunter2hunter2';",
+        true,
+    ),
+    (
+        "sql",
+        "CREATE USER app WITH PASSWORD 'hunter2hunter2'; -- note: temp",
+        true,
+    ),
+    ("sql", "CREATE USER app WITH PASSWORD '';", false),
+    ("sql", "CREATE USER app WITH PASSWORD '%s';", false),
+    ("sql", "CREATE USER app WITH PASSWORD '$1';", false),
+    ("sql", "CREATE USER app WITH PASSWORD ':pw';", false),
+    ("sql", "CREATE USER app WITH PASSWORD '{password}';", false),
+    ("sql", "CREATE USER app IDENTIFIED BY '?';", false),
+    ("sql", "CREATE USER app WITH PASSWORD NULL;", false),
+    ("go", r#"q := "CREATE USER app WITH PASSWORD '%s'""#, false),
+    (
+        "py",
+        r#"q = f"CREATE USER app WITH PASSWORD '{pw}'""#,
+        false,
+    ),
 ];
 
 /// Rows exposing a real false negative/positive that is not fixed yet. Each
@@ -220,20 +287,6 @@ const KNOWN_GAPS: &[Row] = &[
     ("env", "DB_PASSWORD=${DB_PASSWORD_FROM_VAULT}", true),
     ("properties", "db.password=${DB_PASSWORD}", true),
     ("sh", r#"export DB_PASSWORD="$VAULT_DB_PASSWORD""#, true),
-    // KNOWN GAP #618 - FN: Go `:=` short declarations are never matched by the regexes (ideal: flagged)
-    ("go", r#"password := "hunter2hunter2""#, false),
-    ("go", r#"var apiKey string = "abcd1234efgh5678""#, false),
-    ("go", r#"password := "hunter2hunter2" // note: temp"#, false),
-    // KNOWN GAP #619 - FN: unquoted YAML scalar is mistaken for object shorthand; quoted JSON keys never match (ideal: flagged)
-    ("yaml", "password: hunter2hunter2", false),
-    ("json", r#"  "password": "hunter2hunter2","#, false),
-    ("json", r#"  "apiKey": "abcd1234efgh5678""#, false),
-    // KNOWN GAP #620 - FN: SQL `PASSWORD '<literal>'` (no `=`) is not matched (ideal: flagged)
-    (
-        "sql",
-        "CREATE USER app WITH PASSWORD 'hunter2hunter2';",
-        false,
-    ),
 ];
 
 #[test]
