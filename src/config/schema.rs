@@ -613,13 +613,25 @@ fn default_max_findings() -> usize {
     5
 }
 
+/// `rules_engine.max_findings`: an explicit `null` means unlimited (stored as 0).
+fn deserialize_max_findings<'de, D>(d: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<usize>::deserialize(d)?.unwrap_or(0))
+}
+
 /// Rule engine configuration section for `.cora.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RulesSection {
     #[serde(default, skip_serializing_if = "is_default")]
     pub enabled: bool,
-    #[serde(default = "default_max_findings")]
+    /// Cap on deterministic findings shown per run. `0` or `null` = unlimited (#624).
+    #[serde(
+        default = "default_max_findings",
+        deserialize_with = "deserialize_max_findings"
+    )]
     pub max_findings: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom: Vec<crate::engine::rules::types::CustomRule>,

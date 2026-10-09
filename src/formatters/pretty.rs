@@ -254,6 +254,7 @@ mod tests {
             summary: "Found 1 critical issue.".to_string(),
             tokens_used: None,
             should_block: false,
+            dropped_findings: 0,
         }
     }
 
@@ -263,6 +264,7 @@ mod tests {
             summary: String::new(),
             tokens_used: None,
             should_block: false,
+            dropped_findings: 0,
         }
     }
 
@@ -272,6 +274,7 @@ mod tests {
             summary: String::new(),
             tokens_used: None,
             should_block: true,
+            dropped_findings: 0,
         }
     }
 

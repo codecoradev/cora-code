@@ -8,7 +8,8 @@ use crate::engine::Severity;
 pub struct RulesConfig {
     /// Whether the rule engine is enabled.
     pub enabled: bool,
-    /// Maximum number of findings to report per review (prevents noisy output).
+    /// Maximum number of deterministic findings shown per run, applied after
+    /// suppression (`ignore.rules`, `cora-ignore`). `0` = unlimited (#624).
     pub max_findings: usize,
     /// User-defined custom rules, merged with built-in rules.
     pub custom_rules: Vec<CustomRule>,
@@ -46,6 +47,17 @@ pub(crate) fn default_index_skip_files() -> Vec<String> {
         "src/app.ts".into(),
         "src/app.tsx".into(),
     ]
+}
+
+impl RulesConfig {
+    /// Effective cap: `0` means unlimited.
+    pub fn finding_cap(&self) -> usize {
+        if self.max_findings == 0 {
+            usize::MAX
+        } else {
+            self.max_findings
+        }
+    }
 }
 
 impl Default for RulesConfig {

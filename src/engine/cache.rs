@@ -195,6 +195,7 @@ mod tests {
             summary: "Found 1 issue.".to_string(),
             tokens_used: None,
             should_block: false,
+            dropped_findings: 0,
         }
     }
 

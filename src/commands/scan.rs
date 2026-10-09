@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::config::schema::Config;
 use crate::engine::ReviewIssue;
-use crate::engine::postprocess::{Source, postprocess};
+use crate::engine::postprocess::{Source, dropped_warning, postprocess_report};
 use crate::engine::review_store;
 use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
@@ -127,7 +127,8 @@ pub async fn execute_scan(
     let index_findings = crate::engine::index_scanner::scan_project_index(
         &index_bridge,
         &files,
-        config.rules_config.max_findings,
+        // Uncapped: the cap is enforced after suppression in `postprocess` (#624).
+        usize::MAX,
         &index_skip,
     );
     if !index_findings.is_empty() {
@@ -253,7 +254,10 @@ pub async fn execute_scan(
     //    apply ignore.rules and inline cora-ignore markers. Deterministic
     //    findings survive an LLM failure (#595).
     all_issues.extend(index_findings);
-    let all_issues = finalize_issues(config, &files, all_issues);
+    let (all_issues, dropped) = finalize_issues(config, &files, all_issues);
+    if let Some(w) = dropped_warning(dropped, config) {
+        eprintln!("{}", w.yellow());
+    }
     let issue_count = all_issues.len();
     let min_severity = config.hook.min_severity_level();
     // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above
@@ -265,10 +269,17 @@ pub async fn execute_scan(
         files_scanned: files.len(),
         lines_scanned: total_lines,
         summary: format!(
-            "Scanned {} files ({} lines), found {} issues.",
+            "Scanned {} files ({} lines), found {} issues{}.",
             files.len(),
             total_lines,
-            issue_count
+            issue_count,
+            if dropped > 0 {
+                format!(
+                    " ({dropped} more deterministic findings not shown, rules.max_findings cap)"
+                )
+            } else {
+                String::new()
+            }
         ),
         tokens_used: total_tokens,
         should_block,
@@ -342,8 +353,9 @@ fn finalize_issues(
     config: &Config,
     files: &[FileEntry],
     issues: Vec<ReviewIssue>,
-) -> Vec<ReviewIssue> {
-    postprocess(issues, &Source::Files(files), config)
+) -> (Vec<ReviewIssue>, usize) {
+    let report = postprocess_report(issues, &Source::Files(files), config);
+    (report.issues, report.dropped)
 }
 
 /// Compute a short SHA256 hash of a file's content for incremental scanning.
@@ -428,7 +440,7 @@ mod tests {
     }
 
     fn secret_title() -> String {
-        let out = finalize_issues(&Config::default(), &[secret_file("")], Vec::new());
+        let out = finalize_issues(&Config::default(), &[secret_file("")], Vec::new()).0;
         out.iter()
             .find(|i| i.line == Some(2))
             .unwrap_or_else(|| panic!("no finding on line 2: {:?}", titles(&out)))
@@ -438,7 +450,7 @@ mod tests {
 
     #[test]
     fn finds_hardcoded_secret_without_llm() {
-        let out = finalize_issues(&Config::default(), &[secret_file("")], Vec::new());
+        let out = finalize_issues(&Config::default(), &[secret_file("")], Vec::new()).0;
         assert!(
             out.iter()
                 .any(|i| i.file == "src/app.py" && i.line == Some(2)),
@@ -451,7 +463,7 @@ mod tests {
     fn inline_marker_suppresses_secret() {
         let title = secret_title();
         let file = secret_file(&format!("  # cora-ignore: {title}"));
-        let out = finalize_issues(&Config::default(), &[file], Vec::new());
+        let out = finalize_issues(&Config::default(), &[file], Vec::new()).0;
         assert!(
             !out.iter().any(|i| i.line == Some(2)),
             "got {:?}",
@@ -463,7 +475,7 @@ mod tests {
     fn ignore_rules_suppress_secret() {
         let mut config = Config::default();
         config.ignore.rules = vec![secret_title()];
-        let out = finalize_issues(&config, &[secret_file("")], Vec::new());
+        let out = finalize_issues(&config, &[secret_file("")], Vec::new()).0;
         assert!(
             !out.iter().any(|i| i.line == Some(2)),
             "got {:?}",
