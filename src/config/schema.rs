@@ -609,17 +609,36 @@ pub struct LlmSection {
     pub cache_ttl: Option<u64>,
 }
 
+fn default_rules_enabled() -> bool {
+    true
+}
+
 fn default_max_findings() -> usize {
     5
+}
+
+/// `rules_engine.max_findings`: an explicit `null` means unlimited (stored as 0).
+fn deserialize_max_findings<'de, D>(d: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<usize>::deserialize(d)?.unwrap_or(0))
 }
 
 /// Rule engine configuration section for `.cora.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RulesSection {
-    #[serde(default, skip_serializing_if = "is_default")]
+    /// Built-in rule engine switch. Defaults to `true` (the same as having no
+    /// `rules_engine` section at all), so tuning another key such as
+    /// `max_findings` does not silently turn the built-in rules off (#638).
+    #[serde(default = "default_rules_enabled", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    #[serde(default = "default_max_findings")]
+    /// Cap on deterministic findings shown per run. `0` or `null` = unlimited (#624).
+    #[serde(
+        default = "default_max_findings",
+        deserialize_with = "deserialize_max_findings"
+    )]
     pub max_findings: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom: Vec<crate::engine::rules::types::CustomRule>,
@@ -1122,6 +1141,32 @@ provider: zai
             .filter(|f| *f == "node_modules/**")
             .count();
         assert_eq!(nm_count, 1, "duplicate entry should be deduplicated");
+    }
+
+    #[test]
+    fn rules_engine_section_without_enabled_keeps_rules_on() {
+        // #638: `rules_engine: { max_findings: 0 }` must not disable built-in rules.
+        let cora: CoraFile = serde_yaml_ng::from_str("rules_engine:\n  max_findings: 0\n").unwrap();
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert!(cfg.rules_config.enabled);
+        assert_eq!(cfg.rules_config.max_findings, 0);
+    }
+
+    #[test]
+    fn rules_engine_enabled_false_still_disables_and_round_trips() {
+        let cora: CoraFile =
+            serde_yaml_ng::from_str("rules_engine:\n  enabled: false\n  max_findings: 7\n")
+                .unwrap();
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert!(!cfg.rules_config.enabled);
+        let out = serde_yaml_ng::to_string(&cora).unwrap();
+        let again: CoraFile = serde_yaml_ng::from_str(&out).unwrap();
+        assert!(
+            !again.rules_engine.unwrap().enabled,
+            "false must survive a round trip"
+        );
     }
 
     #[test]

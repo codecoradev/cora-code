@@ -4,10 +4,10 @@
 
 use std::sync::LazyLock;
 
-use crate::engine::diff_parser;
+use crate::engine::postprocess::{Source, postprocess_report};
 use crate::engine::profiles;
 use crate::engine::rules;
-use crate::engine::secrets_scanner;
+use crate::engine::scanner::FileEntry;
 use crate::engine::security_scanner;
 
 use super::protocol::{Tool, ToolResult};
@@ -314,44 +314,64 @@ fn handle_check_snippet(params: &serde_json::Value) -> ToolResult {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    // Create a fake diff chunk from the snippet
-    let fake_diff = format!(
-        "diff --git a/snippet.{lang} b/snippet.{lang}\n--- a/snippet.{lang}\n+++ b/snippet.{lang}\n@@ -0,0 +1,{count} @@\n{added}",
-        count = code.lines().count(),
-        added = code
-            .lines()
-            .map(|l| format!("+{l}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
+    // Same project config the other tools use, so `ignore.rules` and
+    // `rules_engine.max_findings` apply exactly as in `cora scan` (#610).
+    let config = match load_project_config() {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
+    };
+
+    check_snippet_with(code, lang, &config)
+}
+
+/// Check `code` through the shared post-processing pipeline (scanners,
+/// `ignore.rules`, inline `cora-ignore:` markers, finding cap) as a synthetic
+/// file `snippet.<lang>`, so path-aware classification sees the snippet's
+/// language/extension.
+fn check_snippet_with(
+    code: &str,
+    lang: &str,
+    config: &crate::config::schema::Config,
+) -> ToolResult {
+    // The language becomes a file extension: keep it a single safe path segment.
+    let ext: String = lang
+        .trim_start_matches('.')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let entry = FileEntry {
+        path: format!("snippet.{ext}"),
+        content: code.to_string(),
+        lines: code.lines().count(),
+    };
+
+    let report = postprocess_report(
+        Vec::new(),
+        &Source::Files(std::slice::from_ref(&entry)),
+        config,
     );
 
-    let chunks = diff_parser::parse_diff(&fake_diff);
-
-    let mut findings = Vec::new();
-
-    // Run secrets scanner
-    let secrets = secrets_scanner::scan_secrets(&chunks, 10);
-    findings.extend(secrets);
-
-    // Run security scanner
-    let security = security_scanner::scan_security(&chunks, 10);
-    findings.extend(security);
-
-    if findings.is_empty() {
-        ToolResult::text("✅ No issues found in snippet by deterministic scanners.")
-    } else {
-        let mut lines = vec![format!("Found {} issue(s):\n", findings.len())];
-        for f in &findings {
-            lines.push(format!(
-                "- **{}** ({}): {} — {}",
-                f.rule_id,
-                f.severity.label(),
-                f.title,
-                f.body
-            ));
-        }
-        ToolResult::text(lines.join("\n"))
+    if report.issues.is_empty() {
+        return ToolResult::text("✅ No issues found in snippet by deterministic scanners.");
     }
+
+    let mut lines = vec![format!("Found {} issue(s):\n", report.issues.len())];
+    for f in &report.issues {
+        lines.push(format!(
+            "- **{}** ({}): {} — {}",
+            f.rule_id.as_deref().unwrap_or(""),
+            f.severity.label(),
+            f.title,
+            f.body
+        ));
+    }
+    if report.dropped > 0 {
+        lines.push(format!(
+            "\n{} more deterministic finding(s) not shown (rules.max_findings = {}; raise it or set 0/null to show all)",
+            report.dropped, config.rules_config.max_findings
+        ));
+    }
+    ToolResult::text(lines.join("\n"))
 }
 
 fn handle_get_quality_gate() -> ToolResult {
@@ -1146,6 +1166,93 @@ mod tests {
         );
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("issue"));
+    }
+
+    // ─── check_snippet through the shared pipeline (#610) ───
+    // These call `check_snippet_with` with an explicit Config: no project
+    // config discovery, no data dir.
+
+    fn snippet_text(code: &str, lang: &str, config: &crate::config::schema::Config) -> String {
+        let r = check_snippet_with(code, lang, config);
+        assert!(!r.is_error);
+        r.content[0].text.clone()
+    }
+
+    const AWS: &str = "key = 'AKIAIOSFODNN7EXAMPLE'";
+
+    #[test]
+    fn snippet_reports_secret_with_rule_id() {
+        let cfg = crate::config::schema::Config::default();
+        let text = snippet_text(AWS, "py", &cfg);
+        assert!(text.contains("Found 1 issue(s)"), "{text}");
+        assert!(text.contains("secrets/aws-access-key"), "{text}");
+    }
+
+    #[test]
+    fn snippet_honors_ignore_rules() {
+        let mut cfg = crate::config::schema::Config::default();
+        cfg.ignore.rules = vec!["secrets/aws-access-key".to_string()];
+        let text = snippet_text(AWS, "py", &cfg);
+        assert!(text.contains("No issues"), "{text}");
+    }
+
+    #[test]
+    fn snippet_honors_inline_cora_ignore() {
+        let cfg = crate::config::schema::Config::default();
+        let same_line = format!("{AWS}  # cora-ignore: secrets/aws-access-key");
+        assert!(snippet_text(&same_line, "py", &cfg).contains("No issues"));
+        let next_line = format!("# cora-ignore: secrets/aws-access-key\n{AWS}");
+        assert!(snippet_text(&next_line, "py", &cfg).contains("No issues"));
+        // A marker naming another rule does not hide it.
+        let other = format!("{AWS}  # cora-ignore: crypto/md5-password");
+        assert!(snippet_text(&other, "py", &cfg).contains("Found 1 issue(s)"));
+    }
+
+    #[test]
+    fn snippet_applies_false_positive_filters() {
+        let cfg = crate::config::schema::Config::default();
+        for line in [
+            "password = os.environ[\"DB_PASSWORD\"]",
+            "const apiKey: string = process.env.API_KEY;",
+            "password: ${DB_PASSWORD}",
+        ] {
+            assert!(
+                snippet_text(line, "py", &cfg).contains("No issues"),
+                "{line}"
+            );
+        }
+        // A literal still fires.
+        let hit = snippet_text("password = \"hunter2hunter2\"", "py", &cfg);
+        assert!(hit.contains("Found"), "{hit}");
+    }
+
+    #[test]
+    fn snippet_path_is_derived_from_language() {
+        let cfg = crate::config::schema::Config::default();
+        let text = snippet_text("let p = \"x\";\nlet h = md5(password);", "rs", &cfg);
+        // The synthetic path carries the extension (shown in scanner bodies).
+        assert!(text.contains("snippet.rs"), "{text}");
+        // Hostile language values cannot escape the single path segment.
+        let text = snippet_text("let h = md5(password);", "../../etc/x", &cfg);
+        assert!(!text.contains("../"), "{text}");
+    }
+
+    #[test]
+    fn snippet_respects_max_findings_and_reports_dropped() {
+        let mut cfg = crate::config::schema::Config::default();
+        cfg.rules_config.max_findings = 1;
+        let code = "a = 'AKIAIOSFODNN7EXAMPLE'\nb = 'AKIAIOSFODNN7EXAMPLF'";
+        let text = snippet_text(code, "py", &cfg);
+        assert!(text.contains("Found 1 issue(s)"), "{text}");
+        assert!(
+            text.contains("1 more deterministic finding(s) not shown"),
+            "{text}"
+        );
+
+        cfg.rules_config.max_findings = 0; // unlimited
+        let text = snippet_text(code, "py", &cfg);
+        assert!(text.contains("Found 2 issue(s)"), "{text}");
+        assert!(!text.contains("not shown"), "{text}");
     }
 
     #[test]

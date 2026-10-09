@@ -404,6 +404,7 @@ After release completes, verify:
 - [ ] GitHub Release page shows vX.Y.Z with correct changelog
 - [ ] 4 platform binaries attached to release
 - [ ] SHA256 checksums file included
+- [ ] `checksums-sha256.txt.sigstore.json` asset exists and verifies (`cosign verify-blob` command in `docs/installation.md#verify-release-signatures`); `CORA_REQUIRE_SIGNATURE=1 CORA_VERSION=vX.Y.Z sh install.sh` succeeds
 - [ ] `crates.io` shows new version: `cargo search cora-code`
 - [ ] `codecora.dev` reflects new docs
 - [ ] Marketplace action still works (test on a test PR)

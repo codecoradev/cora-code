@@ -65,6 +65,7 @@ mod tests {
                 estimated_cost_usd: 0.005,
             }),
             should_block: false,
+            dropped_findings: 0,
         }
     }
 
@@ -74,6 +75,7 @@ mod tests {
             summary: String::new(),
             tokens_used: None,
             should_block: false,
+            dropped_findings: 0,
         }
     }
 

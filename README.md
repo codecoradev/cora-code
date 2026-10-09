@@ -58,7 +58,7 @@ cargo install --git https://github.com/codecoradev/cora-code
 
 > Pin a version: `CORA_VERSION=v0.6.1 curl -fsSL ... | sh`
 
-**Upgrading:** run `cora upgrade` (downloads the latest release, verifies its SHA-256 checksum, replaces the binary) or `cora upgrade --check` to just see if one is available. If you installed via `cargo install --path .`, re-run that instead.
+**Upgrading:** run `cora upgrade` (downloads the latest release, verifies its SHA-256 checksum and, when `cosign` is installed, its Sigstore signature, replaces the binary) or `cora upgrade --check` to just see if one is available. If you installed via `cargo install --path .`, re-run that instead.
 
 **Verify which `cora` you're running** — `which -a cora` will reveal stale copies from other channels:
 

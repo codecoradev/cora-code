@@ -190,7 +190,197 @@ const CASES: &[Row] = &[
     ("yaml", "password_file: /run/secrets/db_password", false),
     ("yaml", "password: /run/secrets/db_password", false),
     ("yaml", "secretName: db-credentials-secret", false),
-    ("ts", "  secret: Secret1Type", true),
+    // #625: the plain-scalar rule is YAML-only; identifiers in code are not scalars
+    ("ts", "  secret: Secret1Type", false),
+    ("py", "secret: Secret1Type", false),
+    ("rs", "    pub secret: Secret1Type,", false),
+    ("yaml", "{ password: hunter2hunter2 }", true),
+    ("yml", "db: { user: app, token: abcd1234efgh5678 }", true),
+    ("yaml", "{ password: ${DB_PASSWORD} }", false),
+    ("yaml", "{ password: formPassword }", false),
+    ("ts", "const body = { password: hunter2hunter2 };", false),
+    ("yaml", "password: ${DB_PASSWORD:-hunter2hunter2xx}", true),
+    (
+        "yaml",
+        r#"password: "${DB_PASSWORD:-hunter2hunter2xx}""#,
+        true,
+    ),
+    ("yaml", "password: ${DB_PASSWORD:-}", false),
+    // #625: unspaced `:=` / `:` never reads as a Go short declaration of a call
+    ("go", r#"password:=os.Getenv("DB_PASSWORD")"#, false),
+    ("txt", r#"password:=os.Getenv("DB_PASSWORD")"#, false),
+    ("go", r#"password:="hunter2hunter2""#, true),
+    // #625: SQL PASSWORD with double quotes
+    (
+        "sql",
+        r#"CREATE USER app WITH PASSWORD "hunter2hunter2";"#,
+        true,
+    ),
+    (
+        "sql",
+        r#"CREATE USER app IDENTIFIED BY "hunter2hunter2";"#,
+        true,
+    ),
+    ("sql", r#"CREATE USER app WITH PASSWORD "";"#, false),
+    ("sql", r#"CREATE USER app WITH PASSWORD "%s";"#, false),
+    ("sql", r#"CREATE USER app WITH PASSWORD "$1";"#, false),
+    (
+        "sql",
+        r#"CREATE USER app WITH PASSWORD "{password}";"#,
+        false,
+    ),
+    ("go", r#"q := "CREATE USER app WITH PASSWORD "%s"""#, false),
+    (
+        "go",
+        r#"q := "CREATE USER app WITH PASSWORD "hunter2hunter2"""#,
+        true,
+    ),
+    // #630: constructor wrappers around a literal
+    (
+        "java",
+        r#"String password = new String("hunter2hunter2xx");"#,
+        true,
+    ),
+    ("java", r#"String password = new String("");"#, false),
+    (
+        "rs",
+        r#"let password = Cow::Owned("hunter2hunter2xx".to_string());"#,
+        true,
+    ),
+    (
+        "rs",
+        r#"let password: Cow<str> = Cow::Borrowed("hunter2hunter2xx");"#,
+        true,
+    ),
+    (
+        "rs",
+        r#"let password: Box<str> = Box::from("hunter2hunter2xx");"#,
+        true,
+    ),
+    (
+        "rs",
+        r#"let password = Secret::new("hunter2hunter2xx".to_string());"#,
+        true,
+    ),
+    ("py", r#"password = str("hunter2hunter2xx")"#, true),
+    ("py", r#"password = str("")"#, false),
+    ("py", r#"password = str("${DB_PASSWORD}")"#, false),
+    ("py", "password = str(raw_value)", false),
+    ("rs", r#"let password = Cow::Owned(String::new());"#, false),
+    ("py", "password = get_password()", false),
+    ("java", "String password = getPassword();", false),
+    ("java", r#"String password = lookup("DB_PASSWORD");"#, false),
+    // #628: literal default inside an env read (default position only)
+    (
+        "py",
+        r#"password = os.environ.get("DB_PASSWORD", "hunter2hunter2xx")"#,
+        true,
+    ),
+    (
+        "py",
+        r#"password = os.getenv("DB_PASSWORD", "hunter2hunter2xx")"#,
+        true,
+    ),
+    (
+        "py",
+        r#"password = os.getenv("DB_PASSWORD", default="hunter2hunter2xx")"#,
+        true,
+    ),
+    ("py", r#"password = os.getenv("DB_PASSWORD", "")"#, false),
+    (
+        "py",
+        r#"password = os.getenv("DB_PASSWORD", "${DB_PASSWORD}")"#,
+        false,
+    ),
+    (
+        "py",
+        r#"password = os.getenv("DB_PASSWORD", fallback)"#,
+        false,
+    ),
+    (
+        "rs",
+        r#"let password = std::env::var("DB_PASSWORD").unwrap_or("hunter2hunter2xx".into());"#,
+        true,
+    ),
+    (
+        "rs",
+        r#"let password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| "hunter2hunter2xx".to_string());"#,
+        true,
+    ),
+    (
+        "rs",
+        r#"let password = std::env::var("DB_PASSWORD").unwrap_or("".into());"#,
+        false,
+    ),
+    (
+        "rs",
+        r#"let password = std::env::var("DB_PASSWORD").unwrap_or_else(|_| fallback());"#,
+        false,
+    ),
+    (
+        "js",
+        r#"const password = process.env.DB_PASSWORD || "hunter2hunter2xx";"#,
+        true,
+    ),
+    (
+        "js",
+        r#"const password = process.env.DB_PASSWORD ?? "hunter2hunter2xx";"#,
+        true,
+    ),
+    (
+        "ts",
+        r#"const password = process.env["DB_PASSWORD"] ?? 'hunter2hunter2xx';"#,
+        true,
+    ),
+    (
+        "js",
+        r#"const password = process.env.DB_PASSWORD || "";"#,
+        false,
+    ),
+    (
+        "js",
+        r#"const password = process.env.DB_PASSWORD ?? "${DB_PASSWORD}";"#,
+        false,
+    ),
+    ("js", "const password = process.env.DB_PASSWORD;", false),
+    (
+        "rb",
+        r#"password = ENV.fetch("DB_PASSWORD", "hunter2hunter2xx")"#,
+        true,
+    ),
+    ("rb", r#"password = ENV.fetch("DB_PASSWORD")"#, false),
+    (
+        "php",
+        r#"$password = getenv('DB_PASSWORD') ?: 'hunter2hunter2xx';"#,
+        true,
+    ),
+    // #629: shell default literal inside `${VAR:-..}` / `${VAR:=..}`
+    ("sh", "DB_PASSWORD=${DB_PASSWORD:-hunter2hunter2xx}", true),
+    ("env", "DB_PASSWORD=${DB_PASSWORD:=hunter2hunter2xx}", true),
+    (
+        "sh",
+        r#"export DB_PASSWORD="${DB_PASSWORD:-hunter2hunter2xx}""#,
+        true,
+    ),
+    ("sh", "DB_PASSWORD=${DB_PASSWORD}", false),
+    ("sh", "DB_PASSWORD=${DB_PASSWORD:-}", false),
+    ("sh", "DB_PASSWORD=${DB_PASSWORD:?must be set}", false),
+    ("sh", "DB_PASSWORD=${DB_PASSWORD:-$VAULT_PASSWORD}", false),
+    (
+        "sh",
+        "DB_PASSWORD=${DB_PASSWORD:-${FALLBACK_PASSWORD}}",
+        false,
+    ),
+    (
+        "sh",
+        "DB_PASSWORD_FILE=${DB_PASSWORD_FILE:-/run/secrets/db}",
+        false,
+    ),
+    (
+        "sh",
+        "DB_PASSWORD=${DB_PASSWORD:-$(cat /run/secrets/pw)}",
+        false,
+    ),
     // #619: quoted JSON keys
     ("json", r#"  "password": "hunter2hunter2","#, true),
     ("json", r#"  "apiKey": "abcd1234efgh5678""#, true),
@@ -359,30 +549,8 @@ const CASES: &[Row] = &[
 /// the ideal result in the trailing comment). Move a row into [`CASES`] with
 /// the ideal expectation when its issue is fixed.
 const KNOWN_GAPS: &[Row] = &[
-    // KNOWN GAP #628 - FN: an unquoted RHS in source code is treated as an expression, so a real literal default inside a call is missed (ideal: flagged)
-    (
-        "py",
-        r#"password = os.environ.get("DB_PASSWORD", "hunter2hunter2xx")"#,
-        false,
-    ),
-    (
-        "rs",
-        r#"let password = std::env::var("DB_PASSWORD").unwrap_or("hunter2hunter2xx".into());"#,
-        false,
-    ),
-    (
-        "js",
-        r#"const password = process.env.DB_PASSWORD || "hunter2hunter2xx";"#,
-        false,
-    ),
-    // KNOWN GAP #630 - FN: the scanner regex needs a >= 8 char token after `=`, so `new String("lit")` and other short-prefixed constructors are never matched (ideal: flagged)
-    (
-        "java",
-        r#"String password = new String("hunter2hunter2xx");"#,
-        false,
-    ),
-    // KNOWN GAP #629 - FN: shell `${VAR:-literal}` default with a real literal is treated as interpolation (ideal: flagged)
-    ("sh", "DB_PASSWORD=${DB_PASSWORD:-hunter2hunter2xx}", false),
+    // KNOWN GAP #635 - FN: an all-alphabetic unquoted YAML secret cannot be told apart from a reference (`secret: kubernetes`, `token: optional`) without a value classifier (ideal: flagged)
+    ("yaml", "password: correcthorsebattery", false),
 ];
 
 #[test]

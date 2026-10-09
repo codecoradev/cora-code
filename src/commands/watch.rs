@@ -476,7 +476,14 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/a.rs"), "pub fn alpha() {}\n").unwrap();
         fs::write(root.join("src/b.rs"), "pub fn beta() {}\n").unwrap();
-        let session = IndexSession::open_at(root, ConfigSource::ProjectOnlyAt(root)).unwrap();
+        // Per-test DB: never touches the shared global index.
+        let db_dir = TempDir::new().unwrap();
+        let session = IndexSession::open_at_db(
+            &db_dir.path().join("cora.db"),
+            root,
+            ConfigSource::ProjectOnlyAt(root),
+        )
+        .unwrap();
         session.index(false).unwrap();
         let pat = PathPattern::new("a.rs").unwrap();
         let s = || scan_files(root, &None, Some(&pat), None).unwrap();

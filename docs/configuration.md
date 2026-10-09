@@ -390,6 +390,14 @@ cora runs a static security scan on added lines before the AI review. 11 built-i
 
 Test files are automatically skipped. Findings are injected into the LLM prompt as additional context.
 
+#### What the hardcoded-secret check does (and does not) flag
+
+The check looks for a secret-named key (`password`, `secret`, `token`, `api_key`, ...) assigned a **literal** value, and ignores values that are references:
+
+- **Flagged:** quoted literals (`password = "..."`, typed declarations, Go `:=`, JSON `"password": "..."`), SQL `PASSWORD '...'`, literal defaults inside env reads (`os.getenv("X", "literal")`, `process.env.X || "literal"`), shell `${VAR:-literal}`, bare values in `.env` / `.properties` / `.ini` / shell / YAML files when they look like a secret.
+- **Not flagged:** env reads and other expressions (`process.env.X`, `os.getenv("X")`), identifiers and member accesses, `${VAR}` / `$VAR` interpolation, empty strings, UI bindings, placeholders such as `%s` / `$1` / `{{ x }}`.
+- **Known limit:** an unquoted YAML value made only of letters (`password: correcthorsebattery`) is not flagged. It cannot be told apart from a reference to another key (`secret: kubernetes`, `token: optional`) without flooding Kubernetes/Compose files with false positives. Quote the value, or give it a digit or symbol, and it is detected. Use `cora-ignore: <rule>` (see below) for a finding you accept.
+
 ## Language-Specific Analyzers
 
 cora detects the languages in your diff and injects tailored review guidance:
@@ -472,8 +480,17 @@ rules_engine:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
-| `max_findings` | `int` | `5` | Max findings per scan |
+| `max_findings` | `int` | `5` | Max deterministic findings shown per run (`0` or `null` = unlimited). See below |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
+
+#### What `max_findings` caps
+
+`max_findings` caps the **deterministic** findings only (rule engine, secrets, security, and index scanners; the findings that carry a `rule_id`). LLM issues are never capped.
+
+- The cap is applied **after** suppression (`ignore.rules` and inline `cora-ignore:` markers), so suppressed findings never use up slots and hide real ones.
+- Findings are kept highest severity first (Critical, Major, Minor, Info); ties keep their original order. Because the most severe findings survive, the cap never changes the blocking decision for a cap of 1 or more.
+- When findings are cut, `cora scan` and `cora review` print one line on **stderr** (`⚠ N more deterministic findings not shown (rules.max_findings = 5; raise it or set 0/null to show all)`), and the `cora scan` summary mentions it. JSON, SARIF and compact output on stdout are unchanged.
+- `0` or `null` means unlimited. For large diffs that `cora review` splits into chunks, the cap applies per chunk.
 
 Default `index_skip_files` patterns (bundled with cora):
 

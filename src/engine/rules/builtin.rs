@@ -143,7 +143,9 @@ pub(crate) fn secret_literal_pattern() -> String {
 }
 
 /// SQL password literal without `=`: `... WITH PASSWORD 'x'`, `IDENTIFIED BY 'x'`.
-const SQL_PASSWORD_PATTERN: &str = r"(?i)\b(?:password|identified\s+by)\s+'([^']+)'";
+/// The literal may be single- or double-quoted (#625), optionally backslash
+/// escaped when the SQL sits inside a host-language string (`\"pw\"`).
+const SQL_PASSWORD_PATTERN: &str = r#"(?i)\b(?:password|identified\s+by)\s+\\?["']([^"']+)["']"#;
 
 static SQL_PASSWORD_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(SQL_PASSWORD_PATTERN).expect("sql password regex must compile"));
@@ -164,13 +166,18 @@ pub(crate) fn has_secret_literal(line: &str, path: &str) -> bool {
     if quoted_placeholder_value(line) || non_literal_rhs(strip_trailing_comment(line), path) {
         return false;
     }
-    SECRET_LITERAL_RE.is_match(line) || plain_scalar_secret(strip_trailing_comment(line))
+    let code = strip_trailing_comment(line);
+    SECRET_LITERAL_RE.is_match(line)
+        || plain_scalar_secret(code, path)
+        || secret_assign_rhs(code).is_some_and(|rhs| {
+            embedded_literal(rhs.trim_end_matches([';', ',']).trim_end()) == Some(true)
+        })
 }
 
 /// A SQL literal that is a bind/format placeholder, not a password:
 /// `%s`, `%v`, `$1`, `?`, `:name`, `@name`, `{}` / `{pw}` / `${PW}`, `<password>`.
 fn is_sql_placeholder(lit: &str) -> bool {
-    let lit = lit.trim();
+    let lit = lit.trim().trim_end_matches('\\');
     lit.starts_with(['$', ':', '@', '?'])
         || lit.contains('%')
         || (lit.contains('{') && lit.contains('}'))
@@ -199,10 +206,49 @@ fn secret_kv_value(line: &str) -> Option<&str> {
 /// (`required`, `formPassword`, `vault_db_password`) stay "references". Never
 /// a YAML tag/anchor/alias/block indicator, `${..}`/`$VAR`, a path, or a
 /// keyword (`true`, `null`, ...).
-fn plain_scalar_secret(line: &str) -> bool {
-    let Some(v) = secret_kv_value(line) else {
+///
+/// Only applies outside source code (#625): `secret: Secret1Type` in a `.ts`
+/// or `.py` file is a type/identifier, not a YAML scalar. Flow-style entries
+/// (`{ password: hunter2hunter2 }`) are only recognised in `.yaml`/`.yml`, as
+/// in code they are object shorthand with an identifier value. All-alphabetic
+/// values (`password: correcthorsebattery`) are deliberately NOT flagged: they
+/// cannot be told apart from references (`secret: kubernetes`, `token: optional`).
+fn plain_scalar_secret(line: &str, path: &str) -> bool {
+    if rhs_style(path) == RhsStyle::Code {
         return false;
-    };
+    }
+    if let Some(v) = secret_kv_value(line) {
+        // compose-style `password: ${DB_PASSWORD:-hunter2hunter2}` (#629)
+        if !v.starts_with(['"', '\'']) && !v.contains("$(") && shell_secret_default(v) {
+            return true;
+        }
+        if plain_scalar_value_ok(v) {
+            return true;
+        }
+    }
+    is_yaml_path(path) && flow_kv_values(line).any(plain_scalar_value_ok)
+}
+
+fn is_yaml_path(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, e)| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"))
+}
+
+/// Values of flow-style mapping entries on the line whose key ends in a secret
+/// word: `{ password: v }`, `db: { user: a, token: v }`.
+fn flow_kv_values(line: &str) -> impl Iterator<Item = &str> {
+    static FLOW_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)[{,]\s*["']?[\w.\-]*(?:password|passwd|pwd|secret|api_?key|token)["']?\s*:\s+([^\s,{}\[\]]+)\s*(?:[,}]|$)"#,
+        )
+        .expect("flow kv regex must compile")
+    });
+    FLOW_RE
+        .captures_iter(line)
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+}
+
+fn plain_scalar_value_ok(v: &str) -> bool {
     let lower = v.to_ascii_lowercase();
     v.len() >= 8
         && !v.contains(char::is_whitespace)
@@ -238,7 +284,7 @@ fn quoted_placeholder_value(line: &str) -> bool {
         let v = &cap[1];
         let inner = &v[1..v.len() - 1];
         let placeholder = inner.is_empty()
-            || (inner.starts_with("${") && inner.ends_with('}'))
+            || (inner.starts_with("${") && inner.ends_with('}') && !shell_secret_default(inner))
             || (inner.starts_with("{{") && inner.ends_with("}}"))
             || (inner.starts_with('$')
                 && inner.len() > 1
@@ -317,7 +363,10 @@ fn secret_assign_rhs(line: &str) -> Option<&str> {
 
 /// A quoted value that is nothing but a reference: `${X}`, `$X`, `$(cmd)`.
 fn is_pure_reference(inner: &str) -> bool {
-    (inner.starts_with("${") && inner.ends_with('}') && inner.matches("${").count() == 1)
+    (inner.starts_with("${")
+        && inner.ends_with('}')
+        && inner.matches("${").count() == 1
+        && !shell_secret_default(inner))
         || (inner.starts_with("$(") && inner.ends_with(')'))
         || (inner.starts_with('$')
             && inner.len() > 1
@@ -327,15 +376,88 @@ fn is_pure_reference(inner: &str) -> bool {
 }
 
 /// Does the RHS start with a quoted literal (`"x"`, `'x'`, `` `x` ``, `b"x"`,
-/// `r#"x"#`, `f'x'`) or a literal wrapped by a constructor (`String::from("x")`)?
+/// `r#"x"#`, `f'x'`)? Constructor-wrapped literals are handled by
+/// [`embedded_literal`].
 fn starts_with_literal(rhs: &str) -> bool {
     static LIT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r#"^(?:[A-Za-z]{0,2}#*["'`]|(?:String::from|Some|Secret(?:String)?::(?:new|from)|new\s+String)\s*\(\s*[A-Za-z]{0,2}#*["'`])"#,
-        )
-        .expect("literal-start regex must compile")
+        Regex::new(r#"^[A-Za-z]{0,2}#*["'`]"#).expect("literal-start regex must compile")
     });
     LIT_RE.is_match(rhs)
+}
+
+/// Constructors that merely wrap a string literal: the literal is still the
+/// value (#630). Plain calls (`get_password()`) are not in this list.
+const WRAPPER: &str = r"(?:new\s+String|String::from|Some|Secret(?:String|Str)?::(?:new|from)|Cow::(?:Owned|Borrowed)|Box::from|Arc::from|Rc::from|str|bytes|String)";
+
+/// Env reads with a literal fallback in the DEFAULT position (#628). Each
+/// alternative ends on the opening quote of the default, so the env var NAME
+/// string (`os.getenv("DB_PASSWORD", ..)`) is never mistaken for the secret.
+const ENV_DEFAULT: &str = concat!(
+    // Python: os.environ.get("X", "lit"), os.getenv("X", "lit")
+    r#"(?:(?:os\.)?(?:environ\.get|getenv)\s*\(\s*(?:"[^"]*"|'[^']*'|[\w.]+)\s*,\s*(?:default\s*=\s*)?[A-Za-z]{0,2}["']"#,
+    // JS/TS: process.env.X || "lit", process.env["X"] ?? "lit"
+    r#"|(?:process\.env|Deno\.env|import\.meta\.env)(?:\.\w+|\[[^\]]*\]|\.get\([^)]*\))\s*(?:\|\||\?\?)\s*["'`]"#,
+    // Rust: env::var("X").unwrap_or("lit".into()), .unwrap_or_else(|_| "lit".to_string())
+    r#"|(?:std::)?env::var(?:_os)?\s*\([^)]*\)\s*(?:\.ok\(\))?\s*\.unwrap_or(?:_else)?\s*\(\s*(?:\|[^|]*\|\s*)?(?:String::from\s*\(\s*)?["']"#,
+    // Ruby: ENV.fetch("X", "lit"), ENV["X"] || "lit"
+    r#"|ENV\.fetch\s*\(\s*(?:"[^"]*"|'[^']*')\s*,\s*["']|ENV\[[^\]]*\]\s*\|\|\s*["']"#,
+    // PHP: getenv('X') ?: 'lit', $_ENV['X'] ?? 'lit'
+    r#"|(?:getenv\s*\([^)]*\)|\$_(?:ENV|SERVER)\[[^\]]*\])\s*(?:\?:|\?\?|\|\|)\s*["'])"#,
+);
+
+/// Inner text of the quoted literal starting at `rest` (which begins with the quote).
+fn literal_after(rest: &str) -> &str {
+    let mut chars = rest.chars();
+    let Some(q) = chars.next() else { return "" };
+    let body = &rest[q.len_utf8()..];
+    body.find(q).map_or(body, |end| &body[..end])
+}
+
+/// A literal that is empty or itself a reference/template (`${X}`, `$X`, `{{ x }}`).
+fn is_placeholder_literal(inner: &str) -> bool {
+    let t = inner.trim();
+    t.is_empty() || is_pure_reference(t) || (t.starts_with("{{") && t.ends_with("}}"))
+}
+
+/// Does the text hold a shell `${VAR:-default}` / `${VAR:=default}` whose default
+/// is a secret-looking literal (#629)? Empty defaults, nested references, paths,
+/// URLs and bare keywords are not. `${VAR}` / `${VAR:?msg}` never match.
+fn shell_secret_default(s: &str) -> bool {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\$\{[A-Za-z_][A-Za-z0-9_]*:[-=]([^}]*)\}").expect("shell default regex")
+    });
+    RE.captures_iter(s).any(|c| {
+        let d = c[1].trim();
+        !d.is_empty()
+            && !d.contains(['$', '`'])
+            && !d.starts_with(['/', '.', '~'])
+            && !d.contains("://")
+            && !matches!(
+                d.to_ascii_lowercase().as_str(),
+                "true" | "false" | "null" | "none" | "nil" | "yes" | "no" | "required"
+            )
+    })
+}
+
+/// A literal embedded in an expression on the RHS: inside a constructor wrapper
+/// (`new String("x")`, `Cow::Owned("x")`, `str("x")`), in the default position of
+/// an env read, or as a shell `${VAR:-default}` default. `Some(true)` = a real
+/// secret literal, `Some(false)` = such a shape but the literal is empty or a
+/// placeholder, `None` = not one of these shapes.
+fn embedded_literal(rhs: &str) -> Option<bool> {
+    static WRAP_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!(r#"^(?:{WRAPPER}\s*\(\s*)+[A-Za-z]{{0,2}}#*["'`]"#))
+            .expect("wrapper regex must compile")
+    });
+    static ENV_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(&format!("^{ENV_DEFAULT}")).expect("env default regex must compile")
+    });
+    for re in [&*WRAP_RE, &*ENV_RE] {
+        if let Some(m) = re.find(rhs) {
+            return Some(!is_placeholder_literal(literal_after(&rhs[m.end() - 1..])));
+        }
+    }
+    (!rhs.contains("$(") && shell_secret_default(rhs)).then_some(true)
 }
 
 /// Is the right-hand side of a secret-named assignment provably NOT a literal
@@ -367,6 +489,11 @@ fn non_literal_rhs(line: &str, path: &str) -> bool {
     }
     if starts_with_literal(rhs) {
         return false;
+    }
+    // A literal inside a constructor wrapper, an env-read default or a shell
+    // `${VAR:-default}` is judged on the literal itself (#628, #629, #630).
+    if let Some(is_literal) = embedded_literal(rhs) {
+        return !is_literal;
     }
     if rhs.starts_with('$') || rhs.contains("${") || rhs.contains("$(") || rhs.contains('`') {
         return true;
@@ -565,7 +692,7 @@ fn is_false_positive_secret(line: &str, path: &str) -> bool {
     }
 
     // Unquoted YAML `password: hunter2hunter2` is a real secret, not shorthand (#619)
-    if plain_scalar_secret(line) {
+    if plain_scalar_secret(line, path) {
         return false;
     }
 
@@ -1227,5 +1354,37 @@ mod tests {
             "crypto/hardcoded-secret",
             "No wildcard in this line"
         ));
+    }
+
+    // ─── #625, #628, #629, #630: the LLM cross-check agrees with the scanners ───
+
+    #[test]
+    fn llm_cross_check_keeps_embedded_literals() {
+        for (line, path) in [
+            (
+                r#"String password = new String("hunter2hunter2xx");"#,
+                "A.java",
+            ),
+            (
+                r#"password = os.getenv("DB_PASSWORD", "hunter2hunter2xx")"#,
+                "a.py",
+            ),
+            (
+                r#"const password = process.env.X || "hunter2hunter2xx";"#,
+                "a.js",
+            ),
+            ("DB_PASSWORD=${DB_PASSWORD:-hunter2hunter2xx}", "a.sh"),
+            ("{ password: hunter2hunter2 }", "a.yaml"),
+        ] {
+            assert!(has_secret_literal(line, path), "{line}");
+        }
+        for (line, path) in [
+            (r#"password = os.getenv("DB_PASSWORD")"#, "a.py"),
+            (r#"password = os.getenv("DB_PASSWORD", "")"#, "a.py"),
+            ("DB_PASSWORD=${DB_PASSWORD:-}", "a.sh"),
+            ("secret: Secret1Type", "a.ts"),
+        ] {
+            assert!(!has_secret_literal(line, path), "{line}");
+        }
     }
 }

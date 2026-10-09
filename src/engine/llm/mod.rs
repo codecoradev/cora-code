@@ -145,6 +145,7 @@ fn into_review_response(findings: Findings, usage: Option<&transport::Usage>) ->
         summary: findings.summary.unwrap_or_default(),
         tokens_used: usage.map(usage_to_token_usage),
         should_block: false,
+        dropped_findings: 0,
     }
 }
 

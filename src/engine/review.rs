@@ -3,7 +3,7 @@ use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
 use crate::engine::llm;
-use crate::engine::postprocess::{Source, postprocess};
+use crate::engine::postprocess::{Source, postprocess_report};
 use crate::engine::types::{LLMConfig, ReviewResponse};
 
 /// Load a custom system prompt from a file path.
@@ -97,6 +97,7 @@ async fn review_diff_inner(
             summary: "No changes to review.".to_string(),
             tokens_used: None,
             should_block: false,
+            dropped_findings: 0,
         });
     }
 
@@ -308,8 +309,11 @@ async fn review_diff_inner(
                     ),
                     tokens_used: None,
                     should_block: false,
+                    dropped_findings: 0,
                 };
-                fallback.issues = postprocess(fallback.issues, &Source::Diff(&diff_chunks), config);
+                let pp = postprocess_report(fallback.issues, &Source::Diff(&diff_chunks), config);
+                fallback.issues = pp.issues;
+                fallback.dropped_findings = pp.dropped;
                 let min_sev = config.hook.min_severity_level();
                 fallback.should_block = fallback
                     .issues
@@ -343,7 +347,9 @@ async fn review_diff_inner(
     // Shared post-processing (LLM secret FP cross-check, Markdown code blocks,
     // ignore.rules, inline `cora-ignore:`, context-line filter), see
     // `engine::postprocess`.
-    response.issues = postprocess(response.issues, &Source::Diff(&diff_chunks), config);
+    let pp = postprocess_report(response.issues, &Source::Diff(&diff_chunks), config);
+    response.issues = pp.issues;
+    response.dropped_findings = pp.dropped;
 
     // Calculate should_block based on min_severity
     let min_severity = config.hook.min_severity_level();

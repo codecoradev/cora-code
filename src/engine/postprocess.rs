@@ -25,6 +25,11 @@
 //! | 5 | inline `cora-ignore:` markers     | yes                | yes   |
 //! | 6 | context-line severity filter      | yes                | no    |
 //!
+//! After the filters, `rules_engine.max_findings` caps the deterministic
+//! findings (those with a `rule_id`; LLM issues are never capped), highest
+//! severity first. `0` or `null` = unlimited. The dropped count is returned by
+//! [`postprocess_report`] so the CLI can warn on stderr (#624).
+//!
 //! Filters 2, 3 and 6 reason about added vs unchanged diff lines (or LLM
 //! mistakes about added lines), which a full-file scan does not have: every
 //! line of a scanned file is "added", and scan findings come from the
@@ -34,7 +39,8 @@ use tracing::debug;
 
 use crate::config::schema::Config;
 use crate::engine::diff_parser::FileChunk;
-use crate::engine::scanner::{FileEntry, files_as_chunks};
+use crate::engine::scan_input;
+use crate::engine::scanner::FileEntry;
 use crate::engine::types::{ReviewIssue, Severity};
 use crate::engine::{inline_suppress, rules, secrets_scanner, security_scanner};
 
@@ -46,14 +52,35 @@ pub enum Source<'a> {
     Files(&'a [FileEntry]),
 }
 
+/// Result of [`postprocess_report`].
+#[derive(Debug, Default)]
+pub struct PostprocessReport {
+    /// Final, user-visible findings.
+    pub issues: Vec<ReviewIssue>,
+    /// Deterministic findings cut by `rules_engine.max_findings` (0 = none).
+    pub dropped: usize,
+}
+
 /// Run the shared post-processing pipeline over `issues`. See the module docs
-/// for the per-source filter table.
+/// for the per-source filter table. Drops the truncation count; use
+/// [`postprocess_report`] when the caller should surface it.
+#[cfg_attr(not(test), allow(dead_code))] // callers use postprocess_report; kept for tests/API
 pub fn postprocess(
     issues: Vec<ReviewIssue>,
     source: &Source<'_>,
     config: &Config,
 ) -> Vec<ReviewIssue> {
-    match source {
+    postprocess_report(issues, source, config).issues
+}
+
+/// Like [`postprocess`], but also reports how many deterministic findings the
+/// `rules_engine.max_findings` cap removed (#624).
+pub fn postprocess_report(
+    issues: Vec<ReviewIssue>,
+    source: &Source<'_>,
+    config: &Config,
+) -> PostprocessReport {
+    let issues = match source {
         Source::Diff(chunks) => {
             let issues = apply_llm_secret_fp_filter(issues, chunks);
             let issues = apply_markdown_code_block_filter(issues, chunks);
@@ -65,21 +92,65 @@ pub fn postprocess(
             apply_context_line_filter(issues, chunks)
         }
         Source::Files(files) => {
-            let chunks = files_as_chunks(files);
-            let max = config.rules_config.max_findings;
+            let scan_files = scan_input::from_entries(files);
+            // Scanners run uncapped; the cap is enforced below, after
+            // suppression (#624).
             let mut merged = issues;
             for family in [
-                secrets_scanner::scan_secrets(&chunks, max),
-                security_scanner::scan_security(&chunks, max),
+                secrets_scanner::scan_secrets_in(&scan_files, usize::MAX),
+                security_scanner::scan_security_in(&scan_files, usize::MAX),
             ] {
                 if !family.is_empty() {
                     merged = rules::merge_rule_findings(merged, family);
                 }
             }
             let merged = apply_ignore_rules(merged, &config.ignore.rules);
-            inline_suppress::apply(merged, &chunks)
+            inline_suppress::apply_lines(merged, &scan_files)
         }
+    };
+    let (issues, dropped) = cap_deterministic(issues, config.rules_config.finding_cap());
+    PostprocessReport { issues, dropped }
+}
+
+/// Keep at most `cap` deterministic findings (those carrying a `rule_id`),
+/// highest severity first; ties keep their existing order (stable). LLM issues
+/// are never counted or dropped, and every kept issue keeps its position.
+///
+/// Because the most severe findings survive, the blocking decision
+/// (`any(severity <= min_severity)`) is unchanged by the cap for any `cap >= 1`.
+/// Returns the kept issues and the number of deterministic findings dropped.
+fn cap_deterministic(issues: Vec<ReviewIssue>, cap: usize) -> (Vec<ReviewIssue>, usize) {
+    let mut det: Vec<usize> = issues
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.rule_id.is_some())
+        .map(|(idx, _)| idx)
+        .collect();
+    if det.len() <= cap {
+        return (issues, 0);
     }
+    // Stable: equal severities stay in their original relative order.
+    det.sort_by_key(|&idx| issues[idx].severity);
+    let drop: std::collections::HashSet<usize> = det[cap..].iter().copied().collect();
+    let dropped = drop.len();
+    let kept = issues
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, _)| !drop.contains(idx))
+        .map(|(_, i)| i)
+        .collect();
+    (kept, dropped)
+}
+
+/// One-line stderr warning for truncated deterministic findings, or `None`
+/// when nothing was dropped.
+pub fn dropped_warning(dropped: usize, config: &Config) -> Option<String> {
+    (dropped > 0).then(|| {
+        format!(
+            "⚠ {dropped} more deterministic findings not shown (rules.max_findings = {}; raise it or set 0/null to show all)",
+            config.rules_config.max_findings
+        )
+    })
 }
 
 /// Filter out LLM findings about hardcoded secrets/passwords that point to
@@ -344,6 +415,190 @@ fn apply_context_line_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── max_findings cap (#624) ───
+
+    fn det(file: &str, line: u32, sev: Severity) -> ReviewIssue {
+        ReviewIssue::new(file, Some(line), sev, format!("t{line}")).with_rule_id("r")
+    }
+
+    fn llm(line: u32, sev: Severity) -> ReviewIssue {
+        ReviewIssue::new("a.rs", Some(line), sev, format!("llm{line}"))
+    }
+
+    #[test]
+    fn cap_keeps_highest_severity_stably_and_counts_dropped() {
+        let issues = vec![
+            det("a", 1, Severity::Info),
+            det("a", 2, Severity::Major),
+            det("a", 3, Severity::Critical),
+            det("a", 4, Severity::Major),
+            det("a", 5, Severity::Info),
+        ];
+        let (kept, dropped) = cap_deterministic(issues, 3);
+        assert_eq!(dropped, 2);
+        // Critical + both Majors kept, original relative order preserved.
+        let lines: Vec<_> = kept.iter().map(|i| i.line.unwrap()).collect();
+        assert_eq!(lines, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn cap_never_counts_or_drops_llm_issues() {
+        let mut issues = vec![llm(1, Severity::Info), llm(2, Severity::Info)];
+        issues.extend((10..16).map(|l| det("a", l, Severity::Major)));
+        issues.push(llm(3, Severity::Minor));
+        let (kept, dropped) = cap_deterministic(issues, 2);
+        assert_eq!(dropped, 4);
+        assert_eq!(kept.iter().filter(|i| i.rule_id.is_none()).count(), 3);
+        assert_eq!(kept.iter().filter(|i| i.rule_id.is_some()).count(), 2);
+    }
+
+    #[test]
+    fn cap_under_limit_is_a_no_op() {
+        let issues = vec![det("a", 1, Severity::Info), llm(2, Severity::Info)];
+        let (kept, dropped) = cap_deterministic(issues, 5);
+        assert_eq!((kept.len(), dropped), (2, 0));
+    }
+
+    #[test]
+    fn zero_and_unlimited_semantics() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.rules_config.finding_cap(), 5, "default cap");
+        cfg.rules_config.max_findings = 0;
+        assert_eq!(cfg.rules_config.finding_cap(), usize::MAX, "0 = unlimited");
+        let parsed: crate::config::schema::RulesSection =
+            serde_yaml_ng::from_str("enabled: true\nmax_findings: null\n").unwrap();
+        assert_eq!(parsed.max_findings, 0, "null = 0");
+        let parsed: crate::config::schema::RulesSection =
+            serde_yaml_ng::from_str("enabled: true\n").unwrap();
+        assert_eq!(parsed.max_findings, 5, "absent = default");
+    }
+
+    #[test]
+    fn dropped_warning_text() {
+        let cfg = Config::default();
+        assert!(dropped_warning(0, &cfg).is_none());
+        let w = dropped_warning(3, &cfg).unwrap();
+        assert!(w.contains("3 more deterministic findings"));
+        assert!(w.contains("rules.max_findings = 5"));
+    }
+
+    /// Inline marker naming every finding a probe secret line produces, so
+    /// the marked lines are suppressed regardless of how many rules fire.
+    fn ignore_marker() -> String {
+        let files = secret_files_with(1, 0, "");
+        let r = postprocess_report(vec![], &Source::Files(&files), &Config::default());
+        let ids: Vec<_> = r.issues.iter().filter_map(|i| i.rule_id.clone()).collect();
+        assert!(!ids.is_empty(), "probe must produce a finding");
+        format!("  # cora-ignore: {}", ids.join(", "))
+    }
+
+    fn secret_files(n: usize, extra_on_first: usize) -> Vec<FileEntry> {
+        secret_files_with(n, extra_on_first, &ignore_marker())
+    }
+
+    fn secret_files_with(n: usize, extra_on_first: usize, marker: &str) -> Vec<FileEntry> {
+        (0..n)
+            .map(|i| {
+                let marker = if i < extra_on_first { marker } else { "" };
+                let content =
+                    format!("import os\npassword = \"hunter2hunter{i}\"{marker}\nprint(1)\n");
+                FileEntry {
+                    path: format!("src/app{i}.py"),
+                    lines: content.lines().count(),
+                    content,
+                }
+            })
+            .collect()
+    }
+
+    fn secret_count(issues: &[ReviewIssue]) -> usize {
+        issues.iter().filter(|i| i.rule_id.is_some()).count()
+    }
+
+    #[test]
+    fn files_source_reports_truncation_with_default_cap() {
+        let files = secret_files(8, 0);
+        let r = postprocess_report(vec![], &Source::Files(&files), &Config::default());
+        assert_eq!(secret_count(&r.issues), 5);
+        assert_eq!(r.dropped, 3);
+    }
+
+    #[test]
+    fn files_source_unlimited_when_cap_is_zero() {
+        let files = secret_files(8, 0);
+        let mut cfg = Config::default();
+        cfg.rules_config.max_findings = 0;
+        let r = postprocess_report(vec![], &Source::Files(&files), &cfg);
+        assert_eq!(secret_count(&r.issues), 8);
+        assert_eq!(r.dropped, 0);
+    }
+
+    #[test]
+    fn files_source_suppressed_findings_do_not_consume_cap_slots() {
+        // 5 inline-suppressed secrets + 1 real one: the real one must survive.
+        let files = secret_files(6, 5);
+        let r = postprocess_report(vec![], &Source::Files(&files), &Config::default());
+        assert_eq!(r.dropped, 0);
+        assert_eq!(secret_count(&r.issues), 1);
+        assert_eq!(r.issues[0].file, "src/app5.py");
+    }
+
+    #[test]
+    fn files_source_llm_issues_are_never_capped() {
+        let files = secret_files(8, 0);
+        let llm_issues: Vec<_> = (1..=7).map(|l| llm(l, Severity::Info)).collect();
+        let r = postprocess_report(llm_issues, &Source::Files(&files), &Config::default());
+        assert_eq!(r.issues.iter().filter(|i| i.rule_id.is_none()).count(), 7);
+        assert_eq!(secret_count(&r.issues), 5);
+        assert_eq!(r.dropped, 3);
+    }
+
+    fn secret_diff(n: usize, ignored: usize) -> String {
+        let marker_text = ignore_marker();
+        let mut d = String::new();
+        for i in 0..n {
+            let marker = if i < ignored {
+                marker_text.as_str()
+            } else {
+                ""
+            };
+            d.push_str(&format!(
+                "diff --git a/src/f{i}.py b/src/f{i}.py\n--- a/src/f{i}.py\n+++ b/src/f{i}.py\n@@ -1,1 +1,2 @@\n import os\n+password = \"hunter2hunter{i}\"{marker}\n"
+            ));
+        }
+        d
+    }
+
+    fn diff_findings(diff: &str) -> (Vec<ReviewIssue>, Vec<FileChunk>) {
+        let chunks = crate::engine::diff_parser::parse_diff(diff);
+        let cfg = Config::default();
+        // Isolated: a db path inside a fresh temp dir that does not exist, so
+        // the real data dir is never read.
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = crate::engine::index_bridge::IndexBridge::open_tolerant_at(
+            &tmp.path().join("none.db"),
+            tmp.path(),
+        );
+        let det = crate::engine::deterministic::run(&chunks, &cfg, &bridge);
+        (det.merge_into(vec![]), chunks)
+    }
+
+    #[test]
+    fn diff_source_caps_after_suppression_and_reports_dropped() {
+        let (issues, chunks) = diff_findings(&secret_diff(8, 0));
+        assert!(secret_count(&issues) >= 8, "scanners must run uncapped");
+        let r = postprocess_report(issues, &Source::Diff(&chunks), &Config::default());
+        assert_eq!(secret_count(&r.issues), 5);
+        assert_eq!(r.dropped, 3);
+
+        // 5 suppressed + 1 real: nothing dropped, the real one is reported.
+        let (issues, chunks) = diff_findings(&secret_diff(6, 5));
+        let r = postprocess_report(issues, &Source::Diff(&chunks), &Config::default());
+        assert_eq!(r.dropped, 0);
+        assert!(r.issues.iter().all(|i| i.file == "src/f5.py"));
+        assert!(!r.issues.is_empty());
+    }
 
     #[test]
     fn secret_fp_filter_removes_struct_field_declarations() {

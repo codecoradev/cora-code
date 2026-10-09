@@ -485,6 +485,11 @@ pub struct ReviewResponse {
     pub summary: String,
     pub tokens_used: Option<TokenUsage>,
     pub should_block: bool,
+    /// Deterministic findings cut by `rules_engine.max_findings` after
+    /// suppression (#624). Never serialized, so JSON/SARIF output is
+    /// unchanged; the CLI reports it on stderr.
+    #[serde(skip)]
+    pub dropped_findings: usize,
 }
 
 /// Response from a full project scan

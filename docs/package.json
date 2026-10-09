@@ -4,7 +4,9 @@
   "scripts": {
     "docs:dev": "vitepress dev",
     "docs:build": "vitepress build",
-    "docs:preview": "vitepress preview"
+    "docs:preview": "vitepress preview",
+    "predocs:build": "cp ../CHANGELOG.md changelog.md",
+    "predocs:dev": "cp ../CHANGELOG.md changelog.md"
   },
   "devDependencies": {
     "@codecora/theme": "github:codecoradev/codecora-theme#c6a6aa654f686a8012a8442310222b8a6e879aa9",
