@@ -7,6 +7,146 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rules_engine.max_findings` is applied after suppression and truncation is reported (#624).** The cap (default 5) used to be applied inside each scanner, before `ignore.rules` / `cora-ignore`, so suppressed findings consumed slots and pushed real findings out, and the rest were dropped silently. Scanners now run uncapped and the cap is enforced once in post-processing on deterministic findings only (LLM issues are never capped), highest severity first. `cora scan` and `cora review` print `⚠ N more deterministic findings not shown (...)` on stderr when findings are cut, and the `cora scan` summary mentions it; stdout formats are unchanged. `max_findings: 0` or `null` now means unlimited (previously `0` hid every finding).
+
+## [0.17.2] - 2026-10-09
+
+### Fixed
+
+- **Env reads, call expressions and shell interpolation are no longer reported as hardcoded secrets.** `process.env.X`, `os.environ["X"]`, `os.getenv("X")`, `std::env::var("X")?`, `System.getenv("X")`, `get_password_from_vault()`, `String::new()` and bare identifiers/member accesses (`const password = userInput;`) are expressions, not literals, in source files (#616). `DB_PASSWORD=${VAR}`, `db.password=${DB_PASSWORD}`, `export X="$VAULT_X"` and `$(cmd)` are references (#617). Real values stay flagged: quoted or concatenated literals in code, and bare tokens in `.env`/`.properties`/`.ini`/`.toml`/shell/YAML files (`DB_PASSWORD=hunter2hunter2xx`). The LLM secret cross-check uses the same classification.
+
+## [0.17.1] - 2026-10-09
+
+### Fixed
+
+- **Hardcoded secrets in Go short declarations, YAML/JSON keys and SQL `PASSWORD` literals are now detected.** Go `password := "..."` (with or without a trailing comment) and `var apiKey string = "..."` (#618); unquoted YAML `password: hunter2hunter2` and JSON quoted keys `"password": "..."` / `"apiKey": "..."` (#619); SQL `CREATE USER app WITH PASSWORD '<literal>'` and `IDENTIFIED BY '<literal>'` (#620). References stay quiet: `${VAR}`/`$VAR`, `!tag`, `*alias`, `&anchor`, paths, `null`/`required`-style bare words, and SQL placeholders (`PASSWORD '%s'`). The LLM secret cross-check uses the same pattern, so LLM findings on these shapes are no longer dropped.
+
+### Changed
+
+- **One shared post-processing module for `cora review` and `cora scan`.** The finding filter pipeline (LLM secret false-positive cross-check, Markdown code blocks, `ignore.rules`, inline `cora-ignore:`, context-line filter, scanner merge for scans) now lives in `engine::postprocess`, so a fix lands in one place. Internal refactor with no CLI or output change (#610).
+
+- **`ReviewIssue::new` constructor and table-driven hardcoded-secret tests.** `ReviewIssue` is now built through `ReviewIssue::new(..)` plus `with_*` setters, so adding a field touches one place instead of every construction site. One end-to-end table covers the hardcoded-secret heuristics across languages; known false positives/negatives are pinned in a separate table. Internal change with no CLI or output change (#610).
+
+## [0.17.0] - 2026-10-09
+
+### Fixed
+
+- **A `cora-ignore:` naming a scanner rule could hide an unrelated LLM finding on the same line.** A scanner finding is now merged into an LLM issue on the same line only when they share a topic word (the secret family — password, key, token, credential — counts as one topic); otherwise both are reported and the marker suppresses only the finding it names (#609).
+
+### Fixed
+
+- **Real secrets in typed declarations were missed.** `const password: string = "..."` (TypeScript), `password: str = "..."` (Python) and `let password: &str = "..."` (Rust) matched none of the secret patterns (they required the value right after `password =`/`password:`), and `cora review` also dropped the LLM's finding on them (and on single-quoted literals) as a false positive. The scanner, the built-in rule and the LLM cross-check now allow an optional type annotation, and the cross-check accepts single-quoted literals. The `bare identifier` check in the object-shorthand filter, which was always true, now rejects values containing a string literal (#607).
+
+### Fixed
+
+- **Real secrets were missed when the line had a trailing comment containing `:`.** The `hardcoded-secret` false-positive filter treated the first `:` anywhere (even inside a comment or string) as object shorthand, so `password = "..."; // note: fix later` was not flagged, and no scanner finding existed on lines carrying a `cora-ignore: <rule>` marker. The filter now judges only the code, ignoring trailing comments and quoted colons (#603).
+- **Concurrent index opens could fail with `UNIQUE constraint failed: schema_version.version`.** Schema migrations are now serialised per process, which also removes a flaky test (#604).
+
+### Added
+
+- **Findings now carry a `rule_id`.** Deterministic scanner findings (rules, secrets, security, index) keep their rule id through the merge; it appears in pretty/compact output, as `rule_id` in JSON (omitted when absent, so older JSON still deserializes), and as `properties.coraRuleId` in SARIF (#597).
+
+### Changed
+
+- **`cora-ignore:` and `ignore.rules` match rule ids.** `cora-ignore: sec-hardcoded-secret` suppresses by id (exact, case-insensitive) as well as title; `ignore.rules` additionally matches ids exactly. A marker naming a scanner rule now also suppresses the LLM finding that displaced that scanner finding on the same line (#597).
+
+## [0.16.1] - 2026-10-08
+
+### Fixed
+
+- **`cora scan` no longer reports "No issues found" when the LLM fails.** It now runs the deterministic secrets and security scanners on every scanned file, merges them with LLM findings, and applies `ignore.rules` and inline `cora-ignore:` markers (read from file contents), so a hardcoded secret is reported even on an LLM 502 (#595).
+- **The LLM no longer flags `cora-ignore:` markers themselves** (e.g. "Security scanner findings suppressed instead of remediated"). The hardened system prompt now explains the marker is Cora's own suppression syntax (#596).
+
+## [0.16.0] - 2026-10-08
+
+### Added
+
+- **Rule-scoped inline suppression with `cora-ignore:`.** A source comment such as `// cora-ignore: Hardcoded password or secret in variable` (also `#`, `--`, `/* */`, `<!-- -->`; comma-separated rules) suppresses findings with that exact title (case-insensitive) on the same line, or on the next line when the marker line holds only a comment. Applies to both static-scanner and LLM findings; other rules and other lines stay visible, and a bare `cora-ignore` without rules suppresses nothing. Coexists with `ignore.rules` / `ignore.files` (#554).
+
+### Security
+
+- **Project `.cora.yaml` can no longer redirect your API key.** `provider.base_url` from a discovered project config is ignored unless `CORA_TRUST_PROJECT_CONFIG=1`; `base_url` must be `https` (plain `http` only for loopback); LLM error bodies echoed to the terminal are length-capped (#563).
+- **Hardened `cora upgrade` and `install.sh`.** Checksums are matched by exact filename; downloads go to a random 0700 temp dir; only the single `cora` binary entry is extracted (symlink/hardlink entries are rejected); every request has a timeout and a size cap; the version probe does not follow redirects and the tag is validated. `CORA_UPGRADE_SKIP_CHECKSUM` now also requires `CORA_UPGRADE_I_UNDERSTAND=1`. `install.sh` fails closed when the checksums file or entry is missing (opt out with `CORA_SKIP_CHECKSUM=1`) and falls back to `shasum -a 256` (#572).
+- **`install.sh` requests now have timeouts and size caps.** Every `curl` call sets `--connect-timeout`, `--max-time` and `--max-filesize` (256 MiB archive, 1 MiB checksums/API JSON), matching `cora upgrade`, so a stalled or hostile server cannot hang or flood the installer (#580).
+- **Hardened LLM response handling.** Review and scan system prompts tell the model to treat diff content as untrusted data; the diff fence is longer than any backtick run in the diff; the SSE stream errors on a line over 1 MiB or more than 16 MiB of content (#573).
+- **Secrets in test and doc files are no longer invisible to the static security scanner.** Test and doc paths still skip the noisy general rules but now run high-confidence checks (AWS keys, private-key headers, GitHub/Slack/Stripe live tokens; values containing `EXAMPLE` are ignored) (#573).
+
+### Fixed
+
+- **`cora watch` reindexed every source file on each cycle.** Change detection now reindexes only files that changed, and `--filter` restricts what is indexed instead of only gating the trigger (#578, #584).
+- **Secrets in test, fixture and example files were skipped entirely by the secrets scanner.** High-confidence secrets are now reported in those paths too (#579, #583).
+- **`cora findings list --severity` never matched, and severity colouring never applied.** Both are now case-insensitive (#586, #588).
+- **Unit tests wrote to the real data directory and could block on the global vector index lock.** Tests are isolated from the real data dir, and the lock wait is bounded (#587, #589).
+- **`cora affected` never matched naming-convention tests.** The CLI took the file extension (`rs`) as the file stem. CLI and MCP now share one query, with escaped `LIKE` wildcards, batched queries and one deduplicated pattern list (`{stem}_test`, `test_{stem}`, `{stem}.test`, `{stem}.spec`, `tests/{stem}`, `__tests__/{stem}`). MCP dead-code now honors `analysis.entry_point_patterns` like the CLI (#575).
+- **`cora --config <file> serve` ignored `--config`.** The global option is now passed through (#576).
+- **MCP `brain_search` ignored the configured embedding backend.** It now resolves the backend from the project config (#576).
+- **Review and indexing disagreed about which files to skip.** Review-time scanners now use the same patterns as the indexer (`ignore.files` + `index.skip_files`) (#576).
+- **Review scanners could resolve a different project than indexing** when run from a subdirectory or workspace member. Every entry point now resolves the project root the same way, and review no longer creates an empty `cora.db` when no index exists (#574).
+- **Files from different projects overwrote each other's fingerprints** (perpetual reindex). Files are keyed by `(project_id, path)` (schema v8). `callers`/`callees`/`trace` match names exactly instead of by substring (`run` no longer matches `rerun`), and index runs prune stale files and their edges (#565).
+- **MCP server robustness.** Stdin is framed as bytes and decoded as UTF-8; garbage input yields a `-32700` parse error; notifications get no response and `notifications/cancelled` no longer stops the server; `tools/call` without a name returns `-32602`; `limit`/`depth`/`min_lines` are clamped; `cora.install` requires `confirm: true` (#564).
+- **Chunked review printed "No issues found" while reporting issues** when chunks returned empty summaries (#562).
+- **CI:** the CLA check works for fork PRs (#553); `rustls` pinned to 0.23.45 for RUSTSEC-2026-0285 and a deprecated `f32` import removed so clippy passes on rustc 1.99 (#561).
+
+### Changed
+
+- **Ignore patterns now use a single matcher** for the index walk, review scanners, `cora scan --include/--exclude` and `watch --filter`. Behavior changes you may notice in `ignore.files` and related options:
+  - `**/*.test.ts` no longer matches `footest.ts`, and `vite.config.*` no longer matches `vite.configx`.
+  - Patterns with a wildcard in the middle (`src/*.rs`, `*.gen.*`) now match; they were silently ignored before, so files you thought were excluded may now actually be excluded.
+  - Patterns without a `/` also match by basename, in `cora scan --include/--exclude` and `watch --filter` too.
+  - An invalid glob matches literally instead of being dropped (#577).
+- **`cora index --watch` now runs the same watcher as `cora watch`.** It checks every 500 ms (was 2 s), skips hidden directories, and prints `Reindexed: ...` (#576).
+- **Internal refactors with no CLI change:** one seam for opening the index (`IndexBridge`, #574), one index-session module (#576), and review split into a deterministic stage testable without an LLM (#577), LLM parse/repair/retry policy unified behind one `Transport` seam (#582), and review-history SQL owned by a single `review_store` module (#585).
+
+## [0.15.0] - 2026-08-31
+
+### Added
+
+- **Opt-in `vecq` vector store for Brain Mode.** Set `brain.vector_store: vecq` in `.cora.yaml` to replace the usearch HNSW index with a vecq quantized scan (pure Rust, deterministic, ~5x smaller). Keyed persistence included: symbol ids survive reload, so a fresh process serves the index as-is and `cora index` no longer re-embeds unchanged projects (#542, #547).
+- **`brain.vector_bits` quantization-width knob.** `residual` (default) | `4` | `5` | `6` — 4-bit base codes with second-pass residual rescoring, or plain Lloyd-Max widths. The default is residual: best recall@10 at 4-bit scan speed in a recall study on cora's own embeddings, ahead of plain 5-bit at 1k/5k/13k-symbol scales. Changing the width rebuilds the index once on the next `cora index` instead of silently serving the old width; unknown values fall back to `residual`.
+
+### Fixed
+
+- **Vector signal never fired in a fresh process.** `cora brain` and MCP `brain_search` only saw the vector index if the same process had run the embed — otherwise results silently degraded to FTS-only. The search path now lazy-loads the on-disk index once per process, with a dimension guard against backend switches (#545).
+- **Stale embed fingerprints after a global vector-index rebuild.** The vector index is a single file shared by all projects; rebuilding it (width/dims change, legacy file, corruption) wiped every project's vectors while their fingerprints still said "embedded" — the incremental path would skip those symbols forever. A rebuild now clears fingerprints for all projects, and the usearch dims-mismatch path (which deleted the index without clearing) joins the same heal.
+
+### Changed
+
+- **vecq-core dependency 0.2.0 → 0.3.0.** Picks up the 4-bit+residual mode, plain 5/6-bit widths, runtime-detected AVX2 scoring, and file formats v1.3–v1.5 with the keyed-slot table. Pre-0.3.0 `.vecq` files carry no key table and rebuild once with a warning, then upgrade to the keyed format.
+
+## [0.14.0] - 2026-08-28
+
+### Fixed
+
+- **Empty LLM responses from reasoning models.** Models like GLM can spend the entire `max_tokens` budget on chain-of-thought and return `content: ""` with `finish_reason: "length"`, which previously surfaced as a misleading `EOF while parsing` error. Cora now reads `finish_reason`/`reasoning_content`, automatically retries with a doubled budget (up to 32768), salvages JSON from reasoning text as a last resort, and reports an explicit "EMPTY response" error when nothing is recoverable (#536).
+
+- **Dead-code false positives from cross-crate method calls.** Method calls inside Rust `impl` blocks were never walked for call edges, and call targets stored raw AST text (`self.export_full`) that could not join against symbol names — 557 false positives on a 5-crate workspace (#519).
+- **Index root mismatch between CLI and MCP.** Running `cora index` inside a workspace member crate created a separate project row from the one MCP resolved, so `index_status` reported 0 symbols despite a populated DB. Root resolution now prefers a `[workspace]` Cargo.toml and never climbs past a `.git` boundary (#522).
+- **`ignore.files` was not honored by the index.** Skip patterns only invalidated fingerprints; matched files were still indexed and surfaced in dead-code/review findings. They are now excluded from indexing entirely (#521).
+
+### Changed
+
+- **Default `max_tokens` raised from 4096 to 8192** to give reasoning models headroom above their chain-of-thought (#536).
+
+### Changed
+
+- **Default `max_tokens` raised from 4096 to 8192** to give reasoning models headroom above their chain-of-thought (#536).
+- **Dead-code now skips public API surface by default** (`pub`/`export` items) — new `--include-pub` flag and MCP `include_pub_api` parameter opt back in (#520).
+- **Review prompts include enclosing control-flow scope.** Hunks touching branching constructs get the enclosing function from the post-image (120-line cap), plus an always-on guardrail against unverified reachability claims (#523).
+- **Incremental re-index reports honestly.** No-op runs print "Index up to date" with stored totals instead of "Indexed 0 symbols"; MCP `index_status` carries a root-mismatch hint (#522).
+- **Relicensed from MIT to Apache-2.0.** All 18 CodeCoraDev repositories now
+  standardize on Apache-2.0 for patent grant protection and open-core model
+  compatibility. Added CLA (Individual + Corporate) for contributor copyright
+  and patent grants.
+- **Added Contributor License Agreement (CLA).** Individual and Corporate CLA
+  documents added (`CLA_INDIVIDUAL.md`, `CLA_CORPORATE.md`). CLA includes
+  SIAC arbitration, patent retaliation, moral rights acknowledgment, and
+  no-compensation clause.
+- **Updated CONTRIBUTING.md.** Added Contribution Terms section with
+  no-compensation notice, CLA requirement, and Apache-2.0 license reference.
+- **Updated README license badge** from MIT to Apache-2.0.
+
 ## [0.13.0]
 
 ### Added
@@ -850,7 +990,14 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.13.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.2...develop
+[0.17.2]: https://github.com/codecoradev/cora-code/compare/v0.17.1...v0.17.2
+[0.17.1]: https://github.com/codecoradev/cora-code/compare/v0.17.0...v0.17.1
+[0.17.0]: https://github.com/codecoradev/cora-code/compare/v0.16.1...v0.17.0
+[0.16.1]: https://github.com/codecoradev/cora-code/compare/v0.16.0...v0.16.1
+[0.16.0]: https://github.com/codecoradev/cora-code/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/codecoradev/cora-code/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/codecoradev/cora-code/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/codecoradev/cora-code/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/codecoradev/cora-code/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/codecoradev/cora-code/compare/v0.11.0...v0.11.1
