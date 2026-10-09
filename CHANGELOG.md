@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Documented what the hardcoded-secret check flags and its one known limit** (all-letter unquoted YAML values), and closed that item as not planned (#625, #635).
+
 ### Fixed
 
 - **A `rules_engine:` section without `enabled: true` no longer disables the built-in rules.** `enabled` now defaults to `true` when the section is present, so `rules_engine: { max_findings: 0 }` only changes the cap; set `enabled: false` to turn the engine off (#638).
