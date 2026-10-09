@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-09
+
 ### Fixed
 
 - **A `cora-ignore:` naming a scanner rule could hide an unrelated LLM finding on the same line.** A scanner finding is now merged into an LLM issue on the same line only when they share a topic word (the secret family — password, key, token, credential — counts as one topic); otherwise both are reported and the marker suppresses only the finding it names (#609).
@@ -966,7 +968,8 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.16.1...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.17.0...develop
+[0.17.0]: https://github.com/codecoradev/cora-code/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/codecoradev/cora-code/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/codecoradev/cora-code/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/codecoradev/cora-code/compare/v0.14.0...v0.15.0
