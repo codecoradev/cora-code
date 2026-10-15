@@ -824,6 +824,7 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
                 "summary": response.summary,
                 "total_issues": response.issues.len(),
                 "should_block": should_block,
+                "not_shown": response.dropped_findings,
                 "issues": response.issues.iter().map(|i| serde_json::json!({
                     "title": i.title,
                     "severity": i.severity.label(),
