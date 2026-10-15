@@ -7,6 +7,7 @@ use tracing::debug;
 use crate::config::schema::Config;
 use crate::engine::ReviewIssue;
 use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
+use crate::engine::judge::admit;
 use crate::engine::postprocess::{Source, dropped_warning, postprocess_report};
 use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
@@ -194,7 +195,10 @@ pub async fn execute_scan(
         spinner.finish();
         match scanned {
             Ok((issues, _summary, tokens)) => {
-                all_issues.extend(issues);
+                // The model's answer is untrusted: only files of this batch,
+                // bounded text, no deterministic markers (#644).
+                let batch_paths: Vec<String> = batch.iter().map(|f| f.path.clone()).collect();
+                all_issues.extend(admit(issues, &batch_paths, &Source::Files(batch)));
                 total_tokens = match (total_tokens, tokens) {
                     (Some(mut acc), Some(t)) => {
                         acc.input_tokens += t.input_tokens;
