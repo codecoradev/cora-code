@@ -69,7 +69,7 @@ impl<'a> ScanFile<'a> {
             .filter(|l| l.line_type != DiffLineType::Remove)
             .filter_map(|l| l.new_line_no.map(|n| (n, l.content.as_str())))
             .collect();
-        set.extend(test_context::rust_test_lines(&post));
+        set.extend(test_context::rust_test_lines(&post, true));
         for hunk in &chunk.chunks {
             if test_context::hunk_header_is_test_module(&hunk.header) {
                 set.extend(hunk.lines.iter().filter_map(|l| l.new_line_no));
@@ -141,7 +141,7 @@ impl<'a> ScanFile<'a> {
             .map(|(t, n)| (n, t))
             .collect();
         let test_lines = if language == "rs" {
-            test_context::rust_test_lines(&lines)
+            test_context::rust_test_lines(&lines, false)
         } else {
             HashSet::new()
         };

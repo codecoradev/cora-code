@@ -202,18 +202,24 @@ pub fn scan_security_in(files: &[ScanFile<'_>], max_findings: usize) -> Vec<Rule
                 continue;
             }
 
-            // Inline test code (`#[cfg(test)]` blocks): only the
-            // high-confidence secret list, like whole test files (#663).
-            if file.test_lines.contains(&line_no) {
+            // Inline test code (`#[cfg(test)]` blocks) is the one place a
+            // fixture credential is expected: the generic secret pattern is
+            // skipped and only the high-confidence list runs. Every OTHER
+            // pattern (injection, eval, weak crypto, ...) still applies, so
+            // wrapping code in a test-looking block does not hide it (#663).
+            let in_test_block = file.test_lines.contains(&line_no);
+            if in_test_block {
                 high_confidence_line(path, line_no, content, &mut findings);
                 if findings.len() >= max_findings {
                     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
                     return findings;
                 }
-                continue;
             }
 
             for (rule_id, name, regex, severity) in COMPILED_PATTERNS.iter() {
+                if in_test_block && rule_id == "crypto/hardcoded-secret" {
+                    continue;
+                }
                 if regex.is_match(content) {
                     // Apply post-match filter to suppress known false positives
                     if post_match_filter_for_path(rule_id, content, path) {
@@ -1411,5 +1417,31 @@ mod tests {
                 .any(|f| f.rule_id == "secrets/high-confidence-in-test-or-doc" && f.line == 6),
             "a real-looking AWS key in a test block must still be reported"
         );
+    }
+
+    #[test]
+    fn test_looking_blocks_do_not_hide_injection_or_eval() {
+        use crate::engine::scanner::FileEntry;
+        let content = "\
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let q = \"SELECT * FROM t WHERE id = \" + id;
+        eval(user_input);
+    }
+}
+";
+        let entry = FileEntry {
+            path: "src/lib.rs".to_string(),
+            lines: content.lines().count(),
+            content: content.to_string(),
+        };
+        let files = crate::engine::scan_input::from_entries(std::slice::from_ref(&entry));
+        let ids: Vec<String> = scan_security_in(&files, 100)
+            .into_iter()
+            .map(|f| f.rule_id)
+            .collect();
+        assert!(ids.contains(&"injection/sql-concat".to_string()), "{ids:?}");
+        assert!(ids.contains(&"injection/eval".to_string()), "{ids:?}");
     }
 }

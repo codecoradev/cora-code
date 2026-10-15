@@ -472,8 +472,8 @@ Tests legitimately `unwrap()`, `println!`, clone, use `http://` fixtures and fak
 - **What counts as test code:** whole files under test paths (`tests/`, `*_test.*`, `*.test.ts`, `spec/`, `__tests__/`, `fixtures/`, `examples/`), Rust `#[cfg(test)]` modules and `#[test]` functions (found by brace matching), and, in a diff, a hunk inside `mod tests`.
 - **What is skipped there:** the built-in rules `bug-unwrap`, `bug-expect`, `bug-println`, `qual-clone`, `qual-error-ignore`, `sec-hardcoded-url` and `sec-hardcoded-secret`. The secret scanners only run their high-confidence patterns (AWS keys, GitHub tokens, private keys, ...) on test code, so a real credential committed in a test is still found.
 - `bug-println` is also skipped in program entry points (`main.rs`, `src/bin/`, `examples/`, `benches/`). Other CLI modules keep the rule; use `ignore.rules` to silence it there.
-- **Not exempt:** custom rules, `bug-todo`, and everything else.
-- Set `rules_engine.include_tests: true` to scan test code like any other code. Detection is conservative: when it cannot tell (for example a diff that does not show the `mod tests` line), the line stays scanned.
+- **Not exempt:** custom rules, `bug-todo`, and every other pattern. In particular, injection, `eval`, weak-crypto and similar security patterns still apply inside inline test blocks, so wrapping code in a test-looking block does not hide it. (Whole test *files* by path keep the older behavior: only high-confidence secrets are scanned.)
+- Set `rules_engine.include_tests: true` to scan test code like any other code. Detection is conservative: when it cannot tell, the line stays scanned. A `#[cfg(test)]` region whose braces never close in a whole file is ignored rather than extended to the end of the file, and a diff that does not show the `mod tests` line is scanned normally.
 
 #### What `max_findings` caps
 

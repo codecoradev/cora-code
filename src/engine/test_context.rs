@@ -78,6 +78,22 @@ fn brace_delta(line: &str) -> i32 {
             continue;
         }
         match c {
+            // Single-line raw string `r"..."` / `r#"..."#`: skip its content.
+            'r' if matches!(chars.peek(), Some('"') | Some('#')) => {
+                let rest: String = chars.clone().collect();
+                let hashes = rest.chars().take_while(|&h| h == '#').count();
+                if rest[hashes..].starts_with('"') {
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    if let Some(end) = rest[hashes + 1..].find(&close) {
+                        // Consume through the closing delimiter.
+                        for _ in 0..(hashes + 1 + end + close.len()) {
+                            chars.next();
+                        }
+                    } else {
+                        break; // unterminated on this line: ignore the rest
+                    }
+                }
+            }
             '"' => in_str = true,
             '/' if chars.peek() == Some(&'/') => break,
             '\'' => {
@@ -118,7 +134,13 @@ fn is_test_attribute(trimmed: &str) -> bool {
 /// `lines` are `(line number, text)` in file order. A gap in the numbering (a
 /// diff skipping unchanged code) abandons the region being tracked, so a
 /// partial view never extends a region it cannot see the end of.
-pub fn rust_test_lines(lines: &[(u32, &str)]) -> HashSet<u32> {
+///
+/// `partial_view` is true for a diff (the view may end inside a region, whose
+/// lines seen so far are still test code). For a WHOLE file it is false: a
+/// region that never closes means the brace matching lost track (a raw string,
+/// a macro, or a hostile `{`), and exempting everything to the end of the file
+/// would hide real code, so the unfinished region is dropped instead.
+pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32> {
     let mut out = HashSet::new();
     // (lines of the region so far, brace depth, seen the opening brace)
     let mut region: Option<(Vec<u32>, i32, bool)> = None;
@@ -174,8 +196,10 @@ pub fn rust_test_lines(lines: &[(u32, &str)]) -> HashSet<u32> {
             }
         }
     }
-    if let Some((seen, _, _)) = region {
-        out.extend(seen);
+    if partial_view {
+        if let Some((seen, _, _)) = region {
+            out.extend(seen);
+        }
     }
     out
 }
@@ -222,7 +246,7 @@ mod tests {
     }
 }
 fn after() { z.unwrap(); }";
-        let set = rust_test_lines(&numbered(src));
+        let set = rust_test_lines(&numbered(src), false);
         assert!(!set.contains(&1), "code before is not test code");
         for n in 2..=10 {
             assert!(set.contains(&n), "line {n} is inside the test module");
@@ -239,7 +263,7 @@ mod tests {
     fn b() {}
 }
 fn after() {}";
-        let set = rust_test_lines(&numbered(src));
+        let set = rust_test_lines(&numbered(src), false);
         assert!(set.contains(&4) && set.contains(&5));
         assert!(!set.contains(&6));
     }
@@ -253,7 +277,7 @@ fn only_this() {
     a.unwrap();
 }
 fn keep_too() { b.unwrap(); }";
-        let set = rust_test_lines(&numbered(src));
+        let set = rust_test_lines(&numbered(src), false);
         assert!((2..=5).all(|n| set.contains(&n)));
         assert!(!set.contains(&1) && !set.contains(&6));
     }
@@ -261,14 +285,14 @@ fn keep_too() { b.unwrap(); }";
     #[test]
     fn test_attribute_on_a_statement_item_marks_one_line() {
         let src = "#[cfg(test)]\nuse helper::x;\nfn real() {}";
-        let set = rust_test_lines(&numbered(src));
+        let set = rust_test_lines(&numbered(src), false);
         assert!(set.contains(&1) && set.contains(&2) && !set.contains(&3));
     }
 
     #[test]
     fn stacked_attributes_and_doc_comments_stay_in_the_region() {
         let src = "#[cfg(test)]\n#[allow(dead_code)]\n/// helper\nmod tests {\n}\nfn real() {}";
-        let set = rust_test_lines(&numbered(src));
+        let set = rust_test_lines(&numbered(src), false);
         assert!((1..=5).all(|n| set.contains(&n)) && !set.contains(&6));
     }
 
@@ -281,14 +305,14 @@ fn keep_too() { b.unwrap(); }";
             (3, "    fn a() {"),
             (40, "    x.unwrap();"),
         ];
-        let set = rust_test_lines(&lines);
+        let set = rust_test_lines(&lines, true);
         assert!(set.contains(&1) && set.contains(&2) && set.contains(&3));
         assert!(!set.contains(&40), "cannot vouch for lines after a gap");
     }
 
     #[test]
     fn plain_code_has_no_test_lines() {
-        let set = rust_test_lines(&numbered("fn main() {\n    println!(\"hi\");\n}"));
+        let set = rust_test_lines(&numbered("fn main() {\n    println!(\"hi\");\n}"), false);
         assert!(set.is_empty());
     }
 
@@ -299,5 +323,34 @@ fn keep_too() { b.unwrap(); }";
         assert!(!hunk_header_is_test_module("mod testing_utils {"));
         assert!(!hunk_header_is_test_module("fn tests() {"));
         assert!(!hunk_header_is_test_module(""));
+    }
+
+    #[test]
+    fn an_unclosed_region_in_a_whole_file_is_dropped_not_extended_to_eof() {
+        // A hostile or unparseable `{` must not exempt the rest of the file.
+        let src = "\
+#[cfg(test)]
+fn helper() {
+    let weird = '\\u{7b}'; let open = r#\"{{{\"#; let more = \"{\"; // tricks
+    {
+}
+fn production() { danger.unwrap(); }
+fn more_production() { x.unwrap(); }";
+        let lines = numbered(src);
+        // Whole-file view: no region is vouched for at all.
+        let whole = rust_test_lines(&lines, false);
+        assert!(!whole.contains(&6) && !whole.contains(&7), "{whole:?}");
+        // Partial view (a diff): what was seen inside the region stays marked.
+        assert!(rust_test_lines(&lines, true).contains(&2));
+    }
+
+    #[test]
+    fn single_line_raw_strings_do_not_confuse_brace_matching() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn a() { let s = r#\"}}}\"#; }\n}\nfn real() {}";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(
+            (1..=4).all(|n| set.contains(&n)) && !set.contains(&5),
+            "{set:?}"
+        );
     }
 }
