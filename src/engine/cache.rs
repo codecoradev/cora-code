@@ -73,13 +73,20 @@ fn migrate_legacy_cache_dir(new_dir: &std::path::Path) {
     }
 }
 
-/// Compute SHA-256 hex digest of the diff content + config parameters.
+/// Compute SHA-256 hex digest of the judge input (the exact prompts) + config
+/// parameters.
 /// Includes model, provider, base_url, and temperature so config changes
 /// invalidate the cache (e.g., switching providers with the same model name).
 #[allow(clippy::format_collect)]
-fn cache_key(diff: &str, model: &str, temperature: f32, provider: &str, base_url: &str) -> String {
+fn cache_key(
+    key_text: &str,
+    model: &str,
+    temperature: f32,
+    provider: &str,
+    base_url: &str,
+) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(diff.as_bytes());
+    hasher.update(key_text.as_bytes());
     hasher.update(model.as_bytes());
     hasher.update(provider.as_bytes());
     hasher.update(base_url.as_bytes());
@@ -93,14 +100,14 @@ fn cache_key(diff: &str, model: &str, temperature: f32, provider: &str, base_url
 /// Returns `None` if no cache exists or if the cache entry has expired
 /// (based on `ttl` in minutes).
 pub fn get_cached_review(
-    diff: &str,
+    key_text: &str,
     model: &str,
     temperature: f32,
     ttl: u64,
     provider: &str,
     base_url: &str,
 ) -> Option<ReviewResponse> {
-    let hash = cache_key(diff, model, temperature, provider, base_url);
+    let hash = cache_key(key_text, model, temperature, provider, base_url);
     let dir = cache_dir().ok()?;
     let path = dir.join(format!("{hash}.json"));
 
@@ -139,7 +146,7 @@ pub fn get_cached_review(
 
 /// Save a review response to the cache.
 pub fn save_cached_review(
-    diff: &str,
+    key_text: &str,
     model: &str,
     temperature: f32,
     response: &ReviewResponse,
@@ -149,7 +156,7 @@ pub fn save_cached_review(
     let dir = cache_dir()?;
     std::fs::create_dir_all(&dir).map_err(CoraError::CacheIo)?;
 
-    let hash = cache_key(diff, model, temperature, provider, base_url);
+    let hash = cache_key(key_text, model, temperature, provider, base_url);
     let path = dir.join(format!("{hash}.json"));
 
     let now = SystemTime::now()

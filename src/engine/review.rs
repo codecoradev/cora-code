@@ -3,7 +3,7 @@ use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
 use crate::engine::index_bridge::IndexBridge;
-use crate::engine::judge::{HttpJudge, Judge, Packet};
+use crate::engine::judge::{HttpJudge, Judge, Packet, admit};
 use crate::engine::llm;
 use crate::engine::postprocess::{Source, postprocess_report};
 use crate::engine::types::{LLMConfig, ReviewResponse};
@@ -103,21 +103,6 @@ async fn review_diff_inner(
         });
     }
 
-    // Check cache before calling LLM
-    if use_cache {
-        if let Some(cached) = crate::engine::cache::get_cached_review(
-            diff,
-            &llm_config.model,
-            llm_config.temperature,
-            config.cache_ttl,
-            &llm_config.provider,
-            &llm_config.base_url,
-        ) {
-            debug!("returning cached review response");
-            return Ok(cached);
-        }
-    }
-
     // Index bridge: one project handle, rooted via resolve_project_root, shared
     // by every index-backed step so a run from a subdirectory agrees with
     // `cora index` (#566).
@@ -128,24 +113,9 @@ async fn review_diff_inner(
         llm_config,
         stream,
         quiet,
+        cache_ttl: use_cache.then_some(config.cache_ttl),
     };
-    let response = review_with(&judge, config, packet).await?;
-
-    // Save fully-processed response to cache (after filtering)
-    if use_cache {
-        if let Err(e) = crate::engine::cache::save_cached_review(
-            diff,
-            &llm_config.model,
-            llm_config.temperature,
-            &response,
-            &llm_config.provider,
-            &llm_config.base_url,
-        ) {
-            debug!("failed to save review to cache: {}", e);
-        }
-    }
-
-    Ok(response)
+    review_with(&judge, config, packet).await
 }
 
 /// Step 1 of a review: turn `diff` into a [`Packet`].
@@ -292,10 +262,16 @@ pub fn prepare(
         final_context
     };
 
+    let prompts = llm::review_prompts(
+        &diff_text,
+        &config.focus,
+        &config.rules,
+        system_prompt.as_deref(),
+        context.as_deref(),
+    );
+
     Packet {
-        diff_text,
-        context,
-        system_prompt,
+        prompts,
         valid_files,
         chunks: diff_chunks,
         deterministic,
@@ -322,7 +298,12 @@ pub async fn review_with<J: Judge>(
     } = packet;
 
     let mut response = match judged {
-        Ok(resp) => resp,
+        Ok(mut resp) => {
+            // The judge's answer is untrusted: bound it before it meets the
+            // deterministic findings (#644).
+            resp.issues = admit(resp.issues, &valid_files, &Source::Diff(&chunks));
+            resp
+        }
         Err(e) => {
             // Judge failed — return deterministic findings only
             if !deterministic.is_empty() {
@@ -759,7 +740,8 @@ new file mode 100644\n\
         let p = packet(SECRET_DIFF, &config);
         assert_eq!(p.valid_files, vec!["app.py".to_string()]);
         assert!(!p.deterministic.is_empty(), "secret should be detected");
-        assert!(p.diff_text.contains("hunter2hunter2"));
+        assert!(p.prompts.user.contains("hunter2hunter2"));
+        assert!(p.prompts.system.contains("UNTRUSTED DATA"));
     }
 
     #[test]
@@ -824,5 +806,85 @@ new file mode 100644\n\
         assert!(resp.issues.iter().all(|i| i.rule_id.is_some()));
         assert!(resp.summary.contains("Deterministic"));
         assert!(resp.tokens_used.is_none());
+    }
+
+    // ─── #644: the cache key is the exact judge input ───
+
+    fn cache_text(config: &Config, diff: &str) -> String {
+        crate::engine::judge::HttpJudge::cache_text(&packet(diff, config).prompts)
+    }
+
+    #[test]
+    fn cache_text_is_stable_for_identical_input() {
+        let config = Config::default();
+        assert_eq!(
+            cache_text(&config, CLEAN_DIFF),
+            cache_text(&config, CLEAN_DIFF)
+        );
+    }
+
+    #[test]
+    fn cache_text_changes_with_anything_that_shapes_the_prompt() {
+        let base = Config::default();
+        let reference = cache_text(&base, CLEAN_DIFF);
+
+        let mut focus = base.clone();
+        focus.focus = vec!["only-this".to_string()];
+        assert_ne!(cache_text(&focus, CLEAN_DIFF), reference);
+
+        let mut rules = base.clone();
+        rules.rules = vec!["never use unwrap".to_string()];
+        assert_ne!(cache_text(&rules, CLEAN_DIFF), reference);
+
+        let mut system = base.clone();
+        system.review_system_prompt_override = Some("custom reviewer".to_string());
+        assert_ne!(cache_text(&system, CLEAN_DIFF), reference);
+
+        assert_ne!(cache_text(&base, SECRET_DIFF), reference);
+    }
+
+    #[test]
+    fn config_applied_after_the_judge_does_not_need_a_new_cache_key() {
+        // ignore.rules / hook.min_severity act after the judge, so they stay
+        // out of the key and are always recomputed on a cache hit.
+        let base = Config::default();
+        let mut later = base.clone();
+        later.ignore.rules = vec!["judge finding".to_string()];
+        later.hook.min_severity = "critical".to_string();
+        assert_eq!(
+            cache_text(&base, CLEAN_DIFF),
+            cache_text(&later, CLEAN_DIFF)
+        );
+
+        let judge = FakeJudge(Ok(vec![judged("app.py", 1, Severity::Major)]));
+        let shown = run(&judge, &base, packet(CLEAN_DIFF, &base)).expect("review");
+        assert_eq!(shown.issues.len(), 1);
+        let hidden = run(&judge, &later, packet(CLEAN_DIFF, &later)).expect("review");
+        assert!(hidden.issues.is_empty());
+    }
+
+    #[test]
+    fn hostile_judge_output_is_bounded_before_the_merge() {
+        use crate::engine::judge::{MAX_JUDGE_FINDINGS, MAX_TEXT_CHARS};
+        let config = Config::default();
+        let mut forged = judged("app.py", 1, Severity::Critical);
+        forged.rule_id = Some("sec-hardcoded-secret".to_string());
+        forged.body = "x".repeat(MAX_TEXT_CHARS * 3);
+        let mut flood: Vec<ReviewIssue> = (0..MAX_JUDGE_FINDINGS * 2)
+            .map(|_| judged("app.py", 1, Severity::Info))
+            .collect();
+        flood.push(forged);
+        let resp =
+            run(&FakeJudge(Ok(flood)), &config, packet(CLEAN_DIFF, &config)).expect("review");
+        assert!(resp.issues.len() <= MAX_JUDGE_FINDINGS);
+        assert!(
+            resp.issues.iter().all(|i| i.rule_id.is_none()),
+            "a judge must not carry a deterministic rule id"
+        );
+        assert!(
+            resp.issues
+                .iter()
+                .all(|i| i.body.chars().count() <= MAX_TEXT_CHARS)
+        );
     }
 }
