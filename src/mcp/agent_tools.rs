@@ -157,6 +157,18 @@ fn parse_agent_issues(value: Option<&Value>) -> Result<(Vec<ReviewIssue>, usize)
     Ok((ok, rejected))
 }
 
+/// Tells the agent when `rules_engine.max_findings` hid deterministic findings
+/// that `*_prepare` listed, instead of letting them vanish unexplained.
+fn not_shown_note(dropped: usize, config: &crate::config::schema::Config) -> Value {
+    if dropped == 0 {
+        return Value::Null;
+    }
+    Value::String(format!(
+        "{dropped} more deterministic findings are not shown (rules_engine.max_findings = {}; raise it or set 0 to show all).",
+        config.rules_config.max_findings
+    ))
+}
+
 fn diff_param(params: &Value) -> Result<&str, ToolResult> {
     let diff = params
         .get("diff")
@@ -215,7 +227,12 @@ pub fn review_prepare(params: &Value) -> ToolResult {
         "system_prompt": packet.prompts.system,
         "user_prompt": packet.prompts.user,
         "valid_files": packet.valid_files,
+        "deterministic_findings_total": deterministic.len(),
         "deterministic_findings": deterministic,
+        "deterministic_findings_note": format!(
+            "cora.review_finalize shows at most rules_engine.max_findings = {} deterministic findings (most severe first) and reports the rest as `not_shown`.",
+            config.rules_config.max_findings
+        ),
         "response_schema": response_schema(),
     }))
 }
@@ -287,6 +304,8 @@ pub fn review_finalize(params: &Value) -> ToolResult {
         "should_block": should_block,
         "rejected_items": rejected,
         "dropped_by_validation": dropped_by_validation,
+        "not_shown": response.dropped_findings,
+        "not_shown_note": not_shown_note(response.dropped_findings, &config),
         "issues": response.issues.iter().map(|i| json!({
             "title": i.title,
             "severity": i.severity.label(),
@@ -506,6 +525,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         "rejected_items": rejected,
         "dropped_by_validation": dropped_by_validation,
         "not_shown": dropped,
+        "not_shown_note": not_shown_note(dropped, &config),
         "issues": all.iter().map(|i| json!({
             "title": i.title,
             "severity": i.severity.label(),
@@ -773,4 +793,36 @@ mod tests {
         "+def add(a, b):\n",
         "+    return a + b\n",
     );
+
+    #[test]
+    fn capped_deterministic_findings_are_reported_not_silently_hidden() {
+        // 7 TODO comments, default cap 5: prepare lists all, finalize says 2 are hidden.
+        let mut diff = String::from(concat!(
+            "diff --git a/lib.rs b/lib.rs\n",
+            "new file mode 100644\n",
+            "--- /dev/null\n",
+            "+++ b/lib.rs\n",
+            "@@ -0,0 +1,7 @@\n",
+        ));
+        for n in 0..7 {
+            diff.push_str(&format!("+// TODO item {n}\n"));
+        }
+        let prep = as_json(&review_prepare(&json!({ "diff": diff })));
+        assert_eq!(prep["deterministic_findings_total"], 7);
+        assert!(
+            prep["deterministic_findings_note"]
+                .as_str()
+                .unwrap()
+                .contains("not_shown")
+        );
+        let out = as_json(&review_finalize(&json!({ "diff": diff, "issues": [] })));
+        assert_eq!(out["total_issues"], 5);
+        assert_eq!(out["not_shown"], 2);
+        assert!(
+            out["not_shown_note"]
+                .as_str()
+                .unwrap()
+                .contains("max_findings")
+        );
+    }
 }
