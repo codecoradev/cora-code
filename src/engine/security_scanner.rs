@@ -166,6 +166,7 @@ static COMPILED_PATTERNS: LazyLock<Vec<(String, String, Regex, Severity)>> = Laz
 ///
 /// Only scans added lines (not removed/context) to reduce false positives.
 /// Returns findings sorted by severity (worst first).
+#[cfg_attr(not(test), allow(dead_code))] // callers use scan_security_in; kept for tests/API
 pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFinding> {
     scan_security_in(&scan_input::from_chunks(chunks), max_findings)
 }
@@ -198,6 +199,17 @@ pub fn scan_security_in(files: &[ScanFile<'_>], max_findings: usize) -> Vec<Rule
 
         for &(line_no, content) in &file.lines {
             if line_no == 0 {
+                continue;
+            }
+
+            // Inline test code (`#[cfg(test)]` blocks): only the
+            // high-confidence secret list, like whole test files (#663).
+            if file.test_lines.contains(&line_no) {
+                high_confidence_line(path, line_no, content, &mut findings);
+                if findings.len() >= max_findings {
+                    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+                    return findings;
+                }
                 continue;
             }
 
@@ -257,25 +269,30 @@ fn scan_high_confidence_secrets(
         if line_no == 0 {
             continue;
         }
-        // Placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are ignored inside.
-        if crate::engine::secret_patterns::find_high_confidence(content).is_none() {
-            continue;
-        }
-        findings.push(RuleFinding {
-            rule_id: "secrets/high-confidence-in-test-or-doc".to_string(),
-            file: path.to_string(),
-            line: line_no,
-            severity: Severity::Major,
-            title: "Credential-like secret in test/doc file".to_string(),
-            body: format!(
-                "Static security scanner detected a credential-like value in {path}:{line_no}. \
-                 Test/doc paths are not exempt from secret scanning; verify it is a fake."
-            ),
-        });
+        high_confidence_line(path, line_no, content, findings);
         if findings.len() >= max_findings {
             return;
         }
     }
+}
+
+/// The high-confidence secret check for one line of test/doc code.
+fn high_confidence_line(path: &str, line_no: u32, content: &str, findings: &mut Vec<RuleFinding>) {
+    // Placeholder keys (e.g. AKIAIOSFODNN7EXAMPLE) are ignored inside.
+    if crate::engine::secret_patterns::find_high_confidence(content).is_none() {
+        return;
+    }
+    findings.push(RuleFinding {
+        rule_id: "secrets/high-confidence-in-test-or-doc".to_string(),
+        file: path.to_string(),
+        line: line_no,
+        severity: Severity::Major,
+        title: "Credential-like secret in test/doc file".to_string(),
+        body: format!(
+            "Static security scanner detected a credential-like value in {path}:{line_no}. \
+             Test/doc paths are not exempt from secret scanning; verify it is a fake."
+        ),
+    });
 }
 
 /// Check if a file path looks like a test/spec/fixture/mock/example file.
@@ -284,28 +301,7 @@ fn scan_high_confidence_secrets(
 /// `attestation`, `protest` are not mistaken for test files (#87). A segment
 /// is any run between `/`, `_`, `-`, and `.` separators.
 fn is_test_file(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    for seg in lower.split(['/', '_', '-', '.']) {
-        if matches!(
-            seg,
-            "test"
-                | "tests"
-                | "testing"
-                | "tested"
-                | "__tests__"
-                | "spec"
-                | "specs"
-                | "fixture"
-                | "fixtures"
-                | "mock"
-                | "mocks"
-                | "example"
-                | "examples"
-        ) {
-            return true;
-        }
-    }
-    false
+    crate::engine::test_context::is_test_path(path)
 }
 
 /// Check if a file path is a documentation or non-code file.
@@ -1376,6 +1372,44 @@ mod tests {
         assert!(
             findings.is_empty(),
             "verify=False in docstring should be suppressed"
+        );
+    }
+
+    #[test]
+    fn inline_test_blocks_only_report_high_confidence_secrets() {
+        use crate::engine::scanner::FileEntry;
+        let content = "\
+fn real() {}
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let c = Cfg { api_key: \"sk-test-123\".into() };
+        let aws = \"AKIAABCDEFGHIJKLMNOP\";
+    }
+}
+";
+        let entry = FileEntry {
+            path: "src/lib.rs".to_string(),
+            lines: content.lines().count(),
+            content: content.to_string(),
+        };
+        let files = crate::engine::scan_input::from_entries(std::slice::from_ref(&entry));
+        let findings = scan_security_in(&files, 100);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| f.rule_id == "crypto/hardcoded-secret"),
+            "fixture secret in a test block: {:?}",
+            findings
+                .iter()
+                .map(|f| (&f.rule_id, f.line))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.rule_id == "secrets/high-confidence-in-test-or-doc" && f.line == 6),
+            "a real-looking AWS key in a test block must still be reported"
         );
     }
 }

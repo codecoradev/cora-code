@@ -46,6 +46,21 @@ pub fn skip_patterns(config: &Config) -> Vec<String> {
     crate::index::skip_patterns_from_config(Some(config)).unwrap_or_default()
 }
 
+/// Switch test awareness off when `rules_engine.include_tests` is set (#663).
+fn scan_files_for<'a>(
+    files: Vec<crate::engine::scan_input::ScanFile<'a>>,
+    config: &Config,
+) -> Vec<crate::engine::scan_input::ScanFile<'a>> {
+    if config.rules_config.include_tests {
+        files
+            .into_iter()
+            .map(crate::engine::scan_input::ScanFile::ignoring_tests)
+            .collect()
+    } else {
+        files
+    }
+}
+
 /// Run every deterministic check on a parsed diff.
 pub fn run(chunks: &[FileChunk], config: &Config, bridge: &IndexBridge) -> DeterministicReport {
     // Scanners run uncapped: `rules_engine.max_findings` is enforced by
@@ -57,11 +72,12 @@ pub fn run(chunks: &[FileChunk], config: &Config, bridge: &IndexBridge) -> Deter
         max_findings: 0,
         ..config.rules_config.clone()
     };
+    let files = scan_files_for(crate::engine::scan_input::from_chunks(chunks), config);
 
     DeterministicReport {
-        rules: rules::run_rules(chunks, &uncapped_rules),
-        secrets: secrets_scanner::scan_secrets(chunks, max),
-        security: security_scanner::scan_security(chunks, max),
+        rules: rules::run_rules_in(&files, &uncapped_rules),
+        secrets: secrets_scanner::scan_secrets_in(&files, max),
+        security: security_scanner::scan_security_in(&files, max),
         index_unused: index_scanner::scan_unused_imports(bridge, chunks, max, &skip),
         index_dead: index_scanner::scan_dead_code_in_review(bridge, chunks, max, &skip),
         index_breaking: index_scanner::scan_breaking_changes(bridge, chunks, max, &skip),
@@ -78,7 +94,7 @@ pub fn run_files(
     files: &[crate::engine::scanner::FileEntry],
     config: &Config,
 ) -> DeterministicReport {
-    let scan_files = crate::engine::scan_input::from_entries(files);
+    let scan_files = scan_files_for(crate::engine::scan_input::from_entries(files), config);
     let uncapped_rules = crate::engine::rules::types::RulesConfig {
         max_findings: 0,
         ..config.rules_config.clone()

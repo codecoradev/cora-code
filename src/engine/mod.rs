@@ -31,6 +31,7 @@ pub mod secret_patterns;
 pub mod secrets_scanner;
 pub mod security_scanner;
 pub mod static_analysis;
+pub mod test_context;
 pub mod types;
 
 // Re-export commonly used types from other modules for convenience

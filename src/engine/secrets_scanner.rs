@@ -113,6 +113,7 @@ static TEST_FIXTURE_RE: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// Returns findings capped at `max_findings`. Secret values are masked in the
 /// message body.
+#[cfg_attr(not(test), allow(dead_code))] // callers use scan_secrets_in; kept for tests/API
 pub fn scan_secrets(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFinding> {
     scan_secrets_in(&scan_input::from_chunks(chunks), max_findings)
 }
@@ -131,7 +132,8 @@ pub fn scan_secrets_in(files: &[ScanFile<'_>], max_findings: usize) -> Vec<RuleF
         let is_fixture = TEST_FIXTURE_RE.is_match(file_path);
 
         for &(line_no, content) in &file.lines {
-            if is_fixture {
+            // Inline test blocks behave like fixture paths (#663).
+            if is_fixture || file.test_lines.contains(&line_no) {
                 if let Some((pat, matched)) =
                     crate::engine::secret_patterns::find_high_confidence(content)
                 {

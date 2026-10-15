@@ -462,7 +462,18 @@ rules_engine:
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
 | `max_findings` | `int` | `50` | Max deterministic findings shown per run; Critical and Major are never hidden (`0` or `null` = unlimited). See below |
+| `include_tests` | `bool` | `false` | Scan test code like any other code (see "Test code" below) |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
+
+#### Test code
+
+Tests legitimately `unwrap()`, `println!`, clone, use `http://` fixtures and fake credentials, so by default the rules treat test code differently:
+
+- **What counts as test code:** whole files under test paths (`tests/`, `*_test.*`, `*.test.ts`, `spec/`, `__tests__/`, `fixtures/`, `examples/`), Rust `#[cfg(test)]` modules and `#[test]` functions (found by brace matching), and, in a diff, a hunk inside `mod tests`.
+- **What is skipped there:** the built-in rules `bug-unwrap`, `bug-expect`, `bug-println`, `qual-clone`, `qual-error-ignore`, `sec-hardcoded-url` and `sec-hardcoded-secret`. The secret scanners only run their high-confidence patterns (AWS keys, GitHub tokens, private keys, ...) on test code, so a real credential committed in a test is still found.
+- `bug-println` is also skipped in program entry points (`main.rs`, `src/bin/`, `examples/`, `benches/`). Other CLI modules keep the rule; use `ignore.rules` to silence it there.
+- **Not exempt:** custom rules, `bug-todo`, and everything else.
+- Set `rules_engine.include_tests: true` to scan test code like any other code. Detection is conservative: when it cannot tell (for example a diff that does not show the `mod tests` line), the line stays scanned.
 
 #### What `max_findings` caps
 
