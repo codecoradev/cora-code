@@ -314,11 +314,10 @@ async fn review_diff_inner(
                 let pp = postprocess_report(fallback.issues, &Source::Diff(&diff_chunks), config);
                 fallback.issues = pp.issues;
                 fallback.dropped_findings = pp.dropped;
-                let min_sev = config.hook.min_severity_level();
-                fallback.should_block = fallback
-                    .issues
-                    .iter()
-                    .any(|issue| issue.severity <= min_sev);
+                fallback.should_block = crate::engine::finalize::blocks(
+                    &fallback.issues,
+                    config.hook.min_severity_level(),
+                );
                 return Ok(fallback);
             }
             return Err(e);
@@ -352,13 +351,8 @@ async fn review_diff_inner(
     response.dropped_findings = pp.dropped;
 
     // Calculate should_block based on min_severity
-    let min_severity = config.hook.min_severity_level();
-    // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above
-    // min_severity" means Ord value <= min_severity.
-    response.should_block = response
-        .issues
-        .iter()
-        .any(|issue| issue.severity <= min_severity);
+    response.should_block =
+        crate::engine::finalize::blocks(&response.issues, config.hook.min_severity_level());
 
     debug!(
         issues = response.issues.len(),

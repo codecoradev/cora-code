@@ -767,11 +767,32 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
     ));
 
     match result {
-        Ok(response) => {
+        Ok(mut response) => {
+            // Honor `min_severity` (default: info = everything), then gate on
+            // what is reported. `should_block` still follows the project's
+            // `hook.min_severity`.
+            let min_severity = params
+                .get("min_severity")
+                .and_then(|v| v.as_str())
+                .map_or(crate::engine::Severity::Info, |s| {
+                    crate::engine::Severity::from_str_lossy(s)
+                });
+            let shaped = crate::engine::finalize::shape(
+                &mut response,
+                &config,
+                &crate::engine::finalize::ShapeOptions {
+                    min_severity,
+                    filter: true,
+                    gate: true,
+                    ci: false,
+                },
+            );
+            let should_block =
+                crate::engine::finalize::blocks(&response.issues, config.hook.min_severity_level());
             let json = serde_json::json!({
                 "summary": response.summary,
                 "total_issues": response.issues.len(),
-                "should_block": response.should_block,
+                "should_block": should_block,
                 "issues": response.issues.iter().map(|i| serde_json::json!({
                     "title": i.title,
                     "severity": i.severity.label(),
@@ -780,14 +801,12 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
                     "type": i.issue_type,
                     "body": i.body,
                 })).collect::<Vec<_>>(),
-                "gate": if config.quality_gate.enabled {
-                    let gate = crate::engine::quality_gate::evaluate(&response.issues, &config.quality_gate);
-                    serde_json::json!({
+                "gate": match &shaped.gate {
+                    Some(gate) => serde_json::json!({
                         "status": format!("{:?}", gate.status),
                         "total_findings": gate.total_findings,
-                    })
-                } else {
-                    serde_json::json!({"enabled": false})
+                    }),
+                    None => serde_json::json!({"enabled": false}),
                 },
             });
             ToolResult::text(serde_json::to_string_pretty(&json).unwrap_or_default())

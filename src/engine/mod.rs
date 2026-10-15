@@ -7,6 +7,7 @@ pub mod debt_tracker;
 pub mod deterministic;
 pub mod diff_parser;
 pub mod enclosing;
+pub mod finalize;
 pub mod index_bridge;
 pub mod index_scanner;
 pub mod inline_suppress;

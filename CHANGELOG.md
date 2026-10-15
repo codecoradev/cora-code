@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Bumped `rustls` 0.23.45 → 0.23.46 and `quinn-proto` 0.11.16 → 0.11.19** (RUSTSEC-2026-0338/0339/0340/0341/0342 and RUSTSEC-2026-0346/0347/0348/0349), plus the yanked `chacha20` 0.10.1 → 0.10.2. Lockfile-only patch bumps; this was failing the `Security Audit (CVE)` job on every PR.
 
+### Changed
+
+- **One `finalize` module owns the result tail of review, scan, commit and MCP (#648).** `engine::finalize` (`shape`, `shape_issues`, `blocks`, `exit_code`, `save_debt`, `save_history`) replaces six hand-copied versions of severity filtering, `should_block`, quality gate, exit code, debt snapshot and review history. Behavior of `cora review` (single and chunked) and `cora scan` is unchanged. Fixed along the way: the MCP `cora.review_diff` tool now honors its `min_severity` parameter and evaluates the quality gate on the reported findings; `cora commit` now records its review in the review history (`command = "commit"`).
+
 ## [0.18.0] - 2026-10-09
 
 ### Security

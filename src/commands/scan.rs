@@ -6,8 +6,8 @@ use tracing::debug;
 
 use crate::config::schema::Config;
 use crate::engine::ReviewIssue;
+use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
 use crate::engine::postprocess::{Source, dropped_warning, postprocess_report};
-use crate::engine::review_store;
 use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
 use crate::formatters::{OutputFormat, formatter_for};
@@ -254,15 +254,23 @@ pub async fn execute_scan(
     //    apply ignore.rules and inline cora-ignore markers. Deterministic
     //    findings survive an LLM failure (#595).
     all_issues.extend(index_findings);
-    let (all_issues, dropped) = finalize_issues(config, &files, all_issues);
+    let (mut all_issues, dropped) = finalize_issues(config, &files, all_issues);
     if let Some(w) = dropped_warning(dropped, config) {
         eprintln!("{}", w.yellow());
     }
     let issue_count = all_issues.len();
-    let min_severity = config.hook.min_severity_level();
-    // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above
-    // min_severity" means Ord value <= min_severity.
-    let should_block = all_issues.iter().any(|i| i.severity <= min_severity);
+    // Scan lists every finding; only `hook.min_severity` decides blocking.
+    let shaped = finalize::shape_issues(
+        &mut all_issues,
+        config,
+        &ShapeOptions {
+            min_severity: config.hook.min_severity_level(),
+            filter: false,
+            gate: false,
+            ci: false,
+        },
+    );
+    let should_block = shaped.should_block;
 
     let response = crate::engine::ScanResponse {
         issues: all_issues,
@@ -305,44 +313,19 @@ pub async fn execute_scan(
     }
 
     // 7. Save scan findings to cora.db (best-effort)
-    {
-        let commit = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
-        let branch = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let record = review_store::ReviewRecord {
+    finalize::save_history(
+        &HistoryEntry {
             command: "scan",
-            project_root: &cwd,
-            commit_hash: commit.as_deref(),
-            branch: branch.as_deref(),
             summary: &response.summary,
-            gate_status: "disabled",
             files_scanned: response.files_scanned,
             lines_scanned: response.lines_scanned,
-            should_block: response.should_block,
             tokens: response.tokens_used.as_ref(),
-            issues: &response.issues,
-        };
-        // Best-effort: a history-write failure never fails the run.
-        review_store::persist_review_best_effort(&record);
-    }
+        },
+        &response.issues,
+        &shaped,
+    );
 
-    if response.should_block && config.hook.mode == "block" {
-        Ok(2)
-    } else {
-        Ok(0)
-    }
+    Ok(shaped.exit_code)
 }
 
 /// Run the deterministic scanners (secrets, security) over whole files and
