@@ -366,7 +366,10 @@ fn secret_assign_rhs(line: &str) -> Option<&str> {
 /// `{0}`, `{:?}`, `%s`, `%v`. Not a literal secret.
 fn is_format_placeholder(inner: &str) -> bool {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^(?:\{[\w:.?#]*\}|%[sdvq])$").expect("placeholder regex must compile")
+        // Digits only as a positional index (`{0}`): a name with digits inside
+        // braces (`{hunter2hunter2}`) is more likely a value than a template.
+        Regex::new(r"^(?:\{(?:\d+|[A-Za-z_][A-Za-z_]{0,31})?(?::[^{}]*)?\}|%[sdvq])$")
+            .expect("placeholder regex must compile")
     });
     RE.is_match(inner)
 }
@@ -386,6 +389,9 @@ fn colon_value_is_not_a_literal(line: &str, path: &str) -> bool {
         Regex::new(r#"(?i)(?:password|passwd|pwd|secret|api_?key|token)["']?\s*:"#)
             .expect("colon regex must compile")
     });
+    // EVERY entry on the line must be a non-literal: `{ token: id, password:
+    // "hunter2hunter2" }` has a real secret after a harmless first entry.
+    let mut entries = 0;
     for m in COLON_RE.find_iter(line) {
         let rest = &line[m.end()..];
         // `a::token`, `x := ...` and `token:=` are not `name: value` entries.
@@ -396,9 +402,14 @@ fn colon_value_is_not_a_literal(line: &str, path: &str) -> bool {
         if rhs.is_empty() || starts_with_literal(rhs) {
             return false;
         }
-        return true;
+        // An env read / wrapper with a literal fallback is judged on the
+        // literal: `secret: env::var("X").unwrap_or("hunter2hunter2".into())`.
+        if embedded_literal(rhs) == Some(true) {
+            return false;
+        }
+        entries += 1;
     }
-    false
+    entries > 0
 }
 
 /// A quoted value that is nothing but a reference: `${X}`, `$X`, `$(cmd)`,
@@ -1528,6 +1539,49 @@ mod tests {
         assert!(!colon_value_is_not_a_literal(
             "password: hunter2hunter2",
             "app.yaml"
+        ));
+    }
+
+    #[test]
+    fn a_harmless_first_entry_does_not_hide_a_later_real_secret() {
+        for (line, path) in [
+            (
+                "const c = { token: ident, password: \"hunter2hunter2\" };",
+                "a.ts",
+            ),
+            (
+                "Cfg { user: name, api_key: \"sk_live_abcdefghijkl\" }",
+                "a.rs",
+            ),
+        ] {
+            assert!(
+                !post_match_filter_for_path("crypto/hardcoded-secret", line, path),
+                "must stay flagged: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_reads_with_a_literal_fallback_stay_flagged_in_colon_entries() {
+        let line = "webhook_secret: env::var(\"X\").unwrap_or(\"hunter2hunter2\".into()),";
+        assert!(!post_match_filter_for_path(
+            "crypto/hardcoded-secret",
+            line,
+            "config.rs"
+        ));
+    }
+
+    #[test]
+    fn braced_values_with_digits_are_not_placeholders() {
+        assert!(!is_format_placeholder("{hunter2hunter2}"));
+        assert!(!is_format_placeholder("{Passw0rd!}"));
+        for ok in ["{}", "{0}", "{name}", "{api_key}", "{:?}", "{0:>8}", "%s"] {
+            assert!(is_format_placeholder(ok), "{ok}");
+        }
+        assert!(!post_match_filter_for_path(
+            "crypto/hardcoded-secret",
+            "password = \"{hunter2hunter2}\"",
+            "app.py"
         ));
     }
 }
