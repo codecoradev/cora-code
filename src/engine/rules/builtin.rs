@@ -568,7 +568,7 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
         "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line, path),
         "sec-hardcoded-url" => is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
-        "injection/sql-concat" => is_false_positive_sql_concat(line),
+        "injection/sql-concat" | "sec-sql-concat" => is_false_positive_sql_concat(line),
         "config/debug-enabled" => is_false_positive_debug(line),
         "injection/eval" => is_false_positive_eval(line),
         "crypto/weak-hash" => is_false_positive_weak_hash(line),
@@ -799,6 +799,62 @@ fn is_false_positive_sql_concat(line: &str) -> bool {
         return true;
     }
 
+    // `query += ...` is a concatenation by itself, whatever the line holds.
+    static QUERY_APPEND_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bquery\s*\+=").expect("query regex must compile"));
+    if QUERY_APPEND_RE.is_match(line) {
+        return false;
+    }
+
+    // A keyword inside prose is not SQL: `format!("Insert failed: {e}")`,
+    // `format!("Deleted tag '{}'")` have no SELECT..FROM / INSERT INTO /
+    // UPDATE..SET / DELETE FROM structure.
+    static SQL_SHAPE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"(?i)\bSELECT\b.+\bFROM\b|\bINSERT\s+INTO\b|\bUPDATE\b\s+[\w.{}"`]+\s+SET\b|\bDELETE\s+FROM\b"#,
+        )
+        .expect("sql shape regex must compile")
+    });
+    if !SQL_SHAPE_RE.is_match(line) {
+        return true;
+    }
+
+    // Real SQL: it is injection-shaped only when a value is spliced in
+    // (`= '{x}'`, `WHERE id = {id}`, `"..." + user`). Identifiers and SET
+    // fragments (`FROM {table}`, `SET {cols}`) cannot be bound as parameters,
+    // and `?{n}` / `${n}` are parameter indexes.
+    !has_value_interpolation(line)
+}
+
+/// Does a SQL line splice a VALUE into the statement: string concatenation
+/// with `+`, or a `{x}` / `${x}` interpolation in a value position (after `=`,
+/// `<`, `>`, `LIKE`, `IN (`, a quote, or inside a `VALUES (...)` list)?
+fn has_value_interpolation(line: &str) -> bool {
+    static CONCAT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"["'`]\s*\+\s*[\w(]|[\w)]\s*\+\s*["'`]"#).expect("concat regex must compile")
+    });
+    static HOLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\$?\{[^{}]*\}").expect("hole regex must compile"));
+    if CONCAT_RE.is_match(line) {
+        return true;
+    }
+    let has_values_list = line.to_ascii_uppercase().contains("VALUES");
+    for hole in HOLE_RE.find_iter(line) {
+        let mut before = line[..hole.start()].trim_end();
+        // A parameter index (`?{n}`, `${n}` inside `$1`-style SQL, `:{n}`, `@{n}`).
+        if before.ends_with(['?', ':', '@']) || line[..hole.start()].ends_with('$') {
+            continue;
+        }
+        before = before.trim_end_matches(['\\', '(']).trim_end();
+        let upper = before.to_ascii_uppercase();
+        let value_position = before.ends_with(['=', '<', '>', '\'', '"', '`', '%'])
+            || upper.ends_with("LIKE")
+            || upper.ends_with(" IN")
+            || (has_values_list && (before.ends_with(',') || line[..hole.start()].ends_with('(')));
+        if value_position {
+            return true;
+        }
+    }
     false
 }
 
@@ -1583,5 +1639,65 @@ mod tests {
             "password = \"{hunter2hunter2}\"",
             "app.py"
         ));
+    }
+
+    // ─── #662: SQL rules flag prose and identifier interpolation ───
+
+    fn sql_fp(line: &str) -> bool {
+        post_match_filter_for_path("injection/sql-concat", line, "x.rs")
+            && post_match_filter_for_path("sec-sql-concat", line, "x.rs")
+    }
+
+    #[test]
+    fn prose_with_a_sql_word_is_not_sql() {
+        for line in [
+            r#".map_err(|e| format!("Insert failed: {e}"))?;"#,
+            r#"text: format!("Deleted tag '{}' ({} memories updated)", tag, count),"#,
+            r#"let msg = format!("Update available: {version}");"#,
+            r#"format!("Select an option from the list")"#,
+        ] {
+            assert!(sql_fp(line), "prose must be suppressed: {line}");
+        }
+    }
+
+    #[test]
+    fn identifier_and_fragment_interpolation_is_not_value_injection() {
+        for line in [
+            r#"self.conn.prepare(&format!("SELECT * FROM {table} LIMIT 0"))"#,
+            r#"let sql = format!("UPDATE documents SET {set_sql} WHERE id = ?{param_idx}");"#,
+            r#"let update_sql = format!("UPDATE {table} SET {column} = ?1 WHERE id = ?2");"#,
+            r#"let sql = format!("SELECT id, {column} FROM {table} WHERE {column} IS NOT NULL");"#,
+            r#"format!("DELETE FROM {table} WHERE id = ?1")"#,
+        ] {
+            assert!(
+                sql_fp(line),
+                "identifier-only SQL must be suppressed: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn spliced_values_are_still_injection() {
+        for line in [
+            r#"let q = format!("SELECT * FROM users WHERE name = '{}'", name);"#,
+            r#"let q = format!("DELETE FROM t WHERE id = {id}");"#,
+            r#"cursor.execute(f"SELECT * FROM t WHERE x = '{x}'")"#,
+            "db.query(`SELECT * FROM t WHERE id = ${id}`)",
+            r#"let q = "SELECT * FROM t WHERE id = " + id;"#,
+            r#"format!("INSERT INTO t (a) VALUES ('{}', {})", a, b)"#,
+            r#"format!("SELECT * FROM t WHERE name LIKE '%{term}%'")"#,
+            r#"format!("SELECT * FROM t WHERE id IN ({ids})")"#,
+        ] {
+            assert!(
+                !post_match_filter_for_path("injection/sql-concat", line, "x.rs"),
+                "must stay flagged: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_append_concatenation_stays_flagged() {
+        let line = r#"query += " AND name = '" + name + "'""#;
+        assert!(!post_match_filter_for_path("sec-sql-concat", line, "a.py"));
     }
 }
