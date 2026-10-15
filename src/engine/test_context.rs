@@ -62,11 +62,19 @@ pub fn hunk_header_is_test_module(header: &str) -> bool {
 /// char literals and after `//`. Approximate on purpose (raw strings and
 /// multi-line literals are not tracked); an error only shrinks or grows the
 /// exempt region, never invents findings.
-fn brace_delta(line: &str) -> i32 {
+fn brace_delta(line: &str, in_block: &mut bool) -> i32 {
     let mut delta = 0;
     let mut chars = line.chars().peekable();
     let mut in_str = false;
     while let Some(c) = chars.next() {
+        // `/* ... */` (may span lines): braces inside are not code.
+        if *in_block {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                *in_block = false;
+            }
+            continue;
+        }
         if in_str {
             match c {
                 '\\' => {
@@ -95,6 +103,10 @@ fn brace_delta(line: &str) -> i32 {
                 }
             }
             '"' => in_str = true,
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                *in_block = true;
+            }
             '/' if chars.peek() == Some(&'/') => break,
             '\'' => {
                 // Char literal ('{', '\'') vs lifetime ('a): only skip literals.
@@ -116,6 +128,22 @@ fn brace_delta(line: &str) -> i32 {
         }
     }
     delta
+}
+
+/// Does this (trimmed) line start a Rust ITEM or macro item (`fn`, `impl`,
+/// `pub struct`, `use`, `#[attr]`, `thread_local! {`, ...)? Used by the
+/// indentation safety net: content of a multi-line string at column 0 (a TOML
+/// or JSON fixture) is not an item and must not abandon a test region, but
+/// code that follows the real end of the region is always an item.
+fn looks_like_item_start(trimmed: &str) -> bool {
+    use std::sync::LazyLock;
+    static ITEM_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^(?:#\[|#!\[|(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|default|extern(?:\s+"[^"]*")?)\s+)*(?:fn|struct|enum|union|trait|impl|mod|use|type|static|const|extern)\b|macro_rules!\s|[A-Za-z_][\w:]*!\s*[(\[{])"#,
+        )
+        .expect("item regex must compile")
+    });
+    ITEM_RE.is_match(trimmed)
 }
 
 /// Is this attribute line one that marks the next item as test code?
@@ -142,8 +170,10 @@ fn is_test_attribute(trimmed: &str) -> bool {
 /// would hide real code, so the unfinished region is dropped instead.
 pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32> {
     let mut out = HashSet::new();
-    // (lines of the region so far, brace depth, seen the opening brace)
-    let mut region: Option<(Vec<u32>, i32, bool)> = None;
+    // (lines of the region so far, brace depth, seen the opening brace,
+    // indentation of the decorated item)
+    let mut region: Option<(Vec<u32>, i32, bool, usize)> = None;
+    let mut in_block = false;
     let mut pending: Vec<u32> = Vec::new();
     let mut prev: Option<u32> = None;
 
@@ -151,23 +181,41 @@ pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32
         if prev.is_some_and(|p| n != p + 1) {
             // Discontinuous: drop what we cannot finish (the lines already
             // collected stay marked: they were inside the region).
-            if let Some((seen, _, _)) = region.take() {
+            if let Some((seen, _, _, _)) = region.take() {
                 out.extend(seen);
             }
             pending.clear();
+            in_block = false;
         }
         prev = Some(n);
         let trimmed = text.trim();
 
-        if let Some((seen, depth, opened)) = region.as_mut() {
+        if let Some((seen, depth, opened, indent)) = region.as_mut() {
+            // Safety net against a parser differential: inside the region,
+            // an ITEM may not start at or left of the decorated item's
+            // indentation, and the closing `}` must balance the count. If one
+            // does, our brace matching disagrees with the compiler (a block
+            // comment, a multi-line string, a hostile `{`), so vouch for
+            // nothing. Non-item text at column 0 (a TOML fixture inside a raw
+            // string) is fine.
+            let ind = text.len() - text.trim_start().len();
+            let closes = trimmed.starts_with('}');
+            if ind <= *indent && !closes && looks_like_item_start(trimmed) {
+                region = None;
+                continue;
+            }
             seen.push(n);
-            *depth += brace_delta(text);
+            *depth += brace_delta(text, &mut in_block);
             if text.contains('{') {
                 *opened = true;
             }
+            if closes && ind <= *indent && *depth > 0 {
+                region = None; // the item's own `}` must balance the count
+                continue;
+            }
             let done = (*opened && *depth <= 0) || (!*opened && trimmed.ends_with(';'));
             if done {
-                let (seen, _, _) = region.take().expect("region present");
+                let (seen, _, _, _) = region.take().expect("region present");
                 out.extend(seen);
             }
             continue;
@@ -187,17 +235,18 @@ pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32
             // The decorated item starts here.
             let mut seen = std::mem::take(&mut pending);
             seen.push(n);
-            let depth = brace_delta(text);
+            let depth = brace_delta(text, &mut in_block);
             let opened = text.contains('{');
+            let indent = text.len() - text.trim_start().len();
             if (opened && depth <= 0) || (!opened && trimmed.ends_with(';')) {
                 out.extend(seen);
             } else {
-                region = Some((seen, depth, opened));
+                region = Some((seen, depth, opened, indent));
             }
         }
     }
     if partial_view {
-        if let Some((seen, _, _)) = region {
+        if let Some((seen, _, _, _)) = region {
             out.extend(seen);
         }
     }
@@ -340,8 +389,13 @@ fn more_production() { x.unwrap(); }";
         // Whole-file view: no region is vouched for at all.
         let whole = rust_test_lines(&lines, false);
         assert!(!whole.contains(&6) && !whole.contains(&7), "{whole:?}");
-        // Partial view (a diff): what was seen inside the region stays marked.
-        assert!(rust_test_lines(&lines, true).contains(&2));
+        // Partial view (a diff): the column-0 `fn production` inside the
+        // still-open region is a disagreement, so nothing is vouched for.
+        let partial = rust_test_lines(&lines, true);
+        assert!(
+            !partial.contains(&6) && !partial.contains(&7),
+            "{partial:?}"
+        );
     }
 
     #[test]
@@ -352,5 +406,109 @@ fn more_production() { x.unwrap(); }";
             (1..=4).all(|n| set.contains(&n)) && !set.contains(&5),
             "{set:?}"
         );
+    }
+
+    #[test]
+    fn a_block_comment_brace_cannot_extend_the_test_region() {
+        // `/* { */` is a comment: the test fn ends on line 2, `production`
+        // is NOT test code. (Counting the comment brace used to extend the
+        // region over it.)
+        let src = "\
+#[cfg(test)]
+fn t() { /* { */ }
+fn production() { danger.unwrap(); }
+/* } */";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(set.contains(&2));
+        assert!(!set.contains(&3), "{set:?}");
+    }
+
+    #[test]
+    fn a_new_top_level_item_inside_an_open_region_abandons_it() {
+        // Multi-line raw string the matcher cannot see: the open brace inside
+        // makes the region look unfinished, and a column-0 item follows. Vouch
+        // for nothing rather than exempt `production`.
+        let src = "\
+#[cfg(test)]
+fn t() {
+    let s = r#\"
+{
+\"#;
+}
+fn production() { danger.unwrap(); }
+/* } */";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(!set.contains(&7), "{set:?}");
+        let partial = rust_test_lines(&numbered(src), true);
+        assert!(!partial.contains(&7), "{partial:?}");
+    }
+
+    #[test]
+    fn multi_line_block_comments_hide_their_braces() {
+        let src =
+            "#[cfg(test)]\nmod tests {\n    /* open {\n       { */\n    fn a() {}\n}\nfn real() {}";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(
+            (1..=6).all(|n| set.contains(&n)) && !set.contains(&7),
+            "{set:?}"
+        );
+    }
+
+    #[test]
+    fn indented_modules_close_at_their_own_indentation() {
+        let src = "mod outer {\n    #[cfg(test)]\n    mod tests {\n        fn a() {}\n    }\n    fn prod() {}\n}";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(
+            (2..=5).all(|n| set.contains(&n)) && !set.contains(&6),
+            "{set:?}"
+        );
+    }
+
+    #[test]
+    fn column_zero_fixture_text_inside_a_test_module_does_not_abandon_it() {
+        // A TOML fixture in a raw string, flush left: not Rust items.
+        let src = "\
+#[cfg(test)]
+mod tests {
+    fn t() {
+        let toml = r#\"
+[embed]
+api_key = \"sk-test\"
+\"#;
+    }
+}
+fn production() {}";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!((1..=9).all(|n| set.contains(&n)), "{set:?}");
+        assert!(!set.contains(&10));
+    }
+
+    #[test]
+    fn item_start_detection() {
+        for yes in [
+            "fn a() {",
+            "pub fn a() {",
+            "pub(crate) async fn a() {",
+            "unsafe impl X for Y {",
+            "impl<T> Z for T {",
+            "struct S;",
+            "use std::fs;",
+            "#[derive(Debug)]",
+            "thread_local! {",
+            "macro_rules! m {",
+            "extern \"C\" fn f() {",
+        ] {
+            assert!(looks_like_item_start(yes), "{yes}");
+        }
+        for no in [
+            "api_key = \"x\"",
+            "[embed]",
+            "{",
+            "\"text\"",
+            "foo.bar();",
+            "}",
+        ] {
+            assert!(!looks_like_item_start(no), "{no}");
+        }
     }
 }
