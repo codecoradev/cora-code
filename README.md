@@ -32,7 +32,7 @@
 - 🧠 **Brain Mode** — hybrid semantic search (FTS5 + vector KNN + graph) with RRF fusion
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
-- 🔌 **MCP server** — 18 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, ...)
+- 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
 - 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
 
@@ -95,6 +95,8 @@ cora auth login
 ```
 
 Pick a provider, enter your API key. Done. Provider env vars (`ZAI_API_KEY`, `OPENAI_API_KEY`, etc.) are auto-detected.
+
+> **No key? Still useful.** `cora review` and `cora scan` run the deterministic checks (rules, secrets, security) with no LLM configured, and your AI coding agent can do the AI review itself: see [Review with your agent](docs/usage.md#review-with-your-agent-no-llm-setup).
 
 ### Review
 
@@ -211,7 +213,7 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora config validate` | Validate configuration |
 | `cora providers` | List available LLM providers |
 | `cora profile list` | List quality profiles (strict, balanced, lax) |
-| `cora mcp` | Start MCP server (18 tools) for AI coding agents |
+| `cora mcp` | Start MCP server (22 tools) for AI coding agents |
 | `cora serve` | Start MCP server + auto-reindex on startup |
 | `cora install` | Auto-detect and configure AI coding agents |
 | `cora hook install` | Install pre-commit hook |

@@ -226,6 +226,15 @@ pub fn merge_rule_findings(
             });
         if let Some(idx) = holder {
             let holder = &mut result[idx];
+            // The judge's issue stands in for the scanner finding, so it must
+            // never be weaker than it: a judge (or a prompt-injected model)
+            // that reports the same line as "info" cannot downgrade a
+            // CRITICAL scanner finding, and the surviving issue carries the
+            // scanner's rule id (so the cap and rule-scoped suppression see it).
+            holder.severity = holder.severity.min(finding.severity);
+            if holder.rule_id.is_none() {
+                holder.rule_id = Some(finding.rule_id.clone());
+            }
             holder.also_matches.push(finding.rule_id.clone());
             holder.also_matches.push(finding.title.clone());
             debug!(
@@ -550,7 +559,9 @@ mod tests {
                 .also_matches
                 .contains(&"[bug-unwrap] Rule: bug-unwrap".to_string())
         );
-        assert!(merged[0].rule_id.is_none());
+        // The surviving issue carries the scanner's id: it stands in for the
+        // finding, so the cap and rule-scoped suppression must see it.
+        assert_eq!(merged[0].rule_id.as_deref(), Some("bug-unwrap"));
     }
 
     #[test]
@@ -666,5 +677,27 @@ mod tests {
             !findings.iter().any(|f| f.rule_id == "sec-hardcoded-url"),
             "localhost http URLs should be allowed"
         );
+    }
+
+    #[test]
+    fn a_judge_issue_cannot_downgrade_the_scanner_finding_it_absorbs() {
+        // Same line, same topic: the judge's "info" stands in for the
+        // CRITICAL secret finding, so it must not be weaker than it.
+        let mut weak = llm_issue(3, "Hardcoded password naming nit", Some("security"));
+        weak.severity = Severity::Info;
+        let out = merge_rule_findings(vec![weak], vec![secret_finding(3)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, Severity::Critical);
+        assert_eq!(out[0].rule_id.as_deref(), Some("crypto/hardcoded-secret"));
+    }
+
+    #[test]
+    fn a_stronger_judge_issue_keeps_its_severity() {
+        let mut strong = llm_issue(3, "Hardcoded password stored in source", Some("security"));
+        strong.severity = Severity::Critical;
+        let mut finding = secret_finding(3);
+        finding.severity = Severity::Major;
+        let out = merge_rule_findings(vec![strong], vec![finding]);
+        assert_eq!(out[0].severity, Severity::Critical);
     }
 }

@@ -93,7 +93,7 @@ src/
 │   ├── mod.rs
 │   ├── protocol.rs      # JSON-RPC 2.0 types
 │   ├── server.rs        # Stdio transport + request dispatch
-│   └── tools.rs         # 18 tool handlers (review, search, brain, debt, ...)
+│   └── tools.rs         # 22 tool handlers (review, search, brain, debt, agent review, ...)
 ├── formatters/          # Output format implementations
 │   ├── mod.rs
 │   ├── pretty.rs        # Human-readable terminal output
@@ -449,7 +449,7 @@ When submitting cora to directories, aggregators, or showcases (Trendshift, etc.
 >
 > Features: diff-based AI code review, static security scanning, quality gate,
 > language-specific analyzers, secret detection, custom rule engine, code intelligence
-> (symbol index, call graph, semantic search via Brain Mode), MCP server with 18 tools,
+> (symbol index, call graph, semantic search via Brain Mode), MCP server with 22 tools,
 > SARIF output, and multi-project global database.
 
 ### Key Metrics to Mention
@@ -458,7 +458,7 @@ When submitting cora to directories, aggregators, or showcases (Trendshift, etc.
 - Lines of Rust code (26,400+)
 - CI checks (10)
 - GitHub Marketplace action published
-- MCP server with 18 tools
+- MCP server with 22 tools
 - Apache-2.0 license
 - Active development cadence
 

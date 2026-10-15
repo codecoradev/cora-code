@@ -111,6 +111,7 @@ pub fn tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "The same path given to cora.scan_prepare" },
+                    "files_fingerprint": { "type": "string", "description": "files_fingerprint from cora.scan_prepare; if given and the project changed since, the call is refused" },
                     "issues": issues_prop
                 },
                 "required": ["issues"]
@@ -143,7 +144,12 @@ fn parse_agent_issues(value: Option<&Value>) -> Result<(Vec<ReviewIssue>, usize)
     let mut ok = Vec::with_capacity(array.len());
     let mut rejected = 0;
     for item in array {
-        match serde_json::from_value::<ReviewIssue>(item.clone()) {
+        // Agents copy the style of what they were shown; accept any case.
+        let mut item = item.clone();
+        if let Some(sev) = item.get("severity").and_then(Value::as_str) {
+            item["severity"] = Value::String(sev.to_lowercase());
+        }
+        match serde_json::from_value::<ReviewIssue>(item) {
             Ok(issue) => ok.push(issue),
             Err(_) => rejected += 1,
         }
@@ -172,7 +178,7 @@ fn brief(issue: &ReviewIssue) -> Value {
     json!({
         "file": issue.file,
         "line": issue.line,
-        "severity": issue.severity.label(),
+        "severity": issue.severity.label().to_lowercase(),
         "title": issue.title,
         "rule_id": issue.rule_id,
     })
@@ -233,26 +239,34 @@ pub fn review_finalize(params: &Value) -> ToolResult {
         .map_or(Severity::Info, Severity::from_str_lossy);
 
     let bridge = IndexBridge::open_cwd();
-    let packet = review::prepare(&config, diff, None, &bridge);
+    // Finalize only needs the deterministic half; no prompts, no clippy.
+    let packet = review::prepare_deterministic(&config, diff, &bridge);
+    // Count what validation drops (admit is idempotent; review_with applies it
+    // again), so the agent is told instead of silently losing findings.
+    let submitted = issues.len();
+    let issues = admit(issues, &packet.valid_files, &Source::Diff(&packet.chunks));
+    let dropped_by_validation = submitted - issues.len();
     let mut response = match block_on(review::review_with(&AgentJudge { issues }, &config, packet))
     {
         Ok(r) => r,
         Err(e) => return ToolResult::error(format!("Review failed: {e}")),
     };
 
-    // `should_block` follows the project's hook.min_severity; the list follows
-    // the caller's min_severity.
+    // Blocking and the quality gate look at ALL findings under the project's
+    // hook.min_severity; the caller's min_severity only trims what is shown.
     let shaped = finalize::shape(
         &mut response,
         &config,
         &ShapeOptions {
-            min_severity,
-            filter: true,
+            min_severity: config.hook.min_severity_level(),
+            filter: false,
             gate: true,
             ci: false,
         },
     );
-    let should_block = finalize::blocks(&response.issues, config.hook.min_severity_level());
+    let should_block = shaped.should_block;
+    let total_found = response.issues.len();
+    response.issues.retain(|i| i.severity <= min_severity);
     finalize::save_history(
         &HistoryEntry {
             command: "review (agent)",
@@ -269,8 +283,10 @@ pub fn review_finalize(params: &Value) -> ToolResult {
         "judge": "agent",
         "summary": response.summary,
         "total_issues": response.issues.len(),
+        "total_found": total_found,
         "should_block": should_block,
         "rejected_items": rejected,
+        "dropped_by_validation": dropped_by_validation,
         "issues": response.issues.iter().map(|i| json!({
             "title": i.title,
             "severity": i.severity.label(),
@@ -287,7 +303,7 @@ pub fn review_finalize(params: &Value) -> ToolResult {
             }),
             None => json!({ "enabled": false }),
         },
-        "note": "Judged by the calling agent: advisory for developers, not a CI gate.",
+        "note": "Judged by the calling agent: advisory for developers, not a CI gate. The verdict covers only the input passed to this finalize call.",
     }))
 }
 
@@ -317,6 +333,25 @@ fn scan_root(params: &Value) -> Result<PathBuf, ToolResult> {
         )));
     }
     Ok(resolved)
+}
+
+/// Fingerprint of the scanned file set (paths and sizes). `scan_prepare` hands
+/// it out; `scan_finalize` checks it, so a project that changed between the
+/// two calls is noticed instead of silently mis-matching batches.
+fn files_fingerprint(files: &[FileEntry]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for f in files {
+        hasher.update(f.path.as_bytes());
+        hasher.update(f.content.len().to_le_bytes());
+        hasher.update([0]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn scan_files_for(
@@ -386,6 +421,7 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         "instructions": "Answer user_prompt following system_prompt with your own model. Return ONLY a JSON array shaped like response_schema (use [] if there are no issues), reporting only the files listed in `files`. Do this for every batch, collect all findings, then call cora.scan_finalize once with them as `issues`.",
         "batch": batch_idx,
         "total_batches": batches.len(),
+        "files_fingerprint": files_fingerprint(&files),
         "files": batch.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
         "system_prompt": prompts.system,
         "user_prompt": prompts.user,
@@ -413,8 +449,18 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         Err(e) => return e,
     };
 
+    if let Some(expected) = params.get("files_fingerprint").and_then(Value::as_str) {
+        if expected != files_fingerprint(&files) {
+            return ToolResult::error(
+                "The project files changed since cora.scan_prepare; run the scan again from batch 0.",
+            );
+        }
+    }
+
     let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+    let submitted = issues.len();
     let mut all = admit(issues, &paths, &Source::Files(&files));
+    let dropped_by_validation = submitted - all.len();
     let bridge = IndexBridge::open(&root);
     all.extend(crate::commands::scan::index_findings(
         &config, &bridge, &files,
@@ -458,6 +504,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         "total_issues": all.len(),
         "should_block": shaped.should_block,
         "rejected_items": rejected,
+        "dropped_by_validation": dropped_by_validation,
         "not_shown": dropped,
         "issues": all.iter().map(|i| json!({
             "title": i.title,
@@ -468,7 +515,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
             "body": i.body,
             "rule_id": i.rule_id,
         })).collect::<Vec<_>>(),
-        "note": "Judged by the calling agent: advisory for developers, not a CI gate.",
+        "note": "Judged by the calling agent: advisory for developers, not a CI gate. The verdict covers only the input passed to this finalize call.",
     }))
 }
 
@@ -665,4 +712,65 @@ mod tests {
         let out = as_json(&review_finalize(&json!({ "diff": DIFF, "issues": [] })));
         assert_eq!(out["judge"], "agent");
     }
+
+    #[test]
+    fn severity_is_accepted_in_any_case_and_prepare_shows_lowercase() {
+        let prep = as_json(&review_prepare(&json!({ "diff": DIFF })));
+        for f in prep["deterministic_findings"].as_array().unwrap() {
+            let sev = f["severity"].as_str().unwrap();
+            assert_eq!(
+                sev,
+                sev.to_lowercase(),
+                "prepare output must match the schema"
+            );
+        }
+        let issues = json!([{ "file": "app.py", "line": 1, "severity": "MAJOR", "title": "t", "body": "b" }]);
+        let out = as_json(&review_finalize(&json!({ "diff": DIFF, "issues": issues })));
+        assert_eq!(out["rejected_items"], 0);
+    }
+
+    #[test]
+    fn findings_dropped_by_validation_are_reported() {
+        let issues = json!([
+            { "file": "nope.py", "line": 1, "severity": "major", "title": "t", "body": "b" },
+            { "file": "app.py", "line": 1, "severity": "major", "title": "ok", "body": "b" }
+        ]);
+        let out = as_json(&review_finalize(&json!({ "diff": DIFF, "issues": issues })));
+        assert_eq!(out["dropped_by_validation"], 1);
+    }
+
+    #[test]
+    fn should_block_ignores_the_callers_list_filter() {
+        // A major finding blocks under the project's hook.min_severity even
+        // when the caller only wants to SEE critical ones.
+        let issues = json!([{ "file": "app.py", "line": 1, "severity": "major", "title": "t", "body": "b" }]);
+        let out = as_json(&review_finalize(
+            &json!({ "diff": CLEAN, "issues": issues, "min_severity": "critical" }),
+        ));
+        assert_eq!(out["total_issues"], 0, "list is filtered");
+        assert_eq!(out["should_block"], true, "decision is not");
+    }
+
+    #[test]
+    fn scan_finalize_refuses_a_changed_project() {
+        let out = scan_finalize(&json!({
+            "path": "tests", "issues": [], "files_fingerprint": "deadbeefdeadbeef"
+        }));
+        assert!(out.is_error);
+        assert!(text(&out).contains("changed since"));
+        let prep = as_json(&scan_prepare(&json!({ "path": "tests", "batch": 0 })));
+        let fp = prep["files_fingerprint"].as_str().unwrap().to_string();
+        let ok = scan_finalize(&json!({ "path": "tests", "issues": [], "files_fingerprint": fp }));
+        assert!(!ok.is_error, "{}", text(&ok));
+    }
+
+    const CLEAN: &str = concat!(
+        "diff --git a/app.py b/app.py\n",
+        "new file mode 100644\n",
+        "--- /dev/null\n",
+        "+++ b/app.py\n",
+        "@@ -0,0 +1,2 @@\n",
+        "+def add(a, b):\n",
+        "+    return a + b\n",
+    );
 }
