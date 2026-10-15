@@ -315,10 +315,11 @@ fn line_is_present(source: &Source<'_>, file: &str, line: u32) -> Option<bool> {
     match source {
         Source::Diff(chunks) => {
             let mut seen = false;
-            for chunk in chunks
-                .iter()
-                .filter(|c| c.new_path.as_deref() == Some(file))
-            {
+            // The new path, or the old one (renamed / deleted file): a file in
+            // the diff with no matching new line has no line to point at.
+            for chunk in chunks.iter().filter(|c| {
+                c.new_path.as_deref() == Some(file) || c.old_path.as_deref() == Some(file)
+            }) {
                 seen = true;
                 let present = chunk.chunks.iter().any(|h| {
                     h.lines.iter().any(|l| {
@@ -565,5 +566,45 @@ mod tests {
     #[test]
     fn other_config_errors_are_not_swallowed() {
         assert!(choose(false, Err(CoraError::LlmParse("bad".into()))).is_err());
+    }
+
+    #[test]
+    fn lines_in_deleted_and_renamed_files_become_file_level() {
+        let diff = concat!(
+            "diff --git a/old.py b/old.py\n",
+            "deleted file mode 100644\n",
+            "--- a/old.py\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-x = 1\n",
+            "-y = 2\n",
+            "diff --git a/before.py b/after.py\n",
+            "similarity index 80%\n",
+            "rename from before.py\n",
+            "rename to after.py\n",
+            "--- a/before.py\n",
+            "+++ b/after.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-a = 1\n",
+            "+a = 2\n",
+        );
+        let chunks = parse_diff(diff);
+        let valid = vec![
+            "old.py".to_string(),
+            "before.py".to_string(),
+            "after.py".to_string(),
+        ];
+        let out = admit(
+            vec![
+                issue("old.py", Some(9999), Severity::Major),
+                issue("before.py", Some(9999), Severity::Major),
+                issue("after.py", Some(1), Severity::Major),
+            ],
+            &valid,
+            &Source::Diff(&chunks),
+        );
+        assert_eq!(out[0].line, None, "deleted file has no new lines");
+        assert_eq!(out[1].line, None, "old path of a rename has no new lines");
+        assert_eq!(out[2].line, Some(1), "real added line stays");
     }
 }

@@ -109,7 +109,7 @@ pub async fn review_diff_with_judge(
                 return Ok(empty_response());
             }
             let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
-            let packet = prepare(config, diff, memory_context, &index_bridge);
+            let packet = prepare_deterministic(config, diff, &index_bridge);
             review_with(&NoJudge, config, packet).await
         }
     }
@@ -160,6 +160,57 @@ async fn review_diff_inner(
     review_with(&judge, config, packet).await
 }
 
+/// What every judge needs regardless of prompts: the files in the diff, the
+/// parsed diff, and the deterministic findings. No prompt text is built and no
+/// external tool (clippy) is run.
+struct Analysis {
+    valid_files: Vec<String>,
+    chunks: Vec<crate::engine::diff_parser::FileChunk>,
+    project_root: std::path::PathBuf,
+    deterministic: crate::engine::deterministic::DeterministicReport,
+}
+
+fn analyze(config: &Config, diff: &str, index_bridge: &IndexBridge) -> Analysis {
+    let valid_files = llm::extract_file_paths_from_diff(diff);
+    let chunks = crate::engine::diff_parser::parse_diff(diff);
+
+    let project_root = if index_bridge.root().as_os_str().is_empty() {
+        std::env::current_dir().unwrap_or_default()
+    } else {
+        index_bridge.root().to_path_buf()
+    };
+
+    // All deterministic checks (rules, secrets, security, index scans) on the
+    // ORIGINAL diff — no LLM involved.
+    let deterministic = crate::engine::deterministic::run(&chunks, config, index_bridge);
+    if !deterministic.claims.suspicious_claims.is_empty() && !config.sanitize_comments {
+        debug!(
+            claims = deterministic.claims.suspicious_claims.len(),
+            "Untrusted verification claims flagged in added comments"
+        );
+    }
+    Analysis {
+        valid_files,
+        chunks,
+        project_root,
+        deterministic,
+    }
+}
+
+/// [`prepare`] without the prompts, for a judge that never reads them
+/// ([`NoJudge`], and `cora.review_finalize`, which only needs the
+/// deterministic half). Skips static analysis (it can spawn `cargo clippy`),
+/// the context chain and the brain queries.
+pub fn prepare_deterministic(config: &Config, diff: &str, index_bridge: &IndexBridge) -> Packet {
+    let a = analyze(config, diff, index_bridge);
+    Packet {
+        prompts: llm::ReviewPrompts::default(),
+        valid_files: a.valid_files,
+        chunks: a.chunks,
+        deterministic: a.deterministic,
+    }
+}
+
 /// Step 1 of a review: turn `diff` into a [`Packet`].
 ///
 /// Runs every deterministic check, assembles the prompt context, and records
@@ -173,8 +224,12 @@ pub fn prepare(
     memory_context: Option<&str>,
     index_bridge: &IndexBridge,
 ) -> Packet {
-    // Extract valid file paths for post-parse filtering
-    let valid_files = llm::extract_file_paths_from_diff(diff);
+    let Analysis {
+        valid_files,
+        chunks: diff_chunks,
+        project_root,
+        deterministic,
+    } = analyze(config, diff, index_bridge);
 
     // Resolve custom system prompt for review
     let system_prompt = resolve_system_prompt(
@@ -186,7 +241,6 @@ pub fn prepare(
     let static_context =
         crate::engine::static_analysis::collect_static_context(diff, &config.static_analysis);
 
-    let diff_chunks = crate::engine::diff_parser::parse_diff(diff);
     let diff_text = if config.sanitize_comments {
         let mut sanitized_chunks = crate::engine::diff_parser::parse_diff(diff);
         let full_report = crate::engine::comment_sanitizer::sanitize_chunks(&mut sanitized_chunks);
@@ -205,22 +259,7 @@ pub fn prepare(
         diff.to_string()
     };
 
-    let project_root = if index_bridge.root().as_os_str().is_empty() {
-        std::env::current_dir().unwrap_or_default()
-    } else {
-        index_bridge.root().to_path_buf()
-    };
-
-    // All deterministic checks (rules, secrets, security, index scans) on the
-    // ORIGINAL diff — no LLM involved. Context = static analysis + claim
-    // warning + one block per scanner family.
-    let deterministic = crate::engine::deterministic::run(&diff_chunks, config, index_bridge);
-    if !deterministic.claims.suspicious_claims.is_empty() && !config.sanitize_comments {
-        debug!(
-            claims = deterministic.claims.suspicious_claims.len(),
-            "Untrusted verification claims flagged in added comments"
-        );
-    }
+    // Context = static analysis + claim warning + one block per scanner family.
     let combined_context = deterministic.context(static_context.as_deref());
 
     // Build context chain (cross-file dependency extraction)
@@ -928,5 +967,77 @@ new file mode 100644\n\
                 .iter()
                 .all(|i| i.body.chars().count() <= MAX_TEXT_CHARS)
         );
+    }
+
+    #[test]
+    fn prepare_deterministic_builds_no_prompts_but_keeps_the_findings() {
+        let config = Config::default();
+        let p = prepare_deterministic(&config, SECRET_DIFF, &IndexBridge::unavailable());
+        assert!(p.prompts.system.is_empty() && p.prompts.user.is_empty());
+        assert_eq!(p.valid_files, vec!["app.py".to_string()]);
+        assert!(!p.deterministic.is_empty());
+        let resp = run(&NoJudge, &config, p).expect("review");
+        assert!(resp.issues.iter().any(|i| i.rule_id.is_some()));
+    }
+
+    // ─── hostile diffs must not hide deterministic findings ───
+
+    #[test]
+    fn removed_comment_line_cannot_hide_an_added_secret() {
+        let diff = concat!(
+            "diff --git a/q.py b/q.py\n",
+            "--- a/q.py\n",
+            "+++ b/q.py\n",
+            "@@ -1,1 +1,1 @@\n",
+            "--- old note\n",
+            "+password = \"hunter2hunter2\"\n",
+        );
+        let config = Config::default();
+        let p = prepare_deterministic(&config, diff, &IndexBridge::unavailable());
+        let resp = run(&NoJudge, &config, p).expect("review");
+        assert!(
+            resp.issues
+                .iter()
+                .any(|i| i.rule_id.is_some() && i.file == "q.py"),
+            "the secret must be reported, got {:?}",
+            resp.issues.iter().map(|i| &i.title).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn added_fake_header_cannot_move_findings_to_an_excluded_path() {
+        let diff = concat!(
+            "diff --git a/app.py b/app.py\n",
+            "--- a/app.py\n",
+            "+++ b/app.py\n",
+            "@@ -1,1 +1,3 @@\n",
+            " x = 1\n",
+            "+++ b/tests/fixture.py\n",
+            "+password = \"hunter2hunter2\"\n",
+        );
+        let config = Config::default();
+        let p = prepare_deterministic(&config, diff, &IndexBridge::unavailable());
+        let resp = run(&NoJudge, &config, p).expect("review");
+        assert!(resp.issues.iter().any(|i| i.file == "app.py"));
+        assert!(resp.issues.iter().all(|i| i.file != "tests/fixture.py"));
+    }
+
+    #[test]
+    fn judge_info_issues_cannot_downgrade_deterministic_findings() {
+        let config = Config::default();
+        let judge = FakeJudge(Ok(vec![judged("app.py", 2, Severity::Info)]));
+        let mut weak = judged("app.py", 2, Severity::Info);
+        weak.title = "password naming nit".to_string();
+        weak.issue_type = Some("security".to_string());
+        let judge2 = FakeJudge(Ok(vec![weak]));
+        drop(judge);
+        let resp = run(&judge2, &config, packet(SECRET_DIFF, &config)).expect("review");
+        let on_line: Vec<_> = resp.issues.iter().filter(|i| i.line == Some(2)).collect();
+        assert!(!on_line.is_empty());
+        assert!(
+            on_line.iter().any(|i| i.severity == Severity::Critical),
+            "the CRITICAL secret finding must survive an info-level judge issue"
+        );
+        assert!(resp.should_block || config.hook.min_severity_level() != Severity::Major);
     }
 }

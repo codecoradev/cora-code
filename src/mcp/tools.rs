@@ -800,18 +800,20 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
                 .map_or(crate::engine::Severity::Info, |s| {
                     crate::engine::Severity::from_str_lossy(s)
                 });
+            // Blocking and the gate look at ALL findings under the project's
+            // hook.min_severity; the caller's min_severity only trims the list.
             let shaped = crate::engine::finalize::shape(
                 &mut response,
                 &config,
                 &crate::engine::finalize::ShapeOptions {
-                    min_severity,
-                    filter: true,
+                    min_severity: config.hook.min_severity_level(),
+                    filter: false,
                     gate: true,
                     ci: false,
                 },
             );
-            let should_block =
-                crate::engine::finalize::blocks(&response.issues, config.hook.min_severity_level());
+            let should_block = shaped.should_block;
+            response.issues.retain(|i| i.severity <= min_severity);
             let json = serde_json::json!({
                 "summary": response.summary,
                 "total_issues": response.issues.len(),

@@ -95,6 +95,14 @@ pub fn walk_project(
             continue;
         }
 
+        // Skip symlinks: a link inside the project can point anywhere (a
+        // hostile repo's `id -> ~/.ssh/id_rsa`), and its target would be read
+        // into the scan and sent to a model.
+        if entry.path_is_symlink() {
+            debug!(file = %path.display(), "skipping symlink");
+            continue;
+        }
+
         // Get relative path (entry.depth() ensures it's under root)
         let relative = path
             .strip_prefix(root)
@@ -196,4 +204,26 @@ pub fn format_batch_for_prompt(files: &[FileEntry]) -> String {
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed_into_the_scan() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("creds"), "SECRETLINE password\n").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.py"), "print(1)\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("creds"), root.path().join("leak.py"))
+            .unwrap();
+        std::os::unix::fs::symlink(outside.path().join("creds"), root.path().join("creds"))
+            .unwrap();
+        let files = walk_project(root.path(), &[], &[], &[]).unwrap();
+        let names: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, vec!["real.py"]);
+        assert!(files.iter().all(|f| !f.content.contains("SECRETLINE")));
+    }
 }

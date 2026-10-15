@@ -115,7 +115,7 @@ fn into_review_response(findings: Findings, usage: Option<&transport::Usage>) ->
 /// and the user prompt (valid-file list, context, rules, and the diff inside a
 /// fence it cannot close). Building them is separate from sending them so a
 /// [`Packet`](crate::engine::judge::Packet) can carry them (#644).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewPrompts {
     pub system: String,
     pub user: String,

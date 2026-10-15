@@ -277,6 +277,15 @@ fn install_skill_at(path: &std::path::Path, opts: &InstallOptions) -> Result<Str
                 "⏭ ".dimmed()
             ));
         }
+        // Never delete a customized copy: only remove ours (or with --force).
+        if !opts.force && std::fs::read_to_string(path).is_ok_and(|c| c != CLAUDE_SKILL) {
+            return Ok(format!(
+                "{} {} {} — customized, kept (use --force to remove)",
+                name.bold(),
+                "⏭ ".dimmed(),
+                path.display()
+            ));
+        }
         if opts.dry_run {
             return Ok(format!(
                 "{} {} {} — would remove",
@@ -344,7 +353,7 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
     if all_agents.is_empty() {
         // Claude Code is configured through its own MCP command, not a config
         // file we edit, but its skill can still be installed.
-        if !opts.list {
+        if !opts.list && opts.agents.is_none() {
             if let Some(result) = install_claude_skill(opts) {
                 return result;
             }
@@ -574,5 +583,30 @@ mod tests {
         }
         assert!(CLAUDE_SKILL.starts_with("---\nname: cora-review\n"));
         assert!(CLAUDE_SKILL.contains("untrusted"));
+    }
+
+    #[test]
+    fn remove_keeps_a_customized_skill_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "my own version").unwrap();
+        let remove = InstallOptions {
+            remove: true,
+            ..opts()
+        };
+        assert!(
+            install_skill_at(&path, &remove)
+                .unwrap()
+                .contains("customized")
+        );
+        assert!(path.exists());
+        let force = InstallOptions {
+            remove: true,
+            force: true,
+            ..opts()
+        };
+        assert!(install_skill_at(&path, &force).unwrap().contains("removed"));
+        assert!(!path.exists());
     }
 }

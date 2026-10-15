@@ -79,8 +79,27 @@ pub fn parse_diff(diff: &str) -> Vec<FileChunk> {
     let mut current: Option<FileChunkBuilder> = None;
 
     for line in diff.lines() {
+        // A `diff --git` line at column 0 is never hunk content (content lines
+        // carry a `+`/`-`/` ` prefix), so it ends any open hunk even when the
+        // header's line counts were wrong.
+        if line.starts_with("diff --git ") {
+            if let Some(builder) = current.as_mut() {
+                builder.rem_old = 0;
+                builder.rem_new = 0;
+            }
+            continue;
+        }
+
+        // Inside a hunk whose counts are not used up, `---` / `+++` are
+        // CONTENT (a removed line `-- x`, an added line `++ y`), never file
+        // headers. Treating them as headers lets a hostile diff re-file the
+        // rest of a hunk under another path, or drop it entirely.
+        let in_hunk = current
+            .as_ref()
+            .is_some_and(|b| b.rem_old > 0 || b.rem_new > 0);
+
         // Check for file header pair (--- / +++)
-        if let Some(caps) = RE_FILE_HEADER_OLD.captures(line) {
+        if let Some(caps) = RE_FILE_HEADER_OLD.captures(line).filter(|_| !in_hunk) {
             // If we have a pending file, flush it
             if let Some(builder) = current.take() {
                 files.push(builder.build());
@@ -96,7 +115,7 @@ pub fn parse_diff(diff: &str) -> Vec<FileChunk> {
         }
 
         if let Some(ref mut builder) = current {
-            if let Some(caps) = RE_FILE_HEADER_NEW.captures(line) {
+            if let Some(caps) = RE_FILE_HEADER_NEW.captures(line).filter(|_| !in_hunk) {
                 let raw_path = caps[1].trim_end_matches('\t').to_string();
                 let is_deleted = raw_path == "/dev/null";
 
@@ -140,6 +159,8 @@ pub fn parse_diff(diff: &str) -> Vec<FileChunk> {
                 // Initialize line counters from hunk header
                 builder.old_line = old_start;
                 builder.new_line = new_start;
+                builder.rem_old = old_count;
+                builder.rem_new = new_count;
 
                 builder.current_hunk = Some(DiffHunk {
                     old_start,
@@ -164,6 +185,15 @@ pub fn parse_diff(diff: &str) -> Vec<FileChunk> {
                     // Unknown line (e.g., "diff --git ..."), skip
                     continue;
                 };
+
+                match line_type {
+                    DiffLineType::Add => builder.rem_new = builder.rem_new.saturating_sub(1),
+                    DiffLineType::Remove => builder.rem_old = builder.rem_old.saturating_sub(1),
+                    DiffLineType::Context => {
+                        builder.rem_old = builder.rem_old.saturating_sub(1);
+                        builder.rem_new = builder.rem_new.saturating_sub(1);
+                    }
+                }
 
                 // Compute line numbers based on line type, then increment counters
                 let (old_line_no, new_line_no) = match line_type {
@@ -306,6 +336,9 @@ struct FileChunkBuilder {
     hunks: Vec<DiffHunk>,
     old_line: u32,
     new_line: u32,
+    /// Old / new lines still expected in the open hunk (from its `@@` counts).
+    rem_old: u32,
+    rem_new: u32,
     is_binary: bool,
     is_deleted: bool,
     is_new: bool,
@@ -321,6 +354,8 @@ impl FileChunkBuilder {
             hunks: Vec::new(),
             old_line: 0,
             new_line: 0,
+            rem_old: 0,
+            rem_new: 0,
             is_binary: false,
             is_deleted: false,
             is_new: false,
@@ -671,5 +706,89 @@ Binary file a/logo.png differs from b/logo.png
         let files = parse_diff(diff);
         assert_eq!(files.len(), 1);
         assert!(files[0].is_binary);
+    }
+
+    // ─── hostile hunk content must not be read as file headers ───
+
+    #[test]
+    fn removed_line_that_looks_like_old_header_does_not_drop_the_hunk() {
+        // `-- old note` removed => the diff line is `--- old note`.
+        let diff = concat!(
+            "diff --git a/q.sql b/q.sql\n",
+            "--- a/q.sql\n",
+            "+++ b/q.sql\n",
+            "@@ -1,1 +1,1 @@\n",
+            "--- old note\n",
+            "+password = \"hunter2hunter2\"\n",
+        );
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1, "no phantom file entry");
+        let lines = &files[0].chunks[0].lines;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.line_type == DiffLineType::Add && l.content.contains("hunter2")),
+            "the added line must still be parsed"
+        );
+    }
+
+    #[test]
+    fn added_line_that_looks_like_new_header_does_not_refile_the_hunk() {
+        // `++ b/tests/fixture.py` added => the diff line is `+++ b/tests/fixture.py`.
+        let diff = concat!(
+            "diff --git a/app.py b/app.py\n",
+            "--- a/app.py\n",
+            "+++ b/app.py\n",
+            "@@ -1,1 +1,3 @@\n",
+            " x = 1\n",
+            "+++ b/tests/fixture.py\n",
+            "+password = \"hunter2hunter2\"\n",
+        );
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].new_path.as_deref(), Some("app.py"));
+        assert_eq!(files[0].chunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn next_file_is_still_found_after_a_hunk_with_correct_counts() {
+        let diff = concat!(
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-a\n",
+            "+b\n",
+            "--- a/two.rs\n",
+            "+++ b/two.rs\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-c\n",
+            "+d\n",
+        );
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].new_path.as_deref(), Some("two.rs"));
+    }
+
+    #[test]
+    fn git_diff_line_ends_a_hunk_even_when_counts_are_wrong() {
+        // Header claims 9 old / 9 new lines but the hunk has 1: the next
+        // `diff --git` must still start a new file.
+        let diff = concat!(
+            "diff --git a/one.rs b/one.rs\n",
+            "--- a/one.rs\n",
+            "+++ b/one.rs\n",
+            "@@ -1,9 +1,9 @@\n",
+            "-a\n",
+            "+b\n",
+            "diff --git a/two.rs b/two.rs\n",
+            "--- a/two.rs\n",
+            "+++ b/two.rs\n",
+            "@@ -1,1 +1,1 @@\n",
+            "-c\n",
+            "+d\n",
+        );
+        let files = parse_diff(diff);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].new_path.as_deref(), Some("two.rs"));
     }
 }

@@ -195,6 +195,12 @@ fn apply_llm_secret_fp_filter(
 
     let before = issues.len();
     issues.retain(|issue| {
+        // A scanner-backed issue is checked by the scanner itself; only
+        // unbacked (model-written) findings are cross-checked here.
+        if issue.rule_id.is_some() {
+            return true;
+        }
+
         // Only check security-type findings about secrets
         let issue_type = issue.issue_type.as_deref().unwrap_or("");
         let title_lower = issue.title.to_lowercase();
