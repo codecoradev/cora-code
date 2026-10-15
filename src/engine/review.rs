@@ -3,7 +3,7 @@ use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
 use crate::engine::index_bridge::IndexBridge;
-use crate::engine::judge::{HttpJudge, Judge, Packet, admit};
+use crate::engine::judge::{HttpJudge, Judge, JudgeChoice, NoJudge, Packet, admit};
 use crate::engine::llm;
 use crate::engine::postprocess::{Source, postprocess_report};
 use crate::engine::types::{LLMConfig, ReviewResponse};
@@ -77,6 +77,54 @@ pub async fn review_diff_with_cache(
     .await
 }
 
+/// [`review_diff_with_cache`] for whichever judge the run chose: the LLM (with
+/// cache and streaming), or no judge at all, which returns the deterministic
+/// findings only.
+#[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
+pub async fn review_diff_with_judge(
+    config: &Config,
+    judge: &JudgeChoice,
+    diff: &str,
+    stream: bool,
+    use_cache: bool,
+    quiet: bool,
+    memory_context: Option<&str>,
+) -> std::result::Result<ReviewResponse, CoraError> {
+    match judge {
+        JudgeChoice::Llm(llm_config) => {
+            review_diff_inner(
+                config,
+                llm_config,
+                diff,
+                stream,
+                use_cache,
+                quiet,
+                memory_context,
+            )
+            .await
+        }
+        JudgeChoice::Deterministic => {
+            if diff.trim().is_empty() {
+                return Ok(empty_response());
+            }
+            let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
+            let packet = prepare(config, diff, memory_context, &index_bridge);
+            review_with(&NoJudge, config, packet).await
+        }
+    }
+}
+
+fn empty_response() -> ReviewResponse {
+    ReviewResponse {
+        issues: vec![],
+        summary: "No changes to review.".to_string(),
+        tokens_used: None,
+        should_block: false,
+        dropped_findings: 0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_diff_inner(
     config: &Config,
@@ -94,13 +142,7 @@ async fn review_diff_inner(
     );
 
     if diff.trim().is_empty() {
-        return Ok(ReviewResponse {
-            issues: vec![],
-            summary: "No changes to review.".to_string(),
-            tokens_used: None,
-            should_block: false,
-            dropped_findings: 0,
-        });
+        return Ok(empty_response());
     }
 
     // Index bridge: one project handle, rooted via resolve_project_root, shared

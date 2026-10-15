@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cora review` and `cora scan` run without an API key (#646).** With no key they run the deterministic checks only, print a one-line notice on stderr, and label the result "Deterministic checks only (no LLM judge)" (SARIF: `cora.judge = none` on the invocation, even with zero results). `--no-llm` forces it and silences the notice. A missing key is no longer an error for these two commands; any other config error still is. The judge is chosen once at the entry point (`judge::select_judge`, `JudgeChoice`). `cora commit` and MCP `cora.review_diff` still need a key.
+
 ### Security
 
 - **Bumped `rustls` 0.23.45 → 0.23.46 and `quinn-proto` 0.11.16 → 0.11.19** (RUSTSEC-2026-0338/0339/0340/0341/0342 and RUSTSEC-2026-0346/0347/0348/0349), plus the yanked `chacha20` 0.10.1 → 0.10.2. Lockfile-only patch bumps; this was failing the `Security Audit (CVE)` job on every PR.

@@ -12,20 +12,29 @@ pub struct SarifFormatter;
 
 impl Formatter for SarifFormatter {
     fn format_review(&self, response: &ReviewResponse) -> Result<String> {
-        let sarif = build_sarif(&response.issues);
+        let sarif = build_sarif(&response.issues, is_deterministic_only(&response.summary));
         let json = serde_json::to_string_pretty(&sarif)?;
         Ok(json)
     }
 
     fn format_scan(&self, response: &ScanResponse) -> Result<String> {
-        let sarif = build_sarif(&response.issues);
+        let sarif = build_sarif(&response.issues, is_deterministic_only(&response.summary));
         let json = serde_json::to_string_pretty(&sarif)?;
         Ok(json)
     }
 }
 
+/// True when the run had no LLM judge (see `judge::DETERMINISTIC_ONLY`).
+fn is_deterministic_only(summary: &str) -> bool {
+    summary.contains(crate::engine::judge::DETERMINISTIC_ONLY)
+}
+
 /// Build a SARIF v2.1.0 document from a list of issues.
-fn build_sarif(issues: &[ReviewIssue]) -> Value {
+///
+/// `deterministic_only` marks a run without an LLM judge: the invocation then
+/// says so, even when there are no results, so an empty SARIF file is never
+/// read as "reviewed and clean".
+fn build_sarif(issues: &[ReviewIssue], deterministic_only: bool) -> Value {
     // Deduplicate rules by id (multiple issues can share same rule)
     let mut rule_map = serde_json::Map::new();
     for issue in issues {
@@ -109,7 +118,16 @@ fn build_sarif(issues: &[ReviewIssue]) -> Value {
         .collect();
 
     // Build invocations array with watermark
-    let invocations = if issues.is_empty() {
+    let invocations = if deterministic_only {
+        json!([{
+            "executionSuccessful": true,
+            "properties": {
+                "cora.watermark": format!("Reviewed by CodeCora v{}", env!("CARGO_PKG_VERSION")),
+                "cora.judge": "none",
+                "cora.note": crate::engine::judge::DETERMINISTIC_ONLY
+            }
+        }])
+    } else if issues.is_empty() {
         json!([])
     } else {
         json!([{
@@ -346,5 +364,34 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         let result = &parsed["runs"][0]["results"][0];
         assert!(result.get("fixes").is_some());
+    }
+
+    #[test]
+    fn deterministic_only_run_says_so_even_with_no_results() {
+        let resp = ReviewResponse {
+            issues: vec![],
+            summary: crate::engine::judge::DETERMINISTIC_ONLY.to_string(),
+            tokens_used: None,
+            should_block: false,
+            dropped_findings: 0,
+        };
+        let out = SarifFormatter.format_review(&resp).unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        let inv = &v["runs"][0]["invocations"][0]["properties"];
+        assert_eq!(inv["cora.judge"], "none");
+        assert!(inv["cora.note"].as_str().unwrap().contains("Deterministic"));
+    }
+
+    #[test]
+    fn llm_run_without_issues_has_no_judge_marker() {
+        let resp = ReviewResponse {
+            issues: vec![],
+            summary: "all good".to_string(),
+            tokens_used: None,
+            should_block: false,
+            dropped_findings: 0,
+        };
+        let out = SarifFormatter.format_review(&resp).unwrap();
+        assert!(!out.contains("cora.judge"));
     }
 }

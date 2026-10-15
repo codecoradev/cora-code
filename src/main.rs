@@ -22,6 +22,7 @@ use commands::{
     scan, upload,
 };
 use config::loader;
+use engine::judge;
 use engine::memory;
 use formatters::OutputFormat;
 
@@ -330,6 +331,11 @@ enum Command {
         /// Save review findings to Uteke after review (implies --memory)
         #[clap(long)]
         learn: bool,
+
+        /// Deterministic checks only: never call an LLM (also the automatic
+        /// behavior when no API key is configured)
+        #[clap(long)]
+        no_llm: bool,
     },
 
     /// Scan a project directory for issues
@@ -367,6 +373,11 @@ enum Command {
         /// skipping it and continuing (default: skip and continue).
         #[clap(long)]
         no_continue_on_batch_error: bool,
+
+        /// Deterministic checks only: never call an LLM (also the automatic
+        /// behavior when no API key is configured)
+        #[clap(long)]
+        no_llm: bool,
     },
 
     /// Manage quality profiles (preset rule sets)
@@ -1147,6 +1158,7 @@ async fn main() -> Result<()> {
             token,
             memory,
             learn,
+            no_llm,
         } => {
             cmd_review(
                 &cli.global,
@@ -1172,6 +1184,7 @@ async fn main() -> Result<()> {
                     ci,
                     memory,
                     learn,
+                    no_llm,
                 },
             )
             .await?
@@ -1185,6 +1198,7 @@ async fn main() -> Result<()> {
             focus,
             batch_files,
             no_continue_on_batch_error,
+            no_llm,
         } => {
             cmd_scan(
                 &cli.global,
@@ -1197,6 +1211,7 @@ async fn main() -> Result<()> {
                     focus,
                     batch_files,
                     continue_on_batch_error: !no_continue_on_batch_error,
+                    no_llm,
                 },
             )
             .await?
@@ -1443,6 +1458,7 @@ struct ReviewOpts {
     ci: bool,
     memory: bool,
     learn: bool,
+    no_llm: bool,
 }
 
 /// Struct to hold scan options from CLI.
@@ -1455,6 +1471,7 @@ struct ScanOpts {
     focus: Vec<String>,
     batch_files: usize,
     continue_on_batch_error: bool,
+    no_llm: bool,
 }
 
 /// Handle the `review` subcommand.
@@ -1467,7 +1484,12 @@ async fn cmd_review(globals: &GlobalOptions, opts: ReviewOpts) -> Result<i32> {
         globals.format.as_deref(),
         globals.no_color,
     )?;
-    let llm_config = loader::build_llm_config(&config, globals.api_key.as_deref())?;
+    let judge = judge::select_judge(
+        &config,
+        globals.api_key.as_deref(),
+        opts.no_llm,
+        opts.quiet || opts.progress,
+    )?;
 
     // If --upload is set, force SARIF format
     let effective_format = if opts.upload {
@@ -1502,15 +1524,17 @@ async fn cmd_review(globals: &GlobalOptions, opts: ReviewOpts) -> Result<i32> {
     };
 
     // When streaming and not quiet/progress, show a simpler message
-    if opts.stream && !opts.quiet && !opts.progress {
-        eprintln!(
-            "{}",
-            format!(
-                "⏳ Streaming review from {} ({})…",
-                llm_config.provider, llm_config.model
-            )
-            .dimmed()
-        );
+    if let judge::JudgeChoice::Llm(llm_config) = &judge {
+        if opts.stream && !opts.quiet && !opts.progress {
+            eprintln!(
+                "{}",
+                format!(
+                    "⏳ Streaming review from {} ({})…",
+                    llm_config.provider, llm_config.model
+                )
+                .dimmed()
+            );
+        }
     }
 
     // Uteke memory integration: recall context before review
@@ -1546,7 +1570,7 @@ async fn cmd_review(globals: &GlobalOptions, opts: ReviewOpts) -> Result<i32> {
     // Execute the review (returns formatted output)
     let result = review::execute_review(
         &config,
-        &llm_config,
+        &judge,
         &review_opts,
         effective_format,
         &progress_reporter,
@@ -1672,7 +1696,7 @@ async fn cmd_scan(globals: &GlobalOptions, opts: ScanOpts) -> Result<i32> {
         globals.format.as_deref(),
         globals.no_color,
     )?;
-    let llm_config = loader::build_llm_config(&config, globals.api_key.as_deref())?;
+    let judge = judge::select_judge(&config, globals.api_key.as_deref(), opts.no_llm, false)?;
 
     let format = resolve_format(globals.format.as_deref(), &config)?;
 
@@ -1687,7 +1711,7 @@ async fn cmd_scan(globals: &GlobalOptions, opts: ScanOpts) -> Result<i32> {
         continue_on_batch_error: opts.continue_on_batch_error,
     };
 
-    scan::execute_scan(&config, &llm_config, &scan_opts, format).await
+    scan::execute_scan(&config, &judge, &scan_opts, format).await
 }
 
 /// Resolve the output format: CLI flag > config > default.

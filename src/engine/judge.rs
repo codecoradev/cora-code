@@ -135,6 +135,59 @@ impl Judge for HttpJudge<'_> {
     }
 }
 
+/// Who judges a `cora review` / `cora scan` run, chosen once at the entry point.
+#[derive(Debug, Clone)]
+pub enum JudgeChoice {
+    /// An OpenAI-compatible LLM.
+    Llm(LLMConfig),
+    /// No LLM: deterministic checks only.
+    Deterministic,
+}
+
+/// One-line stderr notice when a missing API key turned a run deterministic.
+pub const NO_LLM_NOTICE: &str = "ℹ No LLM configured: running deterministic checks only. \
+Run `cora auth login` (or set an API key) to enable AI review; `--no-llm` silences this notice.";
+
+/// Pick the judge from `--no-llm` and the result of building the LLM config.
+///
+/// A missing API key (`NoApiKey`) is not an error: the run is deterministic.
+/// Any other config error is real and is returned. The bool says whether the
+/// choice was a fallback (key missing, `--no-llm` not given), so the caller can
+/// print [`NO_LLM_NOTICE`].
+pub fn choose(
+    no_llm: bool,
+    built: Result<LLMConfig, CoraError>,
+) -> Result<(JudgeChoice, bool), CoraError> {
+    if no_llm {
+        return Ok((JudgeChoice::Deterministic, false));
+    }
+    match built {
+        Ok(llm) => Ok((JudgeChoice::Llm(llm), false)),
+        Err(CoraError::NoApiKey) => Ok((JudgeChoice::Deterministic, true)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Choose the judge for a command from the loaded config. Prints the notice on
+/// fallback unless `quiet`.
+pub fn select_judge(
+    config: &Config,
+    cli_api_key: Option<&str>,
+    no_llm: bool,
+    quiet: bool,
+) -> Result<JudgeChoice, CoraError> {
+    let built = if no_llm {
+        Err(CoraError::NoApiKey) // not consulted
+    } else {
+        crate::config::loader::build_llm_config(config, cli_api_key)
+    };
+    let (judge, fell_back) = choose(no_llm, built)?;
+    if fell_back && !quiet {
+        eprintln!("{NO_LLM_NOTICE}");
+    }
+    Ok(judge)
+}
+
 /// What a judge returned for one scan batch.
 #[derive(Debug, Default)]
 pub struct ScanBatch {
@@ -184,16 +237,18 @@ impl ScanJudge for HttpScanJudge<'_> {
     }
 }
 
+/// Summary text of a run that had no LLM judge. Formatters key off it to say,
+/// in every output format, that a clean result is not an AI review.
+pub const DETERMINISTIC_ONLY: &str = "Deterministic checks only (no LLM judge).";
+
 /// Judge that finds nothing: the review is the deterministic findings only.
-// Selected by `cora review --no-llm` / a missing API key (#646).
-#[allow(dead_code)]
 pub struct NoJudge;
 
 impl Judge for NoJudge {
     async fn judge(&self, _config: &Config, _packet: &Packet) -> Result<ReviewResponse, CoraError> {
         Ok(ReviewResponse {
             issues: Vec::new(),
-            summary: "Deterministic checks only (no LLM judge).".to_string(),
+            summary: DETERMINISTIC_ONLY.to_string(),
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
@@ -456,5 +511,37 @@ mod tests {
         let out = admit_diff(vec![hostile]);
         assert!(out[0].rule_id.is_none());
         assert!(out[0].body.contains("ignore previous instructions"));
+    }
+
+    // ─── #646: choosing the judge ───
+
+    fn llm() -> LLMConfig {
+        LLMConfig::default()
+    }
+
+    #[test]
+    fn key_present_means_llm() {
+        let (j, fell_back) = choose(false, Ok(llm())).unwrap();
+        assert!(matches!(j, JudgeChoice::Llm(_)));
+        assert!(!fell_back);
+    }
+
+    #[test]
+    fn missing_key_falls_back_to_deterministic_with_notice() {
+        let (j, fell_back) = choose(false, Err(CoraError::NoApiKey)).unwrap();
+        assert!(matches!(j, JudgeChoice::Deterministic));
+        assert!(fell_back, "caller must print the notice");
+    }
+
+    #[test]
+    fn no_llm_flag_wins_even_with_a_key_and_is_silent() {
+        let (j, fell_back) = choose(true, Ok(llm())).unwrap();
+        assert!(matches!(j, JudgeChoice::Deterministic));
+        assert!(!fell_back);
+    }
+
+    #[test]
+    fn other_config_errors_are_not_swallowed() {
+        assert!(choose(false, Err(CoraError::LlmParse("bad".into()))).is_err());
     }
 }
