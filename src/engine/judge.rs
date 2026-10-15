@@ -31,7 +31,7 @@ use crate::engine::deterministic::DeterministicReport;
 use crate::engine::diff_parser::{DiffLineType, FileChunk};
 use crate::engine::llm::{self, ReviewPrompts};
 use crate::engine::postprocess::Source;
-use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse};
+use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse, TokenUsage};
 use crate::error::CoraError;
 
 /// Everything about one review that does not depend on who judges it.
@@ -135,6 +135,55 @@ impl Judge for HttpJudge<'_> {
     }
 }
 
+/// What a judge returned for one scan batch.
+#[derive(Debug, Default)]
+pub struct ScanBatch {
+    pub issues: Vec<ReviewIssue>,
+    pub tokens: Option<TokenUsage>,
+}
+
+/// Something that turns a batch of numbered file contents into findings
+/// (`cora scan`). The same seam as [`Judge`], for whole files.
+pub trait ScanJudge {
+    async fn judge_batch(
+        &self,
+        config: &Config,
+        files_content: &str,
+        focus: &[String],
+        brain_context: Option<&str>,
+    ) -> Result<ScanBatch, CoraError>;
+}
+
+/// Scan judge backed by an OpenAI-compatible LLM.
+pub struct HttpScanJudge<'a> {
+    pub llm_config: &'a LLMConfig,
+}
+
+impl ScanJudge for HttpScanJudge<'_> {
+    async fn judge_batch(
+        &self,
+        config: &Config,
+        files_content: &str,
+        focus: &[String],
+        brain_context: Option<&str>,
+    ) -> Result<ScanBatch, CoraError> {
+        let spinner = crate::progress::Spinner::new("Scanning files…", false);
+        let result = llm::scan_files(
+            self.llm_config,
+            files_content,
+            focus,
+            &config.rules,
+            &config.response_format,
+            None,
+            brain_context,
+            &spinner,
+        )
+        .await;
+        spinner.finish();
+        result.map(|(issues, _summary, tokens)| ScanBatch { issues, tokens })
+    }
+}
+
 /// Judge that finds nothing: the review is the deterministic findings only.
 // Selected by `cora review --no-llm` / a missing API key (#646).
 #[allow(dead_code)]
@@ -149,6 +198,18 @@ impl Judge for NoJudge {
             should_block: false,
             dropped_findings: 0,
         })
+    }
+}
+
+impl ScanJudge for NoJudge {
+    async fn judge_batch(
+        &self,
+        _config: &Config,
+        _files_content: &str,
+        _focus: &[String],
+        _brain_context: Option<&str>,
+    ) -> Result<ScanBatch, CoraError> {
+        Ok(ScanBatch::default())
     }
 }
 

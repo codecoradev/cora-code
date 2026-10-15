@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **One `finalize` module owns the result tail of review, scan, commit and MCP (#648).** `engine::finalize` (`shape`, `shape_issues`, `blocks`, `exit_code`, `save_debt`, `save_history`) replaces six hand-copied versions of severity filtering, `should_block`, quality gate, exit code, debt snapshot and review history. Behavior of `cora review` (single and chunked) and `cora scan` is unchanged. Fixed along the way: the MCP `cora.review_diff` tool now honors its `min_severity` parameter and evaluates the quality gate on the reported findings; `cora commit` now records its review in the review history (`command = "commit"`).
 
+### Fixed
+
+- **`cora scan` now runs the rules engine (#645).** Built-in rules (`bug-todo`, `sec-sql-concat`, ...) and custom `rules_engine.custom_rules` were only run by `cora review`; scan silently skipped them. One set of deterministic families (`deterministic::run_files` for whole files, `deterministic::run` for diffs) now serves both, and the MCP `cora.check_snippet` tool picks up rules too. Scan also has a judge seam (`judge::ScanJudge`, with `HttpScanJudge` and `NoJudge`) so the batch loop is tested without a network, and `DEFAULT_BATCH_TOKEN_BUDGET` is renamed `DEFAULT_BATCH_CHAR_BUDGET` (it was always a character count). `docs/cli-reference.md` now states which review flags scan does not have.
+
 ## [0.18.0] - 2026-10-09
 
 ### Security

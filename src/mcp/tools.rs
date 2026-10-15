@@ -31,7 +31,7 @@ pub fn list_tools() -> Vec<Tool> {
         },
         Tool {
             name: "cora.check_snippet".to_string(),
-            description: "Check a code snippet against cora's deterministic rules (secrets, security patterns). No LLM call.".to_string(),
+            description: "Check a code snippet against cora's deterministic checks (built-in and custom rules, secrets, security patterns). No LLM call.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
