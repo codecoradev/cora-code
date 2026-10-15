@@ -20,8 +20,6 @@ mod prompts;
 mod repair;
 mod transport;
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-
 use crate::engine::types::{LLMConfig, ReviewIssue, ReviewResponse, TokenUsage};
 use crate::error::CoraError;
 
@@ -55,42 +53,6 @@ pub trait LlmEvents: Sync {
 /// Silent [`LlmEvents`].
 pub struct NoEvents;
 impl LlmEvents for NoEvents {}
-
-/// Spinner-backed events for interactive non-streaming runs.
-struct SpinnerEvents(ProgressBar);
-
-impl LlmEvents for SpinnerEvents {
-    fn status(&self, msg: &str) {
-        self.0.set_message(msg.to_string());
-    }
-}
-
-/// Create an animated spinner for LLM operations.
-///
-/// Automatically hidden when stderr is not a TTY (piped/redirected),
-/// preventing ANSI pollution in captured output.
-fn create_spinner(message: &str) -> ProgressBar {
-    let spinner = ProgressBar::new_spinner();
-    // Hide spinner when stderr is not a terminal (piped/redirected)
-    if !atty_check() {
-        spinner.set_draw_target(ProgressDrawTarget::hidden());
-        return spinner;
-    }
-    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .expect("valid spinner template")
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
-    );
-    spinner.set_message(message.to_string());
-    spinner
-}
-
-/// Check if stderr is connected to a TTY.
-fn atty_check() -> bool {
-    use std::io::IsTerminal;
-    std::io::stderr().is_terminal()
-}
 
 /// Raw chat completion — returns the raw string response.
 /// Used by commit message generation and other non-review tasks.
@@ -182,6 +144,8 @@ async fn review_with<T: Transport>(
 }
 
 /// Review a diff using the LLM. Returns a `ReviewResponse`.
+///
+/// Status text goes to `events`; the caller decides whether that is a spinner.
 #[allow(clippy::too_many_arguments)]
 pub async fn review_diff(
     llm_config: &LLMConfig,
@@ -190,23 +154,18 @@ pub async fn review_diff(
     rules: &[String],
     response_format: &str,
     system_prompt_override: Option<&str>,
-    quiet: bool,
     static_context: Option<&str>,
+    events: &dyn LlmEvents,
 ) -> std::result::Result<ReviewResponse, CoraError> {
-    let events = SpinnerEvents(if quiet {
-        ProgressBar::hidden()
-    } else {
-        create_spinner("Reviewing diff…")
-    });
     let transport = HttpTransport {
         config: llm_config,
         response_format,
         stream: false,
-        events: &events,
+        events,
     };
-    let result = review_with(
+    review_with(
         &transport,
-        &events,
+        events,
         llm_config.max_tokens,
         diff,
         focus,
@@ -214,9 +173,7 @@ pub async fn review_diff(
         system_prompt_override,
         static_context,
     )
-    .await;
-    events.0.finish_and_clear();
-    result
+    .await
 }
 
 /// Review a diff using the LLM with streaming. Returns a `ReviewResponse`.
@@ -297,17 +254,17 @@ pub async fn scan_files(
     response_format: &str,
     system_prompt_override: Option<&str>,
     brain_context: Option<&str>,
+    events: &dyn LlmEvents,
 ) -> std::result::Result<(Vec<ReviewIssue>, Option<String>, Option<TokenUsage>), CoraError> {
-    let events = SpinnerEvents(create_spinner("Scanning files…"));
     let transport = HttpTransport {
         config: llm_config,
         response_format,
         stream: false,
-        events: &events,
+        events,
     };
-    let result = scan_with(
+    scan_with(
         &transport,
-        &events,
+        events,
         llm_config.max_tokens,
         files_content,
         focus,
@@ -315,9 +272,7 @@ pub async fn scan_files(
         system_prompt_override,
         brain_context,
     )
-    .await;
-    events.0.finish_and_clear();
-    result
+    .await
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ pub mod finalize;
 pub mod index_bridge;
 pub mod index_scanner;
 pub mod inline_suppress;
+pub mod judge;
 pub mod language_analyzer;
 pub mod llm;
 pub mod markdown;

@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Review is now prepare / judge / finalize with the LLM as the seam (#649).** `review::prepare` turns a diff into a `judge::Packet` (judge-visible text, assembled context, system prompt override, `valid_files`, diff chunks, deterministic findings); a `judge::Judge` returns findings (`HttpJudge` = today's LLM call, `NoJudge` = deterministic only); `review::review_with` merges, guards file paths, post-processes and decides `should_block`. Output of `cora review` is unchanged. The review pipeline now has an end-to-end test with a fake judge (no network), and the `llm` module no longer prints: spinners moved to `progress::Spinner` and `llm::review_diff` / `llm::scan_files` take an events observer like the stream variant.
+
 - **One `finalize` module owns the result tail of review, scan, commit and MCP (#648).** `engine::finalize` (`shape`, `shape_issues`, `blocks`, `exit_code`, `save_debt`, `save_history`) replaces six hand-copied versions of severity filtering, `should_block`, quality gate, exit code, debt snapshot and review history. Behavior of `cora review` (single and chunked) and `cora scan` is unchanged. Fixed along the way: the MCP `cora.review_diff` tool now honors its `min_severity` parameter and evaluates the quality gate on the reported findings; `cora commit` now records its review in the review history (`command = "commit"`).
 
 ## [0.18.0] - 2026-10-09
