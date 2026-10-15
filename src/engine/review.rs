@@ -408,7 +408,8 @@ pub async fn review_with<J: Judge>(
                 let mut fallback = ReviewResponse {
                     issues: all_deterministic,
                     summary: format!(
-                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security + {n_index_unused} unused imports + {n_index_dead} dead code + {n_index_breaking} breaking changes."
+                        "LLM review failed: {e}. Showing {n_rules} rule + {n_secrets} secrets + {n_security} security + {n_index_unused} unused imports + {n_index_dead} dead code + {n_index_breaking} breaking changes. {}",
+                        crate::engine::judge::DETERMINISTIC_ONLY
                     ),
                     tokens_used: None,
                     should_block: false,
@@ -1039,5 +1040,17 @@ new file mode 100644\n\
             "the CRITICAL secret finding must survive an info-level judge issue"
         );
         assert!(resp.should_block || config.hook.min_severity_level() != Severity::Major);
+    }
+
+    #[test]
+    fn judge_failure_fallback_is_marked_deterministic_only() {
+        // Only deterministic findings remain, so SARIF must say no judge ran.
+        let config = Config::default();
+        let judge = FakeJudge(Err("boom".to_string()));
+        let resp = run(&judge, &config, packet(SECRET_DIFF, &config)).expect("fallback");
+        assert!(
+            resp.summary
+                .contains(crate::engine::judge::DETERMINISTIC_ONLY)
+        );
     }
 }

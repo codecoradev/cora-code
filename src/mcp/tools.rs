@@ -23,6 +23,12 @@ static MCP_RUNTIME: LazyLock<tokio::runtime::Runtime> =
 /// ("Cannot start a runtime from within a runtime") and kills the server.
 /// `block_in_place` hands the thread over first. Outside a runtime (unit
 /// tests) it blocks directly.
+///
+/// Limitation: `block_in_place` panics on a `current_thread` runtime. The
+/// server is multi-thread (`#[tokio::main]` with `rt-multi-thread`), so this
+/// holds in production; a `#[tokio::test]` calling a handler that reaches
+/// here must use `flavor = "multi_thread"`. (A thread hand-off would need the
+/// future to be `Send`, which the pipeline's futures are not.)
 pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(_) => tokio::task::block_in_place(|| MCP_RUNTIME.block_on(future)),
