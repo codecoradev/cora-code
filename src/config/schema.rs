@@ -614,7 +614,7 @@ fn default_rules_enabled() -> bool {
 }
 
 fn default_max_findings() -> usize {
-    5
+    50
 }
 
 /// `rules_engine.max_findings`: an explicit `null` means unlimited (stored as 0).
