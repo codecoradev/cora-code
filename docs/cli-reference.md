@@ -74,6 +74,7 @@ Complete command reference for the cora CLI.
 | `cora review --max-diff-size` `<chars>` | Override max diff size |
 | `cora review --memory` | Recall project patterns from Uteke before review |
 | `cora review --learn` | Save findings to Uteke after review (implies `--memory`) |
+| `cora review --no-llm` | Deterministic checks only, never call an LLM |
 | `cora commit` | Review staged + generate commit message + commit (HITL prompt) |
 | `cora commit --yolo` | Auto-commit without prompts |
 | `cora commit --force` | Commit even if quality gate fails |
@@ -89,6 +90,9 @@ Complete command reference for the cora CLI.
 | `cora scan --focus` `security` | Override focus areas |
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |
+| `cora scan --no-llm` | Deterministic checks only, never call an LLM |
+
+**No API key needed for deterministic checks.** `cora review` and `cora scan` run without any LLM configured: with no key they run the deterministic checks only (rules, secrets, security, index scans), print a one-line notice on stderr, and mark the result "Deterministic checks only (no LLM judge)" (in SARIF: `invocations[0].properties["cora.judge"] = "none"`), so a clean result is never mistaken for an AI review. `--no-llm` forces this even when a key exists and silences the notice. `cora commit` still needs a key for the commit message.
 
 `cora scan` runs the same deterministic checks as `cora review` (built-in and custom rules, secrets, security patterns, plus unused imports and dead code from the index) on every file, then asks the LLM about each batch. Findings are filtered by `ignore.rules` and inline `cora-ignore:` markers and capped by `rules_engine.max_findings`. Unlike `review`, scan has no `--ci`, `--severity`, `--quiet`, `--stream`, `--output-file` or `--no-cache`, does not apply the quality gate, and keeps every finding in the output (`hook.min_severity` only decides the exit code in `block` mode).
 

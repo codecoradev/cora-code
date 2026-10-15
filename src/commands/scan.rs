@@ -7,7 +7,9 @@ use tracing::debug;
 use crate::config::schema::Config;
 use crate::engine::ReviewIssue;
 use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
-use crate::engine::judge::{HttpScanJudge, ScanBatch, ScanJudge, admit};
+use crate::engine::judge::{
+    DETERMINISTIC_ONLY, HttpScanJudge, JudgeChoice, ScanBatch, ScanJudge, admit,
+};
 use crate::engine::postprocess::{Source, dropped_warning, postprocess_report};
 use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
@@ -51,7 +53,7 @@ pub struct ScanOptions {
 #[allow(clippy::too_many_lines)]
 pub async fn execute_scan(
     config: &Config,
-    llm_config: &crate::engine::LLMConfig,
+    judge: &JudgeChoice,
     opts: &ScanOptions,
     format: OutputFormat,
 ) -> Result<i32> {
@@ -166,20 +168,27 @@ pub async fn execute_scan(
         None
     };
 
-    // 5. Judge the batches and collect issues
-    let judge = HttpScanJudge { llm_config };
+    // 5. Judge the batches and collect issues (no LLM: deterministic only)
     let BatchRun {
         issues: mut all_issues,
         tokens: total_tokens,
-    } = judge_batches(
-        &judge,
-        config,
-        &batches,
-        &effective_focus,
-        brain_ctx.as_deref(),
-        opts.continue_on_batch_error,
-    )
-    .await?;
+    } = match judge {
+        JudgeChoice::Llm(llm_config) => {
+            judge_batches(
+                &HttpScanJudge { llm_config },
+                config,
+                &batches,
+                &effective_focus,
+                brain_ctx.as_deref(),
+                opts.continue_on_batch_error,
+            )
+            .await?
+        }
+        JudgeChoice::Deterministic => BatchRun {
+            issues: Vec::new(),
+            tokens: None,
+        },
+    };
 
     // 5. Merge deterministic + index findings with the LLM findings, then
     //    apply ignore.rules and inline cora-ignore markers. Deterministic
@@ -203,6 +212,13 @@ pub async fn execute_scan(
     );
     let should_block = shaped.should_block;
 
+    // A clean deterministic result is not an AI scan: say so in the summary.
+    let no_judge_note = if matches!(judge, JudgeChoice::Deterministic) {
+        format!(" {DETERMINISTIC_ONLY}")
+    } else {
+        String::new()
+    };
+
     let response = crate::engine::ScanResponse {
         issues: all_issues,
         files_scanned: files.len(),
@@ -219,7 +235,7 @@ pub async fn execute_scan(
             } else {
                 String::new()
             }
-        ),
+        ) + &no_judge_note,
         tokens_used: total_tokens,
         should_block,
     };
@@ -522,7 +538,7 @@ mod tests {
             batch_files: 0,
             continue_on_batch_error: true,
         };
-        let code = execute_scan(&config, &llm, &opts, OutputFormat::Json)
+        let code = execute_scan(&config, &JudgeChoice::Llm(llm), &opts, OutputFormat::Json)
             .await
             .unwrap();
         assert_eq!(code, 2, "deterministic finding must survive LLM failure");
@@ -624,5 +640,32 @@ mod tests {
         .await
         .unwrap();
         assert!(run.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deterministic_scan_needs_no_llm_and_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "password = \"hunter2hunter2\"\n").unwrap();
+        let mut config = Config::default();
+        config.hook.mode = "block".to_string();
+        let opts = ScanOptions {
+            path: Some(dir.path().to_string_lossy().to_string()),
+            include: vec![],
+            exclude: vec![],
+            extensions: vec![],
+            incremental: false,
+            focus: vec![],
+            batch_files: 0,
+            continue_on_batch_error: true,
+        };
+        let code = execute_scan(
+            &config,
+            &JudgeChoice::Deterministic,
+            &opts,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 2);
     }
 }

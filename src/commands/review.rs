@@ -6,6 +6,7 @@ use crate::config::schema::Config;
 use crate::engine::Severity;
 use crate::engine::chunker;
 use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
+use crate::engine::judge::JudgeChoice;
 use crate::engine::quality_gate;
 use crate::engine::types::ReviewResponse;
 use crate::formatters::{OutputFormat, formatter_for};
@@ -121,7 +122,7 @@ impl ReviewResult {
 #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 pub async fn execute_review(
     config: &Config,
-    llm_config: &crate::engine::LLMConfig,
+    judge: &JudgeChoice,
     opts: &ReviewOptions,
     format: OutputFormat,
     progress: &ProgressReporter,
@@ -151,7 +152,7 @@ pub async fn execute_review(
             // Auto-chunk mode: split diff and review each chunk
             return execute_chunked_review(
                 config,
-                llm_config,
+                judge,
                 opts,
                 format,
                 progress,
@@ -191,15 +192,17 @@ pub async fn execute_review(
 
     // 4. Emit calling_llm event
     if progress.is_enabled() {
-        progress.calling_llm(&llm_config.provider, &llm_config.model);
+        if let JudgeChoice::Llm(llm_config) = judge {
+            progress.calling_llm(&llm_config.provider, &llm_config.model);
+        }
     }
 
     let llm_start = std::time::Instant::now();
 
     // 5. Call the LLM engine
-    let response = match crate::engine::review::review_diff_with_cache(
+    let response = match crate::engine::review::review_diff_with_judge(
         config,
-        llm_config,
+        judge,
         &diff,
         opts.stream,
         !opts.no_cache,
@@ -387,7 +390,7 @@ fn get_diff(opts: &ReviewOptions, _config: &Config) -> Result<String> {
 #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 async fn execute_chunked_review(
     config: &Config,
-    llm_config: &crate::engine::LLMConfig,
+    judge: &JudgeChoice,
     opts: &ReviewOptions,
     format: OutputFormat,
     progress: &ProgressReporter,
@@ -445,14 +448,16 @@ async fn execute_chunked_review(
         }
 
         if progress.is_enabled() {
-            progress.calling_llm(&llm_config.provider, &llm_config.model);
+            if let JudgeChoice::Llm(llm_config) = judge {
+                progress.calling_llm(&llm_config.provider, &llm_config.model);
+            }
         }
 
         let chunk_start = std::time::Instant::now();
 
-        match crate::engine::review::review_diff_with_cache(
+        match crate::engine::review::review_diff_with_judge(
             config,
-            llm_config,
+            judge,
             &chunk.diff,
             opts.stream,
             !opts.no_cache,
