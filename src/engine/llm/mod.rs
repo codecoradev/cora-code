@@ -183,6 +183,21 @@ pub async fn run_review_prompts(
     review_with(&transport, events, llm_config.max_tokens, prompts).await
 }
 
+/// Build the prompts for scanning one batch of numbered file contents:
+/// hardened system prompt, user prompt with the files inside a fence.
+pub(crate) fn scan_prompts(
+    files_content: &str,
+    focus: &[String],
+    rules: &[String],
+    system_prompt_override: Option<&str>,
+    brain_context: Option<&str>,
+) -> ReviewPrompts {
+    ReviewPrompts {
+        system: harden_system_prompt(system_prompt_override.unwrap_or(SCAN_SYSTEM_PROMPT)),
+        user: build_scan_prompt(files_content, focus, rules, brain_context),
+    }
+}
+
 /// Scan a batch over any transport (same policy as review).
 #[allow(clippy::too_many_arguments)]
 async fn scan_with<T: Transport>(
@@ -195,15 +210,20 @@ async fn scan_with<T: Transport>(
     system_prompt_override: Option<&str>,
     brain_context: Option<&str>,
 ) -> std::result::Result<(Vec<ReviewIssue>, Option<String>, Option<TokenUsage>), CoraError> {
-    let system_prompt = harden_system_prompt(system_prompt_override.unwrap_or(SCAN_SYSTEM_PROMPT));
-    let user_prompt = build_scan_prompt(files_content, focus, rules, brain_context);
+    let prompts = scan_prompts(
+        files_content,
+        focus,
+        rules,
+        system_prompt_override,
+        brain_context,
+    );
 
     let (findings, usage) = request_findings(
         transport,
         events,
         &FindingsRequest {
-            system: &system_prompt,
-            user: &user_prompt,
+            system: &prompts.system,
+            user: &prompts.user,
             max_tokens,
         },
     )

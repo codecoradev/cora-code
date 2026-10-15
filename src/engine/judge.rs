@@ -237,6 +237,28 @@ impl ScanJudge for HttpScanJudge<'_> {
     }
 }
 
+/// Judge that is the calling agent: it already read the [`Packet`]'s prompts
+/// with its own model and hands back its findings. They are untrusted like any
+/// judge's and pass [`admit`] in the pipeline.
+pub struct AgentJudge {
+    pub issues: Vec<ReviewIssue>,
+}
+
+impl Judge for AgentJudge {
+    async fn judge(&self, _config: &Config, _packet: &Packet) -> Result<ReviewResponse, CoraError> {
+        Ok(ReviewResponse {
+            issues: self.issues.clone(),
+            summary: AGENT_JUDGED.to_string(),
+            tokens_used: None,
+            should_block: false,
+            dropped_findings: 0,
+        })
+    }
+}
+
+/// Summary text of a run judged by the calling agent rather than by cora's LLM.
+pub const AGENT_JUDGED: &str = "Judged by the calling agent (not by a cora-configured LLM).";
+
 /// Summary text of a run that had no LLM judge. Formatters key off it to say,
 /// in every output format, that a clean result is not an AI review.
 pub const DETERMINISTIC_ONLY: &str = "Deterministic checks only (no LLM judge).";
