@@ -2,6 +2,8 @@ use crate::error::CoraError;
 use tracing::{debug, instrument};
 
 use crate::config::schema::Config;
+use crate::engine::index_bridge::IndexBridge;
+use crate::engine::judge::{HttpJudge, Judge, Packet};
 use crate::engine::llm;
 use crate::engine::postprocess::{Source, postprocess_report};
 use crate::engine::types::{LLMConfig, ReviewResponse};
@@ -116,11 +118,54 @@ async fn review_diff_inner(
         }
     }
 
+    // Index bridge: one project handle, rooted via resolve_project_root, shared
+    // by every index-backed step so a run from a subdirectory agrees with
+    // `cora index` (#566).
+    let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
+
+    let packet = prepare(config, diff, memory_context, &index_bridge);
+    let judge = HttpJudge {
+        llm_config,
+        stream,
+        quiet,
+    };
+    let response = review_with(&judge, config, packet).await?;
+
+    // Save fully-processed response to cache (after filtering)
+    if use_cache {
+        if let Err(e) = crate::engine::cache::save_cached_review(
+            diff,
+            &llm_config.model,
+            llm_config.temperature,
+            &response,
+            &llm_config.provider,
+            &llm_config.base_url,
+        ) {
+            debug!("failed to save review to cache: {}", e);
+        }
+    }
+
+    Ok(response)
+}
+
+/// Step 1 of a review: turn `diff` into a [`Packet`].
+///
+/// Runs every deterministic check, assembles the prompt context, and records
+/// what the finishing step needs. Deterministic scanners always operate on the
+/// ORIGINAL unsanitized diff; only the text a judge sees is sanitized (ALIBI
+/// defense, arXiv:2607.24964). No judge is involved and nothing touches the
+/// network.
+pub fn prepare(
+    config: &Config,
+    diff: &str,
+    memory_context: Option<&str>,
+    index_bridge: &IndexBridge,
+) -> Packet {
     // Extract valid file paths for post-parse filtering
     let valid_files = llm::extract_file_paths_from_diff(diff);
 
     // Resolve custom system prompt for review
-    let review_prompt = resolve_system_prompt(
+    let system_prompt = resolve_system_prompt(
         config.review_system_prompt_override.as_deref(),
         config.review_system_prompt_file.as_deref(),
     );
@@ -129,11 +174,8 @@ async fn review_diff_inner(
     let static_context =
         crate::engine::static_analysis::collect_static_context(diff, &config.static_analysis);
 
-    // Parse diff and run rule engine. Deterministic scanners (rules, secrets,
-    // security) always operate on the ORIGINAL unsanitized diff — only the
-    // LLM sees sanitized text (ALIBI defense, arXiv:2607.24964).
     let diff_chunks = crate::engine::diff_parser::parse_diff(diff);
-    let review_diff_text: std::borrow::Cow<'_, str> = if config.sanitize_comments {
+    let diff_text = if config.sanitize_comments {
         let mut sanitized_chunks = crate::engine::diff_parser::parse_diff(diff);
         let full_report = crate::engine::comment_sanitizer::sanitize_chunks(&mut sanitized_chunks);
         let rendered = crate::engine::comment_sanitizer::render_sanitized_diff(&sanitized_chunks);
@@ -143,18 +185,14 @@ async fn review_diff_inner(
             "ALIBI comment defense applied"
         );
         if rendered.is_empty() {
-            std::borrow::Cow::Borrowed(diff)
+            diff.to_string()
         } else {
-            std::borrow::Cow::Owned(rendered)
+            rendered
         }
     } else {
-        std::borrow::Cow::Borrowed(diff)
+        diff.to_string()
     };
 
-    // Index bridge: one project handle, rooted via resolve_project_root, shared
-    // by every index-backed step so a run from a subdirectory agrees with
-    // `cora index` (#566).
-    let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
     let project_root = if index_bridge.root().as_os_str().is_empty() {
         std::env::current_dir().unwrap_or_default()
     } else {
@@ -164,7 +202,7 @@ async fn review_diff_inner(
     // All deterministic checks (rules, secrets, security, index scans) on the
     // ORIGINAL diff — no LLM involved. Context = static analysis + claim
     // warning + one block per scanner family.
-    let deterministic = crate::engine::deterministic::run(&diff_chunks, config, &index_bridge);
+    let deterministic = crate::engine::deterministic::run(&diff_chunks, config, index_bridge);
     if !deterministic.claims.suspicious_claims.is_empty() && !config.sanitize_comments {
         debug!(
             claims = deterministic.claims.suspicious_claims.len(),
@@ -230,11 +268,11 @@ async fn review_diff_inner(
     // ── Brain enrichment phase (Tier 1) ──────────────────────────────────
     // When use_brain is enabled and an index exists, enrich the review prompt
     // with impact analysis, affected tests, and semantic pattern search.
-    let final_context = if config.context_chain.use_brain {
+    let context = if config.context_chain.use_brain {
         match build_brain_context(
             &diff_chunks,
             config.context_chain.impact_depth,
-            &index_bridge,
+            index_bridge,
         ) {
             Some(brain_ctx) if !brain_ctx.is_empty() => {
                 debug!(
@@ -252,38 +290,41 @@ async fn review_diff_inner(
         }
     } else {
         final_context
-    }; // but preserve deterministic rule findings even on LLM failure
-    let llm_result: Result<ReviewResponse, CoraError> = if stream {
-        llm::review_diff_stream(
-            llm_config,
-            &review_diff_text,
-            &config.focus,
-            &config.rules,
-            &config.response_format,
-            review_prompt.as_deref(),
-            final_context.as_deref(),
-            &crate::progress::StdoutStream,
-        )
-        .await
-        .inspect(|_| println!()) // trailing newline after streamed output
-    } else {
-        llm::review_diff(
-            llm_config,
-            &review_diff_text,
-            &config.focus,
-            &config.rules,
-            &config.response_format,
-            review_prompt.as_deref(),
-            quiet,
-            final_context.as_deref(),
-        )
-        .await
     };
 
-    let mut response = match llm_result {
+    Packet {
+        diff_text,
+        context,
+        system_prompt,
+        valid_files,
+        chunks: diff_chunks,
+        deterministic,
+    }
+}
+
+/// Steps 2 and 3 of a review: ask `judge` for findings, then merge the
+/// deterministic findings, guard file paths, post-process, and decide
+/// `should_block`.
+///
+/// If the judge fails but the deterministic scanners found something, that is
+/// returned instead of an error (it must not be silently swallowed).
+pub async fn review_with<J: Judge>(
+    judge: &J,
+    config: &Config,
+    packet: Packet,
+) -> std::result::Result<ReviewResponse, CoraError> {
+    let judged = judge.judge(config, &packet).await;
+    let Packet {
+        valid_files,
+        chunks,
+        deterministic,
+        ..
+    } = packet;
+
+    let mut response = match judged {
         Ok(resp) => resp,
         Err(e) => {
-            // LLM failed — return deterministic findings only (don't silently swallow them)
+            // Judge failed — return deterministic findings only
             if !deterministic.is_empty() {
                 let n_rules = deterministic.rules.len();
                 let n_secrets = deterministic.secrets.len();
@@ -311,7 +352,7 @@ async fn review_diff_inner(
                     should_block: false,
                     dropped_findings: 0,
                 };
-                let pp = postprocess_report(fallback.issues, &Source::Diff(&diff_chunks), config);
+                let pp = postprocess_report(fallback.issues, &Source::Diff(&chunks), config);
                 fallback.issues = pp.issues;
                 fallback.dropped_findings = pp.dropped;
                 fallback.should_block = crate::engine::finalize::blocks(
@@ -324,7 +365,7 @@ async fn review_diff_inner(
         }
     };
 
-    // Merge deterministic findings (rules, secrets, security, index) with LLM issues
+    // Merge deterministic findings (rules, secrets, security, index) with the judge's issues
     response.issues = deterministic.merge_into(response.issues);
 
     // Filter out issues with invalid file paths (hallucination guard)
@@ -346,11 +387,10 @@ async fn review_diff_inner(
     // Shared post-processing (LLM secret FP cross-check, Markdown code blocks,
     // ignore.rules, inline `cora-ignore:`, context-line filter), see
     // `engine::postprocess`.
-    let pp = postprocess_report(response.issues, &Source::Diff(&diff_chunks), config);
+    let pp = postprocess_report(response.issues, &Source::Diff(&chunks), config);
     response.issues = pp.issues;
     response.dropped_findings = pp.dropped;
 
-    // Calculate should_block based on min_severity
     response.should_block =
         crate::engine::finalize::blocks(&response.issues, config.hook.min_severity_level());
 
@@ -359,20 +399,6 @@ async fn review_diff_inner(
         should_block = response.should_block,
         "review complete"
     );
-
-    // Save fully-processed response to cache (after filtering)
-    if use_cache {
-        if let Err(e) = crate::engine::cache::save_cached_review(
-            diff,
-            &llm_config.model,
-            llm_config.temperature,
-            &response,
-            &llm_config.provider,
-            &llm_config.base_url,
-        ) {
-            debug!("failed to save review to cache: {}", e);
-        }
-    }
 
     Ok(response)
 }
@@ -661,5 +687,142 @@ mod tests {
             result.is_none(),
             "system_prompt_file outside project root should be rejected"
         );
+    }
+
+    // ─── #649: the judge seam ───
+
+    use crate::engine::judge::NoJudge;
+    use crate::engine::types::{ReviewIssue, Severity};
+
+    /// Test judge: returns canned issues or a canned error.
+    struct FakeJudge(Result<Vec<ReviewIssue>, String>);
+
+    impl Judge for FakeJudge {
+        async fn judge(
+            &self,
+            _config: &Config,
+            _packet: &Packet,
+        ) -> std::result::Result<ReviewResponse, CoraError> {
+            match &self.0 {
+                Ok(issues) => Ok(ReviewResponse {
+                    issues: issues.clone(),
+                    summary: "fake".to_string(),
+                    tokens_used: None,
+                    should_block: false,
+                    dropped_findings: 0,
+                }),
+                Err(msg) => Err(CoraError::LlmParse(msg.clone())),
+            }
+        }
+    }
+
+    const SECRET_DIFF: &str = "diff --git a/app.py b/app.py\n\
+new file mode 100644\n\
+--- /dev/null\n\
++++ b/app.py\n\
+@@ -0,0 +1,2 @@\n\
++import os\n\
++password = \"hunter2hunter2\"\n";
+
+    const CLEAN_DIFF: &str = "diff --git a/app.py b/app.py\n\
+new file mode 100644\n\
+--- /dev/null\n\
++++ b/app.py\n\
+@@ -0,0 +1,2 @@\n\
++def add(a, b):\n\
++    return a + b\n";
+
+    fn packet(diff: &str, config: &Config) -> Packet {
+        prepare(config, diff, None, &IndexBridge::unavailable())
+    }
+
+    fn judged(file: &str, line: u32, severity: Severity) -> ReviewIssue {
+        ReviewIssue::new(file, Some(line), severity, "judge finding")
+            .with_type("bug")
+            .with_body("body")
+    }
+
+    fn run<J: Judge>(
+        judge: &J,
+        config: &Config,
+        packet: Packet,
+    ) -> std::result::Result<ReviewResponse, CoraError> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(review_with(judge, config, packet))
+    }
+
+    #[test]
+    fn prepare_records_valid_files_and_deterministic_findings() {
+        let config = Config::default();
+        let p = packet(SECRET_DIFF, &config);
+        assert_eq!(p.valid_files, vec!["app.py".to_string()]);
+        assert!(!p.deterministic.is_empty(), "secret should be detected");
+        assert!(p.diff_text.contains("hunter2hunter2"));
+    }
+
+    #[test]
+    fn judge_findings_are_merged_with_deterministic_ones() {
+        let config = Config::default();
+        let judge = FakeJudge(Ok(vec![judged("app.py", 1, Severity::Minor)]));
+        let resp = run(&judge, &config, packet(SECRET_DIFF, &config)).expect("review");
+        assert!(resp.issues.iter().any(|i| i.title == "judge finding"));
+        assert!(
+            resp.issues.iter().any(|i| i.rule_id.is_some()),
+            "deterministic finding must survive the merge"
+        );
+    }
+
+    #[test]
+    fn findings_for_files_outside_the_diff_are_dropped() {
+        let config = Config::default();
+        let judge = FakeJudge(Ok(vec![judged(
+            "src/not_in_diff.rs",
+            3,
+            Severity::Critical,
+        )]));
+        let resp = run(&judge, &config, packet(CLEAN_DIFF, &config)).expect("review");
+        assert!(resp.issues.is_empty());
+        assert!(!resp.should_block);
+    }
+
+    #[test]
+    fn should_block_follows_hook_min_severity() {
+        let mut config = Config::default();
+        config.hook.min_severity = "major".to_string();
+        let minor = FakeJudge(Ok(vec![judged("app.py", 1, Severity::Minor)]));
+        let resp = run(&minor, &config, packet(CLEAN_DIFF, &config)).expect("review");
+        assert!(!resp.should_block);
+
+        let major = FakeJudge(Ok(vec![judged("app.py", 1, Severity::Major)]));
+        let resp = run(&major, &config, packet(CLEAN_DIFF, &config)).expect("review");
+        assert!(resp.should_block);
+    }
+
+    #[test]
+    fn judge_failure_keeps_deterministic_findings() {
+        let config = Config::default();
+        let judge = FakeJudge(Err("boom".to_string()));
+        let resp = run(&judge, &config, packet(SECRET_DIFF, &config)).expect("fallback");
+        assert!(resp.summary.contains("LLM review failed"));
+        assert!(resp.issues.iter().any(|i| i.rule_id.is_some()));
+    }
+
+    #[test]
+    fn judge_failure_without_deterministic_findings_is_an_error() {
+        let config = Config::default();
+        let judge = FakeJudge(Err("boom".to_string()));
+        assert!(run(&judge, &config, packet(CLEAN_DIFF, &config)).is_err());
+    }
+
+    #[test]
+    fn no_judge_returns_deterministic_findings_only() {
+        let config = Config::default();
+        let resp = run(&NoJudge, &config, packet(SECRET_DIFF, &config)).expect("review");
+        assert!(!resp.issues.is_empty());
+        assert!(resp.issues.iter().all(|i| i.rule_id.is_some()));
+        assert!(resp.summary.contains("Deterministic"));
+        assert!(resp.tokens_used.is_none());
     }
 }

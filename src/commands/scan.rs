@@ -179,7 +179,8 @@ pub async fn execute_scan(
 
         eprintln!("  Reviewing{batch_label}…");
 
-        match crate::engine::llm::scan_files(
+        let spinner = crate::progress::Spinner::new("Scanning files…", false);
+        let scanned = crate::engine::llm::scan_files(
             llm_config,
             &files_content,
             &effective_focus,
@@ -187,9 +188,11 @@ pub async fn execute_scan(
             &config.response_format,
             None,
             brain_ctx.as_deref(),
+            &spinner,
         )
-        .await
-        {
+        .await;
+        spinner.finish();
+        match scanned {
             Ok((issues, _summary, tokens)) => {
                 all_issues.extend(issues);
                 total_tokens = match (total_tokens, tokens) {
