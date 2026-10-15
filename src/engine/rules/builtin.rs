@@ -284,6 +284,7 @@ fn quoted_placeholder_value(line: &str) -> bool {
         let v = &cap[1];
         let inner = &v[1..v.len() - 1];
         let placeholder = inner.is_empty()
+            || is_format_placeholder(inner)
             || (inner.starts_with("${") && inner.ends_with('}') && !shell_secret_default(inner))
             || (inner.starts_with("{{") && inner.ends_with("}}"))
             || (inner.starts_with('$')
@@ -361,12 +362,53 @@ fn secret_assign_rhs(line: &str) -> Option<&str> {
     Some(rest.trim())
 }
 
-/// A quoted value that is nothing but a reference: `${X}`, `$X`, `$(cmd)`.
+/// A format-string placeholder standing in for a value: `{}`, `{name}`,
+/// `{0}`, `{:?}`, `%s`, `%v`. Not a literal secret.
+fn is_format_placeholder(inner: &str) -> bool {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"^(?:\{[\w:.?#]*\}|%[sdvq])$").expect("placeholder regex must compile")
+    });
+    RE.is_match(inner)
+}
+
+/// `name: value` entries (struct-literal fields, object/dict entries, type
+/// annotations) in SOURCE CODE whose value is not a quoted literal:
+/// `webhook_secret: env::var("X")`, `refresh_token: prev?.refresh_token`,
+/// `token: Option<&'static str>`, `"password": ACCOUNT_PW`. In code a bare
+/// expression after the colon is a reference or a type, never a secret value; a
+/// quoted literal (`token: "abc12345"`) is not covered here and stays flagged.
+/// Config-style files (YAML, TOML, ...) keep their own judgement.
+fn colon_value_is_not_a_literal(line: &str, path: &str) -> bool {
+    if rhs_style(path) != RhsStyle::Code {
+        return false;
+    }
+    static COLON_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i)(?:password|passwd|pwd|secret|api_?key|token)["']?\s*:"#)
+            .expect("colon regex must compile")
+    });
+    for m in COLON_RE.find_iter(line) {
+        let rest = &line[m.end()..];
+        // `a::token`, `x := ...` and `token:=` are not `name: value` entries.
+        if rest.starts_with([':', '=']) {
+            continue;
+        }
+        let rhs = rest.trim().trim_end_matches([';', ',']).trim_end();
+        if rhs.is_empty() || starts_with_literal(rhs) {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+/// A quoted value that is nothing but a reference: `${X}`, `$X`, `$(cmd)`,
+/// or a format placeholder.
 fn is_pure_reference(inner: &str) -> bool {
-    (inner.starts_with("${")
-        && inner.ends_with('}')
-        && inner.matches("${").count() == 1
-        && !shell_secret_default(inner))
+    is_format_placeholder(inner)
+        || (inner.starts_with("${")
+            && inner.ends_with('}')
+            && inner.matches("${").count() == 1
+            && !shell_secret_default(inner))
         || (inner.starts_with("$(") && inner.ends_with(')'))
         || (inner.starts_with('$')
             && inner.len() > 1
@@ -474,7 +516,7 @@ fn embedded_literal(rhs: &str) -> Option<bool> {
 ///   files nothing changes.
 fn non_literal_rhs(line: &str, path: &str) -> bool {
     let Some(rhs) = secret_assign_rhs(line) else {
-        return false;
+        return colon_value_is_not_a_literal(line, path);
     };
     let rhs = rhs.trim_end_matches([';', ',']).trim_end();
     if rhs.is_empty() {
@@ -1386,5 +1428,106 @@ mod tests {
         ] {
             assert!(!has_secret_literal(line, path), "{line}");
         }
+    }
+
+    // ─── #661: `name: value` entries in code that are not secret literals ───
+
+    fn secret_fp(line: &str, path: &str) -> bool {
+        post_match_filter_for_path("crypto/hardcoded-secret", line, path)
+            && post_match_filter_for_path("sec-hardcoded-secret", line, path)
+    }
+
+    #[test]
+    fn colon_entries_with_non_literal_values_are_not_secrets() {
+        for (line, path) in [
+            (
+                r#"webhook_secret: env::var("POLAR_WEBHOOK_SECRET")"#,
+                "config.rs",
+            ),
+            (
+                "access_token: env::var(\"POLAR_ACCESS_TOKEN\")",
+                "config.rs",
+            ),
+            (
+                "refresh_token: typeof b.refresh_token === 'string' ? b.refresh_token : prev?.refresh_token,",
+                "oidc.ts",
+            ),
+            (
+                "fn with_auth(token: Option<&'static str>) -> Self {",
+                "mod.rs",
+            ),
+            ("admin_token: Option<&'static str>,", "mod.rs"),
+            (
+                "api_key: pick(\"UTEKE_EMBED_FALLBACK_API_KEY\", self.api_key),",
+                "lib.rs",
+            ),
+            ("\"RS_CLIENT_SECRET\": rs[\"clientSecret\"],", "gh_setup.py"),
+            (
+                "json_body={\"email\": ADMIN, \"password\": ACCOUNT_PW})",
+                "lib.py",
+            ),
+            (
+                "let ent = {\"clientSecret\": j[\"clientSecret\"]}",
+                "gh_setup.py",
+            ),
+        ] {
+            assert!(secret_fp(line, path), "should be suppressed: {line}");
+        }
+    }
+
+    #[test]
+    fn format_placeholders_are_not_secret_values() {
+        for line in [
+            "api_key = \"{}\"",
+            "api_key = \"{key}\"",
+            "token = \"%s\"",
+            "password = \"{0}\"",
+            "api_key: \"{}\",",
+        ] {
+            assert!(
+                secret_fp(line, "onboard.rs"),
+                "should be suppressed: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_secret_literals_in_colon_entries_are_still_flagged() {
+        for (line, path) in [
+            ("password: \"hunter2hunter2\",", "config.ts"),
+            ("api_key: 'sk_live_abcdefghijkl',", "client.js"),
+            ("const cfg = { token: \"ghp_abcdefghijklmnop\" };", "a.ts"),
+            ("password = \"hunter2hunter2\"", "app.py"),
+            ("let token: &str = \"abcdefgh12345678\";", "main.rs"),
+            ("api_key: \"k\".into(),", "lib.rs"), // short literal: left to test-code awareness (#663)
+        ] {
+            assert!(
+                !post_match_filter_for_path("crypto/hardcoded-secret", line, path),
+                "must stay flagged: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_path_segments_named_like_secrets_are_not_entries() {
+        // `Token::secret: ...` style paths and `:=` are not `name: value` entries.
+        assert!(!colon_value_is_not_a_literal(
+            "let s = a::token::new();",
+            "x.rs"
+        ));
+        assert!(!colon_value_is_not_a_literal(
+            "token := \"abcdefgh12345678\"",
+            "main.go"
+        ));
+    }
+
+    #[test]
+    fn config_style_files_keep_their_own_judgement() {
+        // YAML: an unquoted value after the colon is still judged by the
+        // plain-scalar rule, not waved through by the code-only rule.
+        assert!(!colon_value_is_not_a_literal(
+            "password: hunter2hunter2",
+            "app.yaml"
+        ));
     }
 }
