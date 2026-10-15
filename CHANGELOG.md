@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The calling agent can be the reviewer, with no LLM configured in cora (#647).** Four MCP tools split a review into prepare / judge / finalize with the agent as the judge: `cora.review_prepare` returns the hardened prompts, `valid_files`, deterministic findings and the response schema; `cora.review_finalize` merges the agent's findings (validated by `judge::admit`), applies `ignore.rules`, inline markers and the quality gate, and returns the verdict. `cora.scan_prepare` (paged by batch, path restricted to the project) and `cora.scan_finalize` do the same for a scan. Stateless: finalize recomputes the deterministic half from the same diff/path. `cora install` also installs a `/cora-review` skill for Claude Code (`~/.claude/skills/cora-review/SKILL.md`, never overwriting a customized copy without `--force`). See `docs/usage.md` for the security model.
+
 - **`cora review` and `cora scan` run without an API key (#646).** With no key they run the deterministic checks only, print a one-line notice on stderr, and label the result "Deterministic checks only (no LLM judge)" (SARIF: `cora.judge = none` on the invocation, even with zero results). `--no-llm` forces it and silences the notice. A missing key is no longer an error for these two commands; any other config error still is. The judge is chosen once at the entry point (`judge::select_judge`, `JudgeChoice`). `cora commit` and MCP `cora.review_diff` still need a key.
 
 ### Security
@@ -26,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One `finalize` module owns the result tail of review, scan, commit and MCP (#648).** `engine::finalize` (`shape`, `shape_issues`, `blocks`, `exit_code`, `save_debt`, `save_history`) replaces six hand-copied versions of severity filtering, `should_block`, quality gate, exit code, debt snapshot and review history. Behavior of `cora review` (single and chunked) and `cora scan` is unchanged. Fixed along the way: the MCP `cora.review_diff` tool now honors its `min_severity` parameter and evaluates the quality gate on the reported findings; `cora commit` now records its review in the review history (`command = "commit"`).
 
 ### Fixed
+
+- **The MCP `cora.review_diff` tool no longer crashes the server (#647).** Every call panicked with "Cannot start a runtime from within a runtime" because the handler blocked on a second runtime from a tokio runtime thread. Handlers now go through `block_in_place`.
 
 - **`cora scan` now runs the rules engine (#645).** Built-in rules (`bug-todo`, `sec-sql-concat`, ...) and custom `rules_engine.custom_rules` were only run by `cora review`; scan silently skipped them. One set of deterministic families (`deterministic::run_files` for whole files, `deterministic::run` for diffs) now serves both, and the MCP `cora.check_snippet` tool picks up rules too. Scan also has a judge seam (`judge::ScanJudge`, with `HttpScanJudge` and `NoJudge`) so the batch loop is tested without a network, and `DEFAULT_BATCH_TOKEN_BUDGET` is renamed `DEFAULT_BATCH_CHAR_BUDGET` (it was always a character count). `docs/cli-reference.md` now states which review flags scan does not have.
 

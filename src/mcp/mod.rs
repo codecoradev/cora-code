@@ -5,6 +5,7 @@
 //!
 //! Transport: stdio (stdin/stdout JSON-RPC)
 
+pub mod agent_tools;
 pub mod protocol;
 pub mod server;
 pub mod tools;

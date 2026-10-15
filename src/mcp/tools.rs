@@ -16,6 +16,20 @@ use super::protocol::{Tool, ToolResult};
 static MCP_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("Failed to create MCP tokio runtime"));
 
+/// Run `future` to completion from a tool handler.
+///
+/// The MCP server runs inside `#[tokio::main]`, so a handler is already on a
+/// runtime thread; calling `MCP_RUNTIME.block_on` directly there panics
+/// ("Cannot start a runtime from within a runtime") and kills the server.
+/// `block_in_place` hands the thread over first. Outside a runtime (unit
+/// tests) it blocks directly.
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| MCP_RUNTIME.block_on(future)),
+        Err(_) => MCP_RUNTIME.block_on(future),
+    }
+}
+
 /// List all available MCP tools.
 pub fn list_tools() -> Vec<Tool> {
     vec![
@@ -234,6 +248,10 @@ pub fn list_tools() -> Vec<Tool> {
             }),
         },
     ]
+    .into_iter()
+    // Agent-as-reviewer tools (#647): no LLM configured in cora.
+    .chain(super::agent_tools::tools())
+    .collect()
 }
 
 /// Dispatch a tool call to the appropriate handler.
@@ -266,6 +284,11 @@ pub fn handle_tool_call(name: &str, params: &serde_json::Value) -> ToolResult {
         "cora.dead_code" => handle_dead_code(params),
         // Graph Query DSL
         "cora.query" => handle_query(params),
+        // Agent-as-reviewer (#647)
+        "cora.review_prepare" => super::agent_tools::review_prepare(params),
+        "cora.review_finalize" => super::agent_tools::review_finalize(params),
+        "cora.scan_prepare" => super::agent_tools::scan_prepare(params),
+        "cora.scan_finalize" => super::agent_tools::scan_finalize(params),
         _ => ToolResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -601,7 +624,7 @@ const MAX_LIMIT: u64 = 500;
 const MAX_DEPTH: u64 = 10;
 const MAX_MIN_LINES: u64 = 100_000;
 /// Max size of a diff accepted by `cora.review_diff` (bytes).
-const MAX_DIFF_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_DIFF_BYTES: usize = 1024 * 1024;
 
 /// Read an unsigned integer param, defaulting when absent and clamping to `max`.
 fn clamped_u64(params: &serde_json::Value, key: &str, default: u64, max: u64) -> u64 {
@@ -756,7 +779,7 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
     };
 
     // Run review synchronously using the shared runtime
-    let result = MCP_RUNTIME.block_on(crate::engine::review::review_diff_with_cache(
+    let result = block_on(crate::engine::review::review_diff_with_cache(
         &config,
         &llm_config,
         diff,
@@ -1130,7 +1153,7 @@ fn handle_query(params: &serde_json::Value) -> ToolResult {
 }
 
 /// Load project config safely (no API keys exposed).
-fn load_project_config() -> anyhow::Result<crate::config::schema::Config> {
+pub(super) fn load_project_config() -> anyhow::Result<crate::config::schema::Config> {
     let mut config = crate::config::schema::Config::default();
     let cwd = std::env::current_dir()?;
 
@@ -1489,7 +1512,19 @@ mod tests {
     #[test]
     fn total_tool_count() {
         let tools = list_tools();
-        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) + dead_code (1) + query (1) = 18
-        assert_eq!(tools.len(), 18);
+        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) + dead_code (1) + query (1) + agent-as-reviewer (4) = 22
+        assert_eq!(tools.len(), 22);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_on_works_from_inside_a_runtime() {
+        // Regression: tool handlers run on a tokio runtime thread (the server
+        // is `#[tokio::main]`); a bare `MCP_RUNTIME.block_on` panicked there.
+        assert_eq!(block_on(async { 1 + 1 }), 2);
+    }
+
+    #[test]
+    fn block_on_works_outside_a_runtime() {
+        assert_eq!(block_on(async { 2 + 2 }), 4);
     }
 }

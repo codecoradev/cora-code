@@ -657,6 +657,10 @@ cora serve    # Start MCP server + auto-reindex on startup (ensures fresh index)
 | `cora.find_affected_tests` | Find test files affected by changed source files |
 | `cora.index_status` | Check if a symbol index exists and get statistics |
 | `cora.review_diff` | Review a git diff using cora's full pipeline (makes LLM call) |
+| `cora.review_prepare` | Agent-as-reviewer step 1: prompts, `valid_files` and deterministic findings for a diff. No LLM in cora |
+| `cora.review_finalize` | Agent-as-reviewer step 2: merge and validate the agent's findings, apply rules and gate. No LLM call |
+| `cora.scan_prepare` | Agent-as-reviewer scan step 1: one batch of project files (paged) plus deterministic findings |
+| `cora.scan_finalize` | Agent-as-reviewer scan step 2: merge and validate the agent's findings for the whole scan |
 | `cora.get_debt` | Get tech debt report from review history |
 | `cora.get_project_info` | Get project context (repo, branch, cora version, index status) |
 | `cora.get_memory` | Recall project patterns from Uteke (requires `uteke` CLI) |

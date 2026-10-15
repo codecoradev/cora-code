@@ -17,12 +17,12 @@ use crate::formatters::{OutputFormat, formatter_for};
 
 /// Default maximum files per LLM batch when `--batch-files` is not specified.
 /// Lower this to work around provider token limits or rate-limit errors.
-const DEFAULT_MAX_FILES_PER_BATCH: usize = 20;
+pub(crate) const DEFAULT_MAX_FILES_PER_BATCH: usize = 20;
 
 /// Character budget per batch (roughly 4 characters per token). Used by the
 /// scanner to split large file sets into review-sized chunks that fit within
 /// typical model context windows.
-const DEFAULT_BATCH_CHAR_BUDGET: usize = 60_000;
+pub(crate) const DEFAULT_BATCH_CHAR_BUDGET: usize = 60_000;
 
 /// Scan command options.
 pub struct ScanOptions {
@@ -123,18 +123,8 @@ pub async fn execute_scan(
     // 2b. Run index-powered deterministic scans (unused imports, dead code)
     // These work even without LLM and add findings to the final report.
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-    // Same merged exclusion set as `cora index` (#521).
-    let mut index_skip = config.ignore.files.clone();
-    index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
-    index_skip.dedup();
     let index_bridge = crate::engine::index_bridge::IndexBridge::open(&root_abs);
-    let index_findings = crate::engine::index_scanner::scan_project_index(
-        &index_bridge,
-        &files,
-        // Uncapped: the cap is enforced after suppression in `postprocess` (#624).
-        usize::MAX,
-        &index_skip,
-    );
+    let index_findings = index_findings(config, &index_bridge, &files);
     if !index_findings.is_empty() {
         eprintln!(
             "  {} index-based findings (unused imports, dead code)",
@@ -275,6 +265,21 @@ pub async fn execute_scan(
     Ok(shaped.exit_code)
 }
 
+/// Index-backed deterministic findings (unused imports, dead code) for `files`.
+///
+/// Uncapped: the cap is enforced after suppression in `postprocess` (#624).
+/// Uses the same merged exclusion set as `cora index` (#521).
+pub(crate) fn index_findings(
+    config: &Config,
+    bridge: &crate::engine::index_bridge::IndexBridge,
+    files: &[FileEntry],
+) -> Vec<ReviewIssue> {
+    let mut index_skip = config.ignore.files.clone();
+    index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
+    index_skip.dedup();
+    crate::engine::index_scanner::scan_project_index(bridge, files, usize::MAX, &index_skip)
+}
+
 /// Findings and token usage gathered from all scan batches.
 struct BatchRun {
     issues: Vec<ReviewIssue>,
@@ -381,7 +386,7 @@ async fn judge_batches<J: ScanJudge>(
 /// merge them with `issues` (LLM + index findings); then drop findings matched
 /// by `ignore.rules` and by inline `cora-ignore:` markers. Reuses the review
 /// pipeline's scanners, merge, and filters (#595).
-fn finalize_issues(
+pub(crate) fn finalize_issues(
     config: &Config,
     files: &[FileEntry],
     issues: Vec<ReviewIssue>,
