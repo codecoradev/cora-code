@@ -796,19 +796,20 @@ mod tests {
 
     #[test]
     fn capped_deterministic_findings_are_reported_not_silently_hidden() {
-        // 7 TODO comments, default cap 5: prepare lists all, finalize says 2 are hidden.
+        // 60 Info-level TODO findings, default cap 50: prepare lists all, finalize
+        // says 10 are hidden.
         let mut diff = String::from(concat!(
             "diff --git a/lib.rs b/lib.rs\n",
             "new file mode 100644\n",
             "--- /dev/null\n",
             "+++ b/lib.rs\n",
-            "@@ -0,0 +1,7 @@\n",
+            "@@ -0,0 +1,60 @@\n",
         ));
-        for n in 0..7 {
+        for n in 0..60 {
             diff.push_str(&format!("+// TODO item {n}\n"));
         }
         let prep = as_json(&review_prepare(&json!({ "diff": diff })));
-        assert_eq!(prep["deterministic_findings_total"], 7);
+        assert_eq!(prep["deterministic_findings_total"], 60);
         assert!(
             prep["deterministic_findings_note"]
                 .as_str()
@@ -816,8 +817,8 @@ mod tests {
                 .contains("not_shown")
         );
         let out = as_json(&review_finalize(&json!({ "diff": diff, "issues": [] })));
-        assert_eq!(out["total_issues"], 5);
-        assert_eq!(out["not_shown"], 2);
+        assert_eq!(out["total_issues"], 50);
+        assert_eq!(out["not_shown"], 10);
         assert!(
             out["not_shown_note"]
                 .as_str()

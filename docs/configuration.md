@@ -445,7 +445,7 @@ Control how index-based scanners (unused imports, dead code, breaking changes) b
 ```yaml
 rules_engine:
   enabled: true
-  max_findings: 5
+  max_findings: 50
   index_skip_files:
     - "*.config.ts"
     - "vite.config.*"
@@ -461,7 +461,7 @@ rules_engine:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
-| `max_findings` | `int` | `5` | Max deterministic findings shown per run (`0` or `null` = unlimited). See below |
+| `max_findings` | `int` | `50` | Max deterministic findings shown per run; Critical and Major are never hidden (`0` or `null` = unlimited). See below |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
 
 #### What `max_findings` caps
@@ -469,8 +469,8 @@ rules_engine:
 `max_findings` caps the **deterministic** findings only (rule engine, secrets, security, and index scanners; the findings that carry a `rule_id`). LLM issues are never capped.
 
 - The cap is applied **after** suppression (`ignore.rules` and inline `cora-ignore:` markers), so suppressed findings never use up slots and hide real ones.
-- Findings are kept highest severity first (Critical, Major, Minor, Info); ties keep their original order. Because the most severe findings survive, the cap never changes the blocking decision for a cap of 1 or more.
-- When findings are cut, `cora scan` and `cora review` print one line on **stderr** (`⚠ N more deterministic findings not shown (rules.max_findings = 5; raise it or set 0/null to show all)`), and the `cora scan` summary mentions it. JSON, SARIF and compact output on stdout are unchanged.
+- Findings are kept highest severity first (Critical, Major, Minor, Info); ties keep their original order. **Critical and Major findings are never hidden:** the cap limits the noise (Minor, Info) and never drops below the number of serious findings, so a project with 60 Major findings sees all 60 (and no Minor ones). Because the most severe findings always survive, the cap never changes the blocking decision.
+- When findings are cut, `cora scan` and `cora review` print one line on **stderr** (`⚠ N more deterministic findings not shown (rules.max_findings = 50; critical and major are never hidden; raise it or set 0/null to show all)`), and the `cora scan` summary mentions it. JSON, SARIF and compact output on stdout are unchanged.
 - `0` or `null` means unlimited. For large diffs that `cora review` splits into chunks, the cap applies per chunk.
 
 Default `index_skip_files` patterns (bundled with cora):

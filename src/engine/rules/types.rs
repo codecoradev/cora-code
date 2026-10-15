@@ -64,7 +64,7 @@ impl Default for RulesConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_findings: 5,
+            max_findings: 50,
             custom_rules: Vec::new(),
             index_skip_files: default_index_skip_files(),
         }

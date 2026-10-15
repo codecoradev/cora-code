@@ -396,7 +396,7 @@ fn check_snippet_with(
     }
     if report.dropped > 0 {
         lines.push(format!(
-            "\n{} more deterministic finding(s) not shown (rules.max_findings = {}; raise it or set 0/null to show all)",
+            "\n{} more deterministic finding(s) not shown (rules.max_findings = {}; critical and major are never hidden; raise it or set 0/null to show all)",
             report.dropped, config.rules_config.max_findings
         ));
     }
@@ -1292,8 +1292,9 @@ mod tests {
     fn snippet_respects_max_findings_and_reports_dropped() {
         let mut cfg = crate::config::schema::Config::default();
         cfg.rules_config.max_findings = 1;
-        let code = "a = 'AKIAIOSFODNN7EXAMPLE'\nb = 'AKIAIOSFODNN7EXAMPLF'";
-        let text = snippet_text(code, "py", &cfg);
+        // Two Info-level findings: only noise is capped.
+        let code = "// TODO: first\n// TODO: second";
+        let text = snippet_text(code, "rs", &cfg);
         assert!(text.contains("Found 1 issue(s)"), "{text}");
         assert!(
             text.contains("1 more deterministic finding(s) not shown"),
@@ -1301,7 +1302,14 @@ mod tests {
         );
 
         cfg.rules_config.max_findings = 0; // unlimited
-        let text = snippet_text(code, "py", &cfg);
+        let text = snippet_text(code, "rs", &cfg);
+        assert!(text.contains("Found 2 issue(s)"), "{text}");
+        assert!(!text.contains("not shown"), "{text}");
+
+        // Critical findings are never hidden, whatever the cap.
+        cfg.rules_config.max_findings = 1;
+        let secrets = "a = 'AKIAIOSFODNN7EXAMPLE'\nb = 'AKIAIOSFODNN7EXAMPLF'";
+        let text = snippet_text(secrets, "py", &cfg);
         assert!(text.contains("Found 2 issue(s)"), "{text}");
         assert!(!text.contains("not shown"), "{text}");
     }
