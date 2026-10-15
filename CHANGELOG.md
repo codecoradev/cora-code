@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Bumped `rustls` 0.23.45 → 0.23.46 and `quinn-proto` 0.11.16 → 0.11.19** (RUSTSEC-2026-0338/0339/0340/0341/0342 and RUSTSEC-2026-0346/0347/0348/0349), plus the yanked `chacha20` 0.10.1 → 0.10.2. Lockfile-only patch bumps; this was failing the `Security Audit (CVE)` job on every PR.
+
 ## [0.18.0] - 2026-10-09
 
 ### Security
