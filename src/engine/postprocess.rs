@@ -18,7 +18,7 @@
 //!
 //! | # | Filter                            | Diff               | Files |
 //! |---|-----------------------------------|--------------------|-------|
-//! | 1 | scanner merge (secrets, security) | no (caller merges) | yes   |
+//! | 1 | scanner merge (rules, secrets, security) | no (caller merges) | yes   |
 //! | 2 | LLM hardcoded-secret FP check     | yes                | no    |
 //! | 3 | Markdown fenced code block        | yes                | no    |
 //! | 4 | `ignore.rules`                    | yes                | yes   |
@@ -42,7 +42,7 @@ use crate::engine::diff_parser::FileChunk;
 use crate::engine::scan_input;
 use crate::engine::scanner::FileEntry;
 use crate::engine::types::{ReviewIssue, Severity};
-use crate::engine::{inline_suppress, rules, secrets_scanner, security_scanner};
+use crate::engine::{deterministic, inline_suppress};
 
 /// What the findings being post-processed were produced from.
 pub enum Source<'a> {
@@ -92,18 +92,10 @@ pub fn postprocess_report(
             apply_context_line_filter(issues, chunks)
         }
         Source::Files(files) => {
+            // Rules, secrets and security run uncapped; the cap is enforced
+            // below, after suppression (#624).
+            let merged = deterministic::run_files(files, config).merge_into(issues);
             let scan_files = scan_input::from_entries(files);
-            // Scanners run uncapped; the cap is enforced below, after
-            // suppression (#624).
-            let mut merged = issues;
-            for family in [
-                secrets_scanner::scan_secrets_in(&scan_files, usize::MAX),
-                security_scanner::scan_security_in(&scan_files, usize::MAX),
-            ] {
-                if !family.is_empty() {
-                    merged = rules::merge_rule_findings(merged, family);
-                }
-            }
             let merged = apply_ignore_rules(merged, &config.ignore.rules);
             inline_suppress::apply_lines(merged, &scan_files)
         }

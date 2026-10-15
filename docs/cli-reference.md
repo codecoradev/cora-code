@@ -90,6 +90,8 @@ Complete command reference for the cora CLI.
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |
 
+`cora scan` runs the same deterministic checks as `cora review` (built-in and custom rules, secrets, security patterns, plus unused imports and dead code from the index) on every file, then asks the LLM about each batch. Findings are filtered by `ignore.rules` and inline `cora-ignore:` markers and capped by `rules_engine.max_findings`. Unlike `review`, scan has no `--ci`, `--severity`, `--quiet`, `--stream`, `--output-file` or `--no-cache`, does not apply the quality gate, and keeps every finding in the output (`hook.min_severity` only decides the exit code in `block` mode).
+
 ### Code Intelligence
 
 See [Code Intelligence](./code-intelligence) for detailed usage.

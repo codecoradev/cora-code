@@ -7,7 +7,7 @@ use tracing::debug;
 use crate::config::schema::Config;
 use crate::engine::ReviewIssue;
 use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
-use crate::engine::judge::admit;
+use crate::engine::judge::{HttpScanJudge, ScanBatch, ScanJudge, admit};
 use crate::engine::postprocess::{Source, dropped_warning, postprocess_report};
 use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
@@ -17,9 +17,10 @@ use crate::formatters::{OutputFormat, formatter_for};
 /// Lower this to work around provider token limits or rate-limit errors.
 const DEFAULT_MAX_FILES_PER_BATCH: usize = 20;
 
-/// Approximate token budget per batch. Used by the scanner to split large file
-/// sets into review-sized chunks that fit within typical model context windows.
-const DEFAULT_BATCH_TOKEN_BUDGET: usize = 60_000;
+/// Character budget per batch (roughly 4 characters per token). Used by the
+/// scanner to split large file sets into review-sized chunks that fit within
+/// typical model context windows.
+const DEFAULT_BATCH_CHAR_BUDGET: usize = 60_000;
 
 /// Scan command options.
 pub struct ScanOptions {
@@ -145,7 +146,7 @@ pub async fn execute_scan(
     } else {
         DEFAULT_MAX_FILES_PER_BATCH
     };
-    let batches = batch_files(&files, DEFAULT_BATCH_TOKEN_BUDGET, max_files_per_batch);
+    let batches = batch_files(&files, DEFAULT_BATCH_CHAR_BUDGET, max_files_per_batch);
     debug!(
         batches = batches.len(),
         max_files = max_files_per_batch,
@@ -165,97 +166,20 @@ pub async fn execute_scan(
         None
     };
 
-    // 5. Process batches and collect issues
-    let mut all_issues = Vec::new();
-    let mut total_tokens: Option<TokenUsage> = None;
-    let mut skipped_batches: Vec<(usize, Vec<String>, String)> = Vec::new();
-
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        let files_content = format_batch_for_prompt(batch);
-        let batch_label = if batches.len() > 1 {
-            format!(" (batch {}/{})", batch_idx + 1, batches.len())
-        } else {
-            String::new()
-        };
-
-        eprintln!("  Reviewing{batch_label}…");
-
-        let spinner = crate::progress::Spinner::new("Scanning files…", false);
-        let scanned = crate::engine::llm::scan_files(
-            llm_config,
-            &files_content,
-            &effective_focus,
-            &config.rules,
-            &config.response_format,
-            None,
-            brain_ctx.as_deref(),
-            &spinner,
-        )
-        .await;
-        spinner.finish();
-        match scanned {
-            Ok((issues, _summary, tokens)) => {
-                // The model's answer is untrusted: only files of this batch,
-                // bounded text, no deterministic markers (#644).
-                let batch_paths: Vec<String> = batch.iter().map(|f| f.path.clone()).collect();
-                all_issues.extend(admit(issues, &batch_paths, &Source::Files(batch)));
-                total_tokens = match (total_tokens, tokens) {
-                    (Some(mut acc), Some(t)) => {
-                        acc.input_tokens += t.input_tokens;
-                        acc.output_tokens += t.output_tokens;
-                        acc.estimated_cost_usd += t.estimated_cost_usd;
-                        Some(acc)
-                    }
-                    (None, Some(t)) => Some(t),
-                    (acc, None) => acc,
-                };
-            }
-            Err(err) => {
-                let file_list: Vec<String> =
-                    batch.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
-                let err_string = err.to_string();
-
-                // Always log the failure at warn level so it shows even without --verbose.
-                tracing::warn!(
-                    batch = batch_idx + 1,
-                    total_batches = batches.len(),
-                    files = ?file_list,
-                    error = %err_string,
-                    "batch scan failed"
-                );
-
-                if !opts.continue_on_batch_error {
-                    eprintln!(
-                        "  {} batch {}/{}: {}",
-                        "failed".red().bold(),
-                        batch_idx + 1,
-                        batches.len(),
-                        err_string
-                    );
-                    return Err(err.into());
-                }
-
-                eprintln!(
-                    "  {} batch {}/{} — skipping ({} files): {}",
-                    "warn".yellow().bold(),
-                    batch_idx + 1,
-                    batches.len(),
-                    file_list.len(),
-                    err_string
-                );
-                skipped_batches.push((batch_idx + 1, file_list, err_string));
-            }
-        }
-    }
-
-    if !skipped_batches.is_empty() {
-        eprintln!(
-            "  {} {} of {} batches skipped due to parse failures.",
-            skipped_batches.len().to_string().yellow(),
-            skipped_batches.len(),
-            batches.len()
-        );
-    }
+    // 5. Judge the batches and collect issues
+    let judge = HttpScanJudge { llm_config };
+    let BatchRun {
+        issues: mut all_issues,
+        tokens: total_tokens,
+    } = judge_batches(
+        &judge,
+        config,
+        &batches,
+        &effective_focus,
+        brain_ctx.as_deref(),
+        opts.continue_on_batch_error,
+    )
+    .await?;
 
     // 5. Merge deterministic + index findings with the LLM findings, then
     //    apply ignore.rules and inline cora-ignore markers. Deterministic
@@ -335,7 +259,109 @@ pub async fn execute_scan(
     Ok(shaped.exit_code)
 }
 
-/// Run the deterministic scanners (secrets, security) over whole files and
+/// Findings and token usage gathered from all scan batches.
+struct BatchRun {
+    issues: Vec<ReviewIssue>,
+    tokens: Option<TokenUsage>,
+}
+
+/// Ask `judge` about every batch. A batch that fails is skipped with a warning
+/// (`continue_on_error`) or aborts the scan. Every batch's answer passes
+/// [`admit`] first: it is untrusted (#644).
+async fn judge_batches<J: ScanJudge>(
+    judge: &J,
+    config: &Config,
+    batches: &[Vec<FileEntry>],
+    focus: &[String],
+    brain_context: Option<&str>,
+    continue_on_error: bool,
+) -> Result<BatchRun> {
+    let mut all_issues = Vec::new();
+    let mut total_tokens: Option<TokenUsage> = None;
+    let mut skipped_batches: Vec<(usize, Vec<String>, String)> = Vec::new();
+
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let files_content = format_batch_for_prompt(batch);
+        let batch_label = if batches.len() > 1 {
+            format!(" (batch {}/{})", batch_idx + 1, batches.len())
+        } else {
+            String::new()
+        };
+
+        eprintln!("  Reviewing{batch_label}…");
+
+        match judge
+            .judge_batch(config, &files_content, focus, brain_context)
+            .await
+        {
+            Ok(ScanBatch { issues, tokens }) => {
+                // Only files of this batch, bounded text, no deterministic markers.
+                let batch_paths: Vec<String> = batch.iter().map(|f| f.path.clone()).collect();
+                all_issues.extend(admit(issues, &batch_paths, &Source::Files(batch)));
+                total_tokens = match (total_tokens, tokens) {
+                    (Some(mut acc), Some(t)) => {
+                        acc.input_tokens += t.input_tokens;
+                        acc.output_tokens += t.output_tokens;
+                        acc.estimated_cost_usd += t.estimated_cost_usd;
+                        Some(acc)
+                    }
+                    (None, Some(t)) => Some(t),
+                    (acc, None) => acc,
+                };
+            }
+            Err(err) => {
+                let file_list: Vec<String> = batch.iter().map(|f| f.path.clone()).collect();
+                let err_string = err.to_string();
+
+                // Always log the failure at warn level so it shows even without --verbose.
+                tracing::warn!(
+                    batch = batch_idx + 1,
+                    total_batches = batches.len(),
+                    files = ?file_list,
+                    error = %err_string,
+                    "batch scan failed"
+                );
+
+                if !continue_on_error {
+                    eprintln!(
+                        "  {} batch {}/{}: {}",
+                        "failed".red().bold(),
+                        batch_idx + 1,
+                        batches.len(),
+                        err_string
+                    );
+                    return Err(err.into());
+                }
+
+                eprintln!(
+                    "  {} batch {}/{} — skipping ({} files): {}",
+                    "warn".yellow().bold(),
+                    batch_idx + 1,
+                    batches.len(),
+                    file_list.len(),
+                    err_string
+                );
+                skipped_batches.push((batch_idx + 1, file_list, err_string));
+            }
+        }
+    }
+
+    if !skipped_batches.is_empty() {
+        eprintln!(
+            "  {} {} of {} batches skipped due to parse failures.",
+            skipped_batches.len().to_string().yellow(),
+            skipped_batches.len(),
+            batches.len()
+        );
+    }
+
+    Ok(BatchRun {
+        issues: all_issues,
+        tokens: total_tokens,
+    })
+}
+
+/// Run the deterministic scanners (rules, secrets, security) over whole files and
 /// merge them with `issues` (LLM + index findings); then drop findings matched
 /// by `ignore.rules` and by inline `cora-ignore:` markers. Reuses the review
 /// pipeline's scanners, merge, and filters (#595).
@@ -500,5 +526,103 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(code, 2, "deterministic finding must survive LLM failure");
+    }
+
+    // ─── #645: scan runs the rules engine, and has a judge seam ───
+
+    #[test]
+    fn builtin_rules_fire_in_scan() {
+        let file = entry("src/lib.rs", "fn main() {\n    // TODO: handle this\n}\n");
+        let out = finalize_issues(&Config::default(), &[file], Vec::new()).0;
+        assert!(
+            out.iter().any(|i| i.rule_id.as_deref() == Some("bug-todo")),
+            "rules engine must run in scan, got {:?}",
+            titles(&out)
+        );
+    }
+
+    #[test]
+    fn disabled_rules_engine_stays_off_in_scan() {
+        let mut config = Config::default();
+        config.rules_config.enabled = false;
+        let file = entry("src/lib.rs", "// TODO: later\n");
+        let out = finalize_issues(&config, &[file], Vec::new()).0;
+        assert!(!out.iter().any(|i| i.rule_id.as_deref() == Some("bug-todo")));
+    }
+
+    struct FakeScanJudge(Result<Vec<ReviewIssue>, String>);
+
+    impl ScanJudge for FakeScanJudge {
+        async fn judge_batch(
+            &self,
+            _config: &Config,
+            _files_content: &str,
+            _focus: &[String],
+            _brain_context: Option<&str>,
+        ) -> std::result::Result<ScanBatch, crate::error::CoraError> {
+            match &self.0 {
+                Ok(issues) => Ok(ScanBatch {
+                    issues: issues.clone(),
+                    tokens: None,
+                }),
+                Err(msg) => Err(crate::error::CoraError::LlmParse(msg.clone())),
+            }
+        }
+    }
+
+    fn judged(file: &str, line: u32) -> ReviewIssue {
+        ReviewIssue::new(
+            file,
+            Some(line),
+            crate::engine::Severity::Major,
+            "judge finding",
+        )
+        .with_type("bug")
+        .with_body("body")
+    }
+
+    fn one_batch() -> Vec<Vec<FileEntry>> {
+        vec![vec![entry("a.rs", "fn a() {}\nfn b() {}\n")]]
+    }
+
+    #[tokio::test]
+    async fn judge_findings_for_the_batch_are_admitted() {
+        let judge = FakeScanJudge(Ok(vec![judged("a.rs", 1), judged("elsewhere.rs", 1)]));
+        let run = judge_batches(&judge, &Config::default(), &one_batch(), &[], None, true)
+            .await
+            .unwrap();
+        assert_eq!(run.issues.len(), 1, "foreign file must be dropped");
+        assert_eq!(run.issues[0].file, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn failed_batch_is_skipped_when_continuing() {
+        let judge = FakeScanJudge(Err("bad json".to_string()));
+        let run = judge_batches(&judge, &Config::default(), &one_batch(), &[], None, true)
+            .await
+            .unwrap();
+        assert!(run.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_batch_aborts_without_continue() {
+        let judge = FakeScanJudge(Err("bad json".to_string()));
+        let err = judge_batches(&judge, &Config::default(), &one_batch(), &[], None, false).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn no_judge_scans_deterministically_only() {
+        let run = judge_batches(
+            &crate::engine::judge::NoJudge,
+            &Config::default(),
+            &one_batch(),
+            &[],
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(run.issues.is_empty());
     }
 }

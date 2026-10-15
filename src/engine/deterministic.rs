@@ -69,6 +69,28 @@ pub fn run(chunks: &[FileChunk], config: &Config, bridge: &IndexBridge) -> Deter
     }
 }
 
+/// Run the deterministic checks that need no index over whole files (`cora
+/// scan`, MCP snippet check): rules, secrets, security. Every line counts as
+/// added. The index-backed families (unused imports, dead code) come from
+/// `index_scanner::scan_project_index`, which needs a project bridge and is
+/// merged by the caller.
+pub fn run_files(
+    files: &[crate::engine::scanner::FileEntry],
+    config: &Config,
+) -> DeterministicReport {
+    let scan_files = crate::engine::scan_input::from_entries(files);
+    let uncapped_rules = crate::engine::rules::types::RulesConfig {
+        max_findings: 0,
+        ..config.rules_config.clone()
+    };
+    DeterministicReport {
+        rules: rules::run_rules_in(&scan_files, &uncapped_rules),
+        secrets: secrets_scanner::scan_secrets_in(&scan_files, usize::MAX),
+        security: security_scanner::scan_security_in(&scan_files, usize::MAX),
+        ..DeterministicReport::default()
+    }
+}
+
 impl DeterministicReport {
     fn families(&self) -> [&Vec<RuleFinding>; 6] {
         [
