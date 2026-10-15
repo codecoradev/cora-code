@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`crypto/hardcoded-secret` / `sec-hardcoded-secret` no longer flag `name: value` entries whose value is not a literal (#661).** In source files, `webhook_secret: env::var("X")`, `refresh_token: prev?.refresh_token`, `token: Option<&'static str>`, `"password": ACCOUNT_PW` and `"clientSecret": j["clientSecret"]` are references or types, and format placeholders (`api_key = "{}"`, `"%s"`) are not values. Quoted literals (`token: "ghp_..."`) and `=` assignments are judged as before. On two real codebases the Critical/Major findings dropped from 38 to 20 (all remaining ones are test fixtures, SQL and test URLs, tracked in #662/#663).
+
 - **Agent-mode review no longer hides capped findings without saying so.** `cora.review_prepare` listed every deterministic finding but `cora.review_finalize` showed only `rules_engine.max_findings` (default 5) of them with no explanation; found by running a real agent on a real project. `review_prepare` now reports `deterministic_findings_total` and the cap, and `review_finalize` / `scan_finalize` / `cora.review_diff` report `not_shown` (with a note).
 
 - **The MCP `cora.review_diff` tool no longer crashes the server (#647).** Every call panicked with "Cannot start a runtime from within a runtime" because the handler blocked on a second runtime from a tokio runtime thread. Handlers now go through `block_in_place`.
