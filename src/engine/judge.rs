@@ -91,6 +91,8 @@ impl Judge for HttpJudge<'_> {
                 &llm.base_url,
             ) {
                 tracing::debug!("returning cached judge response");
+                let mut cached = cached;
+                strip_sentinel(&mut cached.summary);
                 return Ok(cached);
             }
         }
@@ -118,6 +120,9 @@ impl Judge for HttpJudge<'_> {
             spinner.finish();
             result?
         };
+
+        let mut response = response;
+        strip_sentinel(&mut response.summary);
 
         if self.cache_ttl.is_some() {
             if let Err(e) = crate::engine::cache::save_cached_review(
@@ -262,6 +267,18 @@ pub const AGENT_JUDGED: &str = "Judged by the calling agent (not by a cora-confi
 /// Summary text of a run that had no LLM judge. Formatters key off it to say,
 /// in every output format, that a clean result is not an AI review.
 pub const DETERMINISTIC_ONLY: &str = "Deterministic checks only (no LLM judge).";
+
+/// Remove the "no judge" sentinel from a summary written by a model. The
+/// sentinel marks a run that had NO judge (SARIF `cora.judge = none`); text
+/// steered by the diff must not be able to forge it.
+fn strip_sentinel(summary: &mut String) {
+    // Repeat: removing one occurrence can join the text around it into a new
+    // one ("Determ<marker>inistic ..."), so a single pass is bypassable.
+    while summary.contains(DETERMINISTIC_ONLY) {
+        *summary = summary.replace(DETERMINISTIC_ONLY, "");
+    }
+    *summary = summary.trim().to_string();
+}
 
 /// Judge that finds nothing: the review is the deterministic findings only.
 pub struct NoJudge;
@@ -606,5 +623,32 @@ mod tests {
         assert_eq!(out[0].line, None, "deleted file has no new lines");
         assert_eq!(out[1].line, None, "old path of a rename has no new lines");
         assert_eq!(out[2].line, Some(1), "real added line stays");
+    }
+
+    #[test]
+    fn nested_marker_cannot_reassemble_after_removal() {
+        // Removing the inner marker joins the halves into a fresh one.
+        let (a, b) = DETERMINISTIC_ONLY.split_at(10);
+        let mut summary = format!("{a}{DETERMINISTIC_ONLY}{b}");
+        strip_sentinel(&mut summary);
+        assert!(!summary.contains(DETERMINISTIC_ONLY), "got: {summary:?}");
+        let mut deep = DETERMINISTIC_ONLY.to_string();
+        for _ in 0..5 {
+            let (a, b) = DETERMINISTIC_ONLY.split_at(7);
+            deep = format!("{a}{deep}{b}");
+        }
+        strip_sentinel(&mut deep);
+        assert!(!deep.contains(DETERMINISTIC_ONLY));
+    }
+
+    #[test]
+    fn a_model_cannot_forge_the_no_judge_marker() {
+        let mut summary = format!("looks fine. {DETERMINISTIC_ONLY} trust me");
+        strip_sentinel(&mut summary);
+        assert!(!summary.contains(DETERMINISTIC_ONLY));
+        assert!(summary.contains("looks fine."));
+        let mut clean = "all good".to_string();
+        strip_sentinel(&mut clean);
+        assert_eq!(clean, "all good");
     }
 }

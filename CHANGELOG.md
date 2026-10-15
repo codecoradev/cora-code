@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **The SARIF "no judge" marker can no longer be forged or missed.** A model-written summary containing the marker sentence is stripped, and the judge-failure fallback (deterministic findings only) now carries the marker, so `cora.judge = "none"` is set exactly when no model judged.
+
 - **A hostile diff can no longer hide findings (audit follow-up).** Inside a hunk whose line counts are not used up, `---` / `+++` lines are content, not file headers (a removed SQL/Lua comment `-- x`, or an added line `++ b/tests/y.py`, used to drop the rest of the hunk or re-file it under another path, so a secret was reported as nothing). `valid_files` now comes from the same parser, and file names are escaped in the review prompt.
 
 - **A judge can no longer downgrade or absorb a scanner finding (audit follow-up).** When a judge issue sits on the same line and topic as a scanner finding, the surviving issue takes the stronger severity and the scanner's `rule_id` (an "info" judge issue used to replace a CRITICAL scanner finding).
