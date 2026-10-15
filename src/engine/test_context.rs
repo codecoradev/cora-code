@@ -190,6 +190,12 @@ pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32
         prev = Some(n);
         let trimmed = text.trim();
 
+        // One comment/brace pass per line, so block-comment state is tracked
+        // everywhere (not only inside a region) and cannot go stale.
+        let started_in_block = in_block;
+        let delta = brace_delta(text, &mut in_block);
+        let indent_of_line = text.len() - text.trim_start().len();
+
         if let Some((seen, depth, opened, indent)) = region.as_mut() {
             // Safety net against a parser differential: inside the region,
             // an ITEM may not start at or left of the decorated item's
@@ -198,18 +204,21 @@ pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32
             // comment, a multi-line string, a hostile `{`), so vouch for
             // nothing. Non-item text at column 0 (a TOML fixture inside a raw
             // string) is fine.
-            let ind = text.len() - text.trim_start().len();
-            let closes = trimmed.starts_with('}');
-            if ind <= *indent && !closes && looks_like_item_start(trimmed) {
+            let closes = !started_in_block && trimmed.starts_with('}');
+            if !started_in_block
+                && indent_of_line <= *indent
+                && !closes
+                && looks_like_item_start(trimmed)
+            {
                 region = None;
                 continue;
             }
             seen.push(n);
-            *depth += brace_delta(text, &mut in_block);
-            if text.contains('{') {
+            *depth += delta;
+            if text.contains('{') && !started_in_block {
                 *opened = true;
             }
-            if closes && ind <= *indent && *depth > 0 {
+            if closes && indent_of_line <= *indent && *depth > 0 {
                 region = None; // the item's own `}` must balance the count
                 continue;
             }
@@ -221,28 +230,39 @@ pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32
             continue;
         }
 
-        if is_test_attribute(trimmed) {
-            pending.push(n);
+        // Outside a region, a line that begins inside a block comment is
+        // comment text: never an attribute, never the decorated item.
+        if started_in_block {
             continue;
         }
-        if !pending.is_empty() {
-            // Other attributes and blank lines between the test attribute and
-            // the item keep the region pending.
-            if trimmed.starts_with("#[") || trimmed.is_empty() || trimmed.starts_with("///") {
+
+        let is_attr_line = is_test_attribute(trimmed);
+        if is_attr_line || (!pending.is_empty() && trimmed.starts_with("#[")) {
+            // `#[cfg(test)] fn helper() {}` carries its item on the same line:
+            // the attribute decorates THAT item, not the next line.
+            if attribute_rest(trimmed).is_none_or(is_line_comment_or_empty) {
                 pending.push(n);
                 continue;
             }
-            // The decorated item starts here.
-            let mut seen = std::mem::take(&mut pending);
-            seen.push(n);
-            let depth = brace_delta(text, &mut in_block);
-            let opened = text.contains('{');
-            let indent = text.len() - text.trim_start().len();
-            if (opened && depth <= 0) || (!opened && trimmed.ends_with(';')) {
-                out.extend(seen);
-            } else {
-                region = Some((seen, depth, opened, indent));
+        } else if !pending.is_empty() {
+            // Blank lines and doc comments between the test attribute and the
+            // item keep the region pending.
+            if trimmed.is_empty() || trimmed.starts_with("///") {
+                pending.push(n);
+                continue;
             }
+        } else {
+            continue;
+        }
+
+        // The decorated item starts on this line.
+        let mut seen = std::mem::take(&mut pending);
+        seen.push(n);
+        let opened = text.contains('{');
+        if (opened && delta <= 0) || (!opened && trimmed.ends_with(';')) {
+            out.extend(seen);
+        } else {
+            region = Some((seen, delta, opened, indent_of_line));
         }
     }
     if partial_view {
@@ -251,6 +271,30 @@ pub fn rust_test_lines(lines: &[(u32, &str)], partial_view: bool) -> HashSet<u32
         }
     }
     out
+}
+
+/// The text after the first complete `#[...]` attribute on `trimmed`, or
+/// `None` when the attribute does not close on this line.
+fn attribute_rest(trimmed: &str) -> Option<&str> {
+    let bytes = trimmed.as_bytes();
+    let mut depth = 0i32;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(trimmed[i + 1..].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_line_comment_or_empty(rest: &str) -> bool {
+    rest.is_empty() || rest.starts_with("//")
 }
 
 #[cfg(test)]
@@ -510,5 +554,61 @@ fn production() {}";
         ] {
             assert!(!looks_like_item_start(no), "{no}");
         }
+    }
+
+    #[test]
+    fn an_attribute_with_its_item_on_the_same_line_does_not_exempt_the_next_line() {
+        let src = "\
+#[cfg(test)] fn helper() {}
+fn production() { danger.unwrap(); }
+#[cfg(test)]
+#[allow(dead_code)] fn other() {}
+fn production2() { danger.unwrap(); }";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(
+            set.contains(&1) && set.contains(&3) && set.contains(&4),
+            "{set:?}"
+        );
+        assert!(!set.contains(&2) && !set.contains(&5), "{set:?}");
+    }
+
+    #[test]
+    fn a_same_line_item_with_a_body_that_spans_lines_is_one_region() {
+        let src = "#[cfg(test)] mod tests {\n    fn a() {}\n}\nfn production() {}";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(
+            (1..=3).all(|n| set.contains(&n)) && !set.contains(&4),
+            "{set:?}"
+        );
+    }
+
+    #[test]
+    fn an_attribute_inside_a_block_comment_is_not_an_attribute() {
+        let src = "/*\n#[cfg(test)]\n*/\nfn production() { danger.unwrap(); }\n/* #[test] */\nfn also_production() {}";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!(set.is_empty(), "{set:?}");
+    }
+
+    #[test]
+    fn block_comment_state_does_not_go_stale_between_regions() {
+        // An earlier multi-line comment must not leak into brace counting of
+        // the next test module, and a closed region must not leave state behind.
+        let src = "\
+/* a comment
+   { with a brace
+*/
+#[cfg(test)]
+mod tests {
+    fn a() {}
+}
+fn production() { danger.unwrap(); }
+#[cfg(test)]
+mod more {
+}
+";
+        let set = rust_test_lines(&numbered(src), false);
+        assert!((4..=7).all(|n| set.contains(&n)), "{set:?}");
+        assert!(!set.contains(&8), "{set:?}");
+        assert!((9..=11).all(|n| set.contains(&n)), "{set:?}");
     }
 }
