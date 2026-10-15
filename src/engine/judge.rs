@@ -272,9 +272,12 @@ pub const DETERMINISTIC_ONLY: &str = "Deterministic checks only (no LLM judge)."
 /// sentinel marks a run that had NO judge (SARIF `cora.judge = none`); text
 /// steered by the diff must not be able to forge it.
 fn strip_sentinel(summary: &mut String) {
-    if summary.contains(DETERMINISTIC_ONLY) {
-        *summary = summary.replace(DETERMINISTIC_ONLY, "").trim().to_string();
+    // Repeat: removing one occurrence can join the text around it into a new
+    // one ("Determ<marker>inistic ..."), so a single pass is bypassable.
+    while summary.contains(DETERMINISTIC_ONLY) {
+        *summary = summary.replace(DETERMINISTIC_ONLY, "");
     }
+    *summary = summary.trim().to_string();
 }
 
 /// Judge that finds nothing: the review is the deterministic findings only.
@@ -620,6 +623,22 @@ mod tests {
         assert_eq!(out[0].line, None, "deleted file has no new lines");
         assert_eq!(out[1].line, None, "old path of a rename has no new lines");
         assert_eq!(out[2].line, Some(1), "real added line stays");
+    }
+
+    #[test]
+    fn nested_marker_cannot_reassemble_after_removal() {
+        // Removing the inner marker joins the halves into a fresh one.
+        let (a, b) = DETERMINISTIC_ONLY.split_at(10);
+        let mut summary = format!("{a}{DETERMINISTIC_ONLY}{b}");
+        strip_sentinel(&mut summary);
+        assert!(!summary.contains(DETERMINISTIC_ONLY), "got: {summary:?}");
+        let mut deep = DETERMINISTIC_ONLY.to_string();
+        for _ in 0..5 {
+            let (a, b) = DETERMINISTIC_ONLY.split_at(7);
+            deep = format!("{a}{deep}{b}");
+        }
+        strip_sentinel(&mut deep);
+        assert!(!deep.contains(DETERMINISTIC_ONLY));
     }
 
     #[test]
