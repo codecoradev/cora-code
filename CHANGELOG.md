@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-16
+
 ### Added
 
 - **The calling agent can be the reviewer, with no LLM configured in cora (#647).** Four MCP tools split a review into prepare / judge / finalize with the agent as the judge: `cora.review_prepare` returns the hardened prompts, `valid_files`, deterministic findings and the response schema; `cora.review_finalize` merges the agent's findings (validated by `judge::admit`), applies `ignore.rules`, inline markers and the quality gate, and returns the verdict. `cora.scan_prepare` (paged by batch, path restricted to the project) and `cora.scan_finalize` do the same for a scan. Stateless: finalize recomputes the deterministic half from the same diff/path. `cora install` also installs a `/cora-review` skill for Claude Code (`~/.claude/skills/cora-review/SKILL.md` whenever `~/.claude` exists; a customized copy is never overwritten or removed without `--force`). For Claude Code the MCP server itself is registered with `claude mcp add cora -- cora mcp`. See `docs/usage.md` for the security model.
