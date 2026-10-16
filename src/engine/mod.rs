@@ -2,6 +2,7 @@ pub mod bundling;
 pub mod cache;
 pub mod chunker;
 pub mod comment_sanitizer;
+pub mod commit_gate;
 pub mod context;
 pub mod debt_tracker;
 pub mod deterministic;
