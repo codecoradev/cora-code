@@ -5,10 +5,52 @@ use super::types::CustomRule;
 
 /// Check if a rule applies to the given file language.
 pub fn matches_language(rule: &CustomRule, file_lang: &str) -> bool {
-    rule.languages.iter().any(|lang| {
-        let lang_lower = lang.to_lowercase();
-        lang_lower == "all" || lang_lower == file_lang
-    })
+    rule.languages
+        .iter()
+        .any(|lang| match normalize_language(lang) {
+            Some(n) => {
+                // A scan sees the raw extension (`tsx`), a diff the shorthand (`ts`).
+                n == "all"
+                    || n == file_lang
+                    || normalize_language(file_lang).as_deref() == Some(n.as_str())
+            }
+            // Unknown value: keep the old literal comparison (config validation reports it).
+            None => lang.to_lowercase() == file_lang,
+        })
+}
+
+/// Map a configured language (extension or name) to the shorthand used for
+/// files (`"rust"` and `"rs"` -> `"rs"`). `"all"` / `"*"` -> `"all"`.
+/// `None` when it names no known language.
+pub fn normalize_language(lang: &str) -> Option<String> {
+    let l = lang.trim().trim_start_matches('.').to_lowercase();
+    if l == "all" || l == "*" {
+        return Some("all".to_string());
+    }
+    let by_name = match l.as_str() {
+        "rust" => "rs",
+        "python" => "py",
+        "typescript" => "ts",
+        "javascript" | "node" => "js",
+        "golang" => "go",
+        "kotlin" => "kt",
+        "ruby" => "rb",
+        "shell" | "bash" => "sh",
+        "markdown" => "md",
+        "csharp" | "c#" => "cs",
+        "c++" => "cpp",
+        "elixir" => "ex",
+        _ => "",
+    };
+    if !by_name.is_empty() {
+        return Some(by_name.to_string());
+    }
+    let detected = crate::engine::diff_parser::detect_language(&format!("x.{l}"));
+    if detected == "unknown" {
+        // Languages detect_language does not know but that are real extensions.
+        return matches!(l.as_str(), "cs" | "vue" | "tf" | "xml" | "ini" | "txt").then_some(l);
+    }
+    Some(detected.to_string())
 }
 
 /// Check if a file path should be excluded from a rule based on glob patterns.

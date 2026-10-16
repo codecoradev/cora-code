@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Custom rules are validated and the docs match the schema (#684, #678).** `cora config validate` and config load now reject an invalid regex, an empty or duplicate id, an id that shadows a built-in rule, an empty message and an unknown `languages` value, naming the rule. `languages` accepts language names (`"rust"`) as well as extensions (`"rs"`); `languages` and `exclude` are optional. `cora config validate --dry-run [--path DIR]` runs each custom rule and prints how many lines it matched. `docs/configuration.md` now shows the real schema (`rules_engine.custom`); the 0.19.0 entry no longer says `custom_rules`.
 - The `Cora Review` workflow now fails with an error naming each empty secret (`CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`) instead of running without them.
 - The `Cora Review` job no longer gets cancelled on larger pull requests: its time limit is 30 minutes (the review action allows up to three LLM attempts of 10 minutes each).
 
@@ -66,7 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The MCP `cora.review_diff` tool no longer crashes the server (#647).** Every call panicked with "Cannot start a runtime from within a runtime" because the handler blocked on a second runtime from a tokio runtime thread. Handlers now go through `block_in_place`.
 
-- **`cora scan` now runs the rules engine (#645).** Built-in rules (`bug-todo`, `sec-sql-concat`, ...) and custom `rules_engine.custom_rules` were only run by `cora review`; scan silently skipped them. Expect more findings from `cora scan` after upgrading (e.g. `bug-todo` on every TODO), still under the `rules_engine.max_findings` cap (default 5); `rules_engine.enabled: false` turns them off. One set of deterministic families (`deterministic::run_files` for whole files, `deterministic::run` for diffs) now serves both, and the MCP `cora.check_snippet` tool picks up rules too. Scan also has a judge seam (`judge::ScanJudge`, with `HttpScanJudge` and `NoJudge`) so the batch loop is tested without a network, and `DEFAULT_BATCH_TOKEN_BUDGET` is renamed `DEFAULT_BATCH_CHAR_BUDGET` (it was always a character count). `docs/cli-reference.md` now states which review flags scan does not have.
+- **`cora scan` now runs the rules engine (#645).** Built-in rules (`bug-todo`, `sec-sql-concat`, ...) and custom `rules_engine.custom` rules were only run by `cora review`; scan silently skipped them. Expect more findings from `cora scan` after upgrading (e.g. `bug-todo` on every TODO), still under the `rules_engine.max_findings` cap (default 5); `rules_engine.enabled: false` turns them off. One set of deterministic families (`deterministic::run_files` for whole files, `deterministic::run` for diffs) now serves both, and the MCP `cora.check_snippet` tool picks up rules too. Scan also has a judge seam (`judge::ScanJudge`, with `HttpScanJudge` and `NoJudge`) so the batch loop is tested without a network, and `DEFAULT_BATCH_TOKEN_BUDGET` is renamed `DEFAULT_BATCH_CHAR_BUDGET` (it was always a character count). `docs/cli-reference.md` now states which review flags scan does not have.
 
 ## [0.18.0] - 2026-10-09
 

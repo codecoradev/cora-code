@@ -670,7 +670,15 @@ enum ConfigAction {
         global: bool,
     },
     /// Validate the current configuration and report status
-    Validate,
+    Validate {
+        /// Also run each custom rule over the project and report how many
+        /// lines it matched (a rule with 0 matches is flagged)
+        #[clap(long)]
+        dry_run: bool,
+        /// Directory for `--dry-run` (default: current directory)
+        #[clap(long, requires = "dry_run")]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1331,8 +1339,16 @@ async fn main() -> Result<()> {
                 config_cmd::execute_config_set(&key, &value, global)?;
                 0
             }
-            ConfigAction::Validate => {
-                config_cmd::execute_config_validate(cli.global.config.as_deref())?
+            ConfigAction::Validate { dry_run, path } => {
+                let code = config_cmd::execute_config_validate(cli.global.config.as_deref())?;
+                if dry_run && code == 0 {
+                    config_cmd::execute_config_dry_run(
+                        cli.global.config.as_deref(),
+                        path.as_deref(),
+                    )?
+                } else {
+                    code
+                }
             }
         },
         Command::Providers => {

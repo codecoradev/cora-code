@@ -439,6 +439,57 @@ pub fn execute_config_set(key: &str, value: &str, global: bool) -> Result<()> {
     Ok(())
 }
 
+/// Execute `cora config validate --dry-run`: run every custom rule over the
+/// project and print how many lines each one matched (#684). A rule that
+/// matches nothing is reported, since that is how a wrong pattern shows up.
+pub fn execute_config_dry_run(config_path: Option<&str>, path: Option<&str>) -> Result<i32> {
+    use crate::engine::rules;
+    use crate::engine::scan_input;
+
+    let config = loader::load_config(config_path, None, None, None, None, false)?;
+    let custom = &config.rules_config.custom_rules;
+    if custom.is_empty() {
+        println!("No custom rules configured (rules_engine.custom).");
+        return Ok(0);
+    }
+    let root = match path {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir()?,
+    };
+    let files = crate::engine::scanner::walk_project(&root, &[], &config.ignore.files, &[])
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut only_custom = config.rules_config.clone();
+    only_custom.include_tests = true;
+    only_custom.max_findings = 0;
+    let findings = rules::run_rules_in(&scan_input::from_entries(&files), &only_custom);
+    println!("Dry run over {} files in {}", files.len(), root.display());
+    for rule in custom {
+        let hits: Vec<_> = findings.iter().filter(|f| f.rule_id == rule.id).collect();
+        let n_files = hits
+            .iter()
+            .map(|f| f.file.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if hits.is_empty() {
+            println!(
+                "{} {}: 0 matches. Check the pattern and `languages` ({:?})",
+                "⚠️".yellow(),
+                rule.id,
+                rule.languages
+            );
+        } else {
+            println!(
+                "{} {}: {} lines in {} files",
+                "✅".green(),
+                rule.id,
+                hits.len(),
+                n_files
+            );
+        }
+    }
+    Ok(0)
+}
+
 /// Execute `cora config validate` — load config and report validity.
 ///
 /// Returns exit code: 0 if valid, 2 if issues found.

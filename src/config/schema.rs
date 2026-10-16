@@ -296,6 +296,11 @@ impl Config {
             ));
         }
 
+        // ── custom rules (#684) ──
+        errs.extend(crate::engine::rules::validate_custom_rules(
+            &self.rules_config.custom_rules,
+        ));
+
         // ── profile (#81) ──
         if let Some(profile) = &self.profile {
             if let Err(pe) = profile.validate() {
