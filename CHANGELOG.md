@@ -7,14 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **`--help` no longer prints secrets from the environment.** clap shows `[env: NAME=value]` for options bound to an env var, so `cora --help` with `CORA_API_KEY` or `GITHUB_TOKEN` set printed the key (into logs, CI output, screenshots). `--api-key` and `--token` now hide their env value.
-
-### Changed
-
-- **Help points to agent mode.** `cora --help`, `cora review/scan --help`, `cora mcp --help` and `cora install --help` now mention `--no-llm`, the agent-as-reviewer MCP tools, the `/cora-review` skill and `claude mcp add cora -- cora mcp`.
-
 ## [0.19.0] - 2026-10-16
 
 ### Added
@@ -24,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`cora review` and `cora scan` run without an API key (#646).** With no key they run the deterministic checks only, print a one-line notice on stderr, and label the result "Deterministic checks only (no LLM judge)" (SARIF: `cora.judge = none` on the invocation, even with zero results). `--no-llm` forces it and silences the notice. A missing key is no longer an error for these two commands; any other config error still is. The judge is chosen once at the entry point (`judge::select_judge`, `JudgeChoice`). `cora commit` and MCP `cora.review_diff` still need a key.
 
 ### Security
+
+- **`--help` no longer prints secrets from the environment.** clap shows `[env: NAME=value]` for options bound to an env var, so `cora --help` with `CORA_API_KEY` or `GITHUB_TOKEN` set printed the key (into logs, CI output, screenshots). `--api-key` and `--token` now hide their env value.
 
 - **The SARIF "no judge" marker can no longer be forged or missed.** A model-written summary containing the marker sentence is stripped, and the judge-failure fallback (deterministic findings only) now carries the marker, so `cora.judge = "none"` is set exactly when no model judged.
 
@@ -42,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The review cache can no longer serve a stale or cross-mode result (#644).** The cache moved behind the LLM adapter and stores the model's raw answer keyed by the exact prompts (so focus, rules, profile, system prompt, sanitization, context and memory all invalidate it) plus model/provider/base URL/temperature. `ignore.rules`, `hook.min_severity` and deterministic rules are applied on every run, including cache hits. Existing cache entries are simply not hit again.
 
 ### Changed
+
+- **Help points to agent mode.** `cora --help`, `cora review/scan --help`, `cora mcp --help` and `cora install --help` now mention `--no-llm`, the agent-as-reviewer MCP tools, the `/cora-review` skill and `claude mcp add cora -- cora mcp`.
 
 - **Rules are test-code aware (#663).** Whole test files (`*_test.*`, `*.test.ts`, `spec/`, `fixtures/`, ... not just `tests/`) and Rust `#[cfg(test)]` modules / `#[test]` functions (also a diff hunk inside `mod tests`) are exempt from `bug-unwrap`, `bug-expect`, `bug-println`, `qual-clone`, `qual-error-ignore`, `sec-hardcoded-url` and `sec-hardcoded-secret`; the secret scanners only run their high-confidence patterns there, so a real AWS key or token in a test is still reported (injection, `eval` and other security patterns still apply inside test blocks, and a test region is only trusted when our brace matching agrees with the code's own indentation: `/* { */` comments are ignored, and a region that never closes, or that contains an item starting at or left of its own indentation, is dropped instead of exempting what follows). An attribute that carries its item on the same line (`#[cfg(test)] fn helper() {}`) no longer exempts the NEXT line, and an attribute inside a block comment is not an attribute. `bug-println` is also skipped in `main.rs`, `src/bin/`, `examples/` and `benches/`. New setting `rules_engine.include_tests: true` turns the exemptions off. On `uteke-core` (Rust) the findings drop from 2400 to 235 and the 6 Critical ones disappear; on `uteke-cloud` the 3 Major URL findings are gone. New module `engine::test_context`.
 
