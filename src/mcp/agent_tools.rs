@@ -284,6 +284,10 @@ pub fn review_finalize(params: &Value) -> ToolResult {
     let should_block = shaped.should_block;
     let total_found = response.issues.len();
     response.issues.retain(|i| i.severity <= min_severity);
+    // Leave a verifiable trace for the commit gate (#674): the pre-commit hook
+    // and `cora hook claude-guard` accept a staged diff this verdict covers.
+    let gate_recorded =
+        crate::engine::commit_gate::record_for_diff(diff, "agent", should_block, total_found);
     finalize::save_history(
         &HistoryEntry {
             command: "review (agent)",
@@ -306,6 +310,11 @@ pub fn review_finalize(params: &Value) -> ToolResult {
         "dropped_by_validation": dropped_by_validation,
         "not_shown": response.dropped_findings,
         "not_shown_note": not_shown_note(response.dropped_findings, &config),
+        "commit_gate": {
+            "recorded": gate_recorded,
+            "blocking": should_block,
+            "note": "When recorded and not blocking, the pre-commit hook and the commit guard accept this exact staged change set. Edit and re-stage, and it must be reviewed again.",
+        },
         "issues": response.issues.iter().map(|i| json!({
             "title": i.title,
             "severity": i.severity.label(),

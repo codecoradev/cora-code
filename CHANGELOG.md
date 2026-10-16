@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Agents validate before they commit (#674).** A review of the staged diff, by an agent (`cora.review_finalize`) or by `cora review --staged`, now leaves a marker bound to that exact change set. `cora hook verify` reports it (exit 0 validated, 10 validated but blocking, 11 not validated) and `cora hook claude-guard` is a Claude Code `PreToolUse` hook that denies a `git commit` that is unreviewed, blocking, or uses `--no-verify`. The pre-commit hook (now v2, upgraded in place by `cora hook install`) accepts a validated diff and otherwise falls back to `cora review --staged --ci --severity major`; a tooling error is reported as "not a pass". The `/cora-review` skill tells agents to review before every commit. See `docs/usage.md`.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

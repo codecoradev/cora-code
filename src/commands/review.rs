@@ -299,6 +299,22 @@ pub async fn execute_review(
     );
     let exit_code = shaped.exit_code;
 
+    // Leave a verifiable trace for the commit gate (#674): a staged diff that
+    // was really reviewed (not a failed LLM call) may be committed by the
+    // pre-commit hook without a second review.
+    if opts.staged && !response.summary.starts_with("LLM review failed") {
+        let judged_by = match judge {
+            JudgeChoice::Llm(_) => "llm",
+            JudgeChoice::Deterministic => "deterministic",
+        };
+        crate::engine::commit_gate::record_for_diff(
+            &diff,
+            judged_by,
+            shaped.should_block || exit_code == EXIT_BLOCKED,
+            filtered_response.issues.len(),
+        );
+    }
+
     // 10. Emit complete event
     if progress.is_enabled() {
         let tokens = response
