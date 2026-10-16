@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`--help` no longer prints secrets from the environment.** clap shows `[env: NAME=value]` for options bound to an env var, so `cora --help` with `CORA_API_KEY` or `GITHUB_TOKEN` set printed the key (into logs, CI output, screenshots). `--api-key` and `--token` now hide their env value.
+
+### Changed
+
+- **Help points to agent mode.** `cora --help`, `cora review/scan --help`, `cora mcp --help` and `cora install --help` now mention `--no-llm`, the agent-as-reviewer MCP tools, the `/cora-review` skill and `claude mcp add cora -- cora mcp`.
+
 ## [0.19.0] - 2026-10-16
 
 ### Added

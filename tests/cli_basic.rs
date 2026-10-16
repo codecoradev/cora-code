@@ -196,3 +196,59 @@ fn init_without_force_fails_if_exists() {
         .failure()
         .stderr(predicate::str::contains("already exists"));
 }
+
+// ═══════════════════════════════════════════════════════════
+// Help points to agent mode, and never prints secrets from the environment
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+fn cli_mcp_help_explains_agent_as_reviewer() {
+    cora_cmd()
+        .args(["mcp", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("agent-as-reviewer"))
+        .stdout(predicate::str::contains("cora.review_prepare"))
+        .stdout(predicate::str::contains("cora.scan_finalize"))
+        .stdout(predicate::str::contains("claude mcp add cora"));
+}
+
+#[test]
+fn cli_install_help_mentions_the_skill() {
+    cora_cmd()
+        .args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/cora-review"));
+}
+
+#[test]
+fn cli_review_and_scan_help_point_to_no_llm_and_agent_mode() {
+    for cmd in ["review", "scan"] {
+        cora_cmd()
+            .args([cmd, "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--no-llm"))
+            .stdout(predicate::str::contains("cora mcp --help"));
+    }
+}
+
+#[test]
+fn cli_help_does_not_print_secret_env_values() {
+    // clap prints `[env: NAME=value]` by default; a key in the environment
+    // must never end up in help output (logs, screenshots, CI).
+    for args in [
+        &["--help"][..],
+        &["review", "--help"],
+        &["upload-sarif", "--help"],
+    ] {
+        cora_cmd()
+            .args(args)
+            .env("CORA_API_KEY", "sk-secret-do-not-print-123")
+            .env("GITHUB_TOKEN", "ghp_secret_do_not_print_456")
+            .assert()
+            .stdout(predicate::str::contains("sk-secret-do-not-print-123").not())
+            .stdout(predicate::str::contains("ghp_secret_do_not_print_456").not());
+    }
+}
