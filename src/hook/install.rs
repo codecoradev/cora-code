@@ -6,6 +6,15 @@ use crate::hook::template::HOOK_TEMPLATE;
 /// Sentinel marker identifying a cora-managed hook.
 const CORA_HOOK_SENTINEL: &str = "# cora-managed-hook";
 
+/// First line of the v1 hook, which had no sentinel. Hooks carrying it are cora's
+/// own and are upgraded in place instead of being wrapped a second time.
+const LEGACY_HOOK_MARK: &str = "cora pre-commit hook — installed by `cora hook install`";
+
+/// Is `content` a hook written by `cora hook install` (any version)?
+fn is_cora_managed(content: &str) -> bool {
+    content.contains(CORA_HOOK_SENTINEL) || content.contains(LEGACY_HOOK_MARK)
+}
+
 /// Install the pre-commit hook to `.git/hooks/pre-commit`.
 pub fn install_hook() -> Result<String> {
     let hooks_dir = find_git_hooks_dir()?;
@@ -14,7 +23,7 @@ pub fn install_hook() -> Result<String> {
     // Check if a hook already exists and handle accordingly
     if hook_path.is_file() {
         let existing = std::fs::read_to_string(&hook_path)?;
-        if existing.contains(CORA_HOOK_SENTINEL) {
+        if is_cora_managed(&existing) {
             // Already a cora-managed hook — just overwrite
             debug!("existing hook is cora-managed, overwriting");
         } else {
@@ -139,6 +148,7 @@ pub fn is_hook_installed() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    use super::is_cora_managed;
     use std::fs;
     use std::process::Command;
 
@@ -186,5 +196,26 @@ mod tests {
             source.contains(&format!("\"{expected_backup}\"")),
             "install.rs should consistently use '{expected_backup}' for backup"
         );
+    }
+
+    use crate::hook::template::HOOK_TEMPLATE;
+
+    #[test]
+    fn current_and_legacy_hooks_are_recognised_as_cora_managed() {
+        assert!(is_cora_managed(HOOK_TEMPLATE));
+        let v1 = "#!/usr/bin/env bash\n# cora pre-commit hook — installed by `cora hook install`\n# Run `cora hook uninstall` to remove.\n";
+        assert!(is_cora_managed(v1), "v1 hooks had no sentinel");
+        let wrapped = format!(
+            "#!/bin/sh\necho mine\n\n# cora-managed-hook — the section below was added by `cora hook install`\n{HOOK_TEMPLATE}"
+        );
+        assert!(is_cora_managed(&wrapped));
+    }
+
+    #[test]
+    fn a_users_own_hook_is_not_cora_managed() {
+        assert!(!is_cora_managed("#!/bin/sh\nnpm test\n"));
+        assert!(!is_cora_managed(
+            "#!/bin/sh\n# runs cora review by hand\ncora review --staged\n"
+        ));
     }
 }
