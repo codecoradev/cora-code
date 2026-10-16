@@ -98,6 +98,13 @@ Complete command reference for the cora CLI.
 
 `cora scan` runs the same deterministic checks as `cora review` (built-in and custom rules, secrets, security patterns, plus unused imports and dead code from the index) on every file, then asks the LLM about each batch. Findings are filtered by `ignore.rules` and inline `cora-ignore:` markers and capped by `rules_engine.max_findings`. Unlike `review`, scan has no `--ci`, `--severity`, `--quiet`, `--stream`, `--output-file` or `--no-cache`, does not apply the quality gate, and keeps every finding in the output (`hook.min_severity` only decides the exit code in `block` mode).
 
+Scan notes:
+
+- **Deterministic index findings** — when a symbol index exists, `cora scan` adds no-LLM findings (unused imports, dead code) from the index alongside LLM results.
+- **Brain context** — with `review.context_chain.use_brain: true`, scan batches are enriched with the same symbol-index intelligence as review (impact analysis, affected tests, semantic search).
+- **Persistence** — scan results are persisted to the global `cora.db` and fingerprinted; findings from previous scans that no longer reproduce are auto-resolved.
+- **Exit code 2** — also returned when `hook.mode: block` and a finding exceeds `hook.min_severity`.
+
 ### Code Intelligence
 
 See [Code Intelligence](./code-intelligence) for detailed usage.
