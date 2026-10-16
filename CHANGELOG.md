@@ -1056,7 +1056,8 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.18.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.19.0...develop
+[0.19.0]: https://github.com/codecoradev/cora-code/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/codecoradev/cora-code/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/codecoradev/cora-code/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/codecoradev/cora-code/compare/v0.17.0...v0.17.1
