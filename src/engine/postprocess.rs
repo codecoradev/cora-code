@@ -87,7 +87,8 @@ pub fn postprocess_report(
             let issues = apply_ignore_rules(issues, &config.ignore.rules);
             // Rule-scoped inline suppression (`cora-ignore: <rule>`, #554),
             // shared by deterministic and LLM findings.
-            let issues = inline_suppress::apply(issues, chunks);
+            let (issues, unmatched) = inline_suppress::apply(issues, chunks);
+            warn_unmatched(&unmatched);
             // Drop low-severity findings on unchanged (context) lines (#507).
             apply_context_line_filter(issues, chunks)
         }
@@ -97,11 +98,21 @@ pub fn postprocess_report(
             let merged = deterministic::run_files(files, config).merge_into(issues);
             let scan_files = scan_input::from_entries(files);
             let merged = apply_ignore_rules(merged, &config.ignore.rules);
-            inline_suppress::apply_lines(merged, &scan_files)
+            let (kept, unmatched) = inline_suppress::apply_lines(merged, &scan_files);
+            warn_unmatched(&unmatched);
+            kept
         }
     };
     let (issues, dropped) = cap_deterministic(issues, config.rules_config.finding_cap());
     PostprocessReport { issues, dropped }
+}
+
+/// Tell the user about `cora-ignore` markers that suppressed nothing (#679).
+/// Goes to stderr, so JSON / SARIF on stdout stays clean.
+fn warn_unmatched(unmatched: &[inline_suppress::Unmatched]) {
+    for u in unmatched {
+        eprintln!("warning: {}", u.message());
+    }
 }
 
 /// Keep at most `cap` deterministic findings (those carrying a `rule_id`),
