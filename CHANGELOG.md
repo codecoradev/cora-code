@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `Cora Review` workflow now fails with an error naming each empty secret (`CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`) instead of running without them.
 - The `Cora Review` job no longer gets cancelled on larger pull requests: its time limit is 30 minutes (the review action allows up to three LLM attempts of 10 minutes each).
 
 ## [0.19.0] - 2026-10-16

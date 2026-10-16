@@ -9,6 +9,9 @@ code structure are in `AGENT.md`.
 - CI runs the same gates: `cargo fmt --all -- --check` and
   `cargo clippy --all-targets --features tree-sitter -- -D warnings`.
 - User-visible changes go under `## [Unreleased]` in `CHANGELOG.md`.
+- Before committing: review the staged diff (`cora review --staged`, or the
+  `/cora-review` skill) and run `scripts/setup-hooks.sh` once per clone so the
+  pre-commit hook enforces the same gates. Never `--no-verify` past a finding.
 
 ## Conventions enforced by CI
 
