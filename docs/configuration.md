@@ -562,6 +562,8 @@ const next = compute();
 - If an LLM finding and a scanner finding on the same line describe the same problem (they share a topic word, e.g. both are about a hardcoded password/secret), only the LLM finding is reported, and a marker (or `ignore.rules` entry) naming the scanner rule's id or title still suppresses it. If the LLM finding is about something else (say SQL injection next to a hardcoded secret), both are reported and a marker only suppresses the one it names.
 - Scope: the same line; plus the next line when the marker line contains only a comment.
 - A bare `cora-ignore` (no `:` or empty rule list) suppresses nothing, so every suppression names its rule.
+- The rule list runs to the end of the line (or the comment terminator). Put an explanation after ` -- `: `// cora-ignore: sec-hardcoded-secret -- env var name, not a value`. Text without the separator becomes part of the rule name.
+- A marker on a line that has findings but names none of them (a typo, an unknown rule, trailing text) prints `warning: cora-ignore at FILE:LINE matched no finding ...` on stderr, listing the rule ids that are on that line.
 - Applies to both deterministic scanner and LLM findings, in both `cora review` and `cora scan`. Other rules on the same line and the rest of the project stay visible. Works alongside `ignore.rules` and `ignore.files`.
 - `cora review` reads markers from the diff (added and context lines); a marker outside the diff's context window is not seen. `cora scan` reads markers from the full file contents.
 - `cora scan` also runs the deterministic secrets and security scanners on every scanned file and applies `ignore.rules`, so those findings are reported even when the LLM call fails.
