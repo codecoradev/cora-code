@@ -340,7 +340,33 @@ pub fn inspect_command(command: &str) -> CommitCall {
             continue;
         }
         call.is_commit = true;
+        let mut value_next = false;
         for t in tokens {
+            if value_next {
+                value_next = false;
+                continue;
+            }
+            if matches!(
+                t,
+                "-m" | "-F" | "-C" | "-c" | "-t" | "--author" | "--date" | "--cleanup"
+            ) || t.starts_with("--message")
+                || t.starts_with("--file")
+            {
+                value_next = !t.contains('=');
+                continue;
+            }
+            if !t.starts_with('-')
+                && !t.starts_with(['"', '\''])
+                && !t.ends_with(['"', '\''])
+                && !t.contains('=')
+            {
+                // A bare word: a pathspec (commits those files' working-tree
+                // content) or part of a quoted message. Err on the strict side
+                // only for path-looking words.
+                if t.contains(['/', '.']) {
+                    call.beyond_index = true;
+                }
+            }
             if t == "--"
                 || t.starts_with("--all")
                 || t.starts_with("--include")
@@ -398,6 +424,9 @@ mod tests {
         ] {
             assert!(inspect_command(c).beyond_index, "{c}");
         }
+        assert!(inspect_command("git commit -m x file.rs").beyond_index);
+        assert!(inspect_command("git commit -m x src/a").beyond_index);
+        assert!(!inspect_command("git commit -m \"fix a thing\"").beyond_index);
         assert!(!inspect_command("git commit -m x").beyond_index);
         assert!(!inspect_command("git commit -m x").no_verify);
     }
