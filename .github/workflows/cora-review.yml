@@ -24,14 +24,21 @@ jobs:
       # CORA_API_KEY (pull_request_target). A PR-supplied .cora.yaml could set
       # provider.base_url and exfiltrate the key. CORA_BASE_URL (env) always
       # takes precedence over project config, so require it to be pinned.
-      - name: Require pinned CORA_BASE_URL
+      - name: Require the review secrets
         env:
+          CORA_API_KEY: ${{ secrets.CORA_API_KEY }}
           CORA_BASE_URL: ${{ secrets.CORA_BASE_URL }}
+          CORA_MODEL: ${{ secrets.CORA_MODEL }}
         run: |
-          if [ -z "$CORA_BASE_URL" ]; then
-            echo "::error::Secret CORA_BASE_URL must be set so a PR-supplied .cora.yaml cannot redirect the API key."
-            exit 1
-          fi
+          # An empty secret must fail the job: a skipped or fallback review is not a pass.
+          missing=0
+          for name in CORA_API_KEY CORA_BASE_URL CORA_MODEL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is empty or missing. Cora Review cannot run, and that must not pass silently."
+              missing=1
+            fi
+          done
+          exit "$missing"
 
       - name: Checkout PR head
         uses: actions/checkout@v4
