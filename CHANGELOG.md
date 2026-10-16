@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cora.scan_finalize` reports how much of the project the verdict covers (#685).** New optional input `batches_judged`; the result has `coverage` (`complete`, `partial`, or `unverified` when not declared), `total_batches`, `batches_judged`, `files_judged` and `files_total`. A partial run says `Judged 1/11 batches (3/23 files)` and `should_block` is null instead of false. The `/cora-review` skill now passes `batches_judged`.
 - **Custom rules are validated and the docs match the schema (#684, #678).** `cora config validate` and config load now reject an invalid regex, an empty or duplicate id, an id that shadows a built-in rule, an empty message and an unknown `languages` value, naming the rule. `languages` accepts language names (`"rust"`) as well as extensions (`"rs"`); `languages` and `exclude` are optional. `cora config validate --dry-run [--path DIR]` runs each custom rule and prints how many lines it matched. `docs/configuration.md` now shows the real schema (`rules_engine.custom`); the 0.19.0 entry no longer says `custom_rules`.
 - The `Cora Review` workflow now fails with an error naming each empty secret (`CORA_API_KEY`, `CORA_BASE_URL`, `CORA_MODEL`) instead of running without them.
 - The `Cora Review` job no longer gets cancelled on larger pull requests: its time limit is 30 minutes (the review action allows up to three LLM attempts of 10 minutes each).
