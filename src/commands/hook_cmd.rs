@@ -91,9 +91,18 @@ pub fn execute_claude_guard() -> Result<i32> {
     else {
         return Ok(0);
     };
-    let call = commit_gate::inspect_command(command);
+    let mut call = commit_gate::inspect_command(command);
     if !call.is_commit {
-        return Ok(0);
+        // `git ci` where `alias.ci` runs a commit: same rules as a commit.
+        let alias = call
+            .last_subcommand
+            .as_deref()
+            .is_some_and(commit_gate::alias_runs_commit);
+        if !alias {
+            return Ok(0);
+        }
+        call.is_commit = true;
+        call.beyond_index = true;
     }
     if call.no_verify {
         eprintln!(

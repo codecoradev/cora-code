@@ -276,8 +276,12 @@ pub fn staged_diff() -> Option<String> {
 }
 
 /// Does a shell command line run `git commit`? And with which bypass?
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommitCall {
+    /// `-C`, `--git-dir` or `--work-tree`: another repository than the one inspected.
+    pub other_repo: bool,
+    /// The last non-commit git subcommand seen (may be an alias for `commit`).
+    pub last_subcommand: Option<String>,
     /// The command contains a `git commit`.
     pub is_commit: bool,
     /// ... with `--no-verify` or a short-flag cluster containing `n`.
@@ -360,8 +364,13 @@ pub fn inspect_command(command: &str) -> CommitCall {
             .is_some_and(|t| t.contains('=') && !t.starts_with('-') && !t.contains('/'))
         {
             let a = tokens.next().unwrap_or_default().to_ascii_uppercase();
-            if a.starts_with("GIT_CONFIG") || a.starts_with("GIT_DIR") || a.contains("HOOK") {
+            if a.starts_with("GIT_CONFIG") || a.contains("HOOK") {
                 call.no_verify = true;
+            }
+            if a.starts_with("GIT_") {
+                // Repository / index selection (GIT_DIR, GIT_INDEX_FILE, ...): the
+                // staged diff we inspect may not be the one that is committed.
+                call.beyond_index = true;
             }
         }
         let Some(first) = tokens.next() else {
@@ -391,11 +400,15 @@ pub fn inspect_command(command: &str) -> CommitCall {
                     }
                 }
                 "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                    call.other_repo = true;
                     tokens.next();
                 }
                 _ if t.starts_with("--git-dir=")
                     || t.starts_with("--work-tree=")
-                    || t.starts_with("--namespace=") => {}
+                    || t.starts_with("--namespace=") =>
+                {
+                    call.other_repo = true;
+                }
                 "--no-pager"
                 | "--paginate"
                 | "-p"
@@ -408,6 +421,23 @@ pub fn inspect_command(command: &str) -> CommitCall {
                     break;
                 }
             }
+        }
+        if sub == Some("config") {
+            // Writing an alias or the hooks path can disable the gate later.
+            let rest: String = tokens
+                .clone()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            if rest.contains("alias.") || rest.contains("hookspath") {
+                call.is_commit = true;
+                call.beyond_index = true;
+                call.no_verify = true;
+                parsed_commit = true;
+            }
+        }
+        if let Some(other) = sub.filter(|x| *x != "commit") {
+            call.last_subcommand = Some(other.to_string());
         }
         if sub != Some("commit") {
             continue;
@@ -452,6 +482,9 @@ pub fn inspect_command(command: &str) -> CommitCall {
             }
         }
     }
+    if call.other_repo && call.is_commit {
+        call.beyond_index = true;
+    }
     if segments.len() > 1 && call.is_commit {
         // Chained with something else (`git add . && git commit`): the index may
         // change before the commit runs.
@@ -474,6 +507,20 @@ pub fn inspect_command(command: &str) -> CommitCall {
         }
     }
     call
+}
+
+/// Does `git <sub>` resolve to an alias that runs a commit?
+pub fn alias_runs_commit(sub: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["config", "--get", &format!("alias.{sub}")])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase())
+        .is_some_and(|v| {
+            v.split(|c: char| !c.is_alphanumeric() && c != '-')
+                .any(|w| w == "commit")
+        })
 }
 
 #[cfg(test)]
@@ -694,6 +741,30 @@ mod tests {
         let plain = inspect_command("git commit -s -m \"a; b && c\"");
         assert!(plain.is_commit && !plain.beyond_index && !plain.no_verify);
         assert!(inspect_command("git commit -qam x").beyond_index);
+    }
+
+    #[test]
+    fn repo_selection_and_config_writes_fail_closed() {
+        for cmd in [
+            "GIT_DIR=/x git commit -m x",
+            "GIT_INDEX_FILE=/x git commit -m x",
+            "git -C other commit -m x",
+            "git --git-dir=/x commit -m x",
+        ] {
+            let c = inspect_command(cmd);
+            assert!(c.is_commit && c.beyond_index, "{cmd}");
+        }
+        for cmd in [
+            "git config alias.ci commit",
+            "git config core.hooksPath /dev/null",
+        ] {
+            let c = inspect_command(cmd);
+            assert!(c.is_commit && c.no_verify, "{cmd}");
+        }
+        assert_eq!(
+            inspect_command("git ci -m x").last_subcommand.as_deref(),
+            Some("ci")
+        );
     }
 
     #[test]
