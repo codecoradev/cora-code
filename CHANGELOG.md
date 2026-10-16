@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The `Cora Review` job no longer gets cancelled on larger pull requests: its time limit is 30 minutes (the review action allows up to three LLM attempts of 10 minutes each).
+
 ## [0.19.0] - 2026-10-16
 
 ### Added
