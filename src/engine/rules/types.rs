@@ -19,6 +19,13 @@ pub struct RulesConfig {
     /// Matches against the file path relative to the project root.
     #[serde(default = "default_index_skip_files")]
     pub index_skip_files: Vec<String>,
+    /// Scan test code like any other code. By default noisy rules
+    /// (`bug-unwrap`, `bug-expect`, `bug-println`, `qual-clone`,
+    /// `sec-hardcoded-url`, `sec-hardcoded-secret`) skip test files and inline
+    /// Rust test blocks, and the secret/security scanners only run their
+    /// high-confidence patterns on inline test blocks (#663).
+    #[serde(default)]
+    pub include_tests: bool,
 }
 
 /// Default skip patterns for index scanners — common false-positive sources.
@@ -67,6 +74,7 @@ impl Default for RulesConfig {
             max_findings: 50,
             custom_rules: Vec::new(),
             index_skip_files: default_index_skip_files(),
+            include_tests: false,
         }
     }
 }

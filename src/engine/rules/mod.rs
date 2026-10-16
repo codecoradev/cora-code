@@ -31,6 +31,20 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
 
 /// Run all rules (built-in + custom) against file lines. The one implementation
 /// behind both the diff and the whole-file entry points.
+/// Built-in rules that skip test code (files under test paths and inline Rust
+/// test blocks) unless `rules_engine.include_tests` is set (#663): tests
+/// legitimately unwrap, print, clone, use `http://` fixtures and fake secrets.
+/// Real secrets in tests are still found by the high-confidence scanners.
+const TEST_EXEMPT_RULES: &[&str] = &[
+    "bug-unwrap",
+    "bug-expect",
+    "bug-println",
+    "qual-clone",
+    "qual-error-ignore",
+    "sec-hardcoded-url",
+    "sec-hardcoded-secret",
+];
+
 pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFinding> {
     if !config.enabled {
         debug!("rule engine is disabled");
@@ -64,6 +78,14 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
 
                 // Check exclude filter
                 if matching::matches_exclude(rule, file_path) {
+                    continue;
+                }
+
+                // Test code is exempt from the noisy built-in rules (#663).
+                if !config.include_tests
+                    && file.in_test(line_no)
+                    && TEST_EXEMPT_RULES.contains(&rule.id.as_str())
+                {
                     continue;
                 }
 
@@ -301,6 +323,7 @@ mod tests {
             max_findings: 10,
             custom_rules: Vec::new(),
             index_skip_files: super::types::default_index_skip_files(),
+            include_tests: false,
         }
     }
 
@@ -699,5 +722,116 @@ mod tests {
         finding.severity = Severity::Major;
         let out = merge_rule_findings(vec![strong], vec![finding]);
         assert_eq!(out[0].severity, Severity::Critical);
+    }
+
+    // ─── #663: test-code awareness ───
+
+    fn file_entry(path: &str, content: &str) -> crate::engine::scanner::FileEntry {
+        crate::engine::scanner::FileEntry {
+            path: path.to_string(),
+            lines: content.lines().count(),
+            content: content.to_string(),
+        }
+    }
+
+    fn rule_ids(entry: &crate::engine::scanner::FileEntry, cfg: &RulesConfig) -> Vec<String> {
+        let files = crate::engine::scan_input::from_entries(std::slice::from_ref(entry));
+        run_rules_in(&files, cfg)
+            .into_iter()
+            .map(|f| format!("{}@{}", f.rule_id, f.line))
+            .collect()
+    }
+
+    const RUST_WITH_TESTS: &str = "\
+fn real() {
+    let a = x.unwrap();
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        let b = y.unwrap();
+        println!(\"debug\");
+        let u = \"http://example.test/x\";
+    }
+}
+";
+
+    #[test]
+    fn inline_rust_test_blocks_skip_the_noisy_rules() {
+        let entry = file_entry("src/lib.rs", RUST_WITH_TESTS);
+        let ids = rule_ids(&entry, &default_config());
+        assert!(ids.contains(&"bug-unwrap@2".to_string()), "{ids:?}");
+        assert!(
+            !ids.iter()
+                .any(|i| i.ends_with("@8") || i.ends_with("@9") || i.ends_with("@10")),
+            "test block lines must be exempt: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn include_tests_scans_test_blocks_again() {
+        let entry = file_entry("src/lib.rs", RUST_WITH_TESTS);
+        let cfg = RulesConfig {
+            include_tests: true,
+            ..default_config()
+        };
+        let ids = rule_ids(&entry, &cfg);
+        assert!(ids.contains(&"bug-unwrap@8".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bug-println@9".to_string()), "{ids:?}");
+    }
+
+    #[test]
+    fn test_paths_are_exempt_beyond_the_tests_directory() {
+        // `foo_test.rs` / `app.test.ts` are not under tests/, but are test files.
+        for path in ["src/foo_test.rs", "src/app.test.ts", "src/__tests__/a.rs"] {
+            let entry = file_entry(path, "fn a() { let x = y.unwrap(); }\n");
+            let ids = rule_ids(&entry, &default_config());
+            assert!(
+                !ids.iter().any(|i| i.starts_with("bug-unwrap")),
+                "{path}: {ids:?}"
+            );
+        }
+        let entry = file_entry("src/prod.rs", "fn a() { let x = y.unwrap(); }\n");
+        assert!(
+            rule_ids(&entry, &default_config())
+                .iter()
+                .any(|i| i.starts_with("bug-unwrap"))
+        );
+    }
+
+    #[test]
+    fn rules_that_are_not_noise_still_fire_in_tests() {
+        // bug-todo is not exempt: a TODO in a test is still a TODO.
+        let entry = file_entry("src/foo_test.rs", "// TODO: finish\n");
+        assert!(
+            rule_ids(&entry, &default_config())
+                .iter()
+                .any(|i| i.starts_with("bug-todo"))
+        );
+    }
+
+    #[test]
+    fn println_is_fine_in_program_entry_points_only() {
+        let src = "fn main() { println!(\"hi\"); }\n";
+        for ok in [
+            "src/main.rs",
+            "crates/x/src/bin/tool.rs",
+            "examples/demo.rs",
+        ] {
+            let entry = file_entry(ok, src);
+            assert!(
+                !rule_ids(&entry, &default_config())
+                    .iter()
+                    .any(|i| i.starts_with("bug-println")),
+                "{ok}"
+            );
+        }
+        let entry = file_entry("src/lib.rs", "pub fn f() { println!(\"hi\"); }\n");
+        assert!(
+            rule_ids(&entry, &default_config())
+                .iter()
+                .any(|i| i.starts_with("bug-println"))
+        );
     }
 }

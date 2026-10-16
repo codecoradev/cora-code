@@ -566,6 +566,7 @@ pub fn post_match_filter(rule_id: &str, line: &str) -> bool {
 pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool {
     match rule_id {
         "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line, path),
+        "bug-println" => is_cli_output_path(path),
         "sec-hardcoded-url" => is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
         "injection/sql-concat" | "sec-sql-concat" => is_false_positive_sql_concat(line),
@@ -575,6 +576,17 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
         "crypto/ssl-verify-disabled" => is_false_positive_ssl_verify(line),
         _ => false,
     }
+}
+
+/// `println!` is the intended output of a program's entry point: `main.rs`,
+/// `src/bin/`, `examples/`, `benches/` (#663). Other files keep the rule; a
+/// crate's own `commands/` modules can be silenced with `ignore.rules` or
+/// `bug-println` in a profile.
+fn is_cli_output_path(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    p.rsplit('/').next() == Some("main.rs")
+        || p.split('/')
+            .any(|seg| matches!(seg, "bin" | "examples" | "benches"))
 }
 
 /// Check if an `http://` URL match is a false positive.
