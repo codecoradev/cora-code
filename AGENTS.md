@@ -1,26 +1,43 @@
-# AGENTS.md
+# AGENTS.md — cora-code
 
-Guidance for agents working in this repository.
+Rust CLI for code review and code intelligence (BYOK). The module map and
+code structure are in `AGENT.md`.
+
+## Build & test
+
+- `cargo build`, then `cargo test --features tree-sitter`.
+- CI runs the same gates: `cargo fmt --all -- --check` and
+  `cargo clippy --all-targets --features tree-sitter -- -D warnings`.
+- User-visible changes go under `## [Unreleased]` in `CHANGELOG.md`.
+
+## Conventions enforced by CI
+
+- Branch names start with one of `feat/ fix/ docs/ chore/ perf/ security/
+  refactor/ test/ build/ ci/ release/`.
+- PR bodies contain `## What`, `## Why` and `## Testing`.
+- Conventional Commits; the PR title becomes the squash message. Commits are
+  signed off (`git commit -s`) for the CLA.
+
+## Gotchas
+
+- The pre-commit hook runs the installed `cora` binary, not
+  `target/debug/cora`; a stale installed build can disagree with the working
+  tree.
+- Rule and scanner changes: measure on a real project before the PR (unit
+  fixtures alone hide false positives), and keep a regression test for each
+  false positive or bypass found.
+- Never print or log credentials, including environment values in command
+  output.
 
 ## Session start (continuity ritual)
 
-- Every new session/round: read & understand the team knowledge rooms before
-  doing any work.
-- Save every decision or important outcome back to the responsible room during
-  or at the end of the session.
-- Handing over mid-task: leave a `[HANDOFF]` entry (current state, next step,
-  blockers).
+- New session: read & understand the team knowledge rooms before any work.
+- Save every decision or important outcome back to the responsible room
+  during or at the end of the session.
+- Handing over mid-task: leave a [HANDOFF] entry (state, next step, blockers).
 
 ## Workflow summary
 
 Issue → branch from develop → code + pre-commit checks → push → PR to develop
-(`## What` / `## Why` / `## Testing`, English) → CI green + review verdict →
-merge (squash; the PR title becomes the commit message) → cleanup → release
-(bump + CHANGELOG + tag). 1 issue = 1 branch = 1 PR.
-
-## Commits & PRs
-
-- Conventional Commits; the PR title becomes the squash message.
-- Keep commit messages, PR titles/bodies and comments clean: no third-party
-  trailers, no generated-with lines (ecosystem message standard, enforced by
-  tooling).
+(## What / ## Why / ## Testing, English) → CI green + review verdict → merge →
+cleanup → release (bump + CHANGELOG + tag). 1 issue = 1 branch = 1 PR.
