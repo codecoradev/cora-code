@@ -30,6 +30,10 @@ use formatters::OutputFormat;
 ///
 /// Review diffs and scan projects using any OpenAI-compatible LLM.
 /// Configure via .cora.yaml, CLI flags, or environment variables.
+///
+/// No API key? `cora review --no-llm` / `cora scan --no-llm` run the
+/// deterministic checks only, and an AI coding agent can do the AI review
+/// itself through the MCP server (`cora mcp`, see `cora mcp --help`).
 #[derive(Parser, Debug)]
 #[clap(
     name = "cora",
@@ -74,7 +78,7 @@ struct GlobalOptions {
     pub base_url: Option<String>,
 
     /// API key (or set `CORA_API_KEY` env var for CI, or use `cora auth login`)
-    #[clap(long, global = true, env = "CORA_API_KEY")]
+    #[clap(long, global = true, env = "CORA_API_KEY", hide_env_values = true)]
     pub api_key: Option<String>,
 
     /// Enable verbose logging
@@ -246,6 +250,10 @@ enum Command {
     },
 
     /// Review a git diff (staged, unpushed, or branch)
+    ///
+    /// Needs an LLM (BYOK). Without an API key, or with --no-llm, only the
+    /// deterministic checks run. To review with your AI coding agent instead
+    /// (no key in cora), see `cora mcp --help`.
     Review {
         /// Review staged changes (git diff --cached)
         #[clap(long)]
@@ -321,7 +329,7 @@ enum Command {
         ref_name: Option<String>,
 
         /// GitHub token for upload (default: `GITHUB_TOKEN` env var)
-        #[clap(long, env = "GITHUB_TOKEN")]
+        #[clap(long, env = "GITHUB_TOKEN", hide_env_values = true)]
         token: Option<String>,
 
         /// Recall project patterns from Uteke before review (requires `uteke` CLI)
@@ -339,6 +347,10 @@ enum Command {
     },
 
     /// Scan a project directory for issues
+    ///
+    /// Needs an LLM (BYOK). Without an API key, or with --no-llm, only the
+    /// deterministic checks run. To scan with your AI coding agent instead
+    /// (no key in cora), see `cora mcp --help`.
     Scan {
         /// Root directory to scan (default: current directory)
         #[clap(long)]
@@ -400,7 +412,7 @@ enum Command {
         ref_name: Option<String>,
 
         /// GitHub token (default: `GITHUB_TOKEN` env var)
-        #[clap(long, env = "GITHUB_TOKEN")]
+        #[clap(long, env = "GITHUB_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
 
@@ -443,6 +455,14 @@ enum Command {
     },
 
     /// Start MCP server (Model Context Protocol for AI agents)
+    ///
+    /// Includes agent-as-reviewer tools: `cora.review_prepare` +
+    /// `cora.review_finalize` (a diff) and `cora.scan_prepare` +
+    /// `cora.scan_finalize` (a project). The calling agent judges with its own
+    /// model, so no LLM or API key is configured in cora. Register the server
+    /// with your agent via `cora install` (for Claude Code:
+    /// `claude mcp add cora -- cora mcp`). Results are advisory, not a CI
+    /// gate. See docs/usage.md, "Review with your agent".
     Mcp,
 
     /// Manage review findings (list, dismiss, reopen, stats)
@@ -490,6 +510,10 @@ enum Command {
         filter: Option<String>,
     },
     /// Auto-detect and configure AI coding agents for Cora MCP
+    ///
+    /// Also installs the /cora-review skill for Claude Code
+    /// (~/.claude/skills/cora-review). Claude Code itself is registered with
+    /// `claude mcp add cora -- cora mcp`.
     Install {
         /// List detected agents without installing
         #[clap(long)]
