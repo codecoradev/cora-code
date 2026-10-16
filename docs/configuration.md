@@ -437,25 +437,37 @@ profile: security-first
 
 ## Custom Rule Engine
 
-Write your own regex-based rules in `.cora.yaml`:
+Write your own regex-based rules under `rules_engine.custom` in `.cora.yaml`:
 
 ```yaml
-rules:
-  - id: no-unwrap
-    pattern: "\\.unwrap\\(\\)"
-    severity: minor
-    message: "Avoid unwrap() in production code — use proper error handling"
-    languages: ["rust"]
-    exclude: ["tests/**"]
+rules_engine:
+  custom:
+    - id: no-unwrap
+      pattern: "\\.unwrap\\(\\)"
+      severity: minor
+      message: "Avoid unwrap() in production code — use proper error handling"
+      languages: ["rs"]
+      exclude: ["tests/**"]
 
-  - id: no-console-log
-    pattern: "console\\.log\\("
-    severity: minor
-    message: "Remove console.log before merging"
-    languages: ["typescript", "javascript"]
+    - id: no-console-log
+      pattern: "console\\.log\\("
+      severity: minor
+      message: "Remove console.log before merging"
+      languages: ["ts", "js"]
 ```
 
-Rules run during the deterministic pre-scan phase (no LLM needed).
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | yes | Unique rule id; must not collide with a built-in rule id (it is what `ignore.rules` and `cora-ignore` name) |
+| `pattern` | yes | A regex matched against each line; an invalid regex is a config error |
+| `severity` | yes | `critical`, `major`, `minor` or `info` |
+| `message` | yes | The finding text |
+| `languages` | no (default `["all"]`) | File extensions (`"rs"`, `"py"`, `"ts"`) or language names (`"rust"`, `"typescript"`); `"all"` or `"*"` matches every file. An unknown value is a config error |
+| `exclude` | no (default none) | Glob patterns of paths to skip |
+
+The top-level `rules:` key is a different thing: a list of free-text instructions for the LLM reviewer (strings), not rule objects.
+
+Rules run during the deterministic pre-scan phase (no LLM needed). `cora config validate` rejects an invalid pattern, a duplicate id, an unknown language or an empty message with the rule id. `cora config validate --dry-run [--path DIR]` also runs every custom rule over the project and prints how many lines each one matched, so a rule that matches nothing is visible.
 
 ### Index Scanner Configuration
 

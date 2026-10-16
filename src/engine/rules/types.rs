@@ -90,13 +90,20 @@ pub struct CustomRule {
     pub severity: Severity,
     /// Human-readable description used as the finding body.
     pub message: String,
-    /// Languages this rule applies to. `["all"]` means all languages.
+    /// Languages this rule applies to: file extensions (`"rs"`) or language
+    /// names (`"rust"`). `["all"]` (or `"*"`) means all languages; omitted = all.
+    #[serde(default = "default_languages")]
     pub languages: Vec<String>,
-    /// Glob patterns for file paths to exclude from this rule.
+    /// Glob patterns for file paths to exclude from this rule (default: none).
+    #[serde(default)]
     pub exclude: Vec<String>,
     /// Pre-compiled regex for the pattern (populated after rule assembly).
     #[serde(skip, default)]
     pub compiled_pattern: Option<regex::Regex>,
+}
+
+fn default_languages() -> Vec<String> {
+    vec!["all".to_string()]
 }
 
 impl CustomRule {

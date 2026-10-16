@@ -7,7 +7,7 @@ pub mod types;
 use tracing::debug;
 
 use crate::engine::diff_parser::{FileChunk, parse_diff};
-use crate::engine::rules::types::{RuleFinding, RulesConfig};
+use crate::engine::rules::types::{CustomRule, RuleFinding, RulesConfig};
 use crate::engine::scan_input::{self, ScanFile};
 use crate::engine::types::{ReviewIssue, Severity};
 
@@ -44,6 +44,51 @@ const TEST_EXEMPT_RULES: &[&str] = &[
     "sec-hardcoded-url",
     "sec-hardcoded-secret",
 ];
+
+/// Lint custom rules: returns one message per problem (empty = fine).
+///
+/// Catches what would otherwise fail silently: a pattern that is not a valid
+/// regex, an id that is empty, duplicated or shadows a built-in rule, an empty
+/// message, and `languages` values that match no file (#684, #678).
+pub fn validate_custom_rules(rules: &[CustomRule]) -> Vec<String> {
+    let builtin_ids: std::collections::HashSet<String> =
+        builtin::builtin_rules().into_iter().map(|r| r.id).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut errs = Vec::new();
+    for (i, r) in rules.iter().enumerate() {
+        let name = if r.id.is_empty() {
+            format!("rules_engine.custom[{i}]")
+        } else {
+            format!("rules_engine.custom[{i}] ({})", r.id)
+        };
+        if r.id.trim().is_empty() {
+            errs.push(format!("{name}: id must not be empty"));
+        } else if builtin_ids.contains(&r.id) {
+            errs.push(format!("{name}: id collides with a built-in rule"));
+        } else if !seen.insert(r.id.clone()) {
+            errs.push(format!("{name}: duplicate id"));
+        }
+        if let Err(e) = regex::Regex::new(&r.pattern) {
+            errs.push(format!("{name}: pattern is not a valid regex: {e}"));
+        }
+        if r.message.trim().is_empty() {
+            errs.push(format!("{name}: message must not be empty"));
+        }
+        if r.languages.is_empty() {
+            errs.push(format!(
+                "{name}: languages is empty, so the rule can never match; use [\"all\"] or file extensions like [\"rs\"]"
+            ));
+        }
+        for lang in &r.languages {
+            if matching::normalize_language(lang).is_none() {
+                errs.push(format!(
+                    "{name}: languages entry \"{lang}\" is not a known extension or language (use e.g. \"rs\", \"py\", \"ts\", or \"all\")"
+                ));
+            }
+        }
+    }
+    errs
+}
 
 pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFinding> {
     if !config.enabled {
@@ -316,6 +361,63 @@ pub fn parse_and_run_rules(diff: &str, config: &RulesConfig) -> Vec<RuleFinding>
 mod tests {
     use super::*;
     use crate::engine::Severity;
+
+    fn rule(id: &str, pattern: &str, languages: &[&str]) -> CustomRule {
+        CustomRule {
+            id: id.into(),
+            pattern: pattern.into(),
+            severity: Severity::Major,
+            message: "m".into(),
+            languages: languages.iter().map(|s| s.to_string()).collect(),
+            exclude: vec![],
+            compiled_pattern: None,
+        }
+    }
+
+    #[test]
+    fn a_valid_custom_rule_has_no_problems() {
+        assert!(validate_custom_rules(&[rule("mine", "fn a", &["rs"])]).is_empty());
+        assert!(
+            validate_custom_rules(&[rule("mine", "x", &["rust", "TypeScript", "*"])]).is_empty()
+        );
+    }
+
+    #[test]
+    fn validation_reports_each_silent_failure_with_the_rule_id() {
+        let errs = validate_custom_rules(&[
+            rule("bad", "(", &["rs"]),
+            rule("lang", "x", &["klingon"]),
+            rule("lang", "x", &[]),
+            rule("bug-todo", "x", &["rs"]),
+        ]);
+        let all = errs.join("\n");
+        assert!(
+            all.contains("(bad)") && all.contains("not a valid regex"),
+            "{all}"
+        );
+        assert!(all.contains("klingon"), "{all}");
+        assert!(all.contains("duplicate id"), "{all}");
+        assert!(all.contains("languages is empty"), "{all}");
+        assert!(all.contains("collides with a built-in rule"), "{all}");
+    }
+
+    #[test]
+    fn language_names_match_files_like_extensions() {
+        let r = rule("mine", "fn a", &["rust"]);
+        assert!(matching::matches_language(&r, "rs"));
+        assert!(!matching::matches_language(&r, "py"));
+        assert!(matching::matches_language(&rule("m", "x", &["tsx"]), "ts"));
+    }
+
+    #[test]
+    fn exclude_and_languages_are_optional_in_yaml() {
+        let r: CustomRule = serde_yaml_ng::from_str(
+            "id: no-console-log\npattern: 'console'\nseverity: minor\nmessage: no\n",
+        )
+        .unwrap();
+        assert!(r.exclude.is_empty());
+        assert_eq!(r.languages, vec!["all".to_string()]);
+    }
 
     fn default_config() -> RulesConfig {
         RulesConfig {
