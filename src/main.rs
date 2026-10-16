@@ -602,6 +602,24 @@ enum HookAction {
     Install,
     /// Uninstall the pre-commit hook
     Uninstall,
+    /// Check whether the staged diff was already reviewed (agent or CLI)
+    ///
+    /// Exit codes: 0 validated or nothing reviewable staged, 10 validated but
+    /// the verdict blocks, 11 not validated. `cora.review_finalize` and
+    /// `cora review --staged` record the validation; the pre-commit hook asks
+    /// this first and falls back to a full review.
+    Verify {
+        /// Print nothing, only set the exit code
+        #[clap(long, short)]
+        quiet: bool,
+    },
+    /// Claude Code PreToolUse guard: deny `git commit` unless the staged diff is validated
+    ///
+    /// Reads the hook JSON on stdin. Configure it in Claude Code settings as a
+    /// PreToolUse hook with matcher `Bash` and command `cora hook claude-guard`.
+    /// Denies `git commit --no-verify` and commits of an unreviewed staged diff;
+    /// allows everything else.
+    ClaudeGuard,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1279,6 +1297,8 @@ async fn main() -> Result<()> {
                 hook_cmd::execute_hook_uninstall()?;
                 0
             }
+            HookAction::Verify { quiet } => hook_cmd::execute_hook_verify(quiet)?,
+            HookAction::ClaudeGuard => hook_cmd::execute_claude_guard()?,
         },
         Command::Auth { action } => {
             match action {
