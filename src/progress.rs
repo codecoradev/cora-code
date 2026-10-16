@@ -203,6 +203,40 @@ pub fn diff_stats(diff: &str) -> (usize, usize) {
     (files_changed, lines_changed)
 }
 
+/// Spinner-backed [`LlmEvents`](crate::engine::llm::LlmEvents) for interactive
+/// non-streaming runs. Hidden when `quiet` or when stderr is not a TTY, so
+/// piped output stays free of ANSI.
+pub struct Spinner(indicatif::ProgressBar);
+
+impl Spinner {
+    pub fn new(message: &str, quiet: bool) -> Self {
+        use std::io::IsTerminal;
+        if quiet || !std::io::stderr().is_terminal() {
+            return Self(indicatif::ProgressBar::hidden());
+        }
+        let spinner = indicatif::ProgressBar::new_spinner();
+        spinner.enable_steady_tick(std::time::Duration::from_millis(80));
+        spinner.set_style(
+            indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .expect("valid spinner template")
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+        );
+        spinner.set_message(message.to_string());
+        Self(spinner)
+    }
+
+    /// Remove the spinner from the terminal.
+    pub fn finish(&self) {
+        self.0.finish_and_clear();
+    }
+}
+
+impl crate::engine::llm::LlmEvents for Spinner {
+    fn status(&self, msg: &str) {
+        self.0.set_message(msg.to_string());
+    }
+}
+
 /// [`LlmEvents`](crate::engine::llm::LlmEvents) that streams model output to
 /// stdout as it arrives. The LLM layer itself never prints; commands that want
 /// live token output (`review --stream`, `commit --stream`) pass this in.

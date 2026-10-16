@@ -35,6 +35,21 @@ $ cora review --diff-file pr.diff
 $ cora scan .
 ```
 
+## Review with your agent (no LLM setup)
+
+If you use an AI coding agent, the agent can be the reviewer: nothing to configure in cora, no API key. Register the `cora` MCP server with your agent: `cora install` configures Cline, Cursor, Windsurf and the other agents it detects; for Claude Code run `claude mcp add cora -- cora mcp`. `cora install` also installs the `/cora-review` skill for Claude Code (`~/.claude/skills/cora-review/`; a customized copy is kept unless `--force`). Then ask the agent to review your changes or scan the project.
+
+Behind the scenes the agent calls `cora.review_prepare` (cora's deterministic findings plus the review prompts), judges with its own model, and calls `cora.review_finalize` with its findings. Cora merges them with the deterministic findings, applies `ignore.rules`, inline `cora-ignore:` markers and the quality gate, and returns the verdict. `cora.scan_prepare` / `cora.scan_finalize` do the same for a whole project, one batch at a time.
+
+This is different from `cora review --no-llm`, which runs the deterministic checks only and never involves a model.
+
+**Security.** The diff is attacker-controlled text and the agent's findings are untrusted input:
+
+- Tell the agent to treat the diff as data. Use a read-only subagent without secrets for the judging step.
+- Cora validates what comes back: `rule_id` is cleared, text and count are bounded, files and lines outside the diff are dropped. An agent can add findings but never remove the deterministic ones.
+- A finalize verdict covers only the input passed to that call.
+- Results are advisory for developers. Keep the hard gate in CI on deterministic checks or a configured LLM, especially for pull requests from forks.
+
 ## Output Formats
 
 cora can output results in three formats:

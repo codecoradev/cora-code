@@ -16,6 +16,26 @@ use super::protocol::{Tool, ToolResult};
 static MCP_RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("Failed to create MCP tokio runtime"));
 
+/// Run `future` to completion from a tool handler.
+///
+/// The MCP server runs inside `#[tokio::main]`, so a handler is already on a
+/// runtime thread; calling `MCP_RUNTIME.block_on` directly there panics
+/// ("Cannot start a runtime from within a runtime") and kills the server.
+/// `block_in_place` hands the thread over first. Outside a runtime (unit
+/// tests) it blocks directly.
+///
+/// Limitation: `block_in_place` panics on a `current_thread` runtime. The
+/// server is multi-thread (`#[tokio::main]` with `rt-multi-thread`), so this
+/// holds in production; a `#[tokio::test]` calling a handler that reaches
+/// here must use `flavor = "multi_thread"`. (A thread hand-off would need the
+/// future to be `Send`, which the pipeline's futures are not.)
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| MCP_RUNTIME.block_on(future)),
+        Err(_) => MCP_RUNTIME.block_on(future),
+    }
+}
+
 /// List all available MCP tools.
 pub fn list_tools() -> Vec<Tool> {
     vec![
@@ -31,7 +51,7 @@ pub fn list_tools() -> Vec<Tool> {
         },
         Tool {
             name: "cora.check_snippet".to_string(),
-            description: "Check a code snippet against cora's deterministic rules (secrets, security patterns). No LLM call.".to_string(),
+            description: "Check a code snippet against cora's deterministic checks (built-in and custom rules, secrets, security patterns). No LLM call.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -234,6 +254,10 @@ pub fn list_tools() -> Vec<Tool> {
             }),
         },
     ]
+    .into_iter()
+    // Agent-as-reviewer tools (#647): no LLM configured in cora.
+    .chain(super::agent_tools::tools())
+    .collect()
 }
 
 /// Dispatch a tool call to the appropriate handler.
@@ -266,6 +290,11 @@ pub fn handle_tool_call(name: &str, params: &serde_json::Value) -> ToolResult {
         "cora.dead_code" => handle_dead_code(params),
         // Graph Query DSL
         "cora.query" => handle_query(params),
+        // Agent-as-reviewer (#647)
+        "cora.review_prepare" => super::agent_tools::review_prepare(params),
+        "cora.review_finalize" => super::agent_tools::review_finalize(params),
+        "cora.scan_prepare" => super::agent_tools::scan_prepare(params),
+        "cora.scan_finalize" => super::agent_tools::scan_finalize(params),
         _ => ToolResult::error(format!("Unknown tool: {name}")),
     }
 }
@@ -367,7 +396,7 @@ fn check_snippet_with(
     }
     if report.dropped > 0 {
         lines.push(format!(
-            "\n{} more deterministic finding(s) not shown (rules.max_findings = {}; raise it or set 0/null to show all)",
+            "\n{} more deterministic finding(s) not shown (rules.max_findings = {}; critical and major are never hidden; raise it or set 0/null to show all)",
             report.dropped, config.rules_config.max_findings
         ));
     }
@@ -601,7 +630,7 @@ const MAX_LIMIT: u64 = 500;
 const MAX_DEPTH: u64 = 10;
 const MAX_MIN_LINES: u64 = 100_000;
 /// Max size of a diff accepted by `cora.review_diff` (bytes).
-const MAX_DIFF_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_DIFF_BYTES: usize = 1024 * 1024;
 
 /// Read an unsigned integer param, defaulting when absent and clamping to `max`.
 fn clamped_u64(params: &serde_json::Value, key: &str, default: u64, max: u64) -> u64 {
@@ -756,7 +785,7 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
     };
 
     // Run review synchronously using the shared runtime
-    let result = MCP_RUNTIME.block_on(crate::engine::review::review_diff_with_cache(
+    let result = block_on(crate::engine::review::review_diff_with_cache(
         &config,
         &llm_config,
         diff,
@@ -767,11 +796,35 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
     ));
 
     match result {
-        Ok(response) => {
+        Ok(mut response) => {
+            // Honor `min_severity` (default: info = everything), then gate on
+            // what is reported. `should_block` still follows the project's
+            // `hook.min_severity`.
+            let min_severity = params
+                .get("min_severity")
+                .and_then(|v| v.as_str())
+                .map_or(crate::engine::Severity::Info, |s| {
+                    crate::engine::Severity::from_str_lossy(s)
+                });
+            // Blocking and the gate look at ALL findings under the project's
+            // hook.min_severity; the caller's min_severity only trims the list.
+            let shaped = crate::engine::finalize::shape(
+                &mut response,
+                &config,
+                &crate::engine::finalize::ShapeOptions {
+                    min_severity: config.hook.min_severity_level(),
+                    filter: false,
+                    gate: true,
+                    ci: false,
+                },
+            );
+            let should_block = shaped.should_block;
+            response.issues.retain(|i| i.severity <= min_severity);
             let json = serde_json::json!({
                 "summary": response.summary,
                 "total_issues": response.issues.len(),
-                "should_block": response.should_block,
+                "should_block": should_block,
+                "not_shown": response.dropped_findings,
                 "issues": response.issues.iter().map(|i| serde_json::json!({
                     "title": i.title,
                     "severity": i.severity.label(),
@@ -780,14 +833,12 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
                     "type": i.issue_type,
                     "body": i.body,
                 })).collect::<Vec<_>>(),
-                "gate": if config.quality_gate.enabled {
-                    let gate = crate::engine::quality_gate::evaluate(&response.issues, &config.quality_gate);
-                    serde_json::json!({
+                "gate": match &shaped.gate {
+                    Some(gate) => serde_json::json!({
                         "status": format!("{:?}", gate.status),
                         "total_findings": gate.total_findings,
-                    })
-                } else {
-                    serde_json::json!({"enabled": false})
+                    }),
+                    None => serde_json::json!({"enabled": false}),
                 },
             });
             ToolResult::text(serde_json::to_string_pretty(&json).unwrap_or_default())
@@ -1111,7 +1162,7 @@ fn handle_query(params: &serde_json::Value) -> ToolResult {
 }
 
 /// Load project config safely (no API keys exposed).
-fn load_project_config() -> anyhow::Result<crate::config::schema::Config> {
+pub(super) fn load_project_config() -> anyhow::Result<crate::config::schema::Config> {
     let mut config = crate::config::schema::Config::default();
     let cwd = std::env::current_dir()?;
 
@@ -1241,8 +1292,9 @@ mod tests {
     fn snippet_respects_max_findings_and_reports_dropped() {
         let mut cfg = crate::config::schema::Config::default();
         cfg.rules_config.max_findings = 1;
-        let code = "a = 'AKIAIOSFODNN7EXAMPLE'\nb = 'AKIAIOSFODNN7EXAMPLF'";
-        let text = snippet_text(code, "py", &cfg);
+        // Two Info-level findings: only noise is capped.
+        let code = "// TODO: first\n// TODO: second";
+        let text = snippet_text(code, "rs", &cfg);
         assert!(text.contains("Found 1 issue(s)"), "{text}");
         assert!(
             text.contains("1 more deterministic finding(s) not shown"),
@@ -1250,7 +1302,14 @@ mod tests {
         );
 
         cfg.rules_config.max_findings = 0; // unlimited
-        let text = snippet_text(code, "py", &cfg);
+        let text = snippet_text(code, "rs", &cfg);
+        assert!(text.contains("Found 2 issue(s)"), "{text}");
+        assert!(!text.contains("not shown"), "{text}");
+
+        // Critical findings are never hidden, whatever the cap.
+        cfg.rules_config.max_findings = 1;
+        let secrets = "a = 'AKIAIOSFODNN7EXAMPLE'\nb = 'AKIAIOSFODNN7EXAMPLF'";
+        let text = snippet_text(secrets, "py", &cfg);
         assert!(text.contains("Found 2 issue(s)"), "{text}");
         assert!(!text.contains("not shown"), "{text}");
     }
@@ -1470,7 +1529,19 @@ mod tests {
     #[test]
     fn total_tool_count() {
         let tools = list_tools();
-        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) + dead_code (1) + query (1) = 18
-        assert_eq!(tools.len(), 18);
+        // Phase 1 (5) + code intel (5) + Phase 2 (2) + Phase 3 (3) + install (1) + dead_code (1) + query (1) + agent-as-reviewer (4) = 22
+        assert_eq!(tools.len(), 22);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn block_on_works_from_inside_a_runtime() {
+        // Regression: tool handlers run on a tokio runtime thread (the server
+        // is `#[tokio::main]`); a bare `MCP_RUNTIME.block_on` panicked there.
+        assert_eq!(block_on(async { 1 + 1 }), 2);
+    }
+
+    #[test]
+    fn block_on_works_outside_a_runtime() {
+        assert_eq!(block_on(async { 2 + 2 }), 4);
     }
 }

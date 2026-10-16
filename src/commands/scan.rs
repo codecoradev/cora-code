@@ -6,19 +6,23 @@ use tracing::debug;
 
 use crate::config::schema::Config;
 use crate::engine::ReviewIssue;
+use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
+use crate::engine::judge::{
+    DETERMINISTIC_ONLY, HttpScanJudge, JudgeChoice, ScanBatch, ScanJudge, admit,
+};
 use crate::engine::postprocess::{Source, dropped_warning, postprocess_report};
-use crate::engine::review_store;
 use crate::engine::scanner::{FileEntry, batch_files, format_batch_for_prompt, walk_project};
 use crate::engine::types::TokenUsage;
 use crate::formatters::{OutputFormat, formatter_for};
 
 /// Default maximum files per LLM batch when `--batch-files` is not specified.
 /// Lower this to work around provider token limits or rate-limit errors.
-const DEFAULT_MAX_FILES_PER_BATCH: usize = 20;
+pub(crate) const DEFAULT_MAX_FILES_PER_BATCH: usize = 20;
 
-/// Approximate token budget per batch. Used by the scanner to split large file
-/// sets into review-sized chunks that fit within typical model context windows.
-const DEFAULT_BATCH_TOKEN_BUDGET: usize = 60_000;
+/// Character budget per batch (roughly 4 characters per token). Used by the
+/// scanner to split large file sets into review-sized chunks that fit within
+/// typical model context windows.
+pub(crate) const DEFAULT_BATCH_CHAR_BUDGET: usize = 60_000;
 
 /// Scan command options.
 pub struct ScanOptions {
@@ -49,7 +53,7 @@ pub struct ScanOptions {
 #[allow(clippy::too_many_lines)]
 pub async fn execute_scan(
     config: &Config,
-    llm_config: &crate::engine::LLMConfig,
+    judge: &JudgeChoice,
     opts: &ScanOptions,
     format: OutputFormat,
 ) -> Result<i32> {
@@ -119,18 +123,8 @@ pub async fn execute_scan(
     // 2b. Run index-powered deterministic scans (unused imports, dead code)
     // These work even without LLM and add findings to the final report.
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-    // Same merged exclusion set as `cora index` (#521).
-    let mut index_skip = config.ignore.files.clone();
-    index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
-    index_skip.dedup();
     let index_bridge = crate::engine::index_bridge::IndexBridge::open(&root_abs);
-    let index_findings = crate::engine::index_scanner::scan_project_index(
-        &index_bridge,
-        &files,
-        // Uncapped: the cap is enforced after suppression in `postprocess` (#624).
-        usize::MAX,
-        &index_skip,
-    );
+    let index_findings = index_findings(config, &index_bridge, &files);
     if !index_findings.is_empty() {
         eprintln!(
             "  {} index-based findings (unused imports, dead code)",
@@ -144,7 +138,7 @@ pub async fn execute_scan(
     } else {
         DEFAULT_MAX_FILES_PER_BATCH
     };
-    let batches = batch_files(&files, DEFAULT_BATCH_TOKEN_BUDGET, max_files_per_batch);
+    let batches = batch_files(&files, DEFAULT_BATCH_CHAR_BUDGET, max_files_per_batch);
     debug!(
         batches = batches.len(),
         max_files = max_files_per_batch,
@@ -164,7 +158,145 @@ pub async fn execute_scan(
         None
     };
 
-    // 5. Process batches and collect issues
+    // 5. Judge the batches and collect issues (no LLM: deterministic only)
+    let BatchRun {
+        issues: mut all_issues,
+        tokens: total_tokens,
+    } = match judge {
+        JudgeChoice::Llm(llm_config) => {
+            judge_batches(
+                &HttpScanJudge { llm_config },
+                config,
+                &batches,
+                &effective_focus,
+                brain_ctx.as_deref(),
+                opts.continue_on_batch_error,
+            )
+            .await?
+        }
+        JudgeChoice::Deterministic => BatchRun {
+            issues: Vec::new(),
+            tokens: None,
+        },
+    };
+
+    // 5. Merge deterministic + index findings with the LLM findings, then
+    //    apply ignore.rules and inline cora-ignore markers. Deterministic
+    //    findings survive an LLM failure (#595).
+    all_issues.extend(index_findings);
+    let (mut all_issues, dropped) = finalize_issues(config, &files, all_issues);
+    if let Some(w) = dropped_warning(dropped, config) {
+        eprintln!("{}", w.yellow());
+    }
+    let issue_count = all_issues.len();
+    // Scan lists every finding; only `hook.min_severity` decides blocking.
+    let shaped = finalize::shape_issues(
+        &mut all_issues,
+        config,
+        &ShapeOptions {
+            min_severity: config.hook.min_severity_level(),
+            filter: false,
+            gate: false,
+            ci: false,
+        },
+    );
+    let should_block = shaped.should_block;
+
+    // A clean deterministic result is not an AI scan: say so in the summary.
+    let no_judge_note = if matches!(judge, JudgeChoice::Deterministic) {
+        format!(" {DETERMINISTIC_ONLY}")
+    } else {
+        String::new()
+    };
+
+    let response = crate::engine::ScanResponse {
+        issues: all_issues,
+        files_scanned: files.len(),
+        lines_scanned: total_lines,
+        summary: format!(
+            "Scanned {} files ({} lines), found {} issues{}.",
+            files.len(),
+            total_lines,
+            issue_count,
+            if dropped > 0 {
+                format!(
+                    " ({dropped} more deterministic findings not shown, rules.max_findings cap)"
+                )
+            } else {
+                String::new()
+            }
+        ) + &no_judge_note,
+        tokens_used: total_tokens,
+        should_block,
+    };
+
+    let formatter = formatter_for(format);
+    let output = formatter.format_scan(&response)?;
+    println!("{output}");
+
+    // 6. Save scan cache for incremental mode
+    if opts.incremental {
+        let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let mut cache = ScanCache::load().unwrap_or_default();
+        for f in &files {
+            let abs_path = root_abs.join(&f.path);
+            let Some(hash) = file_content_hash(&abs_path) else {
+                continue; // can't read file, skip cache entry
+            };
+            cache.set(&root_abs, &f.path, &hash);
+        }
+        cache.save()?;
+        debug!(cached = files.len(), "saved scan cache");
+    }
+
+    // 7. Save scan findings to cora.db (best-effort)
+    finalize::save_history(
+        &HistoryEntry {
+            command: "scan",
+            summary: &response.summary,
+            files_scanned: response.files_scanned,
+            lines_scanned: response.lines_scanned,
+            tokens: response.tokens_used.as_ref(),
+        },
+        &response.issues,
+        &shaped,
+    );
+
+    Ok(shaped.exit_code)
+}
+
+/// Index-backed deterministic findings (unused imports, dead code) for `files`.
+///
+/// Uncapped: the cap is enforced after suppression in `postprocess` (#624).
+/// Uses the same merged exclusion set as `cora index` (#521).
+pub(crate) fn index_findings(
+    config: &Config,
+    bridge: &crate::engine::index_bridge::IndexBridge,
+    files: &[FileEntry],
+) -> Vec<ReviewIssue> {
+    let mut index_skip = config.ignore.files.clone();
+    index_skip.extend(config.rules_config.index_skip_files.iter().cloned());
+    index_skip.dedup();
+    crate::engine::index_scanner::scan_project_index(bridge, files, usize::MAX, &index_skip)
+}
+
+/// Findings and token usage gathered from all scan batches.
+struct BatchRun {
+    issues: Vec<ReviewIssue>,
+    tokens: Option<TokenUsage>,
+}
+
+/// Ask `judge` about every batch. A batch that fails is skipped with a warning
+/// (`continue_on_error`) or aborts the scan. Every batch's answer passes
+/// [`admit`] first: it is untrusted (#644).
+async fn judge_batches<J: ScanJudge>(
+    judge: &J,
+    config: &Config,
+    batches: &[Vec<FileEntry>],
+    focus: &[String],
+    brain_context: Option<&str>,
+    continue_on_error: bool,
+) -> Result<BatchRun> {
     let mut all_issues = Vec::new();
     let mut total_tokens: Option<TokenUsage> = None;
     let mut skipped_batches: Vec<(usize, Vec<String>, String)> = Vec::new();
@@ -179,19 +311,14 @@ pub async fn execute_scan(
 
         eprintln!("  Reviewing{batch_label}…");
 
-        match crate::engine::llm::scan_files(
-            llm_config,
-            &files_content,
-            &effective_focus,
-            &config.rules,
-            &config.response_format,
-            None,
-            brain_ctx.as_deref(),
-        )
-        .await
+        match judge
+            .judge_batch(config, &files_content, focus, brain_context)
+            .await
         {
-            Ok((issues, _summary, tokens)) => {
-                all_issues.extend(issues);
+            Ok(ScanBatch { issues, tokens }) => {
+                // Only files of this batch, bounded text, no deterministic markers.
+                let batch_paths: Vec<String> = batch.iter().map(|f| f.path.clone()).collect();
+                all_issues.extend(admit(issues, &batch_paths, &Source::Files(batch)));
                 total_tokens = match (total_tokens, tokens) {
                     (Some(mut acc), Some(t)) => {
                         acc.input_tokens += t.input_tokens;
@@ -204,8 +331,7 @@ pub async fn execute_scan(
                 };
             }
             Err(err) => {
-                let file_list: Vec<String> =
-                    batch.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+                let file_list: Vec<String> = batch.iter().map(|f| f.path.clone()).collect();
                 let err_string = err.to_string();
 
                 // Always log the failure at warn level so it shows even without --verbose.
@@ -217,7 +343,7 @@ pub async fn execute_scan(
                     "batch scan failed"
                 );
 
-                if !opts.continue_on_batch_error {
+                if !continue_on_error {
                     eprintln!(
                         "  {} batch {}/{}: {}",
                         "failed".red().bold(),
@@ -250,106 +376,17 @@ pub async fn execute_scan(
         );
     }
 
-    // 5. Merge deterministic + index findings with the LLM findings, then
-    //    apply ignore.rules and inline cora-ignore markers. Deterministic
-    //    findings survive an LLM failure (#595).
-    all_issues.extend(index_findings);
-    let (all_issues, dropped) = finalize_issues(config, &files, all_issues);
-    if let Some(w) = dropped_warning(dropped, config) {
-        eprintln!("{}", w.yellow());
-    }
-    let issue_count = all_issues.len();
-    let min_severity = config.hook.min_severity_level();
-    // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so "at or above
-    // min_severity" means Ord value <= min_severity.
-    let should_block = all_issues.iter().any(|i| i.severity <= min_severity);
-
-    let response = crate::engine::ScanResponse {
+    Ok(BatchRun {
         issues: all_issues,
-        files_scanned: files.len(),
-        lines_scanned: total_lines,
-        summary: format!(
-            "Scanned {} files ({} lines), found {} issues{}.",
-            files.len(),
-            total_lines,
-            issue_count,
-            if dropped > 0 {
-                format!(
-                    " ({dropped} more deterministic findings not shown, rules.max_findings cap)"
-                )
-            } else {
-                String::new()
-            }
-        ),
-        tokens_used: total_tokens,
-        should_block,
-    };
-
-    let formatter = formatter_for(format);
-    let output = formatter.format_scan(&response)?;
-    println!("{output}");
-
-    // 6. Save scan cache for incremental mode
-    if opts.incremental {
-        let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-        let mut cache = ScanCache::load().unwrap_or_default();
-        for f in &files {
-            let abs_path = root_abs.join(&f.path);
-            let Some(hash) = file_content_hash(&abs_path) else {
-                continue; // can't read file, skip cache entry
-            };
-            cache.set(&root_abs, &f.path, &hash);
-        }
-        cache.save()?;
-        debug!(cached = files.len(), "saved scan cache");
-    }
-
-    // 7. Save scan findings to cora.db (best-effort)
-    {
-        let commit = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
-        let branch = std::process::Command::new("git")
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().to_string().into());
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let record = review_store::ReviewRecord {
-            command: "scan",
-            project_root: &cwd,
-            commit_hash: commit.as_deref(),
-            branch: branch.as_deref(),
-            summary: &response.summary,
-            gate_status: "disabled",
-            files_scanned: response.files_scanned,
-            lines_scanned: response.lines_scanned,
-            should_block: response.should_block,
-            tokens: response.tokens_used.as_ref(),
-            issues: &response.issues,
-        };
-        // Best-effort: a history-write failure never fails the run.
-        review_store::persist_review_best_effort(&record);
-    }
-
-    if response.should_block && config.hook.mode == "block" {
-        Ok(2)
-    } else {
-        Ok(0)
-    }
+        tokens: total_tokens,
+    })
 }
 
-/// Run the deterministic scanners (secrets, security) over whole files and
+/// Run the deterministic scanners (rules, secrets, security) over whole files and
 /// merge them with `issues` (LLM + index findings); then drop findings matched
 /// by `ignore.rules` and by inline `cora-ignore:` markers. Reuses the review
 /// pipeline's scanners, merge, and filters (#595).
-fn finalize_issues(
+pub(crate) fn finalize_issues(
     config: &Config,
     files: &[FileEntry],
     issues: Vec<ReviewIssue>,
@@ -506,9 +543,134 @@ mod tests {
             batch_files: 0,
             continue_on_batch_error: true,
         };
-        let code = execute_scan(&config, &llm, &opts, OutputFormat::Json)
+        let code = execute_scan(&config, &JudgeChoice::Llm(llm), &opts, OutputFormat::Json)
             .await
             .unwrap();
         assert_eq!(code, 2, "deterministic finding must survive LLM failure");
+    }
+
+    // ─── #645: scan runs the rules engine, and has a judge seam ───
+
+    #[test]
+    fn builtin_rules_fire_in_scan() {
+        let file = entry("src/lib.rs", "fn main() {\n    // TODO: handle this\n}\n");
+        let out = finalize_issues(&Config::default(), &[file], Vec::new()).0;
+        assert!(
+            out.iter().any(|i| i.rule_id.as_deref() == Some("bug-todo")),
+            "rules engine must run in scan, got {:?}",
+            titles(&out)
+        );
+    }
+
+    #[test]
+    fn disabled_rules_engine_stays_off_in_scan() {
+        let mut config = Config::default();
+        config.rules_config.enabled = false;
+        let file = entry("src/lib.rs", "// TODO: later\n");
+        let out = finalize_issues(&config, &[file], Vec::new()).0;
+        assert!(!out.iter().any(|i| i.rule_id.as_deref() == Some("bug-todo")));
+    }
+
+    struct FakeScanJudge(Result<Vec<ReviewIssue>, String>);
+
+    impl ScanJudge for FakeScanJudge {
+        async fn judge_batch(
+            &self,
+            _config: &Config,
+            _files_content: &str,
+            _focus: &[String],
+            _brain_context: Option<&str>,
+        ) -> std::result::Result<ScanBatch, crate::error::CoraError> {
+            match &self.0 {
+                Ok(issues) => Ok(ScanBatch {
+                    issues: issues.clone(),
+                    tokens: None,
+                }),
+                Err(msg) => Err(crate::error::CoraError::LlmParse(msg.clone())),
+            }
+        }
+    }
+
+    fn judged(file: &str, line: u32) -> ReviewIssue {
+        ReviewIssue::new(
+            file,
+            Some(line),
+            crate::engine::Severity::Major,
+            "judge finding",
+        )
+        .with_type("bug")
+        .with_body("body")
+    }
+
+    fn one_batch() -> Vec<Vec<FileEntry>> {
+        vec![vec![entry("a.rs", "fn a() {}\nfn b() {}\n")]]
+    }
+
+    #[tokio::test]
+    async fn judge_findings_for_the_batch_are_admitted() {
+        let judge = FakeScanJudge(Ok(vec![judged("a.rs", 1), judged("elsewhere.rs", 1)]));
+        let run = judge_batches(&judge, &Config::default(), &one_batch(), &[], None, true)
+            .await
+            .unwrap();
+        assert_eq!(run.issues.len(), 1, "foreign file must be dropped");
+        assert_eq!(run.issues[0].file, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn failed_batch_is_skipped_when_continuing() {
+        let judge = FakeScanJudge(Err("bad json".to_string()));
+        let run = judge_batches(&judge, &Config::default(), &one_batch(), &[], None, true)
+            .await
+            .unwrap();
+        assert!(run.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_batch_aborts_without_continue() {
+        let judge = FakeScanJudge(Err("bad json".to_string()));
+        let err = judge_batches(&judge, &Config::default(), &one_batch(), &[], None, false).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn no_judge_scans_deterministically_only() {
+        let run = judge_batches(
+            &crate::engine::judge::NoJudge,
+            &Config::default(),
+            &one_batch(),
+            &[],
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(run.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deterministic_scan_needs_no_llm_and_still_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.py"), "password = \"hunter2hunter2\"\n").unwrap();
+        let mut config = Config::default();
+        config.hook.mode = "block".to_string();
+        let opts = ScanOptions {
+            path: Some(dir.path().to_string_lossy().to_string()),
+            include: vec![],
+            exclude: vec![],
+            extensions: vec![],
+            incremental: false,
+            focus: vec![],
+            batch_files: 0,
+            continue_on_batch_error: true,
+        };
+        let code = execute_scan(
+            &config,
+            &JudgeChoice::Deterministic,
+            &opts,
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 2);
     }
 }

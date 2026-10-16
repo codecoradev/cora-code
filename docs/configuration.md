@@ -464,7 +464,7 @@ Control how index-based scanners (unused imports, dead code, breaking changes) b
 ```yaml
 rules_engine:
   enabled: true
-  max_findings: 5
+  max_findings: 50
   index_skip_files:
     - "*.config.ts"
     - "vite.config.*"
@@ -480,16 +480,27 @@ rules_engine:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
-| `max_findings` | `int` | `5` | Max deterministic findings shown per run (`0` or `null` = unlimited). See below |
+| `max_findings` | `int` | `50` | Max deterministic findings shown per run; Critical and Major are never hidden (`0` or `null` = unlimited). See below |
+| `include_tests` | `bool` | `false` | Scan test code like any other code (see "Test code" below) |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
+
+#### Test code
+
+Tests legitimately `unwrap()`, `println!`, clone, use `http://` fixtures and fake credentials, so by default the rules treat test code differently:
+
+- **What counts as test code:** whole files under test paths (`tests/`, `*_test.*`, `*.test.ts`, `spec/`, `__tests__/`, `fixtures/`, `examples/`), Rust `#[cfg(test)]` modules and `#[test]` functions (found by brace matching), and, in a diff, a hunk inside `mod tests`.
+- **What is skipped there:** the built-in rules `bug-unwrap`, `bug-expect`, `bug-println`, `qual-clone`, `qual-error-ignore`, `sec-hardcoded-url` and `sec-hardcoded-secret`. The secret scanners only run their high-confidence patterns (AWS keys, GitHub tokens, private keys, ...) on test code, so a real credential committed in a test is still found.
+- `bug-println` is also skipped in program entry points (`main.rs`, `src/bin/`, `examples/`, `benches/`). Other CLI modules keep the rule; use `ignore.rules` to silence it there.
+- **Not exempt:** custom rules, `bug-todo`, and every other pattern. In particular, injection, `eval`, weak-crypto and similar security patterns still apply inside inline test blocks, so wrapping code in a test-looking block does not hide it. (Whole test *files* by path keep the older behavior: only high-confidence secrets are scanned.)
+- Set `rules_engine.include_tests: true` to scan test code like any other code. Detection is conservative: when it cannot tell, the line stays scanned. A `#[cfg(test)]` region is only trusted when brace matching and indentation agree (block comments are skipped; a region that never closes, or has an item starting at or left of its own indentation, is ignored rather than extended over the code after it), and a diff that does not show the `mod tests` line is scanned normally.
 
 #### What `max_findings` caps
 
 `max_findings` caps the **deterministic** findings only (rule engine, secrets, security, and index scanners; the findings that carry a `rule_id`). LLM issues are never capped.
 
 - The cap is applied **after** suppression (`ignore.rules` and inline `cora-ignore:` markers), so suppressed findings never use up slots and hide real ones.
-- Findings are kept highest severity first (Critical, Major, Minor, Info); ties keep their original order. Because the most severe findings survive, the cap never changes the blocking decision for a cap of 1 or more.
-- When findings are cut, `cora scan` and `cora review` print one line on **stderr** (`⚠ N more deterministic findings not shown (rules.max_findings = 5; raise it or set 0/null to show all)`), and the `cora scan` summary mentions it. JSON, SARIF and compact output on stdout are unchanged.
+- Findings are kept highest severity first (Critical, Major, Minor, Info); ties keep their original order. **Critical and Major findings are never hidden:** the cap limits the noise (Minor, Info) and never drops below the number of serious findings, so a project with 60 Major findings sees all 60 (and no Minor ones). Because the most severe findings always survive, the cap never changes the blocking decision.
+- When findings are cut, `cora scan` and `cora review` print one line on **stderr** (`⚠ N more deterministic findings not shown (rules.max_findings = 50; critical and major are never hidden; raise it or set 0/null to show all)`), and the `cora scan` summary mentions it. JSON, SARIF and compact output on stdout are unchanged.
 - `0` or `null` means unlimited. For large diffs that `cora review` splits into chunks, the cap applies per chunk.
 
 Default `index_skip_files` patterns (bundled with cora):
@@ -676,6 +687,10 @@ cora serve    # Start MCP server + auto-reindex on startup (ensures fresh index)
 | `cora.find_affected_tests` | Find test files affected by changed source files |
 | `cora.index_status` | Check if a symbol index exists and get statistics |
 | `cora.review_diff` | Review a git diff using cora's full pipeline (makes LLM call) |
+| `cora.review_prepare` | Agent-as-reviewer step 1: prompts, `valid_files` and deterministic findings for a diff. No LLM in cora |
+| `cora.review_finalize` | Agent-as-reviewer step 2: merge and validate the agent's findings, apply rules and gate. No LLM call |
+| `cora.scan_prepare` | Agent-as-reviewer scan step 1: one batch of project files (paged) plus deterministic findings |
+| `cora.scan_finalize` | Agent-as-reviewer scan step 2: merge and validate the agent's findings for the whole scan |
 | `cora.get_debt` | Get tech debt report from review history |
 | `cora.get_project_info` | Get project context (repo, branch, cora version, index status) |
 | `cora.get_memory` | Recall project patterns from Uteke (requires `uteke` CLI) |

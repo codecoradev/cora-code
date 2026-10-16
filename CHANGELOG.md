@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-16
+
+### Added
+
+- **The calling agent can be the reviewer, with no LLM configured in cora (#647).** Four MCP tools split a review into prepare / judge / finalize with the agent as the judge: `cora.review_prepare` returns the hardened prompts, `valid_files`, deterministic findings and the response schema; `cora.review_finalize` merges the agent's findings (validated by `judge::admit`), applies `ignore.rules`, inline markers and the quality gate, and returns the verdict. `cora.scan_prepare` (paged by batch, path restricted to the project) and `cora.scan_finalize` do the same for a scan. Stateless: finalize recomputes the deterministic half from the same diff/path. `cora install` also installs a `/cora-review` skill for Claude Code (`~/.claude/skills/cora-review/SKILL.md` whenever `~/.claude` exists; a customized copy is never overwritten or removed without `--force`). For Claude Code the MCP server itself is registered with `claude mcp add cora -- cora mcp`. See `docs/usage.md` for the security model.
+
+- **`cora review` and `cora scan` run without an API key (#646).** With no key they run the deterministic checks only, print a one-line notice on stderr, and label the result "Deterministic checks only (no LLM judge)" (SARIF: `cora.judge = none` on the invocation, even with zero results). `--no-llm` forces it and silences the notice. A missing key is no longer an error for these two commands; any other config error still is. The judge is chosen once at the entry point (`judge::select_judge`, `JudgeChoice`). `cora commit` and MCP `cora.review_diff` still need a key.
+
+### Security
+
+- **`--help` no longer prints secrets from the environment.** clap shows `[env: NAME=value]` for options bound to an env var, so `cora --help` with `CORA_API_KEY` or `GITHUB_TOKEN` set printed the key (into logs, CI output, screenshots). `--api-key` and `--token` now hide their env value.
+
+- **The SARIF "no judge" marker can no longer be forged or missed.** A model-written summary containing the marker sentence is stripped, and the judge-failure fallback (deterministic findings only) now carries the marker, so `cora.judge = "none"` is set exactly when no model judged.
+
+- **A hostile diff can no longer hide findings (audit follow-up).** Inside a hunk whose line counts are not used up, `---` / `+++` lines are content, not file headers (a removed SQL/Lua comment `-- x`, or an added line `++ b/tests/y.py`, used to drop the rest of the hunk or re-file it under another path, so a secret was reported as nothing). `valid_files` now comes from the same parser, and file names are escaped in the review prompt.
+
+- **A judge can no longer downgrade or absorb a scanner finding (audit follow-up).** When a judge issue sits on the same line and topic as a scanner finding, the surviving issue takes the stronger severity and the scanner's `rule_id` (an "info" judge issue used to replace a CRITICAL scanner finding).
+
+- **`cora scan` / `cora.scan_prepare` no longer follow symlinks, and enclosing-scope reads stay inside the project** (a hostile repo's `id -> ~/.ssh/id_rsa` or a `+++ b/../../x` header could put outside files into a model prompt).
+
+- `cora install --remove` keeps a customized skill unless `--force`; agent-mode tools report `dropped_by_validation`, accept any severity case, refuse a `scan_finalize` whose `files_fingerprint` no longer matches, and compute `should_block` and the quality gate on all findings (the caller's `min_severity` only trims the list). `admit` also fixes lines for deleted files and the old path of a renamed file. `--no-llm` and `review_finalize` skip building the LLM prompt (no clippy run).
+
+- **Bumped `rustls` 0.23.45 → 0.23.46 and `quinn-proto` 0.11.16 → 0.11.19** (RUSTSEC-2026-0338/0339/0340/0341/0342 and RUSTSEC-2026-0346/0347/0348/0349), plus the yanked `chacha20` 0.10.1 → 0.10.2. Lockfile-only patch bumps; this was failing the `Security Audit (CVE)` job on every PR.
+
+- **A judge's findings are untrusted input, bounded by one gate (#644).** `judge::admit` clears `rule_id` (only deterministic scanners may carry one; it feeds suppression and the finding cap), truncates `title`/`body`/`suggested_fix`, caps the list at 200 findings (most severe kept), drops findings for files outside the diff or scan batch, and turns a line the diff/file does not contain into a file-level finding. `cora review` and `cora scan` both apply it; deterministic findings are merged afterwards, so a judge can add findings but never remove one. `cora scan` now wraps each batch in an untrusted-data fence like review does.
+
+- **The review cache can no longer serve a stale or cross-mode result (#644).** The cache moved behind the LLM adapter and stores the model's raw answer keyed by the exact prompts (so focus, rules, profile, system prompt, sanitization, context and memory all invalidate it) plus model/provider/base URL/temperature. `ignore.rules`, `hook.min_severity` and deterministic rules are applied on every run, including cache hits. Existing cache entries are simply not hit again.
+
+### Changed
+
+- **Help points to agent mode.** `cora --help`, `cora review/scan --help`, `cora mcp --help` and `cora install --help` now mention `--no-llm`, the agent-as-reviewer MCP tools, the `/cora-review` skill and `claude mcp add cora -- cora mcp`.
+
+- **Rules are test-code aware (#663).** Whole test files (`*_test.*`, `*.test.ts`, `spec/`, `fixtures/`, ... not just `tests/`) and Rust `#[cfg(test)]` modules / `#[test]` functions (also a diff hunk inside `mod tests`) are exempt from `bug-unwrap`, `bug-expect`, `bug-println`, `qual-clone`, `qual-error-ignore`, `sec-hardcoded-url` and `sec-hardcoded-secret`; the secret scanners only run their high-confidence patterns there, so a real AWS key or token in a test is still reported (injection, `eval` and other security patterns still apply inside test blocks, and a test region is only trusted when our brace matching agrees with the code's own indentation: `/* { */` comments are ignored, and a region that never closes, or that contains an item starting at or left of its own indentation, is dropped instead of exempting what follows). An attribute that carries its item on the same line (`#[cfg(test)] fn helper() {}`) no longer exempts the NEXT line, and an attribute inside a block comment is not an attribute. `bug-println` is also skipped in `main.rs`, `src/bin/`, `examples/` and `benches/`. New setting `rules_engine.include_tests: true` turns the exemptions off. On `uteke-core` (Rust) the findings drop from 2400 to 235 and the 6 Critical ones disappear; on `uteke-cloud` the 3 Major URL findings are gone. New module `engine::test_context`.
+
+- **`rules_engine.max_findings` now defaults to 50, and Critical/Major findings are never hidden.** The old default of 5 could hide serious findings (a module with 7 critical findings showed 5) and made agents and users misread a capped list as the full picture. The cap now limits only the noise: it keeps every Critical and Major finding and fills the remaining slots with the most severe Minor/Info ones, still reporting how many were not shown. On a real Rust codebase the unfiltered list was up to 2400 findings, 88% `bug-unwrap`, so unlimited is not the default. Set `max_findings: 0` (or `null`) for no cap.
+
+- **Review is now prepare / judge / finalize with the LLM as the seam (#649).** `review::prepare` turns a diff into a `judge::Packet` (judge-visible text, assembled context, system prompt override, `valid_files`, diff chunks, deterministic findings); a `judge::Judge` returns findings (`HttpJudge` = today's LLM call, `NoJudge` = deterministic only); `review::review_with` merges, guards file paths, post-processes and decides `should_block`. Output of `cora review` is unchanged. The review pipeline now has an end-to-end test with a fake judge (no network), and the `llm` module no longer prints: spinners moved to `progress::Spinner` and `llm::run_review_prompts` / `llm::scan_files` take an events observer (the old `llm::review_diff` / `llm::review_diff_stream` are replaced by `run_review_prompts`).
+
+- **One `finalize` module owns the result tail of review, scan, commit and MCP (#648).** `engine::finalize` (`shape`, `shape_issues`, `blocks`, `exit_code`, `save_debt`, `save_history`) replaces six hand-copied versions of severity filtering, `should_block`, quality gate, exit code, debt snapshot and review history. Behavior of `cora review` (single and chunked) and `cora scan` is unchanged. Fixed along the way: the MCP `cora.review_diff` tool now honors its `min_severity` parameter and evaluates the quality gate on the reported findings; `cora commit` now records its review in the review history (`command = "commit"`).
+
+### Fixed
+
+- **`crypto/hardcoded-secret` / `sec-hardcoded-secret` no longer flag `name: value` entries whose value is not a literal (#661).** In source files, `webhook_secret: env::var("X")`, `refresh_token: prev?.refresh_token`, `token: Option<&'static str>`, `"password": ACCOUNT_PW` and `"clientSecret": j["clientSecret"]` are references or types, and format placeholders (`api_key = "{}"`, `"%s"`) are not values. Quoted literals (`token: "ghp_..."`) and `=` assignments are judged as before. On two real codebases the Critical/Major findings dropped from 38 to 20 (all remaining ones are test fixtures, SQL and test URLs, tracked in #662/#663).
+
+- **`injection/sql-concat` and `sec-sql-concat` no longer flag prose or identifier interpolation (#662).** A SQL keyword in a message (`format!("Insert failed: {e}")`, `format!("Deleted tag '{}'")`) is not SQL: the line needs SELECT..FROM, INSERT INTO, UPDATE..SET or DELETE FROM. Real SQL is reported only when a value is spliced in (`= '{x}'`, `WHERE id = {id}`, `LIKE '%{t}%'`, `IN ({ids})`, `VALUES (...)`, `"..." + user`, `query += ...`); `FROM {table}`, `SET {cols}` and `?{n}` parameter indexes cannot be bound as parameters and are not value injection. On two real codebases all five SQL false positives (Critical) are gone.
+
+- **Agent-mode review no longer hides capped findings without saying so.** `cora.review_prepare` listed every deterministic finding but `cora.review_finalize` showed only `rules_engine.max_findings` (default 5) of them with no explanation; found by running a real agent on a real project. `review_prepare` now reports `deterministic_findings_total` and the cap, and `review_finalize` / `scan_finalize` / `cora.review_diff` report `not_shown` (with a note).
+
+- **The MCP `cora.review_diff` tool no longer crashes the server (#647).** Every call panicked with "Cannot start a runtime from within a runtime" because the handler blocked on a second runtime from a tokio runtime thread. Handlers now go through `block_in_place`.
+
+- **`cora scan` now runs the rules engine (#645).** Built-in rules (`bug-todo`, `sec-sql-concat`, ...) and custom `rules_engine.custom_rules` were only run by `cora review`; scan silently skipped them. Expect more findings from `cora scan` after upgrading (e.g. `bug-todo` on every TODO), still under the `rules_engine.max_findings` cap (default 5); `rules_engine.enabled: false` turns them off. One set of deterministic families (`deterministic::run_files` for whole files, `deterministic::run` for diffs) now serves both, and the MCP `cora.check_snippet` tool picks up rules too. Scan also has a judge seam (`judge::ScanJudge`, with `HttpScanJudge` and `NoJudge`) so the batch loop is tested without a network, and `DEFAULT_BATCH_TOKEN_BUDGET` is renamed `DEFAULT_BATCH_CHAR_BUDGET` (it was always a character count). `docs/cli-reference.md` now states which review flags scan does not have.
+
 ## [0.18.0] - 2026-10-09
 
 ### Security
@@ -1008,7 +1060,8 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.18.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.19.0...develop
+[0.19.0]: https://github.com/codecoradev/cora-code/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/codecoradev/cora-code/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/codecoradev/cora-code/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/codecoradev/cora-code/compare/v0.17.0...v0.17.1

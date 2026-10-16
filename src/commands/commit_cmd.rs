@@ -5,6 +5,7 @@ use colored::Colorize;
 use std::io::{self, Write};
 
 use crate::config::schema::Config;
+use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
 use crate::engine::llm;
 use crate::engine::quality_gate;
 use crate::engine::types::LLMConfig;
@@ -95,41 +96,34 @@ pub async fn execute_commit(
         )
         .await?;
 
-        // Filter by severity
-        let min_severity = config.hook.min_severity_level();
+        // Filter by severity, evaluate the quality gate
         let mut filtered = response.clone();
-        filtered.issues.retain(|i| i.severity <= min_severity);
+        let shaped = finalize::shape(
+            &mut filtered,
+            config,
+            &ShapeOptions {
+                min_severity: config.hook.min_severity_level(),
+                filter: true,
+                gate: true,
+                ci: false,
+            },
+        );
+        let gate_result = shaped.gate.clone();
+        let gate_failed = shaped.gate_failed();
 
-        // Quality gate
-        let gate_result = if config.quality_gate.enabled {
-            let result = quality_gate::evaluate(&filtered.issues, &config.quality_gate);
-            Some(result)
-        } else {
-            None
-        };
-
-        // Check gate
-        let gate_failed = gate_result
-            .as_ref()
-            .is_some_and(|g| g.status == quality_gate::GateStatus::Fail);
-
-        // Save debt snapshot (best-effort)
-        if config.debt.enabled {
-            let (commit, branch) = get_git_context();
-            let snapshot = crate::engine::debt_tracker::DebtSnapshot::from_review(
-                &filtered.issues,
-                gate_result.as_ref(),
-                commit,
-                branch,
-                0,
-                None,
-                None,
-            );
-            crate::engine::debt_tracker::save_snapshot(
-                &snapshot,
-                config.debt.history_dir.as_deref(),
-            );
-        }
+        // Debt snapshot + review history (best-effort)
+        finalize::save_debt(config, &filtered.issues, gate_result.as_ref(), 0);
+        finalize::save_history(
+            &HistoryEntry {
+                command: "commit",
+                summary: &filtered.summary,
+                files_scanned: 0,
+                lines_scanned: 0,
+                tokens: response.tokens_used.as_ref(),
+            },
+            &filtered.issues,
+            &shaped,
+        );
 
         if gate_failed && !opts.force {
             // Print findings
@@ -455,33 +449,6 @@ fn do_commit(message: &str, quiet: bool) -> Result<i32> {
         eprintln!("{}", "❌ git commit failed".red().bold());
         Ok(EXIT_ERROR)
     }
-}
-
-/// Get git context (cached).
-fn get_git_context() -> (Option<String>, Option<String>) {
-    use std::sync::LazyLock;
-
-    static CONTEXT: LazyLock<(Option<String>, Option<String>)> = LazyLock::new(|| {
-        let commit = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                } else {
-                    None
-                }
-            });
-
-        let branch = crate::git::get_current_branch().ok();
-
-        (commit, branch)
-    });
-
-    (CONTEXT.0.clone(), CONTEXT.1.clone())
 }
 
 /// Count files and lines in a diff.

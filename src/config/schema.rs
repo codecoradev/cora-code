@@ -614,7 +614,7 @@ fn default_rules_enabled() -> bool {
 }
 
 fn default_max_findings() -> usize {
-    5
+    50
 }
 
 /// `rules_engine.max_findings`: an explicit `null` means unlimited (stored as 0).
@@ -644,6 +644,10 @@ pub struct RulesSection {
     pub custom: Vec<crate::engine::rules::types::CustomRule>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub index_skip_files: Vec<String>,
+    /// Scan test code like any other code (default `false`, see
+    /// `RulesConfig::include_tests`, #663).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub include_tests: bool,
 }
 
 /// File bundling configuration section for `.cora.yaml`.
@@ -800,6 +804,7 @@ impl CoraFile {
         if let Some(re) = &self.rules_engine {
             config.rules_config.enabled = re.enabled;
             config.rules_config.max_findings = re.max_findings;
+            config.rules_config.include_tests = re.include_tests;
             if !re.custom.is_empty() {
                 config.rules_config.custom_rules = re.custom.clone();
             }
@@ -1178,6 +1183,7 @@ provider: zai
                 max_findings: 10,
                 custom: Vec::new(),
                 index_skip_files: vec!["my-generated/**".to_string()],
+                include_tests: false,
             }),
             ..Default::default()
         };

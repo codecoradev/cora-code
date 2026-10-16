@@ -11,7 +11,7 @@ Get up and running with cora in three simple steps.
 1. **Install cora** — Single binary, no runtime dependencies:
    `curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh`
 
-2. **Authenticate** — Run `cora auth login` to pick your provider and enter your API key.
+2. **Authenticate** (optional) — Run `cora auth login` to pick your provider and enter your API key. Without a key, `cora review` / `cora scan` still run the deterministic checks, and an AI coding agent can review through the `cora` MCP server (see [Usage](./usage#review-with-your-agent-no-llm-setup)).
    Cora stores the API key in `~/.cora/auth.toml` (never committed to git) and provider settings in `~/.cora/config.yaml`.
 
 3. **Review** — Analyze your staged changes:

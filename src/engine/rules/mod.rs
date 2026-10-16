@@ -31,6 +31,20 @@ pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding>
 
 /// Run all rules (built-in + custom) against file lines. The one implementation
 /// behind both the diff and the whole-file entry points.
+/// Built-in rules that skip test code (files under test paths and inline Rust
+/// test blocks) unless `rules_engine.include_tests` is set (#663): tests
+/// legitimately unwrap, print, clone, use `http://` fixtures and fake secrets.
+/// Real secrets in tests are still found by the high-confidence scanners.
+const TEST_EXEMPT_RULES: &[&str] = &[
+    "bug-unwrap",
+    "bug-expect",
+    "bug-println",
+    "qual-clone",
+    "qual-error-ignore",
+    "sec-hardcoded-url",
+    "sec-hardcoded-secret",
+];
+
 pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFinding> {
     if !config.enabled {
         debug!("rule engine is disabled");
@@ -64,6 +78,14 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
 
                 // Check exclude filter
                 if matching::matches_exclude(rule, file_path) {
+                    continue;
+                }
+
+                // Test code is exempt from the noisy built-in rules (#663).
+                if !config.include_tests
+                    && file.in_test(line_no)
+                    && TEST_EXEMPT_RULES.contains(&rule.id.as_str())
+                {
                     continue;
                 }
 
@@ -226,6 +248,15 @@ pub fn merge_rule_findings(
             });
         if let Some(idx) = holder {
             let holder = &mut result[idx];
+            // The judge's issue stands in for the scanner finding, so it must
+            // never be weaker than it: a judge (or a prompt-injected model)
+            // that reports the same line as "info" cannot downgrade a
+            // CRITICAL scanner finding, and the surviving issue carries the
+            // scanner's rule id (so the cap and rule-scoped suppression see it).
+            holder.severity = holder.severity.min(finding.severity);
+            if holder.rule_id.is_none() {
+                holder.rule_id = Some(finding.rule_id.clone());
+            }
             holder.also_matches.push(finding.rule_id.clone());
             holder.also_matches.push(finding.title.clone());
             debug!(
@@ -292,6 +323,7 @@ mod tests {
             max_findings: 10,
             custom_rules: Vec::new(),
             index_skip_files: super::types::default_index_skip_files(),
+            include_tests: false,
         }
     }
 
@@ -550,7 +582,9 @@ mod tests {
                 .also_matches
                 .contains(&"[bug-unwrap] Rule: bug-unwrap".to_string())
         );
-        assert!(merged[0].rule_id.is_none());
+        // The surviving issue carries the scanner's id: it stands in for the
+        // finding, so the cap and rule-scoped suppression must see it.
+        assert_eq!(merged[0].rule_id.as_deref(), Some("bug-unwrap"));
     }
 
     #[test]
@@ -665,6 +699,139 @@ mod tests {
         assert!(
             !findings.iter().any(|f| f.rule_id == "sec-hardcoded-url"),
             "localhost http URLs should be allowed"
+        );
+    }
+
+    #[test]
+    fn a_judge_issue_cannot_downgrade_the_scanner_finding_it_absorbs() {
+        // Same line, same topic: the judge's "info" stands in for the
+        // CRITICAL secret finding, so it must not be weaker than it.
+        let mut weak = llm_issue(3, "Hardcoded password naming nit", Some("security"));
+        weak.severity = Severity::Info;
+        let out = merge_rule_findings(vec![weak], vec![secret_finding(3)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, Severity::Critical);
+        assert_eq!(out[0].rule_id.as_deref(), Some("crypto/hardcoded-secret"));
+    }
+
+    #[test]
+    fn a_stronger_judge_issue_keeps_its_severity() {
+        let mut strong = llm_issue(3, "Hardcoded password stored in source", Some("security"));
+        strong.severity = Severity::Critical;
+        let mut finding = secret_finding(3);
+        finding.severity = Severity::Major;
+        let out = merge_rule_findings(vec![strong], vec![finding]);
+        assert_eq!(out[0].severity, Severity::Critical);
+    }
+
+    // ─── #663: test-code awareness ───
+
+    fn file_entry(path: &str, content: &str) -> crate::engine::scanner::FileEntry {
+        crate::engine::scanner::FileEntry {
+            path: path.to_string(),
+            lines: content.lines().count(),
+            content: content.to_string(),
+        }
+    }
+
+    fn rule_ids(entry: &crate::engine::scanner::FileEntry, cfg: &RulesConfig) -> Vec<String> {
+        let files = crate::engine::scan_input::from_entries(std::slice::from_ref(entry));
+        run_rules_in(&files, cfg)
+            .into_iter()
+            .map(|f| format!("{}@{}", f.rule_id, f.line))
+            .collect()
+    }
+
+    const RUST_WITH_TESTS: &str = "\
+fn real() {
+    let a = x.unwrap();
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn t() {
+        let b = y.unwrap();
+        println!(\"debug\");
+        let u = \"http://example.test/x\";
+    }
+}
+";
+
+    #[test]
+    fn inline_rust_test_blocks_skip_the_noisy_rules() {
+        let entry = file_entry("src/lib.rs", RUST_WITH_TESTS);
+        let ids = rule_ids(&entry, &default_config());
+        assert!(ids.contains(&"bug-unwrap@2".to_string()), "{ids:?}");
+        assert!(
+            !ids.iter()
+                .any(|i| i.ends_with("@8") || i.ends_with("@9") || i.ends_with("@10")),
+            "test block lines must be exempt: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn include_tests_scans_test_blocks_again() {
+        let entry = file_entry("src/lib.rs", RUST_WITH_TESTS);
+        let cfg = RulesConfig {
+            include_tests: true,
+            ..default_config()
+        };
+        let ids = rule_ids(&entry, &cfg);
+        assert!(ids.contains(&"bug-unwrap@8".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bug-println@9".to_string()), "{ids:?}");
+    }
+
+    #[test]
+    fn test_paths_are_exempt_beyond_the_tests_directory() {
+        // `foo_test.rs` / `app.test.ts` are not under tests/, but are test files.
+        for path in ["src/foo_test.rs", "src/app.test.ts", "src/__tests__/a.rs"] {
+            let entry = file_entry(path, "fn a() { let x = y.unwrap(); }\n");
+            let ids = rule_ids(&entry, &default_config());
+            assert!(
+                !ids.iter().any(|i| i.starts_with("bug-unwrap")),
+                "{path}: {ids:?}"
+            );
+        }
+        let entry = file_entry("src/prod.rs", "fn a() { let x = y.unwrap(); }\n");
+        assert!(
+            rule_ids(&entry, &default_config())
+                .iter()
+                .any(|i| i.starts_with("bug-unwrap"))
+        );
+    }
+
+    #[test]
+    fn rules_that_are_not_noise_still_fire_in_tests() {
+        // bug-todo is not exempt: a TODO in a test is still a TODO.
+        let entry = file_entry("src/foo_test.rs", "// TODO: finish\n");
+        assert!(
+            rule_ids(&entry, &default_config())
+                .iter()
+                .any(|i| i.starts_with("bug-todo"))
+        );
+    }
+
+    #[test]
+    fn println_is_fine_in_program_entry_points_only() {
+        let src = "fn main() { println!(\"hi\"); }\n";
+        for ok in [
+            "src/main.rs",
+            "crates/x/src/bin/tool.rs",
+            "examples/demo.rs",
+        ] {
+            let entry = file_entry(ok, src);
+            assert!(
+                !rule_ids(&entry, &default_config())
+                    .iter()
+                    .any(|i| i.starts_with("bug-println")),
+                "{ok}"
+            );
+        }
+        let entry = file_entry("src/lib.rs", "pub fn f() { println!(\"hi\"); }\n");
+        assert!(
+            rule_ids(&entry, &default_config())
+                .iter()
+                .any(|i| i.starts_with("bug-println"))
         );
     }
 }

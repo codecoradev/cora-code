@@ -5,16 +5,16 @@ use tracing::debug;
 use crate::config::schema::Config;
 use crate::engine::Severity;
 use crate::engine::chunker;
+use crate::engine::finalize::{self, HistoryEntry, ShapeOptions};
+use crate::engine::judge::JudgeChoice;
 use crate::engine::quality_gate;
-use crate::engine::review_store;
 use crate::engine::types::ReviewResponse;
 use crate::formatters::{OutputFormat, formatter_for};
 use crate::git;
 use crate::progress::{ProgressReporter, TokenInfo, diff_stats};
 
 /// Exit codes for the review command.
-pub const EXIT_OK: i32 = 0;
-pub const EXIT_BLOCKED: i32 = 2;
+pub use crate::engine::types::{EXIT_BLOCKED, EXIT_OK};
 
 /// Review command options.
 #[allow(clippy::struct_excessive_bools)]
@@ -122,7 +122,7 @@ impl ReviewResult {
 #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 pub async fn execute_review(
     config: &Config,
-    llm_config: &crate::engine::LLMConfig,
+    judge: &JudgeChoice,
     opts: &ReviewOptions,
     format: OutputFormat,
     progress: &ProgressReporter,
@@ -152,7 +152,7 @@ pub async fn execute_review(
             // Auto-chunk mode: split diff and review each chunk
             return execute_chunked_review(
                 config,
-                llm_config,
+                judge,
                 opts,
                 format,
                 progress,
@@ -192,15 +192,17 @@ pub async fn execute_review(
 
     // 4. Emit calling_llm event
     if progress.is_enabled() {
-        progress.calling_llm(&llm_config.provider, &llm_config.model);
+        if let JudgeChoice::Llm(llm_config) = judge {
+            progress.calling_llm(&llm_config.provider, &llm_config.model);
+        }
     }
 
     let llm_start = std::time::Instant::now();
 
     // 5. Call the LLM engine
-    let response = match crate::engine::review::review_diff_with_cache(
+    let response = match crate::engine::review::review_diff_with_judge(
         config,
-        llm_config,
+        judge,
         &diff,
         opts.stream,
         !opts.no_cache,
@@ -256,7 +258,7 @@ pub async fn execute_review(
 
     warn_dropped(response.dropped_findings, config, opts.quiet);
 
-    // 6. Filter by severity if specified
+    // 6. Filter by severity, decide gate / blocking / exit code
     let min_severity = if let Some(ref sev) = opts.severity {
         Severity::from_str_lossy(sev)
     } else {
@@ -264,94 +266,38 @@ pub async fn execute_review(
     };
 
     let mut filtered_response = response.clone();
-    // Keep issues at or above min_severity (Critical=worst, Info=lowest in Ord but
-    // Ord order is Critical(0) < Major(1) < Minor(2) < Info(3), so we invert: keep
-    // where severity Ord value <= min_severity Ord value).
-    filtered_response
-        .issues
-        .retain(|i| i.severity <= min_severity);
-    // Recompute should_block against the filtered issue list so the exit code
-    // matches the output the user actually sees (e.g. when `--severity critical`
-    // filters out all Major/Minor issues, we must not block). See #312.
-    filtered_response.should_block = filtered_response
-        .issues
-        .iter()
-        .any(|i| i.severity <= min_severity);
+    let shaped = finalize::shape(
+        &mut filtered_response,
+        config,
+        &ShapeOptions {
+            min_severity,
+            filter: true,
+            gate: true,
+            ci: opts.ci,
+        },
+    );
 
     // 7. Format output
     let formatter = formatter_for(format);
     let mut output = formatter.format_review(&filtered_response)?;
 
-    // 8. Quality gate evaluation
-    let gate_result = if config.quality_gate.enabled {
-        let result = quality_gate::evaluate(&filtered_response.issues, &config.quality_gate);
-        output.push_str(&quality_gate::format_gate_output(&result));
-        Some(result)
-    } else {
-        None
-    };
-
-    // 8b. Save debt tracking snapshot (best-effort, never fails review)
-    if config.debt.enabled {
-        let (commit, branch) = get_git_context();
-        let snapshot = crate::engine::debt_tracker::DebtSnapshot::from_review(
-            &filtered_response.issues,
-            gate_result.as_ref(),
-            commit,
-            branch,
-            0, // files_reviewed not tracked per-review yet
-            None,
-            None, // duration not passed through yet
-        );
-        crate::engine::debt_tracker::save_snapshot(&snapshot, config.debt.history_dir.as_deref());
+    // 8. Quality gate output, debt snapshot, review history (best-effort)
+    if let Some(gate) = &shaped.gate {
+        output.push_str(&quality_gate::format_gate_output(gate));
     }
-
-    // 8c. Save review findings to cora.db (best-effort)
-    {
-        let (commit, branch) = get_git_context();
-        let cmd = if opts.ci { "review --ci" } else { "review" };
-        let gate_status = match gate_result.as_ref().map(|g| g.status) {
-            Some(quality_gate::GateStatus::Pass) => "passed",
-            Some(quality_gate::GateStatus::Fail) => "failed",
-            None => "disabled",
-        };
-        let tokens = response.tokens_used.as_ref();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let record = review_store::ReviewRecord {
-            command: cmd,
-            project_root: &cwd,
-            commit_hash: commit.as_deref(),
-            branch: branch.as_deref(),
+    finalize::save_debt(config, &filtered_response.issues, shaped.gate.as_ref(), 0);
+    finalize::save_history(
+        &HistoryEntry {
+            command: review_command(opts),
             summary: &filtered_response.summary,
-            gate_status,
             files_scanned: 0,
             lines_scanned: 0,
-            should_block: filtered_response.should_block,
-            tokens,
-            issues: &filtered_response.issues,
-        };
-        // Best-effort: a history-write failure never fails the run.
-        review_store::persist_review_best_effort(&record);
-    }
-    let exit_code = if gate_result
-        .as_ref()
-        .is_some_and(|g| g.status == quality_gate::GateStatus::Fail)
-    {
-        EXIT_BLOCKED
-    } else if opts.ci {
-        // CI mode: hard gate — any finding blocks
-        if !filtered_response.issues.is_empty() {
-            EXIT_BLOCKED
-        } else {
-            EXIT_OK
-        }
-    } else if filtered_response.should_block && config.hook.mode == "block" {
-        EXIT_BLOCKED
-    } else {
-        EXIT_OK
-    };
+            tokens: response.tokens_used.as_ref(),
+        },
+        &filtered_response.issues,
+        &shaped,
+    );
+    let exit_code = shaped.exit_code;
 
     // 10. Emit complete event
     if progress.is_enabled() {
@@ -372,32 +318,9 @@ pub async fn execute_review(
         &filtered_response,
     ))
 }
-/// Returns (Some(commit), Some(branch)) if in a git repo, (None, None) otherwise.
-/// Results are cached per process to avoid spawning git on every review.
-fn get_git_context() -> (Option<String>, Option<String>) {
-    use std::sync::LazyLock;
-
-    static CONTEXT: LazyLock<(Option<String>, Option<String>)> = LazyLock::new(|| {
-        let commit = std::process::Command::new("git")
-            .args(["rev-parse", "--short", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                } else {
-                    None
-                }
-            });
-
-        let branch = crate::git::get_current_branch().ok();
-
-        (commit, branch)
-    });
-
-    (CONTEXT.0.clone(), CONTEXT.1.clone())
+/// Command label stored in the review history.
+fn review_command(opts: &ReviewOptions) -> &'static str {
+    if opts.ci { "review --ci" } else { "review" }
 }
 
 /// Merged summary for chunked review reports (#556).
@@ -467,7 +390,7 @@ fn get_diff(opts: &ReviewOptions, _config: &Config) -> Result<String> {
 #[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 async fn execute_chunked_review(
     config: &Config,
-    llm_config: &crate::engine::LLMConfig,
+    judge: &JudgeChoice,
     opts: &ReviewOptions,
     format: OutputFormat,
     progress: &ProgressReporter,
@@ -525,14 +448,16 @@ async fn execute_chunked_review(
         }
 
         if progress.is_enabled() {
-            progress.calling_llm(&llm_config.provider, &llm_config.model);
+            if let JudgeChoice::Llm(llm_config) = judge {
+                progress.calling_llm(&llm_config.provider, &llm_config.model);
+            }
         }
 
         let chunk_start = std::time::Instant::now();
 
-        match crate::engine::review::review_diff_with_cache(
+        match crate::engine::review::review_diff_with_judge(
             config,
-            llm_config,
+            judge,
             &chunk.diff,
             opts.stream,
             !opts.no_cache,
@@ -643,7 +568,7 @@ async fn execute_chunked_review(
         dropped_findings,
     };
 
-    // 6. Filter by severity if specified
+    // 6. Filter by severity, decide gate / blocking / exit code
     let min_severity = if let Some(ref sev) = opts.severity {
         Severity::from_str_lossy(sev)
     } else {
@@ -651,89 +576,50 @@ async fn execute_chunked_review(
     };
 
     let mut filtered_response = merged_response.clone();
-    filtered_response
-        .issues
-        .retain(|i| i.severity <= min_severity);
-    // Recompute should_block against the filtered issue list so the exit code
-    // matches the output the user actually sees (see #312).
-    filtered_response.should_block = filtered_response
-        .issues
-        .iter()
-        .any(|i| i.severity <= min_severity);
+    let shaped = finalize::shape(
+        &mut filtered_response,
+        config,
+        &ShapeOptions {
+            min_severity,
+            filter: true,
+            gate: true,
+            ci: opts.ci,
+        },
+    );
 
     // 7. Format output
     let formatter = formatter_for(format);
     let mut output = formatter.format_review(&filtered_response)?;
 
     // Add chunking summary header if not quiet and format is pretty
+    let files_total: usize = chunks.iter().map(|c| c.file_count).sum();
     if !opts.quiet && format == OutputFormat::Pretty {
-        let header = format!(
-            "📦 Reviewed in {} chunks ({} files total)\n",
-            total_chunks,
-            chunks.iter().map(|c| c.file_count).sum::<usize>()
-        );
+        let header = format!("📦 Reviewed in {total_chunks} chunks ({files_total} files total)\n");
         output = format!("{header}{output}");
     }
 
-    // 8. Quality gate evaluation
-    let gate_result = if config.quality_gate.enabled {
-        let result = quality_gate::evaluate(&filtered_response.issues, &config.quality_gate);
-        output.push_str(&quality_gate::format_gate_output(&result));
-        Some(result)
-    } else {
-        None
-    };
-
-    // 8b. Save debt tracking snapshot (best-effort, never fails review)
-    if config.debt.enabled {
-        let (commit, branch) = get_git_context();
-        let snapshot = crate::engine::debt_tracker::DebtSnapshot::from_review(
-            &filtered_response.issues,
-            gate_result.as_ref(),
-            commit,
-            branch,
-            chunks.iter().map(|c| c.file_count).sum(),
-            None,
-            None,
-        );
-        crate::engine::debt_tracker::save_snapshot(&snapshot, config.debt.history_dir.as_deref());
+    // 8. Quality gate output, debt snapshot, review history (best-effort)
+    if let Some(gate) = &shaped.gate {
+        output.push_str(&quality_gate::format_gate_output(gate));
     }
-
-    // 8c. Save review findings to cora.db (best-effort)
-    {
-        let (commit, branch) = get_git_context();
-        let cmd = if opts.ci { "review --ci" } else { "review" };
-        let gate_status = match gate_result.as_ref().map(|g| g.status) {
-            Some(quality_gate::GateStatus::Pass) => "passed",
-            Some(quality_gate::GateStatus::Fail) => "failed",
-            None => "disabled",
-        };
-        let tokens = merged_response.tokens_used.as_ref();
-        let cwd = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let record = review_store::ReviewRecord {
-            command: cmd,
-            project_root: &cwd,
-            commit_hash: commit.as_deref(),
-            branch: branch.as_deref(),
+    finalize::save_debt(
+        config,
+        &filtered_response.issues,
+        shaped.gate.as_ref(),
+        files_total,
+    );
+    finalize::save_history(
+        &HistoryEntry {
+            command: review_command(opts),
             summary: &filtered_response.summary,
-            gate_status,
             files_scanned: 0,
             lines_scanned: 0,
-            should_block: filtered_response.should_block,
-            tokens,
-            issues: &filtered_response.issues,
-        };
-        // Best-effort: a history-write failure never fails the run.
-        review_store::persist_review_best_effort(&record);
-    }
-    let exit_code = compute_exit_code(
-        gate_result.as_ref().map(|g| g.status),
-        opts.ci,
-        &filtered_response,
-        config.hook.mode.as_str(),
+            tokens: merged_response.tokens_used.as_ref(),
+        },
+        &filtered_response.issues,
+        &shaped,
     );
+    let exit_code = shaped.exit_code;
 
     // 10. Emit complete event
     if progress.is_enabled() {
@@ -755,42 +641,6 @@ async fn execute_chunked_review(
     ))
 }
 
-/// Compute the review exit code from the gate status, CI flag, and the
-/// **filtered** review response (issues after severity filtering).
-///
-/// Exit code semantics (see #312):
-///
-/// | Code | Meaning |
-/// |------|---------|
-/// | 0 | Review completed; no findings at or above the severity threshold |
-/// | 2 | Review completed but findings are blocking (gate fail, CI with any
-///     issue, or hook in block mode with blocking severity) |
-///
-/// `should_block` must be computed against the **filtered** issue list so that
-/// the exit code matches the SARIF/pretty output the user sees.
-fn compute_exit_code(
-    gate_status: Option<quality_gate::GateStatus>,
-    ci: bool,
-    filtered_response: &ReviewResponse,
-    hook_mode: &str,
-) -> i32 {
-    if gate_status == Some(quality_gate::GateStatus::Fail) {
-        return EXIT_BLOCKED;
-    }
-    if ci {
-        return if filtered_response.issues.is_empty() {
-            EXIT_OK
-        } else {
-            EXIT_BLOCKED
-        };
-    }
-    if filtered_response.should_block && hook_mode == "block" {
-        EXIT_BLOCKED
-    } else {
-        EXIT_OK
-    }
-}
-
 /// Print the one-line "findings not shown" warning to stderr (#624).
 fn warn_dropped(dropped: usize, config: &Config, quiet: bool) {
     if quiet {
@@ -804,25 +654,6 @@ fn warn_dropped(dropped: usize, config: &Config, quiet: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ReviewResponse;
-    use crate::engine::Severity;
-    use crate::engine::types::ReviewIssue;
-
-    fn issue(severity: Severity) -> ReviewIssue {
-        ReviewIssue::new("src/main.rs", Some(1), severity, "test")
-            .with_type("bug")
-            .with_body("body")
-    }
-
-    fn response(issues: Vec<ReviewIssue>, should_block: bool) -> ReviewResponse {
-        ReviewResponse {
-            issues,
-            summary: String::new(),
-            tokens_used: None,
-            should_block,
-            dropped_findings: 0,
-        }
-    }
 
     // ─── #556: chunked summary fallback must reflect actual findings ───
 
@@ -866,64 +697,5 @@ mod tests {
         ];
         let s = merged_chunk_summary(&summaries, 0, false);
         assert_eq!(s, "[Chunk 1/2 — a] ok\n\n[Chunk 2/2 — b] fine");
-    }
-
-    // ─── #312: exit code must match filtered output ───
-
-    #[test]
-    fn exit_code_zero_when_no_findings_after_filter() {
-        let resp = response(vec![], false);
-        assert_eq!(compute_exit_code(None, false, &resp, "block"), EXIT_OK);
-    }
-
-    #[test]
-    fn exit_code_zero_when_filtered_should_block_false() {
-        // Even if the unfiltered response would have blocked, after filtering
-        // should_block is false → exit 0. This is the core regression in #312.
-        let resp = response(vec![], false);
-        assert_eq!(compute_exit_code(None, false, &resp, "block"), EXIT_OK);
-    }
-
-    #[test]
-    fn exit_code_blocked_when_filtered_should_block_true_and_hook_blocks() {
-        let resp = response(vec![issue(Severity::Critical)], true);
-        assert_eq!(compute_exit_code(None, false, &resp, "block"), EXIT_BLOCKED);
-    }
-
-    #[test]
-    fn exit_code_zero_when_hook_mode_not_block() {
-        let resp = response(vec![issue(Severity::Critical)], true);
-        assert_eq!(compute_exit_code(None, false, &resp, "warn"), EXIT_OK);
-        assert_eq!(compute_exit_code(None, false, &resp, ""), EXIT_OK);
-    }
-
-    #[test]
-    fn exit_code_ci_zero_when_no_findings() {
-        let resp = response(vec![], false);
-        assert_eq!(compute_exit_code(None, true, &resp, "block"), EXIT_OK);
-    }
-
-    #[test]
-    fn exit_code_ci_blocked_when_any_finding() {
-        let resp = response(vec![issue(Severity::Minor)], false);
-        assert_eq!(compute_exit_code(None, true, &resp, "block"), EXIT_BLOCKED);
-    }
-
-    #[test]
-    fn exit_code_gate_fail_overrides_everything() {
-        let resp = response(vec![], false);
-        assert_eq!(
-            compute_exit_code(Some(quality_gate::GateStatus::Fail), false, &resp, "block"),
-            EXIT_BLOCKED
-        );
-    }
-
-    #[test]
-    fn exit_code_gate_pass_then_falls_through() {
-        let resp = response(vec![], false);
-        assert_eq!(
-            compute_exit_code(Some(quality_gate::GateStatus::Pass), false, &resp, "block"),
-            EXIT_OK
-        );
     }
 }

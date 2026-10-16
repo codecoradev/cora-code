@@ -247,11 +247,117 @@ fn install_agent(agent: &AgentInfo, opts: &InstallOptions) -> Result<String> {
     }
 }
 
+/// The `/cora-review` skill for Claude Code (agent-as-reviewer, #647).
+const CLAUDE_SKILL: &str = include_str!("cora_review_skill.md");
+
+/// `~/.claude/skills/cora-review/SKILL.md`, when Claude Code is installed
+/// (`~/.claude` exists).
+fn claude_skill_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let claude = home.join(".claude");
+    claude
+        .is_dir()
+        .then(|| claude.join("skills").join("cora-review").join("SKILL.md"))
+}
+
+/// Install or remove the `/cora-review` skill for Claude Code. `None` when
+/// Claude Code is not installed.
+fn install_claude_skill(opts: &InstallOptions) -> Option<Result<String>> {
+    let path = claude_skill_path()?;
+    Some(install_skill_at(&path, opts))
+}
+
+fn install_skill_at(path: &std::path::Path, opts: &InstallOptions) -> Result<String> {
+    let name = "claude-code skill /cora-review";
+    if opts.remove {
+        if !path.exists() {
+            return Ok(format!(
+                "{} {} — no skill found",
+                name.bold(),
+                "⏭ ".dimmed()
+            ));
+        }
+        // Never delete a customized copy: only remove ours (or with --force).
+        if !opts.force && std::fs::read_to_string(path).is_ok_and(|c| c != CLAUDE_SKILL) {
+            return Ok(format!(
+                "{} {} {} — customized, kept (use --force to remove)",
+                name.bold(),
+                "⏭ ".dimmed(),
+                path.display()
+            ));
+        }
+        if opts.dry_run {
+            return Ok(format!(
+                "{} {} {} — would remove",
+                name.bold(),
+                "🔍 ".cyan(),
+                path.display()
+            ));
+        }
+        std::fs::remove_file(path)
+            .with_context(|| format!("failed to remove {}", path.display()))?;
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir); // only if empty
+        }
+        return Ok(format!(
+            "{} {} {} — removed",
+            name.bold(),
+            "✓ ".green(),
+            path.display()
+        ));
+    }
+
+    if path.exists() && !opts.force {
+        let current = std::fs::read_to_string(path).unwrap_or_default();
+        if current == CLAUDE_SKILL {
+            return Ok(format!(
+                "{} {} {} — up to date",
+                name.bold(),
+                "⏭ ".dimmed(),
+                path.display()
+            ));
+        }
+        return Ok(format!(
+            "{} {} {} — exists and differs (use --force to overwrite)",
+            name.bold(),
+            "⏭ ".dimmed(),
+            path.display()
+        ));
+    }
+    if opts.dry_run {
+        return Ok(format!(
+            "{} {} {} — would write",
+            name.bold(),
+            "🔍 ".cyan(),
+            path.display()
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    std::fs::write(path, CLAUDE_SKILL)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(format!(
+        "{} {} {} — installed",
+        name.bold(),
+        "✓ ".green(),
+        path.display()
+    ))
+}
+
 /// Execute the `cora install` subcommand.
 pub fn execute_install(opts: &InstallOptions) -> Result<String> {
     let all_agents = detect_agents()?;
 
     if all_agents.is_empty() {
+        // Claude Code is configured through its own MCP command, not a config
+        // file we edit, but its skill can still be installed.
+        if !opts.list && opts.agents.is_none() {
+            if let Some(result) = install_claude_skill(opts) {
+                return result;
+            }
+        }
         return Ok("No AI coding agents detected. Install an agent (e.g. Cline, Cursor, Windsurf) and run again.".to_string());
     }
 
@@ -357,6 +463,12 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
         }
     }
 
+    if opts.agents.is_none() {
+        if let Some(result) = install_claude_skill(opts) {
+            lines.push(result?);
+        }
+    }
+
     lines.push(String::new());
     if opts.remove {
         lines.push("Done. Restart your AI agent to pick up the changes.".to_string());
@@ -365,4 +477,136 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
     }
 
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> InstallOptions {
+        InstallOptions {
+            list: false,
+            agents: None,
+            dry_run: false,
+            force: false,
+            yes: true,
+            remove: false,
+            validate: false,
+        }
+    }
+
+    fn skill_path(dir: &std::path::Path) -> PathBuf {
+        dir.join("skills").join("cora-review").join("SKILL.md")
+    }
+
+    #[test]
+    fn skill_is_written_then_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        let msg = install_skill_at(&path, &opts()).unwrap();
+        assert!(msg.contains("installed"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CLAUDE_SKILL);
+        assert!(
+            install_skill_at(&path, &opts())
+                .unwrap()
+                .contains("up to date")
+        );
+    }
+
+    #[test]
+    fn skill_with_user_edits_is_kept_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "my own version").unwrap();
+        assert!(
+            install_skill_at(&path, &opts())
+                .unwrap()
+                .contains("differs")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "my own version");
+        let force = InstallOptions {
+            force: true,
+            ..opts()
+        };
+        install_skill_at(&path, &force).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CLAUDE_SKILL);
+    }
+
+    #[test]
+    fn dry_run_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        let dry = InstallOptions {
+            dry_run: true,
+            ..opts()
+        };
+        assert!(
+            install_skill_at(&path, &dry)
+                .unwrap()
+                .contains("would write")
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn remove_deletes_the_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        install_skill_at(&path, &opts()).unwrap();
+        let remove = InstallOptions {
+            remove: true,
+            ..opts()
+        };
+        assert!(
+            install_skill_at(&path, &remove)
+                .unwrap()
+                .contains("removed")
+        );
+        assert!(!path.exists());
+        assert!(
+            install_skill_at(&path, &remove)
+                .unwrap()
+                .contains("no skill found")
+        );
+    }
+
+    #[test]
+    fn skill_names_the_four_tools() {
+        for tool in [
+            "cora.review_prepare",
+            "cora.review_finalize",
+            "cora.scan_prepare",
+            "cora.scan_finalize",
+        ] {
+            assert!(CLAUDE_SKILL.contains(tool), "skill must mention {tool}");
+        }
+        assert!(CLAUDE_SKILL.starts_with("---\nname: cora-review\n"));
+        assert!(CLAUDE_SKILL.contains("untrusted"));
+    }
+
+    #[test]
+    fn remove_keeps_a_customized_skill_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = skill_path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "my own version").unwrap();
+        let remove = InstallOptions {
+            remove: true,
+            ..opts()
+        };
+        assert!(
+            install_skill_at(&path, &remove)
+                .unwrap()
+                .contains("customized")
+        );
+        assert!(path.exists());
+        let force = InstallOptions {
+            remove: true,
+            force: true,
+            ..opts()
+        };
+        assert!(install_skill_at(&path, &force).unwrap().contains("removed"));
+        assert!(!path.exists());
+    }
 }

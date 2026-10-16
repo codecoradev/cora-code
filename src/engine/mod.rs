@@ -7,9 +7,11 @@ pub mod debt_tracker;
 pub mod deterministic;
 pub mod diff_parser;
 pub mod enclosing;
+pub mod finalize;
 pub mod index_bridge;
 pub mod index_scanner;
 pub mod inline_suppress;
+pub mod judge;
 pub mod language_analyzer;
 pub mod llm;
 pub mod markdown;
@@ -29,6 +31,7 @@ pub mod secret_patterns;
 pub mod secrets_scanner;
 pub mod security_scanner;
 pub mod static_analysis;
+pub mod test_context;
 pub mod types;
 
 // Re-export commonly used types from other modules for convenience

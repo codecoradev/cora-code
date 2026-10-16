@@ -35,6 +35,23 @@ pub struct EnclosingSnippet {
 /// relative to `root`). New files are skipped — their whole content is
 /// already inside the diff. One snippet per qualifying hunk, each capped at
 /// [`MAX_CONTEXT_LINES`].
+/// `root.join(rel)` if it stays inside `root` (no `..`, not absolute, no
+/// symlink escaping); `None` otherwise.
+fn confined_path(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    let rel_path = std::path::Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let joined = root.join(rel_path);
+    let canon = joined.canonicalize().ok()?;
+    let root_canon = root.canonicalize().ok()?;
+    canon.starts_with(root_canon).then_some(joined)
+}
+
 pub fn extract_enclosing_snippets(diff: &str, root: &std::path::Path) -> Vec<EnclosingSnippet> {
     let mut out = Vec::new();
     for chunk in parse_diff(diff) {
@@ -57,7 +74,11 @@ pub fn extract_enclosing_snippets(diff: &str, root: &std::path::Path) -> Vec<Enc
                 continue;
             }
 
-            let Ok(content) = std::fs::read_to_string(root.join(path)) else {
+            // Diff paths are attacker-controlled: never read outside `root`.
+            let Some(file) = confined_path(root, path) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(file) else {
                 continue;
             };
             let lines: Vec<&str> = content.lines().collect();
@@ -326,5 +347,30 @@ fn handle_request(store: &mut Store, detect_contradiction: bool) -> usize {
             prompt.contains(crate::engine::llm::CONTROL_FLOW_GUARDRAIL),
             "guardrail text must always ship in review prompts"
         );
+    }
+
+    #[test]
+    fn confined_path_rejects_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.rs"), "fn a() {}\n").unwrap();
+        assert!(confined_path(dir.path(), "ok.rs").is_some());
+        assert!(confined_path(dir.path(), "../outside.rs").is_none());
+        assert!(confined_path(dir.path(), "sub/../../outside.rs").is_none());
+        assert!(confined_path(dir.path(), "/etc/passwd").is_none());
+        assert!(confined_path(dir.path(), "missing.rs").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confined_path_rejects_a_symlink_that_leaves_the_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.rs"), "fn s() {}\n").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.rs"),
+            root.path().join("link.rs"),
+        )
+        .unwrap();
+        assert!(confined_path(root.path(), "link.rs").is_none());
     }
 }
