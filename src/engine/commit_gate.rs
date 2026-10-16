@@ -121,6 +121,20 @@ fn change_set(diff: &str) -> String {
             out.push_str(&body);
         }
     }
+    // Mode, rename, blob id and binary markers are part of the change.
+    // Blob ids only matter where the +/- lines cannot show the content (binary).
+    let has_binary = diff.contains("Binary files") || diff.contains("GIT binary patch");
+    for line in diff.lines() {
+        if !line.is_empty()
+            && (has_binary || !line.starts_with("index "))
+            && !line.starts_with([' ', '+', '-', '@'])
+            && !line.starts_with("diff --git")
+        {
+            out.push_str("hdr:");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     if out.is_empty() && !diff.trim().is_empty() {
         // Mode, symlink or rename-only changes carry no text lines: bind the verdict to the raw diff.
         return format!("raw:{diff}");
@@ -273,24 +287,82 @@ pub struct CommitCall {
     pub beyond_index: bool,
 }
 
+/// Split a command line into segments at `; | & \n` and into words, honouring
+/// quotes (a separator inside quotes is part of the word). Quote characters are
+/// dropped; backslash escapes the next character.
+fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = vec![];
+    let mut words: Vec<String> = vec![];
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    in_word = true;
+                }
+            }
+            (None, ';' | '|' | '&' | '\n') => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+                if !words.is_empty() {
+                    segments.push(std::mem::take(&mut words));
+                }
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    if !words.is_empty() {
+        segments.push(words);
+    }
+    segments
+}
+
 /// Inspect a shell command line (as an agent's Bash tool would run it).
 ///
-/// Commands are split on `;`, `&&`, `||`, `|` and newlines; each segment is
-/// read as `[VAR=x ...] git [global options] commit [flags]`. Anything it
-/// cannot read is "not a commit", so the guard never blocks what it does not
-/// understand.
+/// Fails closed: only a standalone `git [global options] commit` made of a
+/// small set of known flags counts as a plain commit. Anything else that
+/// mentions git and commit (chained commands, wrappers, pathspecs, unknown
+/// flags) is reported as `is_commit` + `beyond_index`, so the guard denies it
+/// and asks for a plain `git commit -m "..."` after staging.
 pub fn inspect_command(command: &str) -> CommitCall {
     let mut call = CommitCall::default();
-    let normalized = command.replace([';', '|', '&'], "\n");
-    let mut mutates_index = false;
-    for segment in normalized.lines() {
-        let mut tokens = segment.split_whitespace().peekable();
+    let segments = shell_segments(command);
+    let mut parsed_commit = false;
+    for words in &segments {
+        let mut tokens = words.iter().map(String::as_str).peekable();
         // Leading environment assignments: `GIT_AUTHOR_NAME=x git commit`.
         while tokens
             .peek()
             .is_some_and(|t| t.contains('=') && !t.starts_with('-') && !t.contains('/'))
         {
-            tokens.next();
+            let a = tokens.next().unwrap_or_default().to_ascii_uppercase();
+            if a.starts_with("GIT_CONFIG") || a.starts_with("GIT_DIR") || a.contains("HOOK") {
+                call.no_verify = true;
+            }
         }
         let Some(first) = tokens.next() else {
             continue;
@@ -309,6 +381,13 @@ pub fn inspect_command(command: &str) -> CommitCall {
                         .is_some_and(|v| v.to_ascii_lowercase().contains("hookspath"))
                     {
                         call.no_verify = true;
+                    }
+                }
+                _ if t.starts_with("--config-env") => {
+                    // Both `--config-env=k=v` and `--config-env k=v`.
+                    call.no_verify = true;
+                    if !t.contains('=') {
+                        tokens.next();
                     }
                 }
                 "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
@@ -330,73 +409,69 @@ pub fn inspect_command(command: &str) -> CommitCall {
                 }
             }
         }
-        if matches!(
-            sub,
-            Some("add" | "stage" | "rm" | "mv" | "apply" | "restore")
-        ) {
-            mutates_index = true;
-        }
         if sub != Some("commit") {
             continue;
         }
         call.is_commit = true;
+        parsed_commit = true;
         let mut value_next = false;
         for t in tokens {
             if value_next {
                 value_next = false;
                 continue;
             }
-            if matches!(
-                t,
-                "-m" | "-F" | "-C" | "-c" | "-t" | "--author" | "--date" | "--cleanup"
-            ) || t.starts_with("--message")
-                || t.starts_with("--file")
-            {
-                value_next = !t.contains('=');
-                continue;
-            }
-            if !t.starts_with('-')
-                && !t.starts_with(['"', '\''])
-                && !t.ends_with(['"', '\''])
-                && !t.contains('=')
-            {
-                // A bare word: a pathspec (commits those files' working-tree
-                // content) or part of a quoted message. Err on the strict side
-                // only for path-looking words.
-                if t.contains(['/', '.']) {
+            if let Some(long) = t.strip_prefix("--") {
+                let name = long.split('=').next().unwrap_or("");
+                if name == "message" {
+                    value_next = !long.contains('=');
+                } else if name.len() >= 4 && "no-verify".starts_with(name) {
+                    // git accepts any unambiguous prefix of a long option.
+                    call.no_verify = true;
+                } else if !matches!(
+                    name,
+                    "signoff" | "quiet" | "no-edit" | "amend" | "verbose" | "allow-empty"
+                ) {
                     call.beyond_index = true;
                 }
-            }
-            if t == "--"
-                || t.starts_with("--all")
-                || t.starts_with("--include")
-                || t.starts_with("--only")
-            {
+            } else if t.len() > 1 && t.starts_with('-') {
+                // Walk the cluster; stop at the first option that takes a value.
+                for c in t[1..].chars() {
+                    match c {
+                        'm' => {
+                            value_next = true;
+                            break;
+                        }
+                        'n' => call.no_verify = true,
+                        's' | 'q' | 'v' | 'S' => {}
+                        _ => call.beyond_index = true,
+                    }
+                }
+            } else {
+                // A bare word: a pathspec commits those files' working-tree content.
                 call.beyond_index = true;
-            } else if t.len() >= 5 && "--no-verify".starts_with(t) && t.starts_with("--no-v") {
-                // git accepts any unambiguous prefix of a long option.
-                call.no_verify = true;
-            } else if t.len() > 1
-                && t.starts_with('-')
-                && !t.starts_with("--")
-                && t[1..].chars().all(|c| c.is_ascii_alphabetic())
-                && t[1..].contains(['a', 'i', 'o'])
-            {
-                call.beyond_index = true;
-            }
-            if t.len() > 1
-                && t.starts_with('-')
-                && !t.starts_with("--")
-                && t[1..].chars().all(|c| c.is_ascii_alphabetic())
-                && t[1..].contains('n')
-            {
-                // `git commit -n` is `--no-verify`; `-nm`, `-an` too.
-                call.no_verify = true;
             }
         }
     }
-    if call.is_commit && mutates_index {
+    if segments.len() > 1 && call.is_commit {
+        // Chained with something else (`git add . && git commit`): the index may
+        // change before the commit runs.
         call.beyond_index = true;
+    }
+    if !parsed_commit {
+        // Wrappers, subshells, `bash -c "git commit ..."`: cannot be read, so fail closed.
+        let lower = command.to_ascii_lowercase();
+        let word = |w: &str| {
+            lower
+                .split(|c: char| !c.is_alphanumeric() && c != '-')
+                .any(|x| x == w)
+        };
+        if word("git") && word("commit") {
+            call.is_commit = true;
+            call.beyond_index = true;
+            if lower.contains("no-v") || lower.contains("hookspath") {
+                call.no_verify = true;
+            }
+        }
     }
     call
 }
@@ -593,7 +668,6 @@ mod tests {
             "git status",
             "git log --oneline",
             "git commit-tree abc",
-            "echo git commit",
             "cargo test",
             "git diff --cached",
             "grep commit file.txt",
@@ -601,6 +675,25 @@ mod tests {
         ] {
             assert!(!inspect_command(cmd).is_commit, "{cmd}");
         }
+    }
+
+    #[test]
+    fn wrappers_and_unknown_shapes_fail_closed() {
+        for cmd in [
+            "bash -c 'git commit -n -m x'",
+            "echo git commit",
+            "git commit -m x --unknown-flag",
+            "git commit --pathspec-from-file=list",
+            "git commit -p",
+            "git --config-env=core.hooksPath=X commit -m x",
+            "GIT_CONFIG_COUNT=1 git commit -m x",
+        ] {
+            let c = inspect_command(cmd);
+            assert!(c.is_commit && (c.beyond_index || c.no_verify), "{cmd}");
+        }
+        let plain = inspect_command("git commit -s -m \"a; b && c\"");
+        assert!(plain.is_commit && !plain.beyond_index && !plain.no_verify);
+        assert!(inspect_command("git commit -qam x").beyond_index);
     }
 
     #[test]
