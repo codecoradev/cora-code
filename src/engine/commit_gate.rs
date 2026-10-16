@@ -88,21 +88,30 @@ fn change_set(diff: &str) -> String {
             .or(chunk.old_path.as_deref())
             .unwrap_or("");
         let mut body = String::new();
+        if chunk.is_binary {
+            body.push_str("binary\n");
+        }
         for hunk in &chunk.chunks {
+            let mut hunk_body = String::new();
             for line in &hunk.lines {
                 match line.line_type {
                     DiffLineType::Add => {
-                        body.push('+');
-                        body.push_str(&line.content);
-                        body.push('\n');
+                        hunk_body.push('+');
+                        hunk_body.push_str(&line.content);
+                        hunk_body.push('\n');
                     }
                     DiffLineType::Remove => {
-                        body.push('-');
-                        body.push_str(&line.content);
-                        body.push('\n');
+                        hunk_body.push('-');
+                        hunk_body.push_str(&line.content);
+                        hunk_body.push('\n');
                     }
                     DiffLineType::Context => {}
                 }
+            }
+            if !hunk_body.is_empty() {
+                // The position matters: the same lines moved elsewhere are a different change.
+                body.push_str(&format!("@@ -{} +{}\n", hunk.old_start, hunk.new_start));
+                body.push_str(&hunk_body);
             }
         }
         if !body.is_empty() {
@@ -111,6 +120,10 @@ fn change_set(diff: &str) -> String {
             out.push('\n');
             out.push_str(&body);
         }
+    }
+    if out.is_empty() && !diff.trim().is_empty() {
+        // Mode, symlink or rename-only changes carry no text lines: bind the verdict to the raw diff.
+        return format!("raw:{diff}");
     }
     out
 }
@@ -255,6 +268,9 @@ pub struct CommitCall {
     pub is_commit: bool,
     /// ... with `--no-verify` or a short-flag cluster containing `n`.
     pub no_verify: bool,
+    /// ... that would commit more than the index (`-a`, `-i`, `-o`, `--`), or
+    /// that changes the index in the same command line.
+    pub beyond_index: bool,
 }
 
 /// Inspect a shell command line (as an agent's Bash tool would run it).
@@ -265,10 +281,8 @@ pub struct CommitCall {
 /// understand.
 pub fn inspect_command(command: &str) -> CommitCall {
     let mut call = CommitCall::default();
-    let normalized = command
-        .replace("&&", "\n")
-        .replace("||", "\n")
-        .replace([';', '|'], "\n");
+    let normalized = command.replace([';', '|', '&'], "\n");
+    let mut mutates_index = false;
     for segment in normalized.lines() {
         let mut tokens = segment.split_whitespace().peekable();
         // Leading environment assignments: `GIT_AUTHOR_NAME=x git commit`.
@@ -288,7 +302,16 @@ pub fn inspect_command(command: &str) -> CommitCall {
         let mut sub: Option<&str> = None;
         while let Some(t) = tokens.next() {
             match t {
-                "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" => {
+                "-c" => {
+                    // `-c core.hooksPath=...` switches the hooks off.
+                    if tokens
+                        .next()
+                        .is_some_and(|v| v.to_ascii_lowercase().contains("hookspath"))
+                    {
+                        call.no_verify = true;
+                    }
+                }
+                "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
                     tokens.next();
                 }
                 _ if t.starts_with("--git-dir=")
@@ -307,14 +330,35 @@ pub fn inspect_command(command: &str) -> CommitCall {
                 }
             }
         }
+        if matches!(
+            sub,
+            Some("add" | "stage" | "rm" | "mv" | "apply" | "restore")
+        ) {
+            mutates_index = true;
+        }
         if sub != Some("commit") {
             continue;
         }
         call.is_commit = true;
         for t in tokens {
-            if t == "--no-verify" {
+            if t == "--"
+                || t.starts_with("--all")
+                || t.starts_with("--include")
+                || t.starts_with("--only")
+            {
+                call.beyond_index = true;
+            } else if t.len() >= 5 && "--no-verify".starts_with(t) && t.starts_with("--no-v") {
+                // git accepts any unambiguous prefix of a long option.
                 call.no_verify = true;
             } else if t.len() > 1
+                && t.starts_with('-')
+                && !t.starts_with("--")
+                && t[1..].chars().all(|c| c.is_ascii_alphabetic())
+                && t[1..].contains(['a', 'i', 'o'])
+            {
+                call.beyond_index = true;
+            }
+            if t.len() > 1
                 && t.starts_with('-')
                 && !t.starts_with("--")
                 && t[1..].chars().all(|c| c.is_ascii_alphabetic())
@@ -325,12 +369,46 @@ pub fn inspect_command(command: &str) -> CommitCall {
             }
         }
     }
+    if call.is_commit && mutates_index {
+        call.beyond_index = true;
+    }
     call
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guard_parsing_fails_closed_on_known_bypasses() {
+        for c in [
+            "git commit --no-verif -m x",
+            "git commit --no-v -m x",
+            "git -c core.hooksPath=/dev/null commit -m x",
+            "true & git commit -n -m x",
+        ] {
+            assert!(inspect_command(c).no_verify, "{c}");
+        }
+        for c in [
+            "git commit -am x",
+            "git commit --all -m x",
+            "git commit -m x -- file.rs",
+            "git add . && git commit -m x",
+            "git add . & git commit -m x",
+        ] {
+            assert!(inspect_command(c).beyond_index, "{c}");
+        }
+        assert!(!inspect_command("git commit -m x").beyond_index);
+        assert!(!inspect_command("git commit -m x").no_verify);
+    }
+
+    #[test]
+    fn the_fingerprint_binds_position_and_non_text_changes() {
+        let moved = DIFF.replace("@@ -1,3 +1,4 @@", "@@ -10,3 +10,4 @@");
+        assert_ne!(fingerprint(DIFF), fingerprint(&moved));
+        let mode = "diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+        assert!(fingerprint(mode).is_some());
+    }
 
     const DIFF: &str = concat!(
         "diff --git a/app.py b/app.py\n",
@@ -386,9 +464,10 @@ mod tests {
         assert_eq!(fingerprint(""), None);
         let rename =
             "diff --git a/a.py b/b.py\nsimilarity index 100%\nrename from a.py\nrename to b.py\n";
-        assert_eq!(fingerprint(rename), None);
+        // Non-text changes are not "nothing": they need a verdict of their own.
+        assert!(fingerprint(rename).is_some());
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check(dir.path(), rename), Status::NothingToReview);
+        assert_eq!(check(dir.path(), rename), Status::NotValidated);
     }
 
     #[test]

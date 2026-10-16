@@ -302,7 +302,11 @@ pub async fn execute_review(
     // Leave a verifiable trace for the commit gate (#674): a staged diff that
     // was really reviewed (not a failed LLM call) may be committed by the
     // pre-commit hook without a second review.
-    if opts.staged && !response.summary.starts_with("LLM review failed") {
+    // Only a threshold at least as strict as the hook's (major) may stand in for the hook's review.
+    if opts.staged
+        && min_severity >= Severity::Major
+        && !response.summary.starts_with("LLM review failed")
+    {
         let judged_by = match judge {
             JudgeChoice::Llm(_) => "llm",
             JudgeChoice::Deterministic => "deterministic",

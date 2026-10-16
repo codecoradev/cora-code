@@ -101,6 +101,12 @@ pub fn execute_claude_guard() -> Result<i32> {
         );
         return Ok(2);
     }
+    if call.beyond_index {
+        eprintln!(
+            "commit gate: this commit may include changes that were not staged and reviewed (-a/-i/-o, a pathspec, or `git add` in the same command). Stage first, review the staged diff, then run a plain `git commit`."
+        );
+        return Ok(2);
+    }
     let (Some(git_dir), Some(diff)) = (commit_gate::git_dir(), commit_gate::staged_diff()) else {
         return Ok(0); // not a repository, or git failed: nothing to gate
     };
