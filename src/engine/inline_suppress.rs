@@ -13,6 +13,11 @@
 //! * The marker is matched as the substring `cora-ignore:` anywhere in a line,
 //!   so it works after `//`, `#`, `--`, `/* */`, `<!-- -->`, and so on.
 //! * A bare `cora-ignore` with no `:` and rule list never suppresses anything.
+//! * The rule list runs to the end of the line (or the comment terminator), so
+//!   explanatory text goes after a ` -- ` separator:
+//!   `cora-ignore: sec-hardcoded-secret -- env var name, not a value`.
+//! * A marker on a line that has findings but names none of them is reported
+//!   (see [`Unmatched`]) instead of silently doing nothing (#679).
 //!
 //! One filter ([`apply`]) is applied to the merged deterministic + LLM findings.
 //! It reads the post-change lines present in the parsed diff (added and
@@ -41,6 +46,13 @@ fn parse_rules(line: &str) -> Vec<String> {
         if let Some(i) = rest.find(end) {
             rest = &rest[..i];
         }
+    }
+    // `-- reason text` ends the rule list; the reason is documentation only.
+    if let Some(i) = rest
+        .find(" -- ")
+        .or_else(|| rest.strip_suffix(" --").map(str::len))
+    {
+        rest = &rest[..i];
     }
     rest.split(',')
         .map(|r| r.trim().to_lowercase())
@@ -73,18 +85,51 @@ fn matches_any(issue: &ReviewIssue, rules: &HashSet<String>) -> bool {
         || issue.also_matches.iter().any(|a| hit(a))
 }
 
+/// A marker that sits on a line with findings but names none of them (a typo,
+/// an unknown rule, or trailing text that became part of the rule name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unmatched {
+    pub file: String,
+    pub line: u32,
+    /// What the marker named (lowercased, as parsed).
+    pub named: Vec<String>,
+    /// Rule ids (or titles) of the findings on the marker's target line(s).
+    pub findings: Vec<String>,
+}
+
+impl Unmatched {
+    pub fn message(&self) -> String {
+        format!(
+            "cora-ignore at {}:{} matched no finding (named: {}); findings there: {}. Name a rule id exactly and put any explanation after ` -- `.",
+            self.file,
+            self.line,
+            self.named
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.findings.join(", ")
+        )
+    }
+}
+
 /// Drop findings suppressed by an inline `cora-ignore:` marker, reading the
 /// post-change lines of a diff (diff adapter over [`apply_lines`]).
-pub fn apply(issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<ReviewIssue> {
+pub fn apply(issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> (Vec<ReviewIssue>, Vec<Unmatched>) {
     let files: Vec<ScanFile<'_>> = chunks.iter().map(ScanFile::post_image).collect();
     apply_lines(issues, &files)
 }
 
 /// Drop findings suppressed by an inline `cora-ignore:` marker found in
 /// `files`' lines.
-pub fn apply_lines(mut issues: Vec<ReviewIssue>, files: &[ScanFile<'_>]) -> Vec<ReviewIssue> {
+pub fn apply_lines(
+    mut issues: Vec<ReviewIssue>,
+    files: &[ScanFile<'_>],
+) -> (Vec<ReviewIssue>, Vec<Unmatched>) {
     // (file, line) -> lowercased rules suppressed there.
     let mut suppressed: HashMap<(String, u32), HashSet<String>> = HashMap::new();
+    // Every marker: (file, marker line, target lines, rules).
+    let mut markers: Vec<(String, u32, Vec<u32>, Vec<String>)> = Vec::new();
     for file in files {
         let path = file.path;
         for &(ln, content) in &file.lines {
@@ -103,16 +148,40 @@ pub fn apply_lines(mut issues: Vec<ReviewIssue>, files: &[ScanFile<'_>]) -> Vec<
                 .entry((path.to_string(), ln))
                 .or_default()
                 .extend(rules.iter().cloned());
+            let mut targets = vec![ln];
             if is_comment_only(content) {
                 suppressed
                     .entry((path.to_string(), ln + 1))
                     .or_default()
-                    .extend(rules);
+                    .extend(rules.iter().cloned());
+                targets.push(ln + 1);
             }
+            markers.push((path.to_string(), ln, targets, rules));
         }
     }
     if suppressed.is_empty() {
-        return issues;
+        return (issues, Vec::new());
+    }
+
+    // Markers that sit on findings yet name none of them.
+    let mut unmatched = Vec::new();
+    for (file, ln, targets, rules) in &markers {
+        let set: HashSet<String> = rules.iter().cloned().collect();
+        let on_target: Vec<&ReviewIssue> = issues
+            .iter()
+            .filter(|i| i.file == *file && i.line.is_some_and(|l| targets.contains(&l)))
+            .collect();
+        if !on_target.is_empty() && !on_target.iter().any(|i| matches_any(i, &set)) {
+            unmatched.push(Unmatched {
+                file: file.clone(),
+                line: *ln,
+                named: rules.clone(),
+                findings: on_target
+                    .iter()
+                    .map(|i| i.rule_id.clone().unwrap_or_else(|| i.title.clone()))
+                    .collect(),
+            });
+        }
     }
 
     let before = issues.len();
@@ -127,7 +196,7 @@ pub fn apply_lines(mut issues: Vec<ReviewIssue>, files: &[ScanFile<'_>]) -> Vec<
     if dropped > 0 {
         debug!(dropped, "suppressed findings via inline cora-ignore");
     }
-    issues
+    (issues, unmatched)
 }
 
 #[cfg(test)]
@@ -135,6 +204,14 @@ mod tests {
     use super::*;
     use crate::engine::Severity;
     use crate::engine::diff_parser::parse_diff;
+
+    fn apply(issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<ReviewIssue> {
+        super::apply(issues, chunks).0
+    }
+
+    fn unmatched(issues: Vec<ReviewIssue>, chunks: &[FileChunk]) -> Vec<Unmatched> {
+        super::apply(issues, chunks).1
+    }
 
     const RULE: &str = "Hardcoded password or secret in variable";
 
@@ -379,5 +456,39 @@ mod tests {
         assert!(apply(issues_marked, &marked).is_empty());
         // Without the marker the finding stays.
         assert!(!apply(issues, &plain).is_empty());
+    }
+
+    #[test]
+    fn a_reason_after_the_separator_is_not_part_of_the_rule_list() {
+        let c = diff_of(&["x(); // cora-ignore: Rule A -- env var name, not a value"]);
+        assert!(apply(vec![issue("f.rs", 1, "Rule A")], &c).is_empty());
+        let c = diff_of(&["x(); /* cora-ignore: Rule A, Rule B -- why */"]);
+        assert!(apply(vec![issue("f.rs", 1, "Rule B")], &c).is_empty());
+    }
+
+    #[test]
+    fn trailing_text_without_a_separator_is_reported_not_silent() {
+        let c = diff_of(&["x(); // cora-ignore: Rule A (an env var name, not a value)"]);
+        let issues = vec![issue("f.rs", 1, "Rule A")];
+        assert_eq!(apply(issues.clone(), &c).len(), 1, "still reported");
+        let u = unmatched(issues, &c);
+        assert_eq!(u.len(), 1);
+        assert_eq!((u[0].file.as_str(), u[0].line), ("f.rs", 1));
+        assert!(u[0].message().contains("--"), "{}", u[0].message());
+    }
+
+    #[test]
+    fn an_unknown_rule_name_is_reported() {
+        let c = diff_of(&["x(); // cora-ignore: no-such-rule"]);
+        let u = unmatched(vec![issue("f.rs", 1, "Rule A")], &c);
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].named, vec!["no-such-rule".to_string()]);
+        assert_eq!(u[0].findings, vec!["Rule A".to_string()]);
+    }
+
+    #[test]
+    fn matching_markers_and_markers_on_clean_lines_are_not_reported() {
+        let c = diff_of(&["x(); // cora-ignore: Rule A", "y(); // cora-ignore: stale"]);
+        assert!(unmatched(vec![issue("f.rs", 1, "Rule A")], &c).is_empty());
     }
 }
