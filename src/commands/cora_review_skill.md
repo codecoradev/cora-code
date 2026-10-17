@@ -27,7 +27,7 @@ Run this review on the staged change **before each `git commit`**. Stage first (
 
 1. Call `cora.scan_prepare` with `{ "batch": 0 }` (optionally `"path"`, inside the project). Note `total_batches`.
 2. Judge each batch as above (steps 3), calling `cora.scan_prepare` with `batch` 1, 2, ... until the last. Deterministic findings come with batch 0.
-3. Call `cora.scan_finalize` once with all your findings as `issues`.
+3. Call `cora.scan_finalize` once with all your findings as `issues` and the batch indexes you actually judged as `batches_judged` (e.g. `[0, 1, 2]`). If you judged fewer batches than `total_batches`, the result says `coverage: "partial"` and `should_block` is null; do not report it as a clean scan.
 4. Show the user the result.
 
 ## Notes
