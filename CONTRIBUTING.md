@@ -6,10 +6,6 @@ This document helps you decide *whether* and *how* to contribute in a way that's
 
 > ### 📋 Contribution Terms
 >
-> By submitting a contribution, you agree to the terms in [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) (for individuals) or [CLA_CORPORATE.md](CLA_CORPORATE.md) (for employees contributing on behalf of their employer).
->
-> **TL;DR:** You retain copyright. You grant CodeCoraDev a license to use your contribution — including in commercial products. Contributions are voluntary and unpaid. If you prefer not to sign, that's okay — but your PR cannot be merged.
->
 > All commits must include `Signed-off-by: Your Name <email>` (same format as `git commit -s`).
 
 ## How this project is run
@@ -307,11 +303,6 @@ work), you agree that:
 4. **No Obligation:** CodeCoraDev is not obligated to accept, use, or maintain
    any contribution.
 
-A Contributor License Agreement (CLA) is required for contributions to be
-merged. See [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md) or
-[CLA_CORPORATE.md](CLA_CORPORATE.md) for details.
-
 ## License
 
-By contributing you agree your work is licensed under [Apache-2.0](LICENSE).
-A CLA is required — see [CLA_INDIVIDUAL.md](CLA_INDIVIDUAL.md).
+Contributions are licensed to the project under the Apache-2.0 license (inbound = outbound). No additional agreement is required.
