@@ -112,6 +112,7 @@ pub fn tools() -> Vec<Tool> {
                 "properties": {
                     "path": { "type": "string", "description": "The same path given to cora.scan_prepare" },
                     "files_fingerprint": { "type": "string", "description": "files_fingerprint from cora.scan_prepare; if given and the project changed since, the call is refused" },
+                    "batches_judged": { "type": "array", "items": { "type": "integer" }, "description": "0-based indexes of the scan_prepare batches you actually judged. Without it the result reports coverage as unverified; with fewer than total_batches it is partial and should_block is null" },
                     "issues": issues_prop
                 },
                 "required": ["issues"]
@@ -459,6 +460,57 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
     }))
 }
 
+/// How much of the project the agent's verdict covers (#685).
+struct ScanCoverage {
+    /// `complete`, `partial` (declared, fewer batches than exist) or
+    /// `unverified` (the agent did not say which batches it judged).
+    label: &'static str,
+    total_batches: usize,
+    batches_judged: Option<Vec<usize>>,
+    files_judged: Option<usize>,
+    files_total: usize,
+}
+
+/// Recompute the batches `scan_prepare` handed out and compare them with the
+/// ones the agent says it judged. Stateless, like the rest of the scan tools.
+fn scan_coverage(declared: Option<&Value>, files: &[FileEntry]) -> ScanCoverage {
+    let batches = batch_files(
+        files,
+        crate::commands::scan::DEFAULT_BATCH_CHAR_BUDGET,
+        crate::commands::scan::DEFAULT_MAX_FILES_PER_BATCH,
+    );
+    let total = batches.len();
+    let Some(arr) = declared.and_then(Value::as_array) else {
+        return ScanCoverage {
+            label: "unverified",
+            total_batches: total,
+            batches_judged: None,
+            files_judged: None,
+            files_total: files.len(),
+        };
+    };
+    let mut judged: Vec<usize> = arr
+        .iter()
+        .filter_map(Value::as_u64)
+        .map(|n| n as usize)
+        .filter(|n| *n < total)
+        .collect();
+    judged.sort_unstable();
+    judged.dedup();
+    let files_judged: usize = judged.iter().map(|&i| batches[i].len()).sum();
+    ScanCoverage {
+        label: if judged.len() == total {
+            "complete"
+        } else {
+            "partial"
+        },
+        total_batches: total,
+        batches_judged: Some(judged),
+        files_judged: Some(files_judged),
+        files_total: files.len(),
+    }
+}
+
 pub fn scan_finalize(params: &Value) -> ToolResult {
     let root = match scan_root(params) {
         Ok(r) => r,
@@ -487,6 +539,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
 
     let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let submitted = issues.len();
+    let coverage = scan_coverage(params.get("batches_judged"), &files);
     let mut all = admit(issues, &paths, &Source::Files(&files));
     let dropped_by_validation = submitted - all.len();
     let bridge = IndexBridge::open(&root);
@@ -506,13 +559,24 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         },
     );
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
-    let summary = format!(
-        "Scanned {} files ({} lines), found {} issues. {}",
-        files.len(),
-        total_lines,
-        all.len(),
-        crate::engine::judge::AGENT_JUDGED
-    );
+    let summary = match &coverage.files_judged {
+        Some(j) if coverage.label != "complete" => format!(
+            "Judged {}/{} batches ({}/{} files), found {} issues. {}",
+            coverage.batches_judged.as_ref().map_or(0, Vec::len),
+            coverage.total_batches,
+            j,
+            coverage.files_total,
+            all.len(),
+            crate::engine::judge::AGENT_JUDGED
+        ),
+        _ => format!(
+            "Scanned {} files ({} lines), found {} issues. {}",
+            files.len(),
+            total_lines,
+            all.len(),
+            crate::engine::judge::AGENT_JUDGED
+        ),
+    };
     finalize::save_history(
         &HistoryEntry {
             command: "scan (agent)",
@@ -529,8 +593,14 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         "judge": "agent",
         "summary": summary,
         "files_scanned": files.len(),
+        "coverage": coverage.label,
+        "total_batches": coverage.total_batches,
+        "batches_judged": coverage.batches_judged,
+        "files_judged": coverage.files_judged,
+        "files_total": coverage.files_total,
         "total_issues": all.len(),
-        "should_block": shaped.should_block,
+        // Unknown (null) when the agent declared it judged only some batches.
+        "should_block": if coverage.label == "partial" { Value::Null } else { json!(shaped.should_block) },
         "rejected_items": rejected,
         "dropped_by_validation": dropped_by_validation,
         "not_shown": dropped,
@@ -791,6 +861,63 @@ mod tests {
         let fp = prep["files_fingerprint"].as_str().unwrap().to_string();
         let ok = scan_finalize(&json!({ "path": "tests", "issues": [], "files_fingerprint": fp }));
         assert!(!ok.is_error, "{}", text(&ok));
+    }
+
+    fn entries(n: usize) -> Vec<FileEntry> {
+        (0..n)
+            .map(|i| FileEntry {
+                path: format!("src/f{i}.rs"),
+                content: "fn a() {}\n".to_string(),
+                lines: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coverage_is_partial_when_only_some_batches_were_judged() {
+        // 45 small files = 3 batches of at most 20 files.
+        let files = entries(45);
+        let c = scan_coverage(Some(&json!([1])), &files);
+        assert_eq!((c.label, c.total_batches), ("partial", 3));
+        assert_eq!(c.files_judged, Some(20));
+        assert_eq!(c.files_total, 45);
+        assert_eq!(c.batches_judged, Some(vec![1]));
+    }
+
+    #[test]
+    fn coverage_is_complete_only_when_every_batch_is_declared() {
+        let files = entries(45);
+        let c = scan_coverage(Some(&json!([2, 0, 1, 1, 99])), &files);
+        assert_eq!(c.label, "complete");
+        assert_eq!(c.files_judged, Some(45));
+        assert_eq!(
+            c.batches_judged,
+            Some(vec![0, 1, 2]),
+            "dedupe, drop out of range"
+        );
+    }
+
+    #[test]
+    fn coverage_is_unverified_without_a_declaration() {
+        let c = scan_coverage(None, &entries(45));
+        assert_eq!(c.label, "unverified");
+        assert!(c.files_judged.is_none() && c.batches_judged.is_none());
+    }
+
+    #[test]
+    fn scan_finalize_reports_partial_coverage_and_no_block_verdict() {
+        let out = as_json(&scan_finalize(
+            &json!({ "path": "src", "issues": [], "batches_judged": [0] }),
+        ));
+        assert_eq!(out["coverage"], "partial", "{out}");
+        assert!(out["should_block"].is_null(), "{out}");
+        assert!(
+            out["summary"].as_str().unwrap().starts_with("Judged 1/"),
+            "{out}"
+        );
+        let none = as_json(&scan_finalize(&json!({ "path": "src", "issues": [] })));
+        assert_eq!(none["coverage"], "unverified");
+        assert!(none["should_block"].is_boolean());
     }
 
     const CLEAN: &str = concat!(
