@@ -292,10 +292,8 @@ work), you agree that:
    does not offer bounties, payments, or equity for contributions unless
    explicitly stated in a separate written agreement.
 
-2. **License Grant:** You grant CodeCoraDev a perpetual, worldwide,
-   non-exclusive, royalty-free license to use, modify, and distribute your
-   contribution under the project's open-source license and any future license
-   that CodeCoraDev may adopt (including proprietary/commercial licenses).
+2. **License Grant:** You license your contribution to the project under the
+   Apache-2.0 license (inbound = outbound); no copyright assignment and no CLA.
 
 3. **Original Work:** Your contribution is your original work or properly
    attributed third-party work under a compatible license.
