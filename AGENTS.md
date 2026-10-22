@@ -18,8 +18,7 @@ code structure are in `AGENT.md`.
 - Branch names start with one of `feat/ fix/ docs/ chore/ perf/ security/
   refactor/ test/ build/ ci/ release/`.
 - PR bodies contain `## What`, `## Why` and `## Testing`.
-- Conventional Commits; the PR title becomes the squash message. Commits are
-  signed off (`git commit -s`) for the CLA.
+- Conventional Commits; the PR title becomes the squash message.
 
 ## Gotchas
 
