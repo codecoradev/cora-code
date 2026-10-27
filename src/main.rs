@@ -66,15 +66,15 @@ struct GlobalOptions {
     pub no_color: bool,
 
     /// LLM provider name (e.g. openai, anthropic, ollama)
-    #[clap(long, global = true, env = "CORA_PROVIDER")]
+    #[clap(long, global = true, env = "CORA_PROVIDER", hide_env_values = true)]
     pub provider: Option<String>,
 
     /// LLM model name (e.g. gpt-4o-mini, claude-3-haiku)
-    #[clap(long, global = true, env = "CORA_MODEL")]
+    #[clap(long, global = true, env = "CORA_MODEL", hide_env_values = true)]
     pub model: Option<String>,
 
     /// API base URL
-    #[clap(long, global = true, env = "CORA_BASE_URL")]
+    #[clap(long, global = true, env = "CORA_BASE_URL", hide_env_values = true)]
     pub base_url: Option<String>,
 
     /// API key (or set `CORA_API_KEY` env var for CI, or use `cora auth login`)
