@@ -40,26 +40,22 @@ jobs:
           done
           exit "$missing"
 
-      - name: Fetch the GitHub OIDC token
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const token = await core.getIDToken('https://api.anthropic.com');
-            core.setSecret(token);
-            core.exportVariable('JWT', token);
-
-      - name: Show the OIDC claims a federation rule can match on
+      - name: Exchange the GitHub OIDC token for an Anthropic access token
         run: |
-          # Claims are identifiers (issuer, audience, subject, repository, ref),
-          # not secrets. The signature part of the token is never printed.
-          payload=$(printf '%s' "$JWT" | cut -d. -f2 | tr '_-' '/+')
+          # Same step as in cora-review.yml: the OIDC token stays in this shell.
+          jwt=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r '.value // empty')
+          if [ -z "$jwt" ]; then
+            echo "::error::Could not get a GitHub OIDC token (is id-token: write set?)."
+            exit 1
+          fi
+          echo "::add-mask::$jwt"
+          # Claims are identifiers (subject, repository, event), not secrets.
+          payload=$(printf '%s' "$jwt" | cut -d. -f2 | tr '_-' '/+')
           while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
-          printf '%s' "$payload" | base64 -d | jq '{iss, aud, sub, repository, repository_owner, ref, event_name, job_workflow_ref}'
-
-      - name: Exchange it for an Anthropic access token
-        run: |
+          printf '%s' "$payload" | base64 -d | jq '{sub, repository, event_name}'
           body=$(jq -n \
-            --arg jwt "$JWT" \
+            --arg jwt "$jwt" \
             --arg rule "$FEDERATION_RULE_ID" \
             --arg org "$ORGANIZATION_ID" \
             --arg sa "$SERVICE_ACCOUNT_ID" \
@@ -72,14 +68,13 @@ jobs:
             -H "content-type: application/json" --data "$body")
           echo "token exchange: HTTP $code"
           if [ "$code" != "200" ]; then
-            jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)' exchange.json || true
+            jq -r '.error | "\(.type): \(.message)"' exchange.json || true
             exit 1
           fi
           token=$(jq -r '.access_token' exchange.json)
+          rm -f exchange.json
           echo "::add-mask::$token"
           echo "ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
-          echo "token_type=$(jq -r '.token_type' exchange.json) expires_in=$(jq -r '.expires_in' exchange.json)"
-          rm -f exchange.json
 
       - name: Call the OpenAI-compatible endpoint the way cora does
         run: |
