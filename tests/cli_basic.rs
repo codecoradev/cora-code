@@ -252,3 +252,25 @@ fn cli_help_does_not_print_secret_env_values() {
             .stdout(predicate::str::contains("ghp_secret_do_not_print_456").not());
     }
 }
+
+#[test]
+fn cli_help_does_not_print_url_or_deployment_env_values() {
+    // A base URL can carry credentials (`user:pass@host`, `?key=...`), and the
+    // model/provider names reveal internal deployments (#687).
+    for args in [&["--help"][..], &["review", "--help"], &["scan", "--help"]] {
+        cora_cmd()
+            .args(args)
+            .env(
+                "CORA_BASE_URL",
+                "https://u:hunter2pass@gateway.internal/v1?key=k3yvalue",
+            )
+            .env("CORA_MODEL", "internal-deployment-x")
+            .env("CORA_PROVIDER", "internal-provider-y")
+            .assert()
+            .stdout(predicate::str::contains("hunter2pass").not())
+            .stdout(predicate::str::contains("k3yvalue").not())
+            .stdout(predicate::str::contains("gateway.internal").not())
+            .stdout(predicate::str::contains("internal-deployment-x").not())
+            .stdout(predicate::str::contains("internal-provider-y").not());
+    }
+}
