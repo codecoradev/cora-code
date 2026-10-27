@@ -91,6 +91,7 @@ Complete command reference for the cora CLI.
 | `cora scan --exclude` `"vendor/**"` | Exclude glob patterns |
 | `cora scan --extensions` `"ts,js"` | Additional file extensions to scan |
 | `cora scan --incremental` | Scan only files changed since last scan |
+| `cora scan --min-severity` `minor` | Hide findings below `info`, `minor`, `major` or `critical` in every output format and in the count (blocking still follows `hook.min_severity`) |
 | `cora scan --focus` `security` | Override focus areas |
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |

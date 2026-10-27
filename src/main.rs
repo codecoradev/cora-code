@@ -386,6 +386,11 @@ enum Command {
         #[clap(long)]
         no_continue_on_batch_error: bool,
 
+        /// Hide findings below this severity in the output and the summary
+        /// count (blocking is still decided by `hook.min_severity`)
+        #[clap(long, value_name = "LEVEL", value_parser = ["info", "minor", "major", "critical"])]
+        min_severity: Option<String>,
+
         /// Deterministic checks only: never call an LLM (also the automatic
         /// behavior when no API key is configured)
         #[clap(long)]
@@ -1248,6 +1253,7 @@ async fn main() -> Result<()> {
             focus,
             batch_files,
             no_continue_on_batch_error,
+            min_severity,
             no_llm,
         } => {
             cmd_scan(
@@ -1261,6 +1267,7 @@ async fn main() -> Result<()> {
                     focus,
                     batch_files,
                     continue_on_batch_error: !no_continue_on_batch_error,
+                    min_severity,
                     no_llm,
                 },
             )
@@ -1531,6 +1538,7 @@ struct ScanOpts {
     focus: Vec<String>,
     batch_files: usize,
     continue_on_batch_error: bool,
+    min_severity: Option<String>,
     no_llm: bool,
 }
 
@@ -1769,6 +1777,7 @@ async fn cmd_scan(globals: &GlobalOptions, opts: ScanOpts) -> Result<i32> {
         focus: opts.focus,
         batch_files: opts.batch_files,
         continue_on_batch_error: opts.continue_on_batch_error,
+        min_severity: opts.min_severity,
     };
 
     scan::execute_scan(&config, &judge, &scan_opts, format).await

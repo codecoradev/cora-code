@@ -653,6 +653,9 @@ pub struct RulesSection {
     /// `RulesConfig::include_tests`, #663).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub include_tests: bool,
+    /// Run the `qual-clone` hint for Rust `.clone()` calls (off by default, #683).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clone_hints: bool,
 }
 
 /// File bundling configuration section for `.cora.yaml`.
@@ -810,6 +813,7 @@ impl CoraFile {
             config.rules_config.enabled = re.enabled;
             config.rules_config.max_findings = re.max_findings;
             config.rules_config.include_tests = re.include_tests;
+            config.rules_config.clone_hints = re.clone_hints;
             if !re.custom.is_empty() {
                 config.rules_config.custom_rules = re.custom.clone();
             }
@@ -1189,6 +1193,7 @@ provider: zai
                 custom: Vec::new(),
                 index_skip_files: vec!["my-generated/**".to_string()],
                 include_tests: false,
+                clone_hints: false,
             }),
             ..Default::default()
         };

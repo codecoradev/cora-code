@@ -97,6 +97,10 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
     }
 
     let mut all_rules = builtin::builtin_rules();
+    if !config.clone_hints {
+        // `.clone()` hints are noise on idiomatic Rust (Arc::clone, handles for threads).
+        all_rules.retain(|r| r.id != "qual-clone");
+    }
     all_rules.extend(config.custom_rules.clone());
 
     // Compile regex patterns once before the matching loop (Fix #41)
@@ -362,6 +366,17 @@ mod tests {
     use super::*;
     use crate::engine::Severity;
 
+    #[test]
+    fn qual_clone_is_opt_in() {
+        let entry = file_entry("src/lib.rs", "fn f(a: &Arc<S>) { let b = a.clone(); }\n");
+        let off = rule_ids(&entry, &default_config());
+        assert!(!off.iter().any(|i| i.starts_with("qual-clone")), "{off:?}");
+        let mut cfg = default_config();
+        cfg.clone_hints = true;
+        let on = rule_ids(&entry, &cfg);
+        assert!(on.iter().any(|i| i.starts_with("qual-clone")), "{on:?}");
+    }
+
     fn rule(id: &str, pattern: &str, languages: &[&str]) -> CustomRule {
         CustomRule {
             id: id.into(),
@@ -426,6 +441,7 @@ mod tests {
             custom_rules: Vec::new(),
             index_skip_files: super::types::default_index_skip_files(),
             include_tests: false,
+            clone_hints: false,
         }
     }
 
