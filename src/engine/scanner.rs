@@ -163,6 +163,25 @@ pub fn walk_project(
     Ok(entries)
 }
 
+/// Extensions that are program code (the rest of the defaults are docs/data).
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "kt", "rb", "c", "cpp", "h", "hpp", "cs",
+    "php", "swift", "scala", "vue", "svelte", "sh", "bash", "zsh", "ps1", "sql",
+];
+
+/// Value-first order: source files before docs/data/lockfiles, then shallower
+/// directories first, then by path so the result is deterministic.
+pub fn order_source_first(files: &mut [FileEntry]) {
+    files.sort_by_cached_key(|f| {
+        let p = Path::new(&f.path);
+        let is_source = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SOURCE_EXTENSIONS.contains(&e.to_lowercase().as_str()));
+        (!is_source, p.components().count(), f.path.clone())
+    });
+}
+
 /// Split files into batches to avoid exceeding LLM token limits.
 pub fn batch_files(files: &[FileEntry], max_chars: usize, max_files: usize) -> Vec<Vec<FileEntry>> {
     let mut batches = Vec::new();

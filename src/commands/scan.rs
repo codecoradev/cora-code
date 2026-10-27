@@ -118,22 +118,8 @@ pub async fn execute_scan(
 
     // 1b. Incremental: filter out unchanged files
     if opts.incremental {
-        let cache = ScanCache::load()?;
         let before_count = files.len();
-        let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-        files.retain(|f| {
-            let abs_path = root_abs.join(&f.path);
-            let Some(hash) = file_content_hash(&abs_path) else {
-                return true; // can't read file, rescan it
-            };
-            match cache.get(&root_abs, &f.path) {
-                Some(cached_hash) if cached_hash == hash => {
-                    debug!(file = %f.path, "skipping unchanged file (incremental)");
-                    false
-                }
-                _ => true,
-            }
-        });
+        retain_changed(&root, &mut files)?;
         let skipped = before_count - files.len();
         if skipped > 0 {
             eprintln!(
@@ -276,16 +262,7 @@ pub async fn execute_scan(
 
     // 6. Save scan cache for incremental mode
     if opts.incremental {
-        let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-        let mut cache = ScanCache::load().unwrap_or_default();
-        for f in &files {
-            let abs_path = root_abs.join(&f.path);
-            let Some(hash) = file_content_hash(&abs_path) else {
-                continue; // can't read file, skip cache entry
-            };
-            cache.set(&root_abs, &f.path, &hash);
-        }
-        cache.save()?;
+        record_scanned(&root, &files)?;
         debug!(cached = files.len(), "saved scan cache");
     }
 
@@ -433,6 +410,37 @@ pub(crate) fn finalize_issues(
 ) -> (Vec<ReviewIssue>, usize) {
     let report = postprocess_report(issues, &Source::Files(files), config);
     (report.issues, report.dropped)
+}
+
+/// Incremental mode: drop files whose content hash matches the scan cache.
+pub(crate) fn retain_changed(root: &std::path::Path, files: &mut Vec<FileEntry>) -> Result<()> {
+    let cache = ScanCache::load()?;
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    files.retain(|f| {
+        let Some(hash) = file_content_hash(&root_abs.join(&f.path)) else {
+            return true; // can't read file, rescan it
+        };
+        match cache.get(&root_abs, &f.path) {
+            Some(cached_hash) if cached_hash == hash => {
+                debug!(file = %f.path, "skipping unchanged file (incremental)");
+                false
+            }
+            _ => true,
+        }
+    });
+    Ok(())
+}
+
+/// Incremental mode: remember the hashes of the files just scanned.
+pub(crate) fn record_scanned(root: &std::path::Path, files: &[FileEntry]) -> Result<()> {
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut cache = ScanCache::load().unwrap_or_default();
+    for f in files {
+        if let Some(hash) = file_content_hash(&root_abs.join(&f.path)) {
+            cache.set(&root_abs, &f.path, &hash);
+        }
+    }
+    cache.save()
 }
 
 /// Compute a short SHA256 hash of a file's content for incremental scanning.
