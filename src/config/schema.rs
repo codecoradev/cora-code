@@ -90,6 +90,30 @@ pub struct ProviderConfig {
 pub struct IgnoreConfig {
     pub files: Vec<String>,
     pub rules: Vec<String>,
+    /// Rules silenced only for some paths (`ignore.rules` object entries, #680).
+    #[serde(default)]
+    pub scoped: Vec<ScopedIgnore>,
+}
+
+/// One `ignore.rules` entry in object form: silence `rule` only under `files`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedIgnore {
+    /// Rule id or title fragment, matched like a plain `ignore.rules` string.
+    pub rule: String,
+    /// Glob patterns (same syntax as `ignore.files`) the silencing is limited to.
+    pub files: Vec<String>,
+    /// Why the rule is silenced here (documentation for reviewers; optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// An `ignore.rules` entry: a plain string (whole project) or a scoped object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IgnoreRuleEntry {
+    Plain(String),
+    Scoped(ScopedIgnore),
 }
 
 /// Hook configuration.
@@ -131,6 +155,7 @@ impl Default for Config {
                     ".git/**".into(),
                 ],
                 rules: vec![],
+                scoped: vec![],
             },
             hook: HookConfig {
                 mode: "warn".to_string(),
@@ -296,6 +321,19 @@ impl Config {
             ));
         }
 
+        // ── scoped ignore rules (#680) ──
+        for (i, s) in self.ignore.scoped.iter().enumerate() {
+            if s.rule.trim().is_empty() {
+                errs.push(format!("ignore.rules[{i}]: rule must not be empty"));
+            }
+            if s.files.is_empty() {
+                errs.push(format!(
+                    "ignore.rules ({}): files is empty, so the rule would apply nowhere; list globs or use the plain string form",
+                    s.rule
+                ));
+            }
+        }
+
         // ── custom rules (#684) ──
         errs.extend(crate::engine::rules::validate_custom_rules(
             &self.rules_config.custom_rules,
@@ -405,7 +443,7 @@ pub struct IgnoreSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rules: Option<Vec<String>>,
+    pub rules: Option<Vec<IgnoreRuleEntry>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -731,9 +769,16 @@ impl CoraFile {
                     }
                 }
             }
-            if let Some(v) = &ig.rules {
-                // ignore.rules defaults to empty, so clone is safe here.
-                config.ignore.rules.clone_from(v);
+            if let Some(entries) = &ig.rules {
+                // ignore.rules defaults to empty, so replacing is safe here.
+                config.ignore.rules.clear();
+                config.ignore.scoped.clear();
+                for entry in entries {
+                    match entry {
+                        IgnoreRuleEntry::Plain(rule) => config.ignore.rules.push(rule.clone()),
+                        IgnoreRuleEntry::Scoped(s) => config.ignore.scoped.push(s.clone()),
+                    }
+                }
             }
         }
         if let Some(h) = &self.hook {
@@ -1098,7 +1143,7 @@ provider: zai
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
                 files: Some(vec!["vendor/**".to_string()]),
-                rules: Some(vec!["skip-rule-1".to_string()]),
+                rules: Some(vec![IgnoreRuleEntry::Plain("skip-rule-1".to_string())]),
             }),
             ..Default::default()
         };
@@ -1981,5 +2026,49 @@ bundling:
     fn deny_unknown_fields_allows_valid_keys() {
         let yaml = "\nllm:\n  temperature: 0.5\n  max_tokens: 8192\n";
         assert!(CoraFile::from_str(yaml).is_ok());
+    }
+
+    #[test]
+    fn ignore_rules_accept_strings_and_scoped_objects() {
+        let yaml = r#"
+ignore:
+  rules:
+    - "Hardcoded password or secret"
+    - rule: bug-println
+      files: ["crates/cli/**", "evals/**"]
+    - rule: bug-expect
+      files: ["**/subprocess.rs"]
+      reason: "expects state a local invariant"
+"#;
+        let cora: CoraFile = serde_yaml_ng::from_str(yaml).unwrap();
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.ignore.rules, vec!["Hardcoded password or secret"]);
+        assert_eq!(cfg.ignore.scoped.len(), 2);
+        assert_eq!(cfg.ignore.scoped[0].rule, "bug-println");
+        assert_eq!(
+            cfg.ignore.scoped[0].files,
+            vec!["crates/cli/**", "evals/**"]
+        );
+        assert_eq!(
+            cfg.ignore.scoped[1].reason.as_deref(),
+            Some("expects state a local invariant")
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn a_scoped_ignore_without_files_is_a_config_error() {
+        let mut cfg = Config::default();
+        cfg.ignore.scoped.push(ScopedIgnore {
+            rule: "bug-println".into(),
+            files: vec![],
+            reason: None,
+        });
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("bug-println") && err.contains("files is empty"),
+            "{err}"
+        );
     }
 }

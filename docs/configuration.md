@@ -568,6 +568,23 @@ const next = compute();
 - `cora review` reads markers from the diff (added and context lines); a marker outside the diff's context window is not seen. `cora scan` reads markers from the full file contents.
 - `cora scan` also runs the deterministic secrets and security scanners on every scanned file and applies `ignore.rules`, so those findings are reported even when the LLM call fails.
 
+## Path-scoped ignore rules
+
+`ignore.rules` entries can be plain strings (the rule is silenced everywhere) or objects that silence a rule only under some paths:
+
+```yaml
+ignore:
+  rules:
+    - "Hardcoded password or secret"          # whole project
+    - rule: bug-println
+      files: ["crates/cli/**", "evals/**"]    # only these paths
+    - rule: bug-expect
+      files: ["**/subprocess.rs"]
+      reason: "expects state a local invariant"   # optional, for reviewers
+```
+
+`rule` is matched like a plain entry (rule id or title fragment). `files` uses the same globs as `ignore.files` and must not be empty (an empty list is a config error). It applies to `review`, `scan` and the MCP tools, before the `max_findings` cap. `reason` is documentation for the people reading the config.
+
 ## Ignore Files
 
 Exclude files or directories from **all** cora operations — review, scan, and indexing. This is the broadest exclusion mechanism.
