@@ -9,8 +9,9 @@
 use crate::error::CoraError;
 use serde::Deserialize;
 use serde_json::Value;
-use std::sync::LazyLock;
-use tracing::debug;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+use tracing::{debug, warn};
 
 use super::LlmEvents;
 use crate::engine::types::LLMConfig;
@@ -254,12 +255,55 @@ pub(crate) trait Transport {
     async fn complete(&self, turn: &Turn<'_>) -> Result<Completion, CoraError>;
 }
 
+/// Models that rejected `temperature` during this process (#701). Newer models
+/// (for example `claude-opus-5-5`) answer HTTP 400 "`temperature` is deprecated
+/// for this model"; once seen, later requests for that model leave it out
+/// instead of failing again.
+static NO_TEMPERATURE: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn temperature_omitted(model: &str) -> bool {
+    NO_TEMPERATURE
+        .lock()
+        .map(|set| set.contains(model))
+        .unwrap_or(false)
+}
+
+fn omit_temperature_for(model: &str) {
+    if let Ok(mut set) = NO_TEMPERATURE.lock() {
+        set.insert(model.to_string());
+    }
+}
+
+/// Does a 400 response body complain about the `temperature` parameter?
+fn rejects_temperature(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("temperature")
+}
+
 /// Build the JSON request body for `/chat/completions`.
+#[cfg(test)]
 pub(crate) fn build_request_body(
     config: &LLMConfig,
     turn: &Turn<'_>,
     response_format: &str,
     stream: bool,
+) -> Value {
+    build_request_body_with(
+        config,
+        turn,
+        response_format,
+        stream,
+        !temperature_omitted(&config.model),
+    )
+}
+
+/// [`build_request_body`] with an explicit choice about `temperature`.
+fn build_request_body_with(
+    config: &LLMConfig,
+    turn: &Turn<'_>,
+    response_format: &str,
+    stream: bool,
+    include_temperature: bool,
 ) -> Value {
     let mut body = serde_json::json!({
         "model": config.model,
@@ -267,8 +311,10 @@ pub(crate) fn build_request_body(
             { "role": "system", "content": turn.system },
             { "role": "user", "content": turn.user }
         ],
-        "temperature": config.temperature,
     });
+    if include_temperature {
+        body["temperature"] = serde_json::json!(config.temperature);
+    }
     if stream {
         body["stream"] = serde_json::json!(true);
         // Ask OpenAI-compatible providers to include token usage in the final
@@ -323,15 +369,47 @@ impl HttpTransport<'_> {
             .map_err(CoraError::LlmRequest)
     }
 
+    /// Send one turn. A 400 that names `temperature` is retried once without it
+    /// and remembered for the model (#701); every other status is returned as is.
+    async fn post_turn(
+        &self,
+        turn: &Turn<'_>,
+        stream: bool,
+    ) -> Result<reqwest::Response, CoraError> {
+        let model = &self.config.model;
+        let with_temperature = !temperature_omitted(model);
+        let body = build_request_body_with(
+            self.config,
+            turn,
+            self.response_format,
+            stream,
+            with_temperature,
+        );
+        let response = self.post(&body).await?;
+        if response.status().as_u16() != 400 || !with_temperature {
+            return Ok(response);
+        }
+        let text = response.text().await.map_err(CoraError::LlmRequest)?;
+        if !rejects_temperature(&text) {
+            return Err(CoraError::LlmStatus {
+                status: 400,
+                body: preview_raw(&text),
+            });
+        }
+        warn!(%model, "model rejected `temperature`; retrying without it");
+        omit_temperature_for(model);
+        let body = build_request_body_with(self.config, turn, self.response_format, stream, false);
+        self.post(&body).await
+    }
+
     async fn complete_once(&self, turn: &Turn<'_>) -> Result<Completion, CoraError> {
-        let body = build_request_body(self.config, turn, self.response_format, false);
         self.events.status(&format!(
             "Sending to {} ({})…",
             self.config.provider, self.config.model
         ));
         debug!(model = %self.config.model, url = %self.url(), "sending LLM request");
 
-        let response = self.post(&body).await?;
+        let response = self.post_turn(turn, false).await?;
         let status = response.status();
         let text = response.text().await.map_err(CoraError::LlmRequest)?;
         if !status.is_success() {
@@ -365,10 +443,9 @@ impl HttpTransport<'_> {
     async fn complete_stream(&self, turn: &Turn<'_>) -> Result<Completion, CoraError> {
         use futures_util::StreamExt;
 
-        let body = build_request_body(self.config, turn, self.response_format, true);
         debug!(model = %self.config.model, url = %self.url(), "sending streaming LLM request");
 
-        let response = self.post(&body).await?;
+        let response = self.post_turn(turn, true).await?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -541,6 +618,151 @@ fn extract_stream_usage(parsed: &Value) -> Option<Usage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal one-shot HTTP server: answers each connection with the next
+    /// canned (status line, body) and returns the request bodies it saw.
+    fn fake_server(
+        replies: Vec<(&'static str, &'static str)>,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in replies {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut n = 0;
+                loop {
+                    let r = conn.read(&mut buf[n..]).unwrap();
+                    n += r;
+                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if let Some(i) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if n >= i + 4 + len {
+                            seen.push(text[i + 4..].to_string());
+                            break;
+                        }
+                    }
+                    if r == 0 {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                conn.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn a_400_about_temperature_is_retried_once_without_it() {
+        let rejected = r#"{"error":{"code":"invalid_request_error","message":"`temperature` is deprecated for this model.","type":"invalid_request_error"}}"#;
+        let ok = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        let (port, server) = fake_server(vec![("400 Bad Request", rejected), ("200 OK", ok)]);
+        let cfg = LLMConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-model-retry-plain".to_string(),
+            api_key: "k".to_string(),
+            ..LLMConfig::default()
+        };
+        let transport = HttpTransport {
+            config: &cfg,
+            response_format: "none",
+            stream: false,
+            events: &NoEvents,
+        };
+        let done = transport
+            .complete(&turn(100))
+            .await
+            .expect("retry succeeds");
+        assert_eq!(done.content, "ok");
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains("\"temperature\""), "first try sends it");
+        assert!(
+            !seen[1].contains("temperature"),
+            "retry leaves it out: {}",
+            seen[1]
+        );
+        assert!(temperature_omitted("test-model-retry-plain"));
+    }
+
+    #[tokio::test]
+    async fn another_400_is_not_retried() {
+        let bad = r#"{"error":{"message":"max_tokens is too large"}}"#;
+        let (port, server) = fake_server(vec![("400 Bad Request", bad)]);
+        let cfg = LLMConfig {
+            base_url: format!("http://127.0.0.1:{port}"),
+            model: "test-model-plain-400".to_string(),
+            api_key: "k".to_string(),
+            ..LLMConfig::default()
+        };
+        let transport = HttpTransport {
+            config: &cfg,
+            response_format: "none",
+            stream: false,
+            events: &NoEvents,
+        };
+        let err = transport.complete(&turn(100)).await.unwrap_err();
+        assert!(
+            matches!(err, CoraError::LlmStatus { status: 400, .. }),
+            "{err:?}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_request_has_no_temperature_key_when_it_is_left_out() {
+        let cfg = LLMConfig::default();
+        let with = build_request_body_with(&cfg, &turn(100), "none", false, true);
+        assert_eq!(with["temperature"], serde_json::json!(cfg.temperature));
+        let without = build_request_body_with(&cfg, &turn(100), "none", false, false);
+        assert!(without.get("temperature").is_none(), "{without}");
+        assert!(without.get("model").is_some() && without.get("messages").is_some());
+    }
+
+    #[test]
+    fn a_400_about_temperature_is_recognised() {
+        let anthropic = r#"{"error":{"code":"invalid_request_error","message":"`temperature` is deprecated for this model.","type":"invalid_request_error"}}"#;
+        assert!(rejects_temperature(anthropic));
+        assert!(!rejects_temperature(
+            r#"{"error":{"message":"max_tokens too large"}}"#
+        ));
+    }
+
+    #[test]
+    fn a_model_that_rejected_temperature_is_remembered() {
+        let model = "test-model-that-rejects-temperature";
+        assert!(!temperature_omitted(model));
+        omit_temperature_for(model);
+        assert!(temperature_omitted(model));
+        let cfg = LLMConfig {
+            model: model.to_string(),
+            ..LLMConfig::default()
+        };
+        assert!(
+            build_request_body(&cfg, &turn(100), "none", false)
+                .get("temperature")
+                .is_none()
+        );
+        // Other models keep the deterministic default.
+        assert!(
+            build_request_body(&LLMConfig::default(), &turn(100), "none", false)
+                .get("temperature")
+                .is_some()
+        );
+    }
 
     #[test]
     fn usage_to_token_usage_maps_fields_correctly() {
