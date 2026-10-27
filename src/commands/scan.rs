@@ -93,6 +93,12 @@ pub async fn execute_scan(
         anyhow::bail!("scan path '{}' is not a directory", root.display());
     }
 
+    // Scanned paths are relative to `root`, which need not be the working
+    // directory (`--path`): rules that look at the project layout use it (#682).
+    let mut rooted = config.clone();
+    rooted.rules_config.project_root = Some(root.canonicalize().unwrap_or_else(|_| root.clone()));
+    let config = &rooted;
+
     // Merge include/exclude with config ignore patterns
     let include = opts.include.clone();
     let mut exclude = config.ignore.files.clone();

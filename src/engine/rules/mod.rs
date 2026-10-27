@@ -90,6 +90,26 @@ pub fn validate_custom_rules(rules: &[CustomRule]) -> Vec<String> {
     errs
 }
 
+/// The git toplevel of the working directory: diff paths are relative to it.
+/// Unit tests run inside this repository, so they never probe it.
+fn git_toplevel() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    static TOPLEVEL: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    TOPLEVEL
+        .get_or_init(|| {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+        })
+        .clone()
+}
+
 pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFinding> {
     if !config.enabled {
         debug!("rule engine is disabled");
@@ -107,6 +127,8 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
     for rule in &mut all_rules {
         rule.ensure_compiled();
     }
+
+    let root = config.project_root.clone().or_else(git_toplevel);
 
     debug!(
         rule_count = all_rules.len(),
@@ -144,7 +166,12 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
                 }
 
                 // Post-match filter (e.g., allow localhost URLs)
-                if builtin::post_match_filter_for_path(&rule.id, content, file_path) {
+                if builtin::post_match_filter_for_path(&rule.id, content, file_path)
+                    || (rule.id == "bug-println"
+                        && root
+                            .as_deref()
+                            .is_some_and(|r| builtin::is_in_binary_only_package(r, file_path)))
+                {
                     continue;
                 }
 
@@ -442,6 +469,7 @@ mod tests {
             index_skip_files: super::types::default_index_skip_files(),
             include_tests: false,
             clone_hints: false,
+            project_root: None,
         }
     }
 
