@@ -48,6 +48,14 @@ jobs:
             core.setSecret(token);
             core.exportVariable('JWT', token);
 
+      - name: Show the OIDC claims a federation rule can match on
+        run: |
+          # Claims are identifiers (issuer, audience, subject, repository, ref),
+          # not secrets. The signature part of the token is never printed.
+          payload=$(printf '%s' "$JWT" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          printf '%s' "$payload" | base64 -d | jq '{iss, aud, sub, repository, repository_owner, ref, event_name, job_workflow_ref}'
+
       - name: Exchange it for an Anthropic access token
         run: |
           body=$(jq -n \
