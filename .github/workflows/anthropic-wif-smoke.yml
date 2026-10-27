@@ -1,0 +1,94 @@
+name: Anthropic WIF smoke test
+
+# Checks that this repository can exchange its GitHub OIDC token for a
+# short-lived Anthropic access token (workload identity federation) and that
+# the token works the way cora sends it: `Authorization: Bearer <token>` to the
+# OpenAI-compatible `/chat/completions` endpoint. Prints HTTP statuses only,
+# never a token.
+#
+# Manual only (Actions tab -> Run workflow), so it costs nothing on normal PRs.
+# The federation rule must allow this workflow's OIDC subject (for a manual run
+# on a branch that is `...:ref:refs/heads/<branch>`, not `...:pull_request`).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  smoke:
+    name: Anthropic WIF smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Identifiers, not credentials, but this repository is public: they live
+      # in organization/repository secrets or variables, not in this file.
+      FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID || vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID || vars.ANTHROPIC_ORGANIZATION_ID }}
+      SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID || vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID || vars.ANTHROPIC_WORKSPACE_ID }}
+      MODEL: ${{ secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5' }}
+    steps:
+      - name: Require the federation variables
+        run: |
+          missing=0
+          for name in FEDERATION_RULE_ID ORGANIZATION_ID SERVICE_ACCOUNT_ID WORKSPACE_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret or variable ANTHROPIC_${name} is empty or missing."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Exchange the GitHub OIDC token for an Anthropic access token
+        run: |
+          # Same step as in cora-review.yml: the OIDC token stays in this shell.
+          jwt=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" | jq -r '.value // empty')
+          if [ -z "$jwt" ]; then
+            echo "::error::Could not get a GitHub OIDC token (is id-token: write set?)."
+            exit 1
+          fi
+          echo "::add-mask::$jwt"
+          # Claims are identifiers (subject, repository, event), not secrets.
+          payload=$(printf '%s' "$jwt" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          printf '%s' "$payload" | base64 -d | jq '{sub, repository, event_name}'
+          body=$(jq -n \
+            --arg jwt "$jwt" \
+            --arg rule "$FEDERATION_RULE_ID" \
+            --arg org "$ORGANIZATION_ID" \
+            --arg sa "$SERVICE_ACCOUNT_ID" \
+            --arg ws "$WORKSPACE_ID" \
+            '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+              assertion: $jwt, federation_rule_id: $rule, organization_id: $org,
+              service_account_id: $sa, workspace_id: $ws}')
+          code=$(curl -sS -o exchange.json -w '%{http_code}' \
+            https://api.anthropic.com/v1/oauth/token \
+            -H "content-type: application/json" --data "$body")
+          echo "token exchange: HTTP $code"
+          if [ "$code" != "200" ]; then
+            jq -r '.error | "\(.type): \(.message)"' exchange.json || true
+            exit 1
+          fi
+          token=$(jq -r '.access_token' exchange.json)
+          rm -f exchange.json
+          echo "::add-mask::$token"
+          echo "ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Call the OpenAI-compatible endpoint the way cora does
+        run: |
+          code=$(curl -sS -o compat.json -w '%{http_code}' \
+            https://api.anthropic.com/v1/chat/completions \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg m "$MODEL" '{model: $m, max_tokens: 16, messages: [{role: "user", content: "Reply with the single word ok."}]}')")
+          echo "chat/completions with Bearer: HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "reply length: $(jq -r '.choices[0].message.content | length' compat.json)"
+          else
+            jq -r '.error | "\(.type): \(.message)"' compat.json || true
+            exit 1
+          fi
