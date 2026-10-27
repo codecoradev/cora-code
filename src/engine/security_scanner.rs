@@ -53,7 +53,10 @@ pub static PATTERNS: &[SecurityPattern] = &[
         // `new String("...")` whose callee is too short for the 8-char token (#630);
         // (2) Go `var name type = value`; (3) SQL `PASSWORD '<literal>'` /
         // `IDENTIFIED BY "<literal>"` (#620, #625).
-        regex: r#"(?i)(?:password|passwd|pwd|secret|api_key|apikey|token)["']?(?:\s*:\s*[&\w<>\[\].?|]+)?\s*(?:(?:=|:=\s*["'`])\s*\S{8,}|:\s*[^=\s]\S{7,}|(?:=|:=)\s*(?:new\s+)?[A-Za-z_][\w:.]*\s*\(\s*["'`][^"'`]+["'`])|(?:password|passwd|pwd|secret|api_key|apikey|token)["']?\s+[&*\w<>\[\].?|]+\s*=\s*["'`]\S{7,}|\b(?:password|identified\s+by)\s+\\?["'][^"']+["']"#,
+        // A value after a single colon cannot itself start with a colon, so a Rust
+        // path with a double colon is not read as an assignment (#697).
+        // cora-ignore: crypto/hardcoded-secret
+        regex: r#"(?i)(?:password|passwd|pwd|secret|api_key|apikey|token)["']?(?:\s*:\s*[&\w<>\[\].?|]+)?\s*(?:(?:=|:=\s*["'`])\s*\S{8,}|:\s*[^=\s:]\S{7,}|(?:=|:=)\s*(?:new\s+)?[A-Za-z_][\w:.]*\s*\(\s*["'`][^"'`]+["'`])|(?:password|passwd|pwd|secret|api_key|apikey|token)["']?\s+[&*\w<>\[\].?|]+\s*=\s*["'`]\S{7,}|\b(?:password|identified\s+by)\s+\\?["'][^"']+["']"#,
         severity: Severity::Critical,
     },
     // ── Injection ──
@@ -1443,5 +1446,39 @@ mod tests {
             .collect();
         assert!(ids.contains(&"injection/sql-concat".to_string()), "{ids:?}");
         assert!(ids.contains(&"injection/eval".to_string()), "{ids:?}");
+    }
+
+    #[test]
+    fn a_type_path_ending_in_token_default_is_not_a_hardcoded_secret() {
+        let ids = |line: &str| {
+            let diff = format!(
+                "diff --git a/main.rs b/main.rs\n--- a/main.rs\n+++ b/main.rs\n@@ -0,0 +1,1 @@\n+{line}\n"
+            );
+            let chunks = crate::engine::diff_parser::parse_diff(&diff);
+            scan_security(&chunks, 0)
+                .into_iter()
+                .map(|f| f.rule_id)
+                .collect::<Vec<_>>()
+        };
+        for ok in [
+            "let cancel = CancelToken::default();",
+            "let t = Token::from_parts(1, 2, 3);",
+            "let k = ApiKey::generate_random();",
+        ] {
+            assert!(
+                !ids(ok).contains(&"crypto/hardcoded-secret".to_string()),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "let password = \"hunter2hunter2\";",
+            "token: \"abcdef123456789\"",
+            "{\"api_key\": \"abcdef123456\"}",
+        ] {
+            assert!(
+                ids(bad).contains(&"crypto/hardcoded-secret".to_string()),
+                "{bad}"
+            );
+        }
     }
 }
