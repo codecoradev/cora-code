@@ -84,10 +84,11 @@ pub fn postprocess_report(
         Source::Diff(chunks) => {
             let issues = apply_llm_secret_fp_filter(issues, chunks);
             let issues = apply_markdown_code_block_filter(issues, chunks);
-            let issues = apply_ignore_rules(issues, &config.ignore.rules);
+            let issues = apply_ignore_rules(issues, &config.ignore.rules, &config.ignore.scoped);
             // Rule-scoped inline suppression (`cora-ignore: <rule>`, #554),
             // shared by deterministic and LLM findings.
-            let issues = inline_suppress::apply(issues, chunks);
+            let (issues, unmatched) = inline_suppress::apply(issues, chunks);
+            warn_unmatched(&unmatched);
             // Drop low-severity findings on unchanged (context) lines (#507).
             apply_context_line_filter(issues, chunks)
         }
@@ -96,12 +97,22 @@ pub fn postprocess_report(
             // below, after suppression (#624).
             let merged = deterministic::run_files(files, config).merge_into(issues);
             let scan_files = scan_input::from_entries(files);
-            let merged = apply_ignore_rules(merged, &config.ignore.rules);
-            inline_suppress::apply_lines(merged, &scan_files)
+            let merged = apply_ignore_rules(merged, &config.ignore.rules, &config.ignore.scoped);
+            let (kept, unmatched) = inline_suppress::apply_lines(merged, &scan_files);
+            warn_unmatched(&unmatched);
+            kept
         }
     };
     let (issues, dropped) = cap_deterministic(issues, config.rules_config.finding_cap());
     PostprocessReport { issues, dropped }
+}
+
+/// Tell the user about `cora-ignore` markers that suppressed nothing (#679).
+/// Goes to stderr, so JSON / SARIF on stdout stays clean.
+fn warn_unmatched(unmatched: &[inline_suppress::Unmatched]) {
+    for u in unmatched {
+        eprintln!("warning: {}", u.message());
+    }
 }
 
 /// Keep at most `cap` deterministic findings (those carrying a `rule_id`),
@@ -315,26 +326,48 @@ fn apply_markdown_code_block_filter(
     issues
 }
 
-/// Filter out issues whose `issue_type` matches any ignored rule pattern.
-fn apply_ignore_rules(mut issues: Vec<ReviewIssue>, ignore_rules: &[String]) -> Vec<ReviewIssue> {
-    if ignore_rules.is_empty() {
+/// Does `pattern` (an `ignore.rules` string) name this issue?
+fn ignore_pattern_matches(issue: &ReviewIssue, pattern: &str) -> bool {
+    let pattern_lower = pattern.to_lowercase();
+    let issue_type_lower = issue.issue_type.clone().unwrap_or_default().to_lowercase();
+    let exact = pattern.trim().to_lowercase();
+    let id_hit = |s: &str| s.trim().to_lowercase() == exact;
+    issue_type_lower.contains(&pattern_lower)
+        || issue.title.to_lowercase().contains(&pattern_lower)
+        // Rule ids match exactly, including ids of scanner findings
+        // merged into this issue (#597).
+        || issue.rule_id.as_deref().is_some_and(id_hit)
+        || issue.also_matches.iter().any(|a| id_hit(a))
+}
+
+/// Filter out issues whose `issue_type` matches any ignored rule pattern, or
+/// that match a scoped entry (`rule` + `files`) in a file under its globs (#680).
+fn apply_ignore_rules(
+    mut issues: Vec<ReviewIssue>,
+    ignore_rules: &[String],
+    scoped: &[crate::config::schema::ScopedIgnore],
+) -> Vec<ReviewIssue> {
+    if ignore_rules.is_empty() && scoped.is_empty() {
         return issues;
     }
 
+    let scoped: Vec<(&str, crate::engine::path_match::PathMatcher)> = scoped
+        .iter()
+        .map(|s| {
+            (
+                s.rule.as_str(),
+                crate::engine::path_match::PathMatcher::new(&s.files),
+            )
+        })
+        .collect();
     let before = issues.len();
     issues.retain(|issue| {
-        !ignore_rules.iter().any(|pattern| {
-            let pattern_lower = pattern.to_lowercase();
-            let issue_type_lower = issue.issue_type.clone().unwrap_or_default().to_lowercase();
-            let exact = pattern.trim().to_lowercase();
-            let id_hit = |s: &str| s.trim().to_lowercase() == exact;
-            issue_type_lower.contains(&pattern_lower)
-                || issue.title.to_lowercase().contains(&pattern_lower)
-                // Rule ids match exactly, including ids of scanner findings
-                // merged into this issue (#597).
-                || issue.rule_id.as_deref().is_some_and(id_hit)
-                || issue.also_matches.iter().any(|a| id_hit(a))
-        })
+        !ignore_rules
+            .iter()
+            .any(|pattern| ignore_pattern_matches(issue, pattern))
+            && !scoped.iter().any(|(rule, files)| {
+                files.is_match(&issue.file) && ignore_pattern_matches(issue, rule)
+            })
     });
     let filtered = before - issues.len();
     if filtered > 0 {
@@ -921,7 +954,7 @@ mod tests {
         ];
 
         let rules = vec!["Command injection via exec/system with dynamic input".to_string()];
-        let result = apply_ignore_rules(issues, &rules);
+        let result = apply_ignore_rules(issues, &rules, &[]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].title, "SQL injection via string concatenation");
     }
@@ -935,7 +968,7 @@ mod tests {
         ];
 
         let rules = vec!["style".to_string()];
-        let result = apply_ignore_rules(issues, &rules);
+        let result = apply_ignore_rules(issues, &rules, &[]);
         assert!(result.is_empty());
     }
 
@@ -947,7 +980,7 @@ mod tests {
                 .with_body("..."),
         ];
 
-        let result = apply_ignore_rules(issues, &[]);
+        let result = apply_ignore_rules(issues, &[], &[]);
         assert_eq!(result.len(), 1);
     }
 
@@ -965,7 +998,7 @@ mod tests {
         ];
 
         let rules = vec!["Hardcoded Password Or Secret".to_string()];
-        let result = apply_ignore_rules(issues, &rules);
+        let result = apply_ignore_rules(issues, &rules, &[]);
         assert!(result.is_empty());
     }
 
@@ -1173,15 +1206,15 @@ mod tests {
         let mut a = ReviewIssue::new("a.rs", Some(1), Severity::Major, "Plain title")
             .with_type("rule")
             .with_rule_id("sec-hardcoded-secret");
-        let kept = apply_ignore_rules(vec![a.clone()], &["SEC-Hardcoded-Secret".to_string()]);
+        let kept = apply_ignore_rules(vec![a.clone()], &["SEC-Hardcoded-Secret".to_string()], &[]);
         assert!(kept.is_empty());
         // ids are exact, not substring
-        let kept = apply_ignore_rules(vec![a.clone()], &["hardcoded".to_string()]);
+        let kept = apply_ignore_rules(vec![a.clone()], &["hardcoded".to_string()], &[]);
         assert_eq!(kept.len(), 1);
         // merged-away scanner id
         a.rule_id = None;
         a.also_matches = vec!["sec-hardcoded-secret".to_string()];
-        let kept = apply_ignore_rules(vec![a], &["sec-hardcoded-secret".to_string()]);
+        let kept = apply_ignore_rules(vec![a], &["sec-hardcoded-secret".to_string()], &[]);
         assert!(kept.is_empty());
     }
 
@@ -1404,5 +1437,74 @@ mod tests {
         )];
         let out = postprocess(issues, &Source::Diff(&chunks), &Config::default());
         assert!(out.is_empty(), "got {out:?}");
+    }
+
+    // ─── path-scoped ignore.rules (#680) ───
+
+    fn scoped(rule: &str, files: &[&str]) -> crate::config::schema::ScopedIgnore {
+        crate::config::schema::ScopedIgnore {
+            rule: rule.to_string(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            reason: None,
+        }
+    }
+
+    fn issue_in(file: &str, rule_id: &str) -> ReviewIssue {
+        let mut i = ReviewIssue::new(
+            file.to_string(),
+            Some(1),
+            Severity::Minor,
+            format!("[{rule_id}] x"),
+        );
+        i.rule_id = Some(rule_id.to_string());
+        i
+    }
+
+    #[test]
+    fn a_scoped_rule_is_silenced_only_under_its_globs() {
+        let issues = vec![
+            issue_in("crates/cli/src/main.rs", "bug-println"),
+            issue_in("crates/core/src/lib.rs", "bug-println"),
+            issue_in("crates/cli/src/main.rs", "bug-unwrap"),
+        ];
+        let kept = apply_ignore_rules(issues, &[], &[scoped("bug-println", &["crates/cli/**"])]);
+        let ids: Vec<(String, String)> = kept
+            .iter()
+            .map(|i| (i.file.clone(), i.rule_id.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (
+                    "crates/core/src/lib.rs".to_string(),
+                    "bug-println".to_string()
+                ),
+                (
+                    "crates/cli/src/main.rs".to_string(),
+                    "bug-unwrap".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_strings_still_silence_a_rule_everywhere() {
+        let issues = vec![
+            issue_in("a/x.rs", "bug-println"),
+            issue_in("b/y.rs", "bug-println"),
+        ];
+        let kept = apply_ignore_rules(issues, &["bug-println".to_string()], &[]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn scoped_globs_support_double_star_and_file_names() {
+        let issues = vec![
+            issue_in("pkg/deep/subprocess.rs", "bug-expect"),
+            issue_in("pkg/other.rs", "bug-expect"),
+        ];
+        let kept = apply_ignore_rules(issues, &[], &[scoped("bug-expect", &["**/subprocess.rs"])]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].file, "pkg/other.rs");
     }
 }

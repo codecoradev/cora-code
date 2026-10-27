@@ -135,6 +135,30 @@ commit unless `--force` is passed:
 $ cora commit --force
 ```
 
+## Gate every commit (agent first, hook as fallback)
+
+Three layers, strongest first:
+
+1. **Agent judge.** The agent reviews `git diff --cached` with the `/cora-review` skill and calls `cora.review_finalize` with the exact staged diff. Cora records the verdict for that change set.
+2. **Pre-commit hook** (`cora hook install`). If the staged diff is already validated it passes; otherwise it runs `cora review --staged --ci --severity major` (an LLM when configured, deterministic checks otherwise). Exit 2 denies the commit; any other exit is a tooling error, reported as "not a pass".
+3. **CI.** Run `cora review` on pull requests to `develop`, and fail the job when its secrets are missing.
+
+`cora hook verify` prints the state of the staged diff: exit 0 validated, 10 validated but blocking, 11 not validated. Any edit to the staged change invalidates the verdict (24 h expiry).
+
+To stop Claude Code from committing unreviewed changes or using `--no-verify`, add this to `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash", "hooks": [{ "type": "command", "command": "cora hook claude-guard" }] }
+    ]
+  }
+}
+```
+
+The guard is a safety net for honest agents, not a sandbox; the hook and CI remain the enforcement.
+
 ## Configuration File
 
 The `.cora.yaml` file provides persistent configuration. Place it in your project root.

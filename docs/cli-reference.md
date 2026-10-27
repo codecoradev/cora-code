@@ -52,6 +52,8 @@ Complete command reference for the cora CLI.
 | `claude mcp add cora -- cora mcp` | Register the MCP server with Claude Code (`cora install` only adds its `/cora-review` skill) |
 | `cora hook install` | Install pre-commit hook |
 | `cora hook uninstall` | Remove pre-commit hook |
+| `cora hook verify [--quiet]` | Is the staged diff already reviewed? Exit 0 validated, 10 validated but blocking, 11 not validated |
+| `cora hook claude-guard` | Claude Code `PreToolUse` hook: reads the tool call from stdin, denies (exit 2) an unreviewed or blocking `git commit` and any `--no-verify` |
 | `cora completion` `<shell>` | Generate shell completions (bash/zsh/fish/powershell) |
 
 ### Review & Scan
@@ -89,6 +91,7 @@ Complete command reference for the cora CLI.
 | `cora scan --exclude` `"vendor/**"` | Exclude glob patterns |
 | `cora scan --extensions` `"ts,js"` | Additional file extensions to scan |
 | `cora scan --incremental` | Scan only files changed since last scan |
+| `cora scan --min-severity` `minor` | Hide findings below `info`, `minor`, `major` or `critical` in every output format and in the count (blocking still follows `hook.min_severity`) |
 | `cora scan --focus` `security` | Override focus areas |
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |

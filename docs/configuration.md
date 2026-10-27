@@ -437,25 +437,37 @@ profile: security-first
 
 ## Custom Rule Engine
 
-Write your own regex-based rules in `.cora.yaml`:
+Write your own regex-based rules under `rules_engine.custom` in `.cora.yaml`:
 
 ```yaml
-rules:
-  - id: no-unwrap
-    pattern: "\\.unwrap\\(\\)"
-    severity: minor
-    message: "Avoid unwrap() in production code — use proper error handling"
-    languages: ["rust"]
-    exclude: ["tests/**"]
+rules_engine:
+  custom:
+    - id: no-unwrap
+      pattern: "\\.unwrap\\(\\)"
+      severity: minor
+      message: "Avoid unwrap() in production code — use proper error handling"
+      languages: ["rs"]
+      exclude: ["tests/**"]
 
-  - id: no-console-log
-    pattern: "console\\.log\\("
-    severity: minor
-    message: "Remove console.log before merging"
-    languages: ["typescript", "javascript"]
+    - id: no-console-log
+      pattern: "console\\.log\\("
+      severity: minor
+      message: "Remove console.log before merging"
+      languages: ["ts", "js"]
 ```
 
-Rules run during the deterministic pre-scan phase (no LLM needed).
+| Field | Required | Description |
+|-------|----------|-------------|
+| `id` | yes | Unique rule id; must not collide with a built-in rule id (it is what `ignore.rules` and `cora-ignore` name) |
+| `pattern` | yes | A regex matched against each line; an invalid regex is a config error |
+| `severity` | yes | `critical`, `major`, `minor` or `info` |
+| `message` | yes | The finding text |
+| `languages` | no (default `["all"]`) | File extensions (`"rs"`, `"py"`, `"ts"`) or language names (`"rust"`, `"typescript"`); `"all"` or `"*"` matches every file. An unknown value is a config error |
+| `exclude` | no (default none) | Glob patterns of paths to skip |
+
+The top-level `rules:` key is a different thing: a list of free-text instructions for the LLM reviewer (strings), not rule objects.
+
+Rules run during the deterministic pre-scan phase (no LLM needed). `cora config validate` rejects an invalid pattern, a duplicate id, an unknown language or an empty message with the rule id. `cora config validate --dry-run [--path DIR]` also runs every custom rule over the project and prints how many lines each one matched, so a rule that matches nothing is visible.
 
 ### Index Scanner Configuration
 
@@ -482,6 +494,7 @@ rules_engine:
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
 | `max_findings` | `int` | `50` | Max deterministic findings shown per run; Critical and Major are never hidden (`0` or `null` = unlimited). See below |
 | `include_tests` | `bool` | `false` | Scan test code like any other code (see "Test code" below) |
+| `clone_hints` | `bool` | `false` | Run the `qual-clone` hint for Rust `.clone()` calls (info; noisy on idiomatic Rust, so off by default) |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
 
 #### Test code
@@ -550,9 +563,28 @@ const next = compute();
 - If an LLM finding and a scanner finding on the same line describe the same problem (they share a topic word, e.g. both are about a hardcoded password/secret), only the LLM finding is reported, and a marker (or `ignore.rules` entry) naming the scanner rule's id or title still suppresses it. If the LLM finding is about something else (say SQL injection next to a hardcoded secret), both are reported and a marker only suppresses the one it names.
 - Scope: the same line; plus the next line when the marker line contains only a comment.
 - A bare `cora-ignore` (no `:` or empty rule list) suppresses nothing, so every suppression names its rule.
+- The rule list runs to the end of the line (or the comment terminator). Put an explanation after ` -- `: `// cora-ignore: sec-hardcoded-secret -- env var name, not a value`. Text without the separator becomes part of the rule name.
+- A marker on a line that has findings but names none of them (a typo, an unknown rule, trailing text) prints `warning: cora-ignore at FILE:LINE matched no finding ...` on stderr, listing the rule ids that are on that line.
 - Applies to both deterministic scanner and LLM findings, in both `cora review` and `cora scan`. Other rules on the same line and the rest of the project stay visible. Works alongside `ignore.rules` and `ignore.files`.
 - `cora review` reads markers from the diff (added and context lines); a marker outside the diff's context window is not seen. `cora scan` reads markers from the full file contents.
 - `cora scan` also runs the deterministic secrets and security scanners on every scanned file and applies `ignore.rules`, so those findings are reported even when the LLM call fails.
+
+## Path-scoped ignore rules
+
+`ignore.rules` entries can be plain strings (the rule is silenced everywhere) or objects that silence a rule only under some paths:
+
+```yaml
+ignore:
+  rules:
+    - "Hardcoded password or secret"          # whole project
+    - rule: bug-println
+      files: ["crates/cli/**", "evals/**"]    # only these paths
+    - rule: bug-expect
+      files: ["**/subprocess.rs"]
+      reason: "expects state a local invariant"   # optional, for reviewers
+```
+
+`rule` is matched like a plain entry (rule id or title fragment). `files` uses the same globs as `ignore.files` and must not be empty (an empty list is a config error). It applies to `review`, `scan` and the MCP tools, before the `max_findings` cap. `reason` is documentation for the people reading the config.
 
 ## Ignore Files
 

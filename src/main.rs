@@ -66,15 +66,15 @@ struct GlobalOptions {
     pub no_color: bool,
 
     /// LLM provider name (e.g. openai, anthropic, ollama)
-    #[clap(long, global = true, env = "CORA_PROVIDER")]
+    #[clap(long, global = true, env = "CORA_PROVIDER", hide_env_values = true)]
     pub provider: Option<String>,
 
     /// LLM model name (e.g. gpt-4o-mini, claude-3-haiku)
-    #[clap(long, global = true, env = "CORA_MODEL")]
+    #[clap(long, global = true, env = "CORA_MODEL", hide_env_values = true)]
     pub model: Option<String>,
 
     /// API base URL
-    #[clap(long, global = true, env = "CORA_BASE_URL")]
+    #[clap(long, global = true, env = "CORA_BASE_URL", hide_env_values = true)]
     pub base_url: Option<String>,
 
     /// API key (or set `CORA_API_KEY` env var for CI, or use `cora auth login`)
@@ -386,6 +386,11 @@ enum Command {
         #[clap(long)]
         no_continue_on_batch_error: bool,
 
+        /// Hide findings below this severity in the output and the summary
+        /// count (blocking is still decided by `hook.min_severity`)
+        #[clap(long, value_name = "LEVEL", value_parser = ["info", "minor", "major", "critical"])]
+        min_severity: Option<String>,
+
         /// Deterministic checks only: never call an LLM (also the automatic
         /// behavior when no API key is configured)
         #[clap(long)]
@@ -602,6 +607,24 @@ enum HookAction {
     Install,
     /// Uninstall the pre-commit hook
     Uninstall,
+    /// Check whether the staged diff was already reviewed (agent or CLI)
+    ///
+    /// Exit codes: 0 validated or nothing reviewable staged, 10 validated but
+    /// the verdict blocks, 11 not validated. `cora.review_finalize` and
+    /// `cora review --staged` record the validation; the pre-commit hook asks
+    /// this first and falls back to a full review.
+    Verify {
+        /// Print nothing, only set the exit code
+        #[clap(long, short)]
+        quiet: bool,
+    },
+    /// Claude Code PreToolUse guard: deny `git commit` unless the staged diff is validated
+    ///
+    /// Reads the hook JSON on stdin. Configure it in Claude Code settings as a
+    /// PreToolUse hook with matcher `Bash` and command `cora hook claude-guard`.
+    /// Denies `git commit --no-verify` and commits of an unreviewed staged diff;
+    /// allows everything else.
+    ClaudeGuard,
 }
 
 #[derive(Subcommand, Debug)]
@@ -652,7 +675,15 @@ enum ConfigAction {
         global: bool,
     },
     /// Validate the current configuration and report status
-    Validate,
+    Validate {
+        /// Also run each custom rule over the project and report how many
+        /// lines it matched (a rule with 0 matches is flagged)
+        #[clap(long)]
+        dry_run: bool,
+        /// Directory for `--dry-run` (default: current directory)
+        #[clap(long, requires = "dry_run")]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1222,6 +1253,7 @@ async fn main() -> Result<()> {
             focus,
             batch_files,
             no_continue_on_batch_error,
+            min_severity,
             no_llm,
         } => {
             cmd_scan(
@@ -1235,6 +1267,7 @@ async fn main() -> Result<()> {
                     focus,
                     batch_files,
                     continue_on_batch_error: !no_continue_on_batch_error,
+                    min_severity,
                     no_llm,
                 },
             )
@@ -1279,6 +1312,8 @@ async fn main() -> Result<()> {
                 hook_cmd::execute_hook_uninstall()?;
                 0
             }
+            HookAction::Verify { quiet } => hook_cmd::execute_hook_verify(quiet)?,
+            HookAction::ClaudeGuard => hook_cmd::execute_claude_guard()?,
         },
         Command::Auth { action } => {
             match action {
@@ -1311,8 +1346,16 @@ async fn main() -> Result<()> {
                 config_cmd::execute_config_set(&key, &value, global)?;
                 0
             }
-            ConfigAction::Validate => {
-                config_cmd::execute_config_validate(cli.global.config.as_deref())?
+            ConfigAction::Validate { dry_run, path } => {
+                let code = config_cmd::execute_config_validate(cli.global.config.as_deref())?;
+                if dry_run && code == 0 {
+                    config_cmd::execute_config_dry_run(
+                        cli.global.config.as_deref(),
+                        path.as_deref(),
+                    )?
+                } else {
+                    code
+                }
             }
         },
         Command::Providers => {
@@ -1495,6 +1538,7 @@ struct ScanOpts {
     focus: Vec<String>,
     batch_files: usize,
     continue_on_batch_error: bool,
+    min_severity: Option<String>,
     no_llm: bool,
 }
 
@@ -1733,6 +1777,7 @@ async fn cmd_scan(globals: &GlobalOptions, opts: ScanOpts) -> Result<i32> {
         focus: opts.focus,
         batch_files: opts.batch_files,
         continue_on_batch_error: opts.continue_on_batch_error,
+        min_severity: opts.min_severity,
     };
 
     scan::execute_scan(&config, &judge, &scan_opts, format).await

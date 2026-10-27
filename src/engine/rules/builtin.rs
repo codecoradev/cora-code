@@ -69,7 +69,9 @@ pub fn builtin_rules() -> Vec<CustomRule> {
         },
         CustomRule {
             id: "bug-println".to_string(),
-            pattern: r"(?:println!|dbg!|print!\s*\()".to_string(),
+            // `eprintln!` / `eprint!` write to stderr (diagnostics) and are not matched:
+            // the macro name must not be preceded by an identifier character (#682).
+            pattern: r"(?:^|[^A-Za-z0-9_])(?:println!|dbg!|print!\s*\()".to_string(),
             severity: Severity::Minor,
             message: "Debug output macro found. Remove `println!`/`dbg!`/`print!` before merging.".to_string(),
             languages: vec!["rs".to_string()],
@@ -567,6 +569,8 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
     match rule_id {
         "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line, path),
         "bug-println" => is_cli_output_path(path),
+        "bug-todo" => !is_deliberate_todo_marker(line),
+        "bug-expect" => is_invariant_expect(line),
         "sec-hardcoded-url" => is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
         "injection/sql-concat" | "sec-sql-concat" => is_false_positive_sql_concat(line),
@@ -578,15 +582,56 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
     }
 }
 
+/// `bug-todo` fires only on a deliberate marker: an upper-case `TODO`, `FIXME`,
+/// `HACK` or `XXX` whole word inside a comment (#681). The word "todo" in an
+/// identifier, a module name or prose (`pub mod todo;`, "the todo list") is not
+/// a marker.
+fn is_deliberate_todo_marker(line: &str) -> bool {
+    static COMMENT_START: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"//|/\*|<!--|#|--|%|^\s*\*").expect("comment start regex")
+    });
+    static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:TODO|FIXME|HACK|XXX)\b").expect("marker regex")
+    });
+    let Some(start) = COMMENT_START.find(line) else {
+        return false;
+    };
+    MARKER.is_match(&line[start.start()..])
+}
+
+/// `.expect("<message>")` with a non-empty message documents an invariant, the
+/// panic style the Rust API guidelines recommend over a bare `unwrap()`; only
+/// `.expect("")` is flagged (#682). Returns `true` to suppress.
+fn is_invariant_expect(line: &str) -> bool {
+    let Some(i) = line.find(".expect(\"") else {
+        return false;
+    };
+    !line[i + ".expect(\"".len()..].starts_with('"')
+}
+
 /// `println!` is the intended output of a program's entry point: `main.rs`,
-/// `src/bin/`, `examples/`, `benches/` (#663). Other files keep the rule; a
-/// crate's own `commands/` modules can be silenced with `ignore.rules` or
-/// `bug-println` in a profile.
+/// `src/bin/`, `examples/`, `benches/` (#663). Every module of a binary-only
+/// package is exempt as well, but that needs the project root, so the rule
+/// engine checks it ([`is_in_binary_only_package`], #682).
 fn is_cli_output_path(path: &str) -> bool {
     let p = path.replace('\\', "/");
     p.rsplit('/').next() == Some("main.rs")
         || p.split('/')
             .any(|seg| matches!(seg, "bin" | "examples" | "benches"))
+}
+
+/// Is `p` (relative to `base`, the project root) under a `<package>/src/`
+/// whose package has `src/main.rs` and no `src/lib.rs`? In such a package
+/// stdout is the program's interface (#682).
+pub fn is_in_binary_only_package(base: &std::path::Path, p: &str) -> bool {
+    let p = p.replace('\\', "/");
+    let segments: Vec<&str> = p.split('/').collect();
+    let Some(src_idx) = segments.iter().position(|seg| *seg == "src") else {
+        return false;
+    };
+    let package: std::path::PathBuf = segments[..src_idx].iter().collect();
+    let src_dir = base.join(package).join("src");
+    src_dir.join("main.rs").is_file() && !src_dir.join("lib.rs").is_file()
 }
 
 /// Check if an `http://` URL match is a false positive.
@@ -1711,5 +1756,49 @@ mod tests {
     fn query_append_concatenation_stays_flagged() {
         let line = r#"query += " AND name = '" + name + "'""#;
         assert!(!post_match_filter_for_path("sec-sql-concat", line, "a.py"));
+    }
+
+    #[test]
+    fn every_module_of_a_binary_only_package_is_program_code() {
+        let d = tempfile::tempdir().unwrap();
+        let w = |rel: &str| {
+            let p = d.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+        };
+        w("crates/cli/src/main.rs");
+        w("crates/cli/src/commands/review.rs");
+        w("crates/core/src/lib.rs");
+        w("crates/core/src/engine.rs");
+        w("crates/both/src/main.rs");
+        w("crates/both/src/lib.rs");
+        w("crates/both/src/util.rs");
+        w("src/main.rs");
+        w("src/cmd.rs");
+        let b = d.path();
+        assert!(is_in_binary_only_package(
+            b,
+            "crates/cli/src/commands/review.rs"
+        ));
+        assert!(
+            is_in_binary_only_package(b, "src/cmd.rs"),
+            "package at the root"
+        );
+        assert!(
+            !is_in_binary_only_package(b, "crates/core/src/engine.rs"),
+            "library"
+        );
+        assert!(
+            !is_in_binary_only_package(b, "crates/both/src/util.rs"),
+            "lib + bin keeps the rule"
+        );
+        assert!(
+            !is_in_binary_only_package(b, "crates/unknown/src/a.rs"),
+            "no package files"
+        );
+        assert!(
+            !is_in_binary_only_package(b, "docs/readme.md"),
+            "outside src/"
+        );
     }
 }

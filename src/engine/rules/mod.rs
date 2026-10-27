@@ -7,7 +7,7 @@ pub mod types;
 use tracing::debug;
 
 use crate::engine::diff_parser::{FileChunk, parse_diff};
-use crate::engine::rules::types::{RuleFinding, RulesConfig};
+use crate::engine::rules::types::{CustomRule, RuleFinding, RulesConfig};
 use crate::engine::scan_input::{self, ScanFile};
 use crate::engine::types::{ReviewIssue, Severity};
 
@@ -45,6 +45,71 @@ const TEST_EXEMPT_RULES: &[&str] = &[
     "sec-hardcoded-secret",
 ];
 
+/// Lint custom rules: returns one message per problem (empty = fine).
+///
+/// Catches what would otherwise fail silently: a pattern that is not a valid
+/// regex, an id that is empty, duplicated or shadows a built-in rule, an empty
+/// message, and `languages` values that match no file (#684, #678).
+pub fn validate_custom_rules(rules: &[CustomRule]) -> Vec<String> {
+    let builtin_ids: std::collections::HashSet<String> =
+        builtin::builtin_rules().into_iter().map(|r| r.id).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut errs = Vec::new();
+    for (i, r) in rules.iter().enumerate() {
+        let name = if r.id.is_empty() {
+            format!("rules_engine.custom[{i}]")
+        } else {
+            format!("rules_engine.custom[{i}] ({})", r.id)
+        };
+        if r.id.trim().is_empty() {
+            errs.push(format!("{name}: id must not be empty"));
+        } else if builtin_ids.contains(&r.id) {
+            errs.push(format!("{name}: id collides with a built-in rule"));
+        } else if !seen.insert(r.id.clone()) {
+            errs.push(format!("{name}: duplicate id"));
+        }
+        if let Err(e) = regex::Regex::new(&r.pattern) {
+            errs.push(format!("{name}: pattern is not a valid regex: {e}"));
+        }
+        if r.message.trim().is_empty() {
+            errs.push(format!("{name}: message must not be empty"));
+        }
+        if r.languages.is_empty() {
+            errs.push(format!(
+                "{name}: languages is empty, so the rule can never match; use [\"all\"] or file extensions like [\"rs\"]"
+            ));
+        }
+        for lang in &r.languages {
+            if matching::normalize_language(lang).is_none() {
+                errs.push(format!(
+                    "{name}: languages entry \"{lang}\" is not a known extension or language (use e.g. \"rs\", \"py\", \"ts\", or \"all\")"
+                ));
+            }
+        }
+    }
+    errs
+}
+
+/// The git toplevel of the working directory: diff paths are relative to it.
+/// Unit tests run inside this repository, so they never probe it.
+fn git_toplevel() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    static TOPLEVEL: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    TOPLEVEL
+        .get_or_init(|| {
+            let out = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+        })
+        .clone()
+}
+
 pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFinding> {
     if !config.enabled {
         debug!("rule engine is disabled");
@@ -52,12 +117,18 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
     }
 
     let mut all_rules = builtin::builtin_rules();
+    if !config.clone_hints {
+        // `.clone()` hints are noise on idiomatic Rust (Arc::clone, handles for threads).
+        all_rules.retain(|r| r.id != "qual-clone");
+    }
     all_rules.extend(config.custom_rules.clone());
 
     // Compile regex patterns once before the matching loop (Fix #41)
     for rule in &mut all_rules {
         rule.ensure_compiled();
     }
+
+    let root = config.project_root.clone().or_else(git_toplevel);
 
     debug!(
         rule_count = all_rules.len(),
@@ -95,7 +166,12 @@ pub fn run_rules_in(files: &[ScanFile<'_>], config: &RulesConfig) -> Vec<RuleFin
                 }
 
                 // Post-match filter (e.g., allow localhost URLs)
-                if builtin::post_match_filter_for_path(&rule.id, content, file_path) {
+                if builtin::post_match_filter_for_path(&rule.id, content, file_path)
+                    || (rule.id == "bug-println"
+                        && root
+                            .as_deref()
+                            .is_some_and(|r| builtin::is_in_binary_only_package(r, file_path)))
+                {
                     continue;
                 }
 
@@ -317,6 +393,74 @@ mod tests {
     use super::*;
     use crate::engine::Severity;
 
+    #[test]
+    fn qual_clone_is_opt_in() {
+        let entry = file_entry("src/lib.rs", "fn f(a: &Arc<S>) { let b = a.clone(); }\n");
+        let off = rule_ids(&entry, &default_config());
+        assert!(!off.iter().any(|i| i.starts_with("qual-clone")), "{off:?}");
+        let mut cfg = default_config();
+        cfg.clone_hints = true;
+        let on = rule_ids(&entry, &cfg);
+        assert!(on.iter().any(|i| i.starts_with("qual-clone")), "{on:?}");
+    }
+
+    fn rule(id: &str, pattern: &str, languages: &[&str]) -> CustomRule {
+        CustomRule {
+            id: id.into(),
+            pattern: pattern.into(),
+            severity: Severity::Major,
+            message: "m".into(),
+            languages: languages.iter().map(|s| s.to_string()).collect(),
+            exclude: vec![],
+            compiled_pattern: None,
+        }
+    }
+
+    #[test]
+    fn a_valid_custom_rule_has_no_problems() {
+        assert!(validate_custom_rules(&[rule("mine", "fn a", &["rs"])]).is_empty());
+        assert!(
+            validate_custom_rules(&[rule("mine", "x", &["rust", "TypeScript", "*"])]).is_empty()
+        );
+    }
+
+    #[test]
+    fn validation_reports_each_silent_failure_with_the_rule_id() {
+        let errs = validate_custom_rules(&[
+            rule("bad", "(", &["rs"]),
+            rule("lang", "x", &["klingon"]),
+            rule("lang", "x", &[]),
+            rule("bug-todo", "x", &["rs"]),
+        ]);
+        let all = errs.join("\n");
+        assert!(
+            all.contains("(bad)") && all.contains("not a valid regex"),
+            "{all}"
+        );
+        assert!(all.contains("klingon"), "{all}");
+        assert!(all.contains("duplicate id"), "{all}");
+        assert!(all.contains("languages is empty"), "{all}");
+        assert!(all.contains("collides with a built-in rule"), "{all}");
+    }
+
+    #[test]
+    fn language_names_match_files_like_extensions() {
+        let r = rule("mine", "fn a", &["rust"]);
+        assert!(matching::matches_language(&r, "rs"));
+        assert!(!matching::matches_language(&r, "py"));
+        assert!(matching::matches_language(&rule("m", "x", &["tsx"]), "ts"));
+    }
+
+    #[test]
+    fn exclude_and_languages_are_optional_in_yaml() {
+        let r: CustomRule = serde_yaml_ng::from_str(
+            "id: no-console-log\npattern: 'console'\nseverity: minor\nmessage: no\n",
+        )
+        .unwrap();
+        assert!(r.exclude.is_empty());
+        assert_eq!(r.languages, vec!["all".to_string()]);
+    }
+
     fn default_config() -> RulesConfig {
         RulesConfig {
             enabled: true,
@@ -324,6 +468,8 @@ mod tests {
             custom_rules: Vec::new(),
             index_skip_files: super::types::default_index_skip_files(),
             include_tests: false,
+            clone_hints: false,
+            project_root: None,
         }
     }
 
@@ -740,6 +886,52 @@ mod tests {
             .into_iter()
             .map(|f| format!("{}@{}", f.rule_id, f.line))
             .collect()
+    }
+
+    const TODO_SRC: &str = "\
+pub mod todo;
+fn f() { let todo_state = 1; let _ = todo_state; }
+/// the todo list is per session
+fn g() {}
+// TODO(me): real marker
+// todo lower case is prose
+// FIXME: also real
+# HACK in a hash comment
+";
+
+    #[test]
+    fn bug_todo_flags_only_deliberate_markers() {
+        let entry = file_entry("src/a.rs", TODO_SRC);
+        let ids: Vec<String> = rule_ids(&entry, &default_config())
+            .into_iter()
+            .filter(|i| i.starts_with("bug-todo"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["bug-todo@5", "bug-todo@7", "bug-todo@8"],
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn bug_println_ignores_stderr_macros_but_keeps_stdout_ones() {
+        let src = "fn a(){ println!(\"x\"); }\nfn b(){ eprintln!(\"ok\"); }\nfn c(){ print!(\"y\"); }\nfn d(){ eprint!(\"z\"); }\n";
+        let entry = file_entry("src/lib.rs", src);
+        let ids: Vec<String> = rule_ids(&entry, &default_config())
+            .into_iter()
+            .filter(|i| i.starts_with("bug-println"))
+            .collect();
+        assert_eq!(ids, vec!["bug-println@1", "bug-println@3"], "{ids:?}");
+    }
+
+    #[test]
+    fn bug_expect_flags_an_empty_message_but_not_a_stated_invariant() {
+        let src = "fn a(){ c.stdout.take().expect(\"stdout piped above\"); }\nfn b(){ x.expect(\"\"); }\nfn c(){ y.unwrap(); }\n";
+        let entry = file_entry("src/lib.rs", src);
+        let ids = rule_ids(&entry, &default_config());
+        assert!(!ids.contains(&"bug-expect@1".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bug-expect@2".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bug-unwrap@3".to_string()), "{ids:?}");
     }
 
     const RUST_WITH_TESTS: &str = "\

@@ -44,6 +44,33 @@ pub struct ScanOptions {
     /// When true (default), a failed batch is skipped with a warning and the
     /// rest of the scan continues. When false, a failed batch aborts the run.
     pub continue_on_batch_error: bool,
+    /// Hide findings below this severity (`info`, `minor`, `major`,
+    /// `critical`) in every output format and in the summary count. Blocking
+    /// is still decided by `hook.min_severity`.
+    pub min_severity: Option<String>,
+}
+
+/// ` (1 critical, 2 major, 306 info)`, or an empty string when there are no
+/// findings, so a long list of info findings cannot hide a critical one.
+fn severity_breakdown(issues: &[crate::engine::ReviewIssue]) -> String {
+    use crate::engine::types::Severity;
+    let parts: Vec<String> = [
+        Severity::Critical,
+        Severity::Major,
+        Severity::Minor,
+        Severity::Info,
+    ]
+    .into_iter()
+    .filter_map(|sev| {
+        let n = issues.iter().filter(|i| i.severity == sev).count();
+        (n > 0).then(|| format!("{n} {}", sev.label().to_lowercase()))
+    })
+    .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 /// Execute the scan command.
@@ -66,6 +93,12 @@ pub async fn execute_scan(
         anyhow::bail!("scan path '{}' is not a directory", root.display());
     }
 
+    // Scanned paths are relative to `root`, which need not be the working
+    // directory (`--path`): rules that look at the project layout use it (#682).
+    let mut rooted = config.clone();
+    rooted.rules_config.project_root = Some(root.canonicalize().unwrap_or_else(|_| root.clone()));
+    let config = &rooted;
+
     // Merge include/exclude with config ignore patterns
     let include = opts.include.clone();
     let mut exclude = config.ignore.files.clone();
@@ -85,22 +118,8 @@ pub async fn execute_scan(
 
     // 1b. Incremental: filter out unchanged files
     if opts.incremental {
-        let cache = ScanCache::load()?;
         let before_count = files.len();
-        let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-        files.retain(|f| {
-            let abs_path = root_abs.join(&f.path);
-            let Some(hash) = file_content_hash(&abs_path) else {
-                return true; // can't read file, rescan it
-            };
-            match cache.get(&root_abs, &f.path) {
-                Some(cached_hash) if cached_hash == hash => {
-                    debug!(file = %f.path, "skipping unchanged file (incremental)");
-                    false
-                }
-                _ => true,
-            }
-        });
+        retain_changed(&root, &mut files)?;
         let skipped = before_count - files.len();
         if skipped > 0 {
             eprintln!(
@@ -188,7 +207,6 @@ pub async fn execute_scan(
     if let Some(w) = dropped_warning(dropped, config) {
         eprintln!("{}", w.yellow());
     }
-    let issue_count = all_issues.len();
     // Scan lists every finding; only `hook.min_severity` decides blocking.
     let shaped = finalize::shape_issues(
         &mut all_issues,
@@ -201,6 +219,13 @@ pub async fn execute_scan(
         },
     );
     let should_block = shaped.should_block;
+    // `--min-severity` only changes what is shown, never the blocking decision.
+    if let Some(min) = opts.min_severity.as_deref() {
+        let min = crate::engine::types::Severity::from_str_lossy(min);
+        all_issues.retain(|i| i.severity <= min);
+    }
+    let issue_count = all_issues.len();
+    let by_severity = severity_breakdown(&all_issues);
 
     // A clean deterministic result is not an AI scan: say so in the summary.
     let no_judge_note = if matches!(judge, JudgeChoice::Deterministic) {
@@ -214,10 +239,11 @@ pub async fn execute_scan(
         files_scanned: files.len(),
         lines_scanned: total_lines,
         summary: format!(
-            "Scanned {} files ({} lines), found {} issues{}.",
+            "Scanned {} files ({} lines), found {} issues{}{}.",
             files.len(),
             total_lines,
             issue_count,
+            by_severity,
             if dropped > 0 {
                 format!(
                     " ({dropped} more deterministic findings not shown, rules.max_findings cap)"
@@ -236,16 +262,7 @@ pub async fn execute_scan(
 
     // 6. Save scan cache for incremental mode
     if opts.incremental {
-        let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-        let mut cache = ScanCache::load().unwrap_or_default();
-        for f in &files {
-            let abs_path = root_abs.join(&f.path);
-            let Some(hash) = file_content_hash(&abs_path) else {
-                continue; // can't read file, skip cache entry
-            };
-            cache.set(&root_abs, &f.path, &hash);
-        }
-        cache.save()?;
+        record_scanned(&root, &files)?;
         debug!(cached = files.len(), "saved scan cache");
     }
 
@@ -395,6 +412,37 @@ pub(crate) fn finalize_issues(
     (report.issues, report.dropped)
 }
 
+/// Incremental mode: drop files whose content hash matches the scan cache.
+pub(crate) fn retain_changed(root: &std::path::Path, files: &mut Vec<FileEntry>) -> Result<()> {
+    let cache = ScanCache::load()?;
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    files.retain(|f| {
+        let Some(hash) = file_content_hash(&root_abs.join(&f.path)) else {
+            return true; // can't read file, rescan it
+        };
+        match cache.get(&root_abs, &f.path) {
+            Some(cached_hash) if cached_hash == hash => {
+                debug!(file = %f.path, "skipping unchanged file (incremental)");
+                false
+            }
+            _ => true,
+        }
+    });
+    Ok(())
+}
+
+/// Incremental mode: remember the hashes of the files just scanned.
+pub(crate) fn record_scanned(root: &std::path::Path, files: &[FileEntry]) -> Result<()> {
+    let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut cache = ScanCache::load().unwrap_or_default();
+    for f in files {
+        if let Some(hash) = file_content_hash(&root_abs.join(&f.path)) {
+            cache.set(&root_abs, &f.path, &hash);
+        }
+    }
+    cache.save()
+}
+
 /// Compute a short SHA256 hash of a file's content for incremental scanning.
 /// Returns None if the file cannot be read (caller should rescan it).
 #[allow(clippy::format_collect)]
@@ -542,6 +590,7 @@ mod tests {
             focus: vec![],
             batch_files: 0,
             continue_on_batch_error: true,
+            min_severity: None,
         };
         let code = execute_scan(&config, &JudgeChoice::Llm(llm), &opts, OutputFormat::Json)
             .await
@@ -662,6 +711,7 @@ mod tests {
             focus: vec![],
             batch_files: 0,
             continue_on_batch_error: true,
+            min_severity: None,
         };
         let code = execute_scan(
             &config,

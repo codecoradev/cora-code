@@ -26,6 +26,13 @@ pub struct RulesConfig {
     /// high-confidence patterns on inline test blocks (#663).
     #[serde(default)]
     pub include_tests: bool,
+    /// Run the noisy `qual-clone` hint (`.clone()` in Rust). Off by default (#683).
+    pub clone_hints: bool,
+    /// Root the scanned paths are relative to (set by `cora scan` and the MCP
+    /// scan tools; `None` = the git toplevel of the working directory). Used to
+    /// find the package a file belongs to (#682). Not configurable.
+    #[serde(skip)]
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Default skip patterns for index scanners — common false-positive sources.
@@ -75,6 +82,8 @@ impl Default for RulesConfig {
             custom_rules: Vec::new(),
             index_skip_files: default_index_skip_files(),
             include_tests: false,
+            clone_hints: false,
+            project_root: None,
         }
     }
 }
@@ -90,13 +99,20 @@ pub struct CustomRule {
     pub severity: Severity,
     /// Human-readable description used as the finding body.
     pub message: String,
-    /// Languages this rule applies to. `["all"]` means all languages.
+    /// Languages this rule applies to: file extensions (`"rs"`) or language
+    /// names (`"rust"`). `["all"]` (or `"*"`) means all languages; omitted = all.
+    #[serde(default = "default_languages")]
     pub languages: Vec<String>,
-    /// Glob patterns for file paths to exclude from this rule.
+    /// Glob patterns for file paths to exclude from this rule (default: none).
+    #[serde(default)]
     pub exclude: Vec<String>,
     /// Pre-compiled regex for the pattern (populated after rule assembly).
     #[serde(skip, default)]
     pub compiled_pattern: Option<regex::Regex>,
+}
+
+fn default_languages() -> Vec<String> {
+    vec!["all".to_string()]
 }
 
 impl CustomRule {

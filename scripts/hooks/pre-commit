@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Repo pre-commit hook: fmt, clippy (when Rust files are staged), then the cora gate.
+# Enable once per clone with scripts/setup-hooks.sh.
+set -uo pipefail
+
+CORA_BIN="${CORA_BIN:-cora}"
+
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "cargo fmt --all -- --check failed. Run: cargo fmt --all" >&2
+    exit 1
+fi
+
+if git diff --cached --name-only | grep -q '\.rs$'; then
+    if ! cargo clippy --all-targets --features tree-sitter -- -D warnings >/dev/null 2>&1; then
+        echo "cargo clippy failed. Run it and fix the warnings before committing." >&2
+        exit 1
+    fi
+fi
+
+# Already reviewed (by an agent or by `cora review --staged`)? Then it passes.
+"$CORA_BIN" hook verify --quiet
+case $? in
+    0) exit 0 ;;
+    10)
+        echo "cora: the staged diff was reviewed and the verdict blocks the commit." >&2
+        exit 2
+        ;;
+esac
+
+"$CORA_BIN" review --staged --ci --severity major --format compact
+case $? in
+    0) exit 0 ;;
+    2)
+        echo "cora review found blocking issues. Do not use --no-verify to get past them." >&2
+        exit 2
+        ;;
+    *)
+        echo "cora review hit a tooling error. That is not a pass." >&2
+        exit 0
+        ;;
+esac

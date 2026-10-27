@@ -27,7 +27,9 @@ use crate::engine::judge::{AgentJudge, admit};
 use crate::engine::llm;
 use crate::engine::postprocess::Source;
 use crate::engine::review;
-use crate::engine::scanner::{FileEntry, batch_files, walk_project};
+use crate::engine::scanner::{
+    FileEntry, batch_files, format_batch_for_prompt, order_source_first, walk_project,
+};
 use crate::engine::types::{ReviewIssue, Severity};
 
 use super::protocol::{Tool, ToolResult};
@@ -94,24 +96,37 @@ pub fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "cora.scan_prepare".to_string(),
-            description: "Agent-as-reviewer scan, step 1. Prepare one batch of project files for you to review with your own model (no LLM in cora). Page through batches with `batch` (0-based) until `batch` reaches total_batches - 1; deterministic findings are returned with batch 0. Then call cora.scan_finalize once with all your findings. The path must be inside the current project.".to_string(),
+            description: "Agent-as-reviewer scan, step 1. Prepare one batch of project files for you to review with your own model (no LLM in cora). Page through batches with `batch` (0-based) until `batch` reaches total_batches - 1; deterministic findings are returned with batch 0. Optional include/exclude/extensions/incremental/changed_since select files; `order` defaults to source-first. Every response carries total_chars, estimated_tokens and per-batch sizes for planning. Then call cora.scan_finalize once with all your findings. The path must be inside the current project.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Directory to scan, inside the current working directory (default: the working directory)" },
-                    "batch": { "type": "integer", "description": "0-based batch index (default 0)" }
+                    "batch": { "type": "integer", "description": "0-based batch index (default 0)" },
+                    "include": { "type": "array", "items": { "type": "string" }, "description": "Only scan files matching these globs, relative to path (e.g. [\"crates/**/*.rs\"])" },
+                    "exclude": { "type": "array", "items": { "type": "string" }, "description": "Skip files matching these globs, in addition to the config's ignore.files" },
+                    "extensions": { "type": "array", "items": { "type": "string" }, "description": "Extra file extensions to scan, beyond the defaults" },
+                    "incremental": { "type": "boolean", "description": "Skip files unchanged since the last completed incremental scan (same cache as `cora scan --incremental`; scan_finalize records them)" },
+                    "changed_since": { "type": "string", "description": "Git revision: only scan files changed since it (`git diff <rev>` plus untracked files)" },
+                    "order": { "type": "string", "enum": ["source-first", "path"], "description": "Batch order: source-first (default; code before docs/data, shallower first) or path (walk order)" }
                 },
                 "required": []
             }),
         },
         Tool {
             name: "cora.scan_finalize".to_string(),
-            description: "Agent-as-reviewer scan, step 2. Merge all your findings from every scan_prepare batch with cora's deterministic findings, validate them (untrusted input), apply ignore rules and inline markers, and return the verdict. Use the same path as scan_prepare. No LLM call.".to_string(),
+            description: "Agent-as-reviewer scan, step 2. Merge all your findings from every scan_prepare batch with cora's deterministic findings, validate them (untrusted input), apply ignore rules and inline markers, and return the verdict. Use the same path and the same selection inputs (include, exclude, extensions, incremental, changed_since, order) as scan_prepare, or the call is refused via files_fingerprint. No LLM call.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "The same path given to cora.scan_prepare" },
+                    "include": { "type": "array", "items": { "type": "string" }, "description": "Only scan files matching these globs, relative to path (e.g. [\"crates/**/*.rs\"])" },
+                    "exclude": { "type": "array", "items": { "type": "string" }, "description": "Skip files matching these globs, in addition to the config's ignore.files" },
+                    "extensions": { "type": "array", "items": { "type": "string" }, "description": "Extra file extensions to scan, beyond the defaults" },
+                    "incremental": { "type": "boolean", "description": "Skip files unchanged since the last completed incremental scan (same cache as `cora scan --incremental`; scan_finalize records them)" },
+                    "changed_since": { "type": "string", "description": "Git revision: only scan files changed since it (`git diff <rev>` plus untracked files)" },
+                    "order": { "type": "string", "enum": ["source-first", "path"], "description": "Batch order: source-first (default; code before docs/data, shallower first) or path (walk order)" },
                     "files_fingerprint": { "type": "string", "description": "files_fingerprint from cora.scan_prepare; if given and the project changed since, the call is refused" },
+                    "batches_judged": { "type": "array", "items": { "type": "integer" }, "description": "0-based indexes of the scan_prepare batches you actually judged. Without it the result reports coverage as unverified; with fewer than total_batches it is partial and should_block is null" },
                     "issues": issues_prop
                 },
                 "required": ["issues"]
@@ -202,6 +217,23 @@ fn json_result(value: &Value) -> ToolResult {
 
 // ─── review ───
 
+/// The deterministic findings `review_finalize` would report for this diff.
+fn visible_deterministic(
+    deterministic: crate::engine::deterministic::DeterministicReport,
+    chunks: &[crate::engine::diff_parser::FileChunk],
+    config: &crate::config::schema::Config,
+) -> crate::engine::postprocess::PostprocessReport {
+    // The cap is not applied here: prepare lists everything finalize may show
+    // (the note says finalize shows at most `max_findings`).
+    let mut uncapped = config.clone();
+    uncapped.rules_config.max_findings = 0;
+    crate::engine::postprocess::postprocess_report(
+        deterministic.merge_into(Vec::new()),
+        &Source::Diff(chunks),
+        &uncapped,
+    )
+}
+
 pub fn review_prepare(params: &Value) -> ToolResult {
     let diff = match diff_param(params) {
         Ok(d) => d,
@@ -213,12 +245,11 @@ pub fn review_prepare(params: &Value) -> ToolResult {
     };
     let bridge = IndexBridge::open_cwd();
     let packet = review::prepare(&config, diff, None, &bridge);
-    let deterministic: Vec<Value> = packet
-        .deterministic
-        .merge_into(Vec::new())
-        .iter()
-        .map(brief)
-        .collect();
+    // Show what `review_finalize` will report: the same post-processing
+    // (`ignore.rules`, inline `cora-ignore` markers, the findings cap) runs here,
+    // so the agent does not act on a finding the project already silenced (#697).
+    let report = visible_deterministic(packet.deterministic, &packet.chunks, &config);
+    let deterministic: Vec<Value> = report.issues.iter().map(brief).collect();
 
     json_result(&json!({
         "mode": "agent",
@@ -284,6 +315,10 @@ pub fn review_finalize(params: &Value) -> ToolResult {
     let should_block = shaped.should_block;
     let total_found = response.issues.len();
     response.issues.retain(|i| i.severity <= min_severity);
+    // Leave a verifiable trace for the commit gate (#674): the pre-commit hook
+    // and `cora hook claude-guard` accept a staged diff this verdict covers.
+    let gate_recorded =
+        crate::engine::commit_gate::record_for_diff(diff, "agent", should_block, total_found);
     finalize::save_history(
         &HistoryEntry {
             command: "review (agent)",
@@ -306,6 +341,11 @@ pub fn review_finalize(params: &Value) -> ToolResult {
         "dropped_by_validation": dropped_by_validation,
         "not_shown": response.dropped_findings,
         "not_shown_note": not_shown_note(response.dropped_findings, &config),
+        "commit_gate": {
+            "recorded": gate_recorded,
+            "blocking": should_block,
+            "note": "When recorded and not blocking, the pre-commit hook and the commit guard accept this exact staged change set. Edit and re-stage, and it must be reviewed again.",
+        },
         "issues": response.issues.iter().map(|i| json!({
             "title": i.title,
             "severity": i.severity.label(),
@@ -373,12 +413,107 @@ fn files_fingerprint(files: &[FileEntry]) -> String {
         .collect()
 }
 
-fn scan_files_for(
+/// The CLI's selection inputs, shared by `scan_prepare` and `scan_finalize` so
+/// both compute the same file set and batch layout.
+struct ScanSelection {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    extensions: Vec<String>,
+    incremental: bool,
+    changed_since: Option<String>,
+    source_first: bool,
+}
+
+fn str_array(params: &Value, key: &str) -> Result<Vec<String>, ToolResult> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<_>>()
+            .ok_or_else(|| ToolResult::error(format!("{key} must be an array of strings"))),
+        Some(_) => Err(ToolResult::error(format!(
+            "{key} must be an array of strings"
+        ))),
+    }
+}
+
+fn scan_selection(
+    params: &Value,
     config: &crate::config::schema::Config,
-    root: &Path,
-) -> Result<Vec<FileEntry>, ToolResult> {
-    walk_project(root, &[], &config.ignore.files, &[])
-        .map_err(|e| ToolResult::error(format!("Scan failed: {e}")))
+) -> Result<ScanSelection, ToolResult> {
+    // Same merge as the CLI: config ignore.files + the caller's excludes.
+    let mut exclude = config.ignore.files.clone();
+    exclude.extend(str_array(params, "exclude")?);
+    let changed_since = match params.get("changed_since") {
+        None | Some(Value::Null) => None,
+        // A leading '-' would be read by git as an option.
+        Some(Value::String(r)) if !r.is_empty() && !r.starts_with('-') => Some(r.clone()),
+        Some(_) => return Err(ToolResult::error("changed_since must be a git revision")),
+    };
+    let source_first = match params.get("order").and_then(Value::as_str) {
+        None | Some("source-first") => true,
+        Some("path") => false,
+        Some(o) => {
+            return Err(ToolResult::error(format!(
+                "order must be \"source-first\" or \"path\", got \"{o}\""
+            )));
+        }
+    };
+    Ok(ScanSelection {
+        include: str_array(params, "include")?,
+        exclude,
+        extensions: str_array(params, "extensions")?,
+        incremental: params
+            .get("incremental")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        changed_since,
+        source_first,
+    })
+}
+
+/// Paths (relative to `root`) changed since `rev`: tracked changes plus untracked files.
+fn changed_paths(root: &Path, rev: &str) -> Result<std::collections::HashSet<String>, ToolResult> {
+    let git = |args: &[&str]| -> Result<String, ToolResult> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .map_err(|e| ToolResult::error(format!("Cannot run git: {e}")))?;
+        if !out.status.success() {
+            return Err(ToolResult::error(format!(
+                "git {} failed: {}",
+                args[0],
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let diff = git(&["diff", "--name-only", "--relative", rev, "--"])?;
+    let untracked = git(&["ls-files", "--others", "--exclude-standard"])?;
+    Ok(diff
+        .lines()
+        .chain(untracked.lines())
+        .map(str::to_string)
+        .collect())
+}
+
+fn scan_files_for(sel: &ScanSelection, root: &Path) -> Result<Vec<FileEntry>, ToolResult> {
+    let mut files = walk_project(root, &sel.include, &sel.exclude, &sel.extensions)
+        .map_err(|e| ToolResult::error(format!("Scan failed: {e}")))?;
+    if let Some(rev) = &sel.changed_since {
+        let changed = changed_paths(root, rev)?;
+        files.retain(|f| changed.contains(&f.path));
+    }
+    if sel.incremental {
+        crate::commands::scan::retain_changed(root, &mut files)
+            .map_err(|e| ToolResult::error(format!("Incremental scan failed: {e}")))?;
+    }
+    if sel.source_first {
+        order_source_first(&mut files);
+    }
+    Ok(files)
 }
 
 pub fn scan_prepare(params: &Value) -> ToolResult {
@@ -386,13 +521,24 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         Ok(r) => r,
         Err(e) => return e,
     };
-    let config = match load_project_config() {
+    let mut config = match load_project_config() {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
     };
-    let files = match scan_files_for(&config, &root) {
+    // Scanned paths are relative to the scan root (#682).
+    config.rules_config.project_root = Some(root.clone());
+    let sel = match scan_selection(params, &config) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let files = match scan_files_for(&sel, &root) {
         Ok(f) => f,
         Err(e) => return e,
+    };
+    let order = if sel.source_first {
+        "source-first"
+    } else {
+        "path"
     };
     let batches = batch_files(
         &files,
@@ -404,6 +550,9 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         return json_result(&json!({
             "mode": "agent",
             "total_batches": 0,
+            "total_chars": 0,
+            "estimated_tokens": 0,
+            "order": order,
             "note": "No files to scan.",
         }));
     }
@@ -414,8 +563,16 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         ));
     };
 
+    // Planning data: the formatted size of every batch, so the agent can decide
+    // how much to review before paying for it.
+    let batch_chars: Vec<usize> = batches
+        .iter()
+        .map(|b| format_batch_for_prompt(b).len())
+        .collect();
+    let total_chars: usize = batch_chars.iter().sum();
+
     let prompts = llm::scan_prompts(
-        &crate::engine::scanner::format_batch_for_prompt(batch),
+        &format_batch_for_prompt(batch),
         &config.focus,
         &config.rules,
         None,
@@ -440,6 +597,14 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         "instructions": "Answer user_prompt following system_prompt with your own model. Return ONLY a JSON array shaped like response_schema (use [] if there are no issues), reporting only the files listed in `files`. Do this for every batch, collect all findings, then call cora.scan_finalize once with them as `issues`.",
         "batch": batch_idx,
         "total_batches": batches.len(),
+        "total_chars": total_chars,
+        "estimated_tokens": total_chars / 4,
+        "order": order,
+        "include": sel.include,
+        "exclude": sel.exclude,
+        "batches": batches.iter().zip(&batch_chars).enumerate().map(|(i, (b, c))| json!({
+            "batch": i, "files": b.len(), "chars": c,
+        })).collect::<Vec<_>>(),
         "files_fingerprint": files_fingerprint(&files),
         "files": batch.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
         "system_prompt": prompts.system,
@@ -448,6 +613,57 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         "deterministic_findings_note": "Included with batch 0 only.",
         "response_schema": response_schema(),
     }))
+}
+
+/// How much of the project the agent's verdict covers (#685).
+struct ScanCoverage {
+    /// `complete`, `partial` (declared, fewer batches than exist) or
+    /// `unverified` (the agent did not say which batches it judged).
+    label: &'static str,
+    total_batches: usize,
+    batches_judged: Option<Vec<usize>>,
+    files_judged: Option<usize>,
+    files_total: usize,
+}
+
+/// Recompute the batches `scan_prepare` handed out and compare them with the
+/// ones the agent says it judged. Stateless, like the rest of the scan tools.
+fn scan_coverage(declared: Option<&Value>, files: &[FileEntry]) -> ScanCoverage {
+    let batches = batch_files(
+        files,
+        crate::commands::scan::DEFAULT_BATCH_CHAR_BUDGET,
+        crate::commands::scan::DEFAULT_MAX_FILES_PER_BATCH,
+    );
+    let total = batches.len();
+    let Some(arr) = declared.and_then(Value::as_array) else {
+        return ScanCoverage {
+            label: "unverified",
+            total_batches: total,
+            batches_judged: None,
+            files_judged: None,
+            files_total: files.len(),
+        };
+    };
+    let mut judged: Vec<usize> = arr
+        .iter()
+        .filter_map(Value::as_u64)
+        .map(|n| n as usize)
+        .filter(|n| *n < total)
+        .collect();
+    judged.sort_unstable();
+    judged.dedup();
+    let files_judged: usize = judged.iter().map(|&i| batches[i].len()).sum();
+    ScanCoverage {
+        label: if judged.len() == total {
+            "complete"
+        } else {
+            "partial"
+        },
+        total_batches: total,
+        batches_judged: Some(judged),
+        files_judged: Some(files_judged),
+        files_total: files.len(),
+    }
 }
 
 pub fn scan_finalize(params: &Value) -> ToolResult {
@@ -459,11 +675,17 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         Ok(v) => v,
         Err(e) => return ToolResult::error(e),
     };
-    let config = match load_project_config() {
+    let mut config = match load_project_config() {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
     };
-    let files = match scan_files_for(&config, &root) {
+    // Scanned paths are relative to the scan root (#682).
+    config.rules_config.project_root = Some(root.clone());
+    let sel = match scan_selection(params, &config) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let files = match scan_files_for(&sel, &root) {
         Ok(f) => f,
         Err(e) => return e,
     };
@@ -478,6 +700,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
 
     let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     let submitted = issues.len();
+    let coverage = scan_coverage(params.get("batches_judged"), &files);
     let mut all = admit(issues, &paths, &Source::Files(&files));
     let dropped_by_validation = submitted - all.len();
     let bridge = IndexBridge::open(&root);
@@ -496,14 +719,31 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
             ci: false,
         },
     );
+    // Incremental: remember what a complete judgement covered, as the CLI does.
+    if sel.incremental && coverage.label == "complete" {
+        if let Err(e) = crate::commands::scan::record_scanned(&root, &files) {
+            tracing::debug!(error = %e, "could not save the incremental scan cache");
+        }
+    }
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
-    let summary = format!(
-        "Scanned {} files ({} lines), found {} issues. {}",
-        files.len(),
-        total_lines,
-        all.len(),
-        crate::engine::judge::AGENT_JUDGED
-    );
+    let summary = match &coverage.files_judged {
+        Some(j) if coverage.label != "complete" => format!(
+            "Judged {}/{} batches ({}/{} files), found {} issues. {}",
+            coverage.batches_judged.as_ref().map_or(0, Vec::len),
+            coverage.total_batches,
+            j,
+            coverage.files_total,
+            all.len(),
+            crate::engine::judge::AGENT_JUDGED
+        ),
+        _ => format!(
+            "Scanned {} files ({} lines), found {} issues. {}",
+            files.len(),
+            total_lines,
+            all.len(),
+            crate::engine::judge::AGENT_JUDGED
+        ),
+    };
     finalize::save_history(
         &HistoryEntry {
             command: "scan (agent)",
@@ -520,8 +760,14 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         "judge": "agent",
         "summary": summary,
         "files_scanned": files.len(),
+        "coverage": coverage.label,
+        "total_batches": coverage.total_batches,
+        "batches_judged": coverage.batches_judged,
+        "files_judged": coverage.files_judged,
+        "files_total": coverage.files_total,
         "total_issues": all.len(),
-        "should_block": shaped.should_block,
+        // Unknown (null) when the agent declared it judged only some batches.
+        "should_block": if coverage.label == "partial" { Value::Null } else { json!(shaped.should_block) },
         "rejected_items": rejected,
         "dropped_by_validation": dropped_by_validation,
         "not_shown": dropped,
@@ -784,6 +1030,80 @@ mod tests {
         assert!(!ok.is_error, "{}", text(&ok));
     }
 
+    fn entries(n: usize) -> Vec<FileEntry> {
+        (0..n)
+            .map(|i| FileEntry {
+                path: format!("src/f{i}.rs"),
+                content: "fn a() {}\n".to_string(),
+                lines: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn coverage_is_partial_when_only_some_batches_were_judged() {
+        // 45 small files = 3 batches of at most 20 files.
+        let files = entries(45);
+        let c = scan_coverage(Some(&json!([1])), &files);
+        assert_eq!((c.label, c.total_batches), ("partial", 3));
+        assert_eq!(c.files_judged, Some(20));
+        assert_eq!(c.files_total, 45);
+        assert_eq!(c.batches_judged, Some(vec![1]));
+    }
+
+    #[test]
+    fn coverage_is_complete_only_when_every_batch_is_declared() {
+        let files = entries(45);
+        let c = scan_coverage(Some(&json!([2, 0, 1, 1, 99])), &files);
+        assert_eq!(c.label, "complete");
+        assert_eq!(c.files_judged, Some(45));
+        assert_eq!(
+            c.batches_judged,
+            Some(vec![0, 1, 2]),
+            "dedupe, drop out of range"
+        );
+    }
+
+    #[test]
+    fn coverage_is_unverified_without_a_declaration() {
+        let c = scan_coverage(None, &entries(45));
+        assert_eq!(c.label, "unverified");
+        assert!(c.files_judged.is_none() && c.batches_judged.is_none());
+    }
+
+    #[test]
+    fn scan_finalize_reports_partial_coverage_and_no_block_verdict() {
+        let out = as_json(&scan_finalize(
+            &json!({ "path": "src", "issues": [], "batches_judged": [0] }),
+        ));
+        assert_eq!(out["coverage"], "partial", "{out}");
+        assert!(out["should_block"].is_null(), "{out}");
+        assert!(
+            out["summary"].as_str().unwrap().starts_with("Judged 1/"),
+            "{out}"
+        );
+        let none = as_json(&scan_finalize(&json!({ "path": "src", "issues": [] })));
+        assert_eq!(none["coverage"], "unverified");
+        assert!(none["should_block"].is_boolean());
+    }
+
+    #[test]
+    fn prepare_lists_only_the_findings_finalize_will_report() {
+        let chunks = crate::engine::diff_parser::parse_diff(DIFF);
+        let mut config = crate::config::schema::Config::default();
+        let det = |c: &crate::config::schema::Config| {
+            let packet = review::prepare_deterministic(c, DIFF, &IndexBridge::unavailable());
+            visible_deterministic(packet.deterministic, &chunks, c)
+        };
+        let before = det(&config).issues;
+        assert!(!before.is_empty(), "the diff has a deterministic finding");
+        config.ignore.rules = before.iter().map(|i| i.title.clone()).collect();
+        assert!(
+            det(&config).issues.is_empty(),
+            "an ignored finding must not be shown to the agent"
+        );
+    }
+
     const CLEAN: &str = concat!(
         "diff --git a/app.py b/app.py\n",
         "new file mode 100644\n",
@@ -825,5 +1145,172 @@ mod tests {
                 .unwrap()
                 .contains("max_findings")
         );
+    }
+
+    // ─── #686: selection inputs, ordering, planning data ───
+
+    /// A scratch project inside the working directory (scan paths must be).
+    fn fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix(".scanfx")
+            .tempdir_in(".")
+            .unwrap();
+        for (path, content) in files {
+            let full = dir.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, content).unwrap();
+        }
+        dir
+    }
+
+    fn mixed() -> tempfile::TempDir {
+        fixture(&[
+            ("README.md", "# readme\n"),
+            ("Cargo.toml", "[package]\n"),
+            ("data.json", "{\"a\": 1}\n"),
+            ("crates/a/src/lib.rs", "fn a() {}\n"),
+            ("crates/a/tests/t.rs", "fn t() {}\n"),
+            ("crates/b/deep/er/x.rs", "fn x() {}\n"),
+            ("main.py", "x = 1\n"),
+        ])
+    }
+
+    fn prep(dir: &tempfile::TempDir, extra: Value) -> Value {
+        let mut p = json!({ "path": dir.path().to_str().unwrap() });
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        as_json(&scan_prepare(&p))
+    }
+
+    fn names(v: &Value) -> Vec<String> {
+        v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn include_exclude_filter_and_planning_data_is_reported() {
+        let dir = mixed();
+        let out = prep(
+            &dir,
+            json!({ "include": ["crates/**/*.rs"], "exclude": ["**/tests/**"] }),
+        );
+        assert_eq!(
+            names(&out),
+            ["crates/a/src/lib.rs", "crates/b/deep/er/x.rs"]
+        );
+        assert_eq!(out["order"], "source-first");
+        assert_eq!(out["include"], json!(["crates/**/*.rs"]));
+        assert!(
+            out["exclude"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("**/tests/**"))
+        );
+        let total = out["total_chars"].as_u64().unwrap();
+        assert!(total > 0);
+        assert_eq!(out["estimated_tokens"].as_u64().unwrap(), total / 4);
+        let max = out["batches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["chars"].as_u64().unwrap())
+            .max()
+            .unwrap();
+        assert!(total >= max);
+        assert_eq!(out["batches"][0]["files"], 2);
+    }
+
+    #[test]
+    fn source_files_come_first_then_shallower_and_order_is_deterministic() {
+        let dir = mixed();
+        let a = names(&prep(&dir, json!({})));
+        assert_eq!(
+            a,
+            [
+                "main.py",
+                "crates/a/src/lib.rs",
+                "crates/a/tests/t.rs",
+                "crates/b/deep/er/x.rs",
+                "Cargo.toml",
+                "README.md",
+                "data.json",
+            ]
+        );
+        assert_eq!(a, names(&prep(&dir, json!({ "order": "source-first" }))));
+        let legacy = prep(&dir, json!({ "order": "path" }));
+        assert_eq!(legacy["order"], "path");
+        assert!(scan_prepare(&json!({ "order": "bogus" })).is_error);
+    }
+
+    #[test]
+    fn changed_since_returns_only_changed_files() {
+        let dir = mixed();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                st.status.success(),
+                "{}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(dir.path().join("main.py"), "x = 2\n").unwrap();
+        std::fs::write(dir.path().join("new.rs"), "fn n() {}\n").unwrap();
+        let out = prep(&dir, json!({ "changed_since": "HEAD" }));
+        assert_eq!(names(&out), ["main.py", "new.rs"]);
+        assert!(scan_prepare(&json!({ "changed_since": "--output=x" })).is_error);
+    }
+
+    #[test]
+    fn finalize_agrees_with_prepare_only_for_the_same_filters() {
+        let dir = mixed();
+        let sel = json!({ "include": ["crates/**/*.rs"], "order": "path" });
+        let out = prep(&dir, sel.clone());
+        let fp = out["files_fingerprint"].as_str().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut same = json!({ "path": path, "issues": [], "files_fingerprint": fp });
+        same.as_object_mut()
+            .unwrap()
+            .extend(sel.as_object().unwrap().clone());
+        assert!(!scan_finalize(&same).is_error);
+        let other = json!({ "path": path, "issues": [], "files_fingerprint": fp });
+        let r = scan_finalize(&other);
+        assert!(r.is_error);
+        assert!(text(&r).contains("changed since"));
+        let reordered = json!({ "path": path, "issues": [], "files_fingerprint": fp,
+            "include": ["crates/**/*.rs"] });
+        assert!(scan_finalize(&reordered).is_error);
+    }
+
+    #[test]
+    fn schemas_list_the_selection_properties() {
+        for t in tools().iter().filter(|t| t.name.starts_with("cora.scan_")) {
+            for k in [
+                "include",
+                "exclude",
+                "extensions",
+                "incremental",
+                "changed_since",
+                "order",
+            ] {
+                assert!(
+                    t.input_schema["properties"].get(k).is_some(),
+                    "{} lacks {k}",
+                    t.name
+                );
+            }
+        }
     }
 }
