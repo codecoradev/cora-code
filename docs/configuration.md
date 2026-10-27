@@ -494,6 +494,7 @@ rules_engine:
 | `enabled` | `bool` | `true` | Enable/disable the rule engine |
 | `max_findings` | `int` | `50` | Max deterministic findings shown per run; Critical and Major are never hidden (`0` or `null` = unlimited). See below |
 | `include_tests` | `bool` | `false` | Scan test code like any other code (see "Test code" below) |
+| `clone_hints` | `bool` | `false` | Run the `qual-clone` hint for Rust `.clone()` calls (info; noisy on idiomatic Rust, so off by default) |
 | `index_skip_files` | `[string]` | *(see below)* | Glob patterns for files to skip during index scanning |
 
 #### Test code

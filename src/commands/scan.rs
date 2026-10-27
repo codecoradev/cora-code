@@ -44,6 +44,33 @@ pub struct ScanOptions {
     /// When true (default), a failed batch is skipped with a warning and the
     /// rest of the scan continues. When false, a failed batch aborts the run.
     pub continue_on_batch_error: bool,
+    /// Hide findings below this severity (`info`, `minor`, `major`,
+    /// `critical`) in every output format and in the summary count. Blocking
+    /// is still decided by `hook.min_severity`.
+    pub min_severity: Option<String>,
+}
+
+/// ` (1 critical, 2 major, 306 info)`, or an empty string when there are no
+/// findings, so a long list of info findings cannot hide a critical one.
+fn severity_breakdown(issues: &[crate::engine::ReviewIssue]) -> String {
+    use crate::engine::types::Severity;
+    let parts: Vec<String> = [
+        Severity::Critical,
+        Severity::Major,
+        Severity::Minor,
+        Severity::Info,
+    ]
+    .into_iter()
+    .filter_map(|sev| {
+        let n = issues.iter().filter(|i| i.severity == sev).count();
+        (n > 0).then(|| format!("{n} {}", sev.label().to_lowercase()))
+    })
+    .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
 }
 
 /// Execute the scan command.
@@ -188,7 +215,6 @@ pub async fn execute_scan(
     if let Some(w) = dropped_warning(dropped, config) {
         eprintln!("{}", w.yellow());
     }
-    let issue_count = all_issues.len();
     // Scan lists every finding; only `hook.min_severity` decides blocking.
     let shaped = finalize::shape_issues(
         &mut all_issues,
@@ -201,6 +227,13 @@ pub async fn execute_scan(
         },
     );
     let should_block = shaped.should_block;
+    // `--min-severity` only changes what is shown, never the blocking decision.
+    if let Some(min) = opts.min_severity.as_deref() {
+        let min = crate::engine::types::Severity::from_str_lossy(min);
+        all_issues.retain(|i| i.severity <= min);
+    }
+    let issue_count = all_issues.len();
+    let by_severity = severity_breakdown(&all_issues);
 
     // A clean deterministic result is not an AI scan: say so in the summary.
     let no_judge_note = if matches!(judge, JudgeChoice::Deterministic) {
@@ -214,10 +247,11 @@ pub async fn execute_scan(
         files_scanned: files.len(),
         lines_scanned: total_lines,
         summary: format!(
-            "Scanned {} files ({} lines), found {} issues{}.",
+            "Scanned {} files ({} lines), found {} issues{}{}.",
             files.len(),
             total_lines,
             issue_count,
+            by_severity,
             if dropped > 0 {
                 format!(
                     " ({dropped} more deterministic findings not shown, rules.max_findings cap)"
@@ -542,6 +576,7 @@ mod tests {
             focus: vec![],
             batch_files: 0,
             continue_on_batch_error: true,
+            min_severity: None,
         };
         let code = execute_scan(&config, &JudgeChoice::Llm(llm), &opts, OutputFormat::Json)
             .await
@@ -662,6 +697,7 @@ mod tests {
             focus: vec![],
             batch_files: 0,
             continue_on_batch_error: true,
+            min_severity: None,
         };
         let code = execute_scan(
             &config,
