@@ -412,10 +412,12 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         Ok(r) => r,
         Err(e) => return e,
     };
-    let config = match load_project_config() {
+    let mut config = match load_project_config() {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
     };
+    // Scanned paths are relative to the scan root (#682).
+    config.rules_config.project_root = Some(root.clone());
     let files = match scan_files_for(&config, &root) {
         Ok(f) => f,
         Err(e) => return e,
@@ -536,10 +538,12 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         Ok(v) => v,
         Err(e) => return ToolResult::error(e),
     };
-    let config = match load_project_config() {
+    let mut config = match load_project_config() {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
     };
+    // Scanned paths are relative to the scan root (#682).
+    config.rules_config.project_root = Some(root.clone());
     let files = match scan_files_for(&config, &root) {
         Ok(f) => f,
         Err(e) => return e,
