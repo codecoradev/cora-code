@@ -4,12 +4,14 @@ name: Anthropic WIF smoke test
 # short-lived Anthropic access token (workload identity federation) and that
 # the token works the way cora sends it: `Authorization: Bearer <token>` to the
 # OpenAI-compatible `/chat/completions` endpoint. Prints HTTP statuses only,
-# never a token. Runs when this file changes.
+# never a token.
+#
+# Manual only (Actions tab -> Run workflow), so it costs nothing on normal PRs.
+# The federation rule must allow this workflow's OIDC subject (for a manual run
+# on a branch that is `...:ref:refs/heads/<branch>`, not `...:pull_request`).
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/anthropic-wif-smoke.yml"
+  workflow_dispatch:
 
 permissions:
   id-token: write
