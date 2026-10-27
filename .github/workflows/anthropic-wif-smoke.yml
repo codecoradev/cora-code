@@ -1,0 +1,89 @@
+name: Anthropic WIF smoke test
+
+# Checks that this repository can exchange its GitHub OIDC token for a
+# short-lived Anthropic access token (workload identity federation) and that
+# the token works the way cora sends it: `Authorization: Bearer <token>` to the
+# OpenAI-compatible `/chat/completions` endpoint. Prints HTTP statuses only,
+# never a token. Runs when this file changes.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/anthropic-wif-smoke.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  smoke:
+    name: Anthropic WIF smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Identifiers, not credentials, but this repository is public: they live
+      # in repository variables instead of the workflow file.
+      FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+      SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+      MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-5-5' }}
+    steps:
+      - name: Require the federation variables
+        run: |
+          missing=0
+          for name in FEDERATION_RULE_ID ORGANIZATION_ID SERVICE_ACCOUNT_ID WORKSPACE_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository variable ANTHROPIC_${name} is empty or missing."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Fetch the GitHub OIDC token
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const token = await core.getIDToken('https://api.anthropic.com');
+            core.setSecret(token);
+            core.exportVariable('JWT', token);
+
+      - name: Exchange it for an Anthropic access token
+        run: |
+          body=$(jq -n \
+            --arg jwt "$JWT" \
+            --arg rule "$FEDERATION_RULE_ID" \
+            --arg org "$ORGANIZATION_ID" \
+            --arg sa "$SERVICE_ACCOUNT_ID" \
+            --arg ws "$WORKSPACE_ID" \
+            '{grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+              assertion: $jwt, federation_rule_id: $rule, organization_id: $org,
+              service_account_id: $sa, workspace_id: $ws}')
+          code=$(curl -sS -o exchange.json -w '%{http_code}' \
+            https://api.anthropic.com/v1/oauth/token \
+            -H "content-type: application/json" --data "$body")
+          echo "token exchange: HTTP $code"
+          if [ "$code" != "200" ]; then
+            jq 'with_entries(if (.key | test("token$")) then .value = "<redacted>" else . end)' exchange.json || true
+            exit 1
+          fi
+          token=$(jq -r '.access_token' exchange.json)
+          echo "::add-mask::$token"
+          echo "ACCESS_TOKEN=$token" >> "$GITHUB_ENV"
+          echo "token_type=$(jq -r '.token_type' exchange.json) expires_in=$(jq -r '.expires_in' exchange.json)"
+          rm -f exchange.json
+
+      - name: Call the OpenAI-compatible endpoint the way cora does
+        run: |
+          code=$(curl -sS -o compat.json -w '%{http_code}' \
+            https://api.anthropic.com/v1/chat/completions \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$(jq -n --arg m "$MODEL" '{model: $m, max_tokens: 16, messages: [{role: "user", content: "Reply with the single word ok."}]}')")
+          echo "chat/completions with Bearer: HTTP $code"
+          if [ "$code" = "200" ]; then
+            echo "reply length: $(jq -r '.choices[0].message.content | length' compat.json)"
+          else
+            jq -r '.error | "\(.type): \(.message)"' compat.json || true
+            exit 1
+          fi
