@@ -143,6 +143,14 @@ jobs:
           cora-model: ${{ secrets.CORA_MODEL }}
 ```
 
+### Anthropic with workload identity federation (no stored API key)
+
+Instead of a long-lived `CORA_API_KEY`, the job can exchange its GitHub OIDC token for a short-lived Anthropic access token. Create a federation rule in the Anthropic Console (issuer `https://token.actions.githubusercontent.com`, audience `https://api.anthropic.com`, a **subject prefix** that matches your repository), then provide `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID` (and optionally `ANTHROPIC_MODEL`) as organization or repository secrets or variables.
+
+GitHub now issues subjects with numeric ids, for example `repo:my-org@289767358/my-repo@1254014703:pull_request`; a prefix written as `repo:my-org/my-repo:` never matches it. The Anthropic Console authentication log shows the reason for a denial (`match_subject_prefix`).
+
+The job needs `permissions: id-token: write`. The exchanged token is sent only to `https://api.anthropic.com/v1` (never to `CORA_BASE_URL`), and when federation is unavailable the job falls back to the `CORA_*` secrets. This repository's `.github/workflows/cora-review.yml` and `anthropic-wif-smoke.yml` are a working reference.
+
 ### Options
 
 | Input | Default | Description |
