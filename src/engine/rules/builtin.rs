@@ -69,7 +69,9 @@ pub fn builtin_rules() -> Vec<CustomRule> {
         },
         CustomRule {
             id: "bug-println".to_string(),
-            pattern: r"(?:println!|dbg!|print!\s*\()".to_string(),
+            // `eprintln!` / `eprint!` write to stderr (diagnostics) and are not matched:
+            // the macro name must not be preceded by an identifier character (#682).
+            pattern: r"(?:^|[^A-Za-z0-9_])(?:println!|dbg!|print!\s*\()".to_string(),
             severity: Severity::Minor,
             message: "Debug output macro found. Remove `println!`/`dbg!`/`print!` before merging.".to_string(),
             languages: vec!["rs".to_string()],
@@ -567,6 +569,8 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
     match rule_id {
         "sec-hardcoded-secret" | "crypto/hardcoded-secret" => is_false_positive_secret(line, path),
         "bug-println" => is_cli_output_path(path),
+        "bug-todo" => !is_deliberate_todo_marker(line),
+        "bug-expect" => is_invariant_expect(line),
         "sec-hardcoded-url" => is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
         "injection/sql-concat" | "sec-sql-concat" => is_false_positive_sql_concat(line),
@@ -576,6 +580,33 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
         "crypto/ssl-verify-disabled" => is_false_positive_ssl_verify(line),
         _ => false,
     }
+}
+
+/// `bug-todo` fires only on a deliberate marker: an upper-case `TODO`, `FIXME`,
+/// `HACK` or `XXX` whole word inside a comment (#681). The word "todo" in an
+/// identifier, a module name or prose (`pub mod todo;`, "the todo list") is not
+/// a marker.
+fn is_deliberate_todo_marker(line: &str) -> bool {
+    static COMMENT_START: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"//|/\*|<!--|#|--|%|^\s*\*").expect("comment start regex")
+    });
+    static MARKER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:TODO|FIXME|HACK|XXX)\b").expect("marker regex")
+    });
+    let Some(start) = COMMENT_START.find(line) else {
+        return false;
+    };
+    MARKER.is_match(&line[start.start()..])
+}
+
+/// `.expect("<message>")` with a non-empty message documents an invariant, the
+/// panic style the Rust API guidelines recommend over a bare `unwrap()`; only
+/// `.expect("")` is flagged (#682). Returns `true` to suppress.
+fn is_invariant_expect(line: &str) -> bool {
+    let Some(i) = line.find(".expect(\"") else {
+        return false;
+    };
+    !line[i + ".expect(\"".len()..].starts_with('"')
 }
 
 /// `println!` is the intended output of a program's entry point: `main.rs`,

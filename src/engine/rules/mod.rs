@@ -844,6 +844,52 @@ mod tests {
             .collect()
     }
 
+    const TODO_SRC: &str = "\
+pub mod todo;
+fn f() { let todo_state = 1; let _ = todo_state; }
+/// the todo list is per session
+fn g() {}
+// TODO(me): real marker
+// todo lower case is prose
+// FIXME: also real
+# HACK in a hash comment
+";
+
+    #[test]
+    fn bug_todo_flags_only_deliberate_markers() {
+        let entry = file_entry("src/a.rs", TODO_SRC);
+        let ids: Vec<String> = rule_ids(&entry, &default_config())
+            .into_iter()
+            .filter(|i| i.starts_with("bug-todo"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["bug-todo@5", "bug-todo@7", "bug-todo@8"],
+            "{ids:?}"
+        );
+    }
+
+    #[test]
+    fn bug_println_ignores_stderr_macros_but_keeps_stdout_ones() {
+        let src = "fn a(){ println!(\"x\"); }\nfn b(){ eprintln!(\"ok\"); }\nfn c(){ print!(\"y\"); }\nfn d(){ eprint!(\"z\"); }\n";
+        let entry = file_entry("src/lib.rs", src);
+        let ids: Vec<String> = rule_ids(&entry, &default_config())
+            .into_iter()
+            .filter(|i| i.starts_with("bug-println"))
+            .collect();
+        assert_eq!(ids, vec!["bug-println@1", "bug-println@3"], "{ids:?}");
+    }
+
+    #[test]
+    fn bug_expect_flags_an_empty_message_but_not_a_stated_invariant() {
+        let src = "fn a(){ c.stdout.take().expect(\"stdout piped above\"); }\nfn b(){ x.expect(\"\"); }\nfn c(){ y.unwrap(); }\n";
+        let entry = file_entry("src/lib.rs", src);
+        let ids = rule_ids(&entry, &default_config());
+        assert!(!ids.contains(&"bug-expect@1".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bug-expect@2".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bug-unwrap@3".to_string()), "{ids:?}");
+    }
+
     const RUST_WITH_TESTS: &str = "\
 fn real() {
     let a = x.unwrap();
