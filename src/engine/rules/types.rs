@@ -26,6 +26,8 @@ pub struct RulesConfig {
     /// high-confidence patterns on inline test blocks (#663).
     #[serde(default)]
     pub include_tests: bool,
+    /// Run the noisy `qual-clone` hint (`.clone()` in Rust). Off by default (#683).
+    pub clone_hints: bool,
 }
 
 /// Default skip patterns for index scanners — common false-positive sources.
@@ -75,6 +77,7 @@ impl Default for RulesConfig {
             custom_rules: Vec::new(),
             index_skip_files: default_index_skip_files(),
             include_tests: false,
+            clone_hints: false,
         }
     }
 }
