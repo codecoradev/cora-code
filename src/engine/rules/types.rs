@@ -28,6 +28,11 @@ pub struct RulesConfig {
     pub include_tests: bool,
     /// Run the noisy `qual-clone` hint (`.clone()` in Rust). Off by default (#683).
     pub clone_hints: bool,
+    /// Root the scanned paths are relative to (set by `cora scan` and the MCP
+    /// scan tools; `None` = the git toplevel of the working directory). Used to
+    /// find the package a file belongs to (#682). Not configurable.
+    #[serde(skip)]
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Default skip patterns for index scanners — common false-positive sources.
@@ -78,6 +83,7 @@ impl Default for RulesConfig {
             index_skip_files: default_index_skip_files(),
             include_tests: false,
             clone_hints: false,
+            project_root: None,
         }
     }
 }
