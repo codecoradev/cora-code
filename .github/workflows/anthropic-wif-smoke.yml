@@ -22,19 +22,19 @@ jobs:
     timeout-minutes: 5
     env:
       # Identifiers, not credentials, but this repository is public: they live
-      # in repository variables instead of the workflow file.
-      FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
-      ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
-      SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
-      WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
-      MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-opus-5-5' }}
+      # in organization/repository secrets or variables, not in this file.
+      FEDERATION_RULE_ID: ${{ secrets.ANTHROPIC_FEDERATION_RULE_ID || vars.ANTHROPIC_FEDERATION_RULE_ID }}
+      ORGANIZATION_ID: ${{ secrets.ANTHROPIC_ORGANIZATION_ID || vars.ANTHROPIC_ORGANIZATION_ID }}
+      SERVICE_ACCOUNT_ID: ${{ secrets.ANTHROPIC_SERVICE_ACCOUNT_ID || vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+      WORKSPACE_ID: ${{ secrets.ANTHROPIC_WORKSPACE_ID || vars.ANTHROPIC_WORKSPACE_ID }}
+      MODEL: ${{ secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5' }}
     steps:
       - name: Require the federation variables
         run: |
           missing=0
           for name in FEDERATION_RULE_ID ORGANIZATION_ID SERVICE_ACCOUNT_ID WORKSPACE_ID; do
             if [ -z "${!name}" ]; then
-              echo "::error::Repository variable ANTHROPIC_${name} is empty or missing."
+              echo "::error::Secret or variable ANTHROPIC_${name} is empty or missing."
               missing=1
             fi
           done
