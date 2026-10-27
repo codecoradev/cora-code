@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-27
+
 ### Added
 
 - **Path-scoped `ignore.rules` (#680).** An entry can be an object, `- rule: bug-println` with `files: ["crates/cli/**"]` and an optional `reason`, to silence a rule in some directories only while it keeps firing elsewhere; plain strings still silence a rule everywhere. An empty `files` list is a config error. Works in `review`, `scan` and the MCP tools. See `docs/configuration.md`.
