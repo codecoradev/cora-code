@@ -203,6 +203,23 @@ fn json_result(value: &Value) -> ToolResult {
 
 // ─── review ───
 
+/// The deterministic findings `review_finalize` would report for this diff.
+fn visible_deterministic(
+    deterministic: crate::engine::deterministic::DeterministicReport,
+    chunks: &[crate::engine::diff_parser::FileChunk],
+    config: &crate::config::schema::Config,
+) -> crate::engine::postprocess::PostprocessReport {
+    // The cap is not applied here: prepare lists everything finalize may show
+    // (the note says finalize shows at most `max_findings`).
+    let mut uncapped = config.clone();
+    uncapped.rules_config.max_findings = 0;
+    crate::engine::postprocess::postprocess_report(
+        deterministic.merge_into(Vec::new()),
+        &Source::Diff(chunks),
+        &uncapped,
+    )
+}
+
 pub fn review_prepare(params: &Value) -> ToolResult {
     let diff = match diff_param(params) {
         Ok(d) => d,
@@ -214,12 +231,11 @@ pub fn review_prepare(params: &Value) -> ToolResult {
     };
     let bridge = IndexBridge::open_cwd();
     let packet = review::prepare(&config, diff, None, &bridge);
-    let deterministic: Vec<Value> = packet
-        .deterministic
-        .merge_into(Vec::new())
-        .iter()
-        .map(brief)
-        .collect();
+    // Show what `review_finalize` will report: the same post-processing
+    // (`ignore.rules`, inline `cora-ignore` markers, the findings cap) runs here,
+    // so the agent does not act on a finding the project already silenced (#697).
+    let report = visible_deterministic(packet.deterministic, &packet.chunks, &config);
+    let deterministic: Vec<Value> = report.issues.iter().map(brief).collect();
 
     json_result(&json!({
         "mode": "agent",
@@ -918,6 +934,23 @@ mod tests {
         let none = as_json(&scan_finalize(&json!({ "path": "src", "issues": [] })));
         assert_eq!(none["coverage"], "unverified");
         assert!(none["should_block"].is_boolean());
+    }
+
+    #[test]
+    fn prepare_lists_only_the_findings_finalize_will_report() {
+        let chunks = crate::engine::diff_parser::parse_diff(DIFF);
+        let mut config = crate::config::schema::Config::default();
+        let det = |c: &crate::config::schema::Config| {
+            let packet = review::prepare_deterministic(c, DIFF, &IndexBridge::unavailable());
+            visible_deterministic(packet.deterministic, &chunks, c)
+        };
+        let before = det(&config).issues;
+        assert!(!before.is_empty(), "the diff has a deterministic finding");
+        config.ignore.rules = before.iter().map(|i| i.title.clone()).collect();
+        assert!(
+            det(&config).issues.is_empty(),
+            "an ignored finding must not be shown to the agent"
+        );
     }
 
     const CLEAN: &str = concat!(
