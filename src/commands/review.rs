@@ -560,16 +560,6 @@ async fn execute_chunked_review(
                     total_tokens.estimated_cost_usd += usage.estimated_cost_usd;
                 }
 
-                if !resp.summary.is_empty() {
-                    summaries.push(format!(
-                        "[Chunk {}/{} — {}] {}",
-                        chunk.index + 1,
-                        chunk.total,
-                        chunk.label,
-                        resp.summary
-                    ));
-                }
-
                 // The judge fell back to deterministic findings. Try the chunk
                 // again in two halves before giving up on it (#718); the pieces
                 // re-run the deterministic checks, so this attempt is dropped.
@@ -581,6 +571,18 @@ async fn execute_chunked_review(
                         }
                         continue;
                     }
+                }
+                // Only a chunk that is kept speaks in the merged summary; the
+                // "LLM review failed" text of a chunk that was split and
+                // retried must not survive into a run that then succeeded.
+                if !resp.summary.is_empty() {
+                    summaries.push(format!(
+                        "[Chunk {}/{} — {}] {}",
+                        chunk.index + 1,
+                        chunk.total,
+                        chunk.label,
+                        resp.summary
+                    ));
                 }
                 dropped_findings += resp.dropped_findings;
                 // The judge fell back to deterministic findings: keep them, but

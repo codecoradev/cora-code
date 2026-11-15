@@ -106,7 +106,14 @@ pub(super) fn extract_json_and_summary_marked(raw: &str) -> (String, String, boo
 /// truncated copy of the findings (#718).
 pub(super) fn is_stray_json(unmarked_tail: &str) -> bool {
     let t = unmarked_tail.trim_start();
-    t.starts_with('[') || t.starts_with('{') || t.starts_with("```")
+    if t.starts_with('{') || t.starts_with("```") {
+        return true;
+    }
+    // `[` opens JSON only when an element or `]` follows; `[INFO] ...` or
+    // `[note]` is prose that happens to start with a bracket.
+    t.strip_prefix('[')
+        .map(str::trim_start)
+        .is_some_and(|r| r.starts_with(['{', '[', ']', '"']))
 }
 
 /// Repair common LLM JSON mistakes before strict parse.
@@ -610,5 +617,16 @@ mod tests {
         let (json, summary) = extract_json_and_summary("[{\"a\":\"x");
         assert_eq!(json, "[{\"a\":\"x");
         assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn stray_json_detection_ignores_bracketed_prose() {
+        assert!(is_stray_json("{\"file\":\"a\""));
+        assert!(is_stray_json("```json\n[]"));
+        assert!(is_stray_json("[{\"file\""));
+        assert!(is_stray_json("[ ]"));
+        assert!(!is_stray_json("[INFO] nothing to flag"));
+        assert!(!is_stray_json("[note] fine"));
+        assert!(!is_stray_json("All good."));
     }
 }
