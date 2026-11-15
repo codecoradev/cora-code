@@ -460,6 +460,7 @@ pub fn build_llm_config(
         max_tokens: config.max_tokens,
         max_tokens_param,
         timeout: config.timeout,
+        reasoning_effort: config.reasoning_effort.clone(),
     })
 }
 

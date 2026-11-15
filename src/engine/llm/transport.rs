@@ -322,6 +322,9 @@ fn build_request_body_with(
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
     body[config.max_tokens_param.clone()] = serde_json::json!(turn.max_tokens);
+    if let Some(effort) = &config.reasoning_effort {
+        body["reasoning_effort"] = serde_json::json!(effort);
+    }
     if response_format == "json_object" {
         body["response_format"] = serde_json::json!({"type": "json_object"});
     }
@@ -730,6 +733,16 @@ mod tests {
         let without = build_request_body_with(&cfg, &turn(100), "none", false, false);
         assert!(without.get("temperature").is_none(), "{without}");
         assert!(without.get("model").is_some() && without.get("messages").is_some());
+    }
+
+    #[test]
+    fn reasoning_effort_is_sent_only_when_configured() {
+        let mut cfg = LLMConfig::default();
+        let off = build_request_body_with(&cfg, &turn(100), "none", false, true);
+        assert!(off.get("reasoning_effort").is_none(), "{off}");
+        cfg.reasoning_effort = Some("low".to_string());
+        let on = build_request_body_with(&cfg, &turn(100), "none", false, true);
+        assert_eq!(on["reasoning_effort"], serde_json::json!("low"));
     }
 
     #[test]
