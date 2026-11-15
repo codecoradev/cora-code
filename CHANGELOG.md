@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`review.fail_on_incomplete` (#720, default `true`).** A review that did not cover the whole diff (a chunk failed, or the model call failed and only the deterministic findings remain) names the files it skipped and exits 1. Set it to `false` for the old warn-and-pass behaviour.
 - **`llm.reasoning_effort` (#718).** Optional value sent as `reasoning_effort` with every request, so a reasoning model does not spend the output budget on thinking.
 - **A review the model cannot answer is retried in smaller pieces (#718).** When the reply stays empty at `finish_reason=length`, or the model call fails, the diff is reviewed again in halves (a failing chunk is halved again, down to a quarter) instead of failing the whole run. Before, the run ended with "Review could not complete" at any `max_tokens`.
+- **`cora findings prune` (#725).** `--stale-projects` removes projects whose root directory no longer exists (worktrees and temp clones piled up: 339 projects for about 20 live repositories), with their index, reviews and findings. `--older-than DAYS` removes resolved or dismissed findings older than that and the reviews left without findings; open findings are kept. `--dry-run` reports exactly what a real run would remove. The current project is never removed.
+- **`debt.max_stored_findings` (default 500, `0` = no limit; #725).** A review or scan stores at most this many findings, the most severe first, and its summary says how many were left out. One full-repository scan stored 5,557 findings, 96% of all open ones. The score still uses the whole run, and findings that were not stored are not auto-resolved.
 
 ### Changed
 

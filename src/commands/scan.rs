@@ -268,6 +268,7 @@ pub async fn execute_scan(
 
     // 7. Save scan findings to cora.db (best-effort)
     finalize::save_history(
+        config,
         &HistoryEntry {
             command: "scan",
             summary: &response.summary,

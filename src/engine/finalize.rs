@@ -165,7 +165,12 @@ pub struct HistoryEntry<'a> {
 
 /// Save the findings to `cora.db` (best-effort: a history-write failure never
 /// fails the run).
-pub fn save_history(entry: &HistoryEntry<'_>, issues: &[ReviewIssue], shaped: &Shape) {
+pub fn save_history(
+    config: &Config,
+    entry: &HistoryEntry<'_>,
+    issues: &[ReviewIssue],
+    shaped: &Shape,
+) {
     let (commit, branch) = git_context();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -182,6 +187,7 @@ pub fn save_history(entry: &HistoryEntry<'_>, issues: &[ReviewIssue], shaped: &S
         should_block: shaped.should_block,
         tokens: entry.tokens,
         issues,
+        max_stored_findings: config.debt.max_stored_findings,
     };
     review_store::persist_review_best_effort(&record);
 }

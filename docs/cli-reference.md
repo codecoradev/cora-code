@@ -168,6 +168,9 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora findings dismiss <id>` | Mark finding as won't-fix |
 | `cora findings dismiss <id> --reason "..."` | Dismiss with reason |
 | `cora findings reopen <id>` | Reopen a dismissed/resolved finding |
+| `cora findings prune --stale-projects --dry-run` | Report projects whose root directory no longer exists (worktrees, temp clones), with their index, reviews and findings |
+| `cora findings prune --stale-projects` | Remove them |
+| `cora findings prune --older-than 90` | Remove resolved/dismissed findings older than 90 days and the reviews left empty (open findings are kept) |
 | `cora debt` | Show tech debt report from review history |
 | `cora debt --json` | Debt report as JSON (for CI/dashboards) |
 | `cora debt --trend` | Quality score trend graph |
