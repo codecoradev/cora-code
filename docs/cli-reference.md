@@ -95,9 +95,9 @@ Complete command reference for the cora CLI.
 | `cora scan --focus` `security` | Override focus areas |
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |
-| `cora scan --no-llm` | Deterministic checks only, never call an LLM |
+| `cora scan --no-llm` (alias `--rules-only`) | Deterministic checks only (rules, secrets, security patterns, index scans), never call an LLM: zero tokens, no API key, no network |
 
-**No API key needed for deterministic checks.** `cora review` and `cora scan` run without any LLM configured: with no key they run the deterministic checks only (rules, secrets, security, index scans), print a one-line notice on stderr, and mark the result "Deterministic checks only (no LLM judge)" (in SARIF: `invocations[0].properties["cora.judge"] = "none"`), so a clean result is never mistaken for an AI review. `--no-llm` forces this even when a key exists and silences the notice. `cora commit` still needs a key for the commit message.
+**No API key needed for deterministic checks.** `cora review` and `cora scan` run without any LLM configured: with no key they run the deterministic checks only (rules, secrets, security, index scans), print a one-line notice on stderr, and mark the result "Deterministic checks only (no LLM judge)" (in SARIF: `invocations[0].properties["cora.judge"] = "none"`), so a clean result is never mistaken for an AI review. `--no-llm` forces this even when a key exists and silences the notice. In a normal scan the same deterministic findings are reported when a model batch fails or is skipped (for example a 504), so they are never lost with it. `cora commit` still needs a key for the commit message.
 
 `cora scan` runs the same deterministic checks as `cora review` (built-in and custom rules, secrets, security patterns, plus unused imports and dead code from the index) on every file, then asks the LLM about each batch. Findings are filtered by `ignore.rules` and inline `cora-ignore:` markers and capped by `rules_engine.max_findings`. Unlike `review`, scan has no `--ci`, `--severity`, `--quiet`, `--stream`, `--output-file` or `--no-cache`, does not apply the quality gate, and keeps every finding in the output (`hook.min_severity` only decides the exit code in `block` mode).
 
