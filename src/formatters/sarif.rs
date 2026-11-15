@@ -185,6 +185,7 @@ mod tests {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         }
     }
 
@@ -195,6 +196,7 @@ mod tests {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         }
     }
 
@@ -348,6 +350,7 @@ mod tests {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         };
         let fmt = SarifFormatter;
         let output = fmt.format_review(&response).unwrap();
@@ -374,6 +377,7 @@ mod tests {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         };
         let out = SarifFormatter.format_review(&resp).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -390,6 +394,7 @@ mod tests {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         };
         let out = SarifFormatter.format_review(&resp).unwrap();
         assert!(!out.contains("cora.judge"));

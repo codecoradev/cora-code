@@ -108,6 +108,7 @@ fn into_review_response(findings: Findings, usage: Option<&transport::Usage>) ->
         tokens_used: usage.map(usage_to_token_usage),
         should_block: false,
         dropped_findings: 0,
+        judge_failure: None,
     }
 }
 

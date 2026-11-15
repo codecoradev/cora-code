@@ -63,6 +63,10 @@ review:
   static_analysis:
     auto_clippy: false       # auto-run `cargo clippy` (Rust only)
     clippy_output_file: ""   # or read clippy output from file
+  # Large diffs (see "Large Diffs")
+  max_chunk_chars: 48000     # split a diff above this many characters
+  exclude: []                # globs removed from the reviewed diff
+  fail_on_incomplete: true   # exit 1 when part of the diff was not reviewed
 
 focus: security, performance, bugs
 
@@ -568,6 +572,29 @@ const next = compute();
 - Applies to both deterministic scanner and LLM findings, in both `cora review` and `cora scan`. Other rules on the same line and the rest of the project stay visible. Works alongside `ignore.rules` and `ignore.files`.
 - `cora review` reads markers from the diff (added and context lines); a marker outside the diff's context window is not seen. `cora scan` reads markers from the full file contents.
 - `cora scan` also runs the deterministic secrets and security scanners on every scanned file and applies `ignore.rules`, so those findings are reported even when the LLM call fails.
+
+## Large Diffs
+
+`cora review` sends the diff to the model in requests of at most
+`review.max_chunk_chars` characters (default 48,000, about 1,000 lines; the
+minimum is 2,000). A larger diff is split into chunks of whole files, a single
+file larger than the budget is split at hunk boundaries (the file header is
+repeated in every piece), and the findings are merged and de-duplicated. This
+also applies with `--ci`; `--no-auto-chunk` turns it off.
+`hook.max_diff_size` remains the hard limit for runs that do not chunk.
+
+`review.exclude` takes the same globs as `ignore.files`, but it filters the
+diff itself: an excluded file is never sent to the model and never produces a
+finding (`ignore.files` only scopes the symbol index and the context chain).
+Use it for `CHANGELOG.md`, `docs/**`, lockfiles and generated code. The pretty
+output names the excluded files; with `json`, `sarif` and `compact` the note
+goes to stderr so stdout stays parseable.
+
+A review that did not cover the whole diff is not a pass. When a chunk fails,
+or the model call fails and only the deterministic findings remain, the
+output says which files were not reviewed and the exit code is 1 instead of 0
+(a blocking code, 2, is never lowered). Set `review.fail_on_incomplete: false`
+to keep the old warn-and-pass behaviour.
 
 ## Path-scoped ignore rules
 
