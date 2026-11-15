@@ -327,7 +327,10 @@ debt:
   enabled: true              # show the debt report (`cora debt`, `cora.get_debt`)
   history_dir: ""            # deprecated and ignored; still accepted
   retention_days: 90         # (reserved)
+  max_stored_findings: 500   # findings stored per run, most severe first; 0 = all
 ```
+
+`debt.max_stored_findings` bounds what one review or scan writes to `cora.db`. A full-repository scan can find thousands of issues; storing them all buried the few actionable ones. When a run is cut, its stored summary says how many were left out, and the quality score still uses the whole run. Findings that were not stored are not auto-resolved. To clean an existing database, use `cora findings prune` (see the CLI reference): `--stale-projects` removes projects whose directory is gone, and `--older-than DAYS` removes old resolved findings. Run it with `--dry-run` first. `prune` only edits `cora.db`: the shared vector index file (`cora_index.usearch`) is left as it is, so vectors of removed projects stay in it until the index is rebuilt.
 
 ### CLI Usage
 
