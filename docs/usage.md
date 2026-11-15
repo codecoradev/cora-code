@@ -267,12 +267,11 @@ $ cora debt --since v0.4.5
 $ cora debt --branch develop
 ```
 
-Snapshots are saved to `.cora/history/` after each review. Configure in `.cora.yaml`:
+Each review is recorded in `cora.db`; `cora debt` reads it from there. The old `.cora/history/` JSON files are no longer used and can be deleted. Configure in `.cora.yaml`:
 
 ```yaml
 debt:
   enabled: true           # default
-  history_dir: .cora/history
   retention_days: 90
 ```
 

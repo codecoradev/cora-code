@@ -848,17 +848,21 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
 }
 
 fn handle_get_debt() -> ToolResult {
-    let config = load_project_config().unwrap_or_default();
+    // Same source as `cora debt`: the review history in cora.db (#724).
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let snapshots = crate::engine::debt_tracker::load_snapshots_from_db(&cwd.to_string_lossy());
+    debt_report_result(&snapshots)
+}
 
-    let snapshots = crate::engine::debt_tracker::load_snapshots(config.debt.history_dir.as_deref());
-
+/// The `cora.get_debt` answer for already loaded review history.
+fn debt_report_result(snapshots: &[crate::engine::debt_tracker::DebtSnapshot]) -> ToolResult {
     if snapshots.is_empty() {
         return ToolResult::text(
-            "No debt snapshots found. Run 'cora review' or 'cora commit' to generate history.",
+            "No review history found. Run 'cora review' or 'cora commit' to generate history.",
         );
     }
 
-    let report = crate::engine::debt_tracker::aggregate(&snapshots);
+    let report = crate::engine::debt_tracker::aggregate(snapshots);
 
     let json = serde_json::json!({
         "quality_score": report.quality_score_avg,
@@ -1543,5 +1547,28 @@ mod tests {
     #[test]
     fn block_on_works_outside_a_runtime() {
         assert_eq!(block_on(async { 2 + 2 }), 4);
+    }
+
+    // ─── #724: get_debt reads the review history from cora.db ───
+
+    #[test]
+    fn get_debt_without_history_says_so() {
+        let r = debt_report_result(&[]);
+        assert!(!r.is_error);
+        assert!(r.content[0].text.contains("No review history found"));
+    }
+
+    #[test]
+    fn get_debt_reports_the_loaded_snapshots() {
+        use crate::engine::debt_tracker::DebtSnapshot;
+        use crate::engine::types::{ReviewIssue, Severity};
+        let issue =
+            ReviewIssue::new("a.rs", Some(1), Severity::Major, "t").with_type("bugs".to_string());
+        let snap = DebtSnapshot::from_review(&[issue], None, None, None, 1, None, None);
+        let r = debt_report_result(&[snap]);
+        assert!(!r.is_error);
+        let v: serde_json::Value = serde_json::from_str(&r.content[0].text).unwrap();
+        assert_eq!(v["total_reviews"], 1);
+        assert_eq!(v["total_findings"], 1);
     }
 }

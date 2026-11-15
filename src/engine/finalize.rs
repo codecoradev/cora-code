@@ -14,7 +14,6 @@
 //! testable without an LLM; the `save_*` functions never fail a run.
 
 use crate::config::schema::Config;
-use crate::engine::debt_tracker::{self, DebtSnapshot};
 use crate::engine::quality_gate::{self, GateResult, GateStatus};
 use crate::engine::review_store::{self, ReviewRecord};
 use crate::engine::types::{
@@ -147,23 +146,6 @@ fn git_context() -> (Option<String>, Option<String>) {
     });
 
     (CONTEXT.0.clone(), CONTEXT.1.clone())
-}
-
-/// Save a debt-tracking snapshot (best-effort, no-op when `debt.enabled` is
-/// off).
-pub fn save_debt(
-    config: &Config,
-    issues: &[ReviewIssue],
-    gate: Option<&GateResult>,
-    files_reviewed: usize,
-) {
-    if !config.debt.enabled {
-        return;
-    }
-    let (commit, branch) = git_context();
-    let snapshot =
-        DebtSnapshot::from_review(issues, gate, commit, branch, files_reviewed, None, None);
-    debt_tracker::save_snapshot(&snapshot, config.debt.history_dir.as_deref());
 }
 
 /// What a run records in the review history.

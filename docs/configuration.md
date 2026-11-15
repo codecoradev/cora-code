@@ -320,13 +320,13 @@ When `quality_gate.enabled` is `false` (default), quality gate is skipped. The e
 
 ## Debt Tracking
 
-cora tracks review findings over time and reports quality trends. After each review, a lightweight JSON snapshot is saved to `.cora/history/`. Use `cora debt` to view the aggregated report.
+cora tracks review findings over time and reports quality trends. Every review is recorded in the `reviews` table of `cora.db`, and `cora debt` (and the MCP tool `cora.get_debt`) aggregate it. `cora.db` is the only source: the `.cora/history/*.json` snapshots of older versions are no longer written or read, and the directory can be deleted.
 
 ```yaml
 debt:
-  enabled: true              # enable auto-save of review snapshots
-  history_dir: .cora/history # directory for snapshot files
-  retention_days: 90         # auto-cleanup old snapshots
+  enabled: true              # show the debt report (`cora debt`, `cora.get_debt`)
+  history_dir: ""            # deprecated and ignored; still accepted
+  retention_days: 90         # (reserved)
 ```
 
 ### CLI Usage
@@ -721,8 +721,8 @@ cora tracks review history and calculates tech debt metrics over time.
 ```yaml
 debt:
   enabled: true           # default: true
-  history_dir: .cora/history  # snapshot storage
-  retention_days: 90      # auto-cleanup old snapshots
+  # history_dir is deprecated and ignored: history is stored in cora.db
+  retention_days: 90
 ```
 
 ### CLI

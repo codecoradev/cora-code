@@ -50,16 +50,11 @@ pub fn execute_debt(opts: &DebtOptions) -> Result<i32> {
         return Ok(EXIT_OK);
     }
 
-    // Try DB as primary SoT first (cora.db reviews table), fall back to file snapshots
+    // History lives in cora.db (the `reviews` table).
     let cwd = std::env::current_dir().unwrap_or_default();
     let cwd_str = cwd.to_string_lossy().to_string();
 
     let mut snapshots = debt_tracker::load_snapshots_from_db(&cwd_str);
-
-    if snapshots.is_empty() {
-        // Fallback: legacy file-based snapshots
-        snapshots = debt_tracker::load_snapshots(config.debt.history_dir.as_deref());
-    }
 
     if snapshots.is_empty() {
         println!(
@@ -81,12 +76,6 @@ pub fn execute_debt(opts: &DebtOptions) -> Result<i32> {
         println!("{}", "No snapshots match the given filters.".yellow());
         return Ok(EXIT_NO_DATA);
     }
-
-    // Cleanup old snapshots (best-effort)
-    let _ = debt_tracker::cleanup_old_snapshots(
-        config.debt.history_dir.as_deref(),
-        config.debt.retention_days,
-    );
 
     let report = debt_tracker::aggregate(&snapshots);
 
