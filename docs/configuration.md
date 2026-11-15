@@ -190,10 +190,11 @@ Requires provider support for structured output. Works with OpenAI, Anthropic, a
 
 ## Anti-Hallucination
 
-cora uses two mechanisms to prevent the LLM from fabricating findings:
+cora uses three mechanisms to prevent the LLM from fabricating findings:
 
 - **File path injection** — Actual file paths are embedded in the prompt, anchoring the LLM to real files in the diff.
 - **Post-parse filtering** — After parsing, any reported file paths or line numbers that don't exist in the actual diff are discarded.
+- **Position validation** — The model also quotes the source line each finding is about (`snippet`). Before a finding is shown or stored, cora checks `line` against that quote. If the quote is on `line`, nothing changes. If it is on exactly one line within 25 lines of `line` (or the only line of the file that holds it when there is no `line`), the finding moves there. If the quote is nowhere to be found, or two lines equally near hold it, the finding becomes file-level instead of pointing at the wrong code. Whitespace and a `+`/`-` diff marker in the quote are ignored, quotes shorter than 4 characters are not trusted, and a finding with no quote keeps the old behaviour. The same check runs for `review`, `scan` and the MCP tools.
 
 ## Cross-File Review Context
 

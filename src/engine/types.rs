@@ -133,6 +133,11 @@ pub struct ReviewIssue {
     /// scanner rule still hides the surviving issue. Never serialized.
     #[serde(skip)]
     pub also_matches: Vec<String>,
+    /// The source line the finding is about, as the judge quoted it. Used once,
+    /// by admission, to check (and if needed move) `line`; never serialized
+    /// (#721).
+    #[serde(default, skip_serializing)]
+    pub snippet: Option<String>,
 }
 
 impl ReviewIssue {
@@ -155,6 +160,7 @@ impl ReviewIssue {
             suggested_fix: None,
             rule_id: None,
             also_matches: Vec::new(),
+            snippet: None,
         }
     }
 

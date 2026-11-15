@@ -359,6 +359,116 @@ fn line_is_present(source: &Source<'_>, file: &str, line: u32) -> Option<bool> {
     }
 }
 
+// ─── Position validation (#721) ───
+
+/// Lines further than this from the claimed line are not accepted as the
+/// quoted line when a nearer-than-whole-file match is needed.
+const SNAP_WINDOW: u32 = 25;
+/// Shortest quote (after normalizing) that is trusted to identify a line.
+const MIN_SNIPPET_CHARS: usize = 4;
+
+/// Collapse whitespace so indentation and spacing drift do not matter.
+fn normalize(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The line a judge quoted, reduced to what identifies it: the first
+/// non-empty line of the quote, without a diff marker, normalized. `None`
+/// when too short to trust.
+fn quote_key(snippet: &str) -> Option<String> {
+    let first = snippet.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let first = first
+        .strip_prefix('+')
+        .or_else(|| first.strip_prefix('-'))
+        .unwrap_or(first);
+    let key = normalize(first);
+    (key.chars().count() >= MIN_SNIPPET_CHARS).then_some(key)
+}
+
+/// Every `(line number, normalized text)` the source holds for `file`, in
+/// order, or `None` when the source says nothing about that file.
+fn file_lines(source: &Source<'_>, file: &str) -> Option<Vec<(u32, String)>> {
+    match source {
+        Source::Diff(chunks) => {
+            let mut out: Vec<(u32, String)> = Vec::new();
+            let mut seen = false;
+            for chunk in chunks
+                .iter()
+                .filter(|c| c.new_path.as_deref() == Some(file))
+            {
+                seen = true;
+                for h in &chunk.chunks {
+                    for l in &h.lines {
+                        if let (Some(n), DiffLineType::Add | DiffLineType::Context) =
+                            (l.new_line_no, l.line_type)
+                        {
+                            out.push((n, normalize(&l.content)));
+                        }
+                    }
+                }
+            }
+            seen.then_some(out)
+        }
+        Source::Files(files) => files.iter().find(|f| f.path == file).map(|f| {
+            f.content
+                .lines()
+                .enumerate()
+                .map(|(i, t)| (u32::try_from(i + 1).unwrap_or(u32::MAX), normalize(t)))
+                .collect()
+        }),
+    }
+}
+
+/// Check `line` against the line the judge quoted, and move it when the quote
+/// is on a nearby line.
+///
+/// - the quote is on `line`: unchanged;
+/// - the quote is on exactly one line within [`SNAP_WINDOW`] of `line` (or, with
+///   no `line`, on exactly one line of the file): `line` moves there;
+/// - otherwise the line becomes file-level (`None`), so a comment never points
+///   at code the finding is not about.
+///
+/// A quote that is missing or too short, or a file the source does not cover,
+/// leaves `line` alone.
+fn verify_position(
+    source: &Source<'_>,
+    file: &str,
+    line: Option<u32>,
+    snippet: Option<&str>,
+) -> Option<u32> {
+    let Some(key) = snippet.and_then(quote_key) else {
+        return line;
+    };
+    let Some(lines) = file_lines(source, file) else {
+        return line;
+    };
+    let hits: Vec<u32> = lines
+        .iter()
+        .filter(|(_, text)| text.contains(&key))
+        .map(|(n, _)| *n)
+        .collect();
+    match line {
+        Some(l) if hits.contains(&l) => Some(l),
+        Some(l) => {
+            let mut near: Vec<u32> = hits
+                .into_iter()
+                .filter(|n| n.abs_diff(l) <= SNAP_WINDOW)
+                .collect();
+            near.sort_by_key(|n| n.abs_diff(l));
+            // Two equally near lines are ambiguous.
+            match near.as_slice() {
+                [one] => Some(*one),
+                [a, b, ..] if a.abs_diff(l) != b.abs_diff(l) => Some(*a),
+                _ => None,
+            }
+        }
+        None => match hits.as_slice() {
+            [one] => Some(*one),
+            _ => None,
+        },
+    }
+}
+
 /// Admit the findings of an untrusted judge.
 ///
 /// - `file` must be one of `valid_files` (skipped when `valid_files` is
@@ -395,6 +505,18 @@ pub fn admit(
                 if line == 0 || line_is_present(source, &i.file, line) == Some(false) {
                     i.line = None;
                 }
+            }
+            // The quoted line is the evidence for the position (#721).
+            let snippet = i.snippet.take();
+            let checked = verify_position(source, &i.file, i.line, snippet.as_deref());
+            if checked != i.line {
+                tracing::debug!(
+                    file = %i.file,
+                    from = ?i.line,
+                    to = ?checked,
+                    "moved a finding to the line it quotes"
+                );
+                i.line = checked;
             }
             i
         })
@@ -652,5 +774,146 @@ mod tests {
         let mut clean = "all good".to_string();
         strip_sentinel(&mut clean);
         assert_eq!(clean, "all good");
+    }
+
+    // ─── #721: the quoted line is the evidence for the position ───
+
+    const CODE: &str = concat!(
+        "diff --git a/lib.rs b/lib.rs\n",
+        "--- a/lib.rs\n",
+        "+++ b/lib.rs\n",
+        "@@ -1,5 +1,6 @@\n",
+        " fn one() {}\n",
+        " fn two() {}\n",
+        "+    let secret = load_token();\n",
+        " fn three() {}\n",
+        " fn four() {}\n",
+        " fn five() {}\n",
+    );
+
+    const DUP: &str = concat!(
+        "diff --git a/lib.rs b/lib.rs\n",
+        "--- a/lib.rs\n",
+        "+++ b/lib.rs\n",
+        "@@ -1,5 +1,5 @@\n",
+        " a();\n",
+        " x();\n",
+        " b();\n",
+        " x();\n",
+        " c();\n",
+    );
+
+    fn quoted(line: Option<u32>, snippet: &str) -> ReviewIssue {
+        let mut i = issue("lib.rs", line, Severity::Major);
+        i.snippet = Some(snippet.to_string());
+        i
+    }
+
+    fn admit_lib(diff: &str, i: ReviewIssue) -> Option<u32> {
+        let chunks = parse_diff(diff);
+        admit(vec![i], &["lib.rs".to_string()], &Source::Diff(&chunks))[0].line
+    }
+
+    #[test]
+    fn a_quote_on_the_claimed_line_changes_nothing() {
+        let i = quoted(Some(3), "let secret = load_token();");
+        assert_eq!(admit_lib(CODE, i), Some(3));
+    }
+
+    #[test]
+    fn a_drifted_line_moves_to_the_line_it_quotes() {
+        // Claimed line 5 ("fn four"), but the quote is on line 3.
+        let i = quoted(Some(5), "let secret = load_token();");
+        assert_eq!(admit_lib(CODE, i), Some(3));
+    }
+
+    #[test]
+    fn spacing_and_a_diff_marker_in_the_quote_do_not_matter() {
+        let i = quoted(Some(6), "+    let   secret = load_token();");
+        assert_eq!(admit_lib(CODE, i), Some(3));
+    }
+
+    #[test]
+    fn a_quote_found_nowhere_makes_the_finding_file_level() {
+        let i = quoted(Some(4), "let nothing_like_this = 1;");
+        assert_eq!(admit_lib(CODE, i), None);
+    }
+
+    #[test]
+    fn two_equally_near_matches_are_ambiguous() {
+        // `x();` is on lines 2 and 4; line 3 is between them.
+        assert_eq!(admit_lib(DUP, quoted(Some(3), "x();")), None);
+        // Closer to line 2 than to 4: the nearer one wins.
+        assert_eq!(admit_lib(DUP, quoted(Some(1), "x();")), Some(2));
+    }
+
+    #[test]
+    fn without_a_claimed_line_only_a_unique_quote_gives_one() {
+        assert_eq!(
+            admit_lib(CODE, quoted(None, "let secret = load_token();")),
+            Some(3)
+        );
+        assert_eq!(admit_lib(DUP, quoted(None, "x();")), None);
+    }
+
+    #[test]
+    fn a_line_outside_the_diff_is_recovered_from_its_quote() {
+        // 99 is not in the diff, so admission drops it; the quote restores it.
+        let i = quoted(Some(99), "let secret = load_token();");
+        assert_eq!(admit_lib(CODE, i), Some(3));
+    }
+
+    #[test]
+    fn a_too_short_quote_is_ignored() {
+        assert_eq!(admit_lib(CODE, quoted(Some(5), "{}")), Some(5));
+        assert_eq!(admit_lib(CODE, quoted(Some(5), "   ")), Some(5));
+    }
+
+    #[test]
+    fn no_quote_keeps_the_old_behaviour() {
+        assert_eq!(
+            admit_lib(CODE, issue("lib.rs", Some(5), Severity::Major)),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn full_files_are_checked_too_and_far_matches_are_not_followed() {
+        let near = FileEntry {
+            path: "m.py".into(),
+            content: "a\nb\n    needle = 1\nc\n".into(),
+            lines: 4,
+        };
+        let mut far_content = String::new();
+        for i in 0..120 {
+            far_content.push_str(&if i == 100 {
+                "needle = 1\n".to_string()
+            } else {
+                format!("l{i}\n")
+            });
+        }
+        let far = FileEntry {
+            path: "f.py".into(),
+            content: far_content,
+            lines: 120,
+        };
+        let files = [near, far];
+        let src = Source::Files(&files);
+        let mut a = issue("m.py", Some(1), Severity::Major);
+        a.snippet = Some("needle = 1".into());
+        let mut b = issue("f.py", Some(2), Severity::Major);
+        b.snippet = Some("needle = 1".into());
+        let out = admit(vec![a, b], &["m.py".to_string(), "f.py".to_string()], &src);
+        assert_eq!(out[0].line, Some(3), "near drift is fixed");
+        assert_eq!(out[1].line, None, "a match 98 lines away is not trusted");
+    }
+
+    #[test]
+    fn the_snippet_is_read_from_the_model_reply_but_never_written_out() {
+        let raw = r#"{"file":"a.rs","line":3,"severity":"major","title":"t","body":"b","snippet":"let x = 1;"}"#;
+        let i: ReviewIssue = serde_json::from_str(raw).unwrap();
+        assert_eq!(i.snippet.as_deref(), Some("let x = 1;"));
+        let out = serde_json::to_string(&i).unwrap();
+        assert!(!out.contains("snippet"), "{out}");
     }
 }
