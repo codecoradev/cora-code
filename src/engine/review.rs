@@ -122,6 +122,7 @@ fn empty_response() -> ReviewResponse {
         tokens_used: None,
         should_block: false,
         dropped_findings: 0,
+        judge_failure: None,
     }
 }
 
@@ -414,6 +415,7 @@ pub async fn review_with<J: Judge>(
                     tokens_used: None,
                     should_block: false,
                     dropped_findings: 0,
+                    judge_failure: Some(e.to_string()),
                 };
                 let pp = postprocess_report(fallback.issues, &Source::Diff(&chunks), config);
                 fallback.issues = pp.issues;
@@ -773,6 +775,7 @@ mod tests {
                     tokens_used: None,
                     should_block: false,
                     dropped_findings: 0,
+                    judge_failure: None,
                 }),
                 Err(msg) => Err(CoraError::LlmParse(msg.clone())),
             }
@@ -870,6 +873,10 @@ new file mode 100644\n\
         let judge = FakeJudge(Err("boom".to_string()));
         let resp = run(&judge, &config, packet(SECRET_DIFF, &config)).expect("fallback");
         assert!(resp.summary.contains("LLM review failed"));
+        assert!(
+            resp.judge_failure.is_some(),
+            "a judge fallback must be marked as incomplete (#720)"
+        );
         assert!(resp.issues.iter().any(|i| i.rule_id.is_some()));
     }
 

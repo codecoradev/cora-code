@@ -62,6 +62,10 @@ pub struct Config {
     /// Brain Mode configuration — embedding backend selection.
     #[serde(default, skip_serializing_if = "is_default")]
     pub brain: BrainConfig,
+    /// Large-diff handling for `cora review`: request budget, excluded
+    /// paths, incomplete-review policy (#720).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub review: ReviewConfig,
     /// Enable background update check on startup (default: true).
     #[serde(default = "default_update_check", skip_serializing_if = "is_true")]
     pub update_check: bool,
@@ -114,6 +118,44 @@ pub struct ScopedIgnore {
 pub enum IgnoreRuleEntry {
     Plain(String),
     Scoped(ScopedIgnore),
+}
+
+/// Default size of one review request, in diff characters (#720).
+///
+/// Reviews of about 1,000 diff lines (roughly 45 KB) were reliable in the
+/// field while about 1,850 lines (roughly 85 KB) hit `finish_reason=length`
+/// on reasoning models, so the default stays inside the known-good zone.
+pub const DEFAULT_MAX_CHUNK_CHARS: usize = 48_000;
+
+/// Smallest accepted `review.max_chunk_chars`.
+pub const MIN_MAX_CHUNK_CHARS: usize = 2_000;
+
+/// Large-diff handling for `cora review` (#720).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Globs of files removed from the reviewed diff. Unlike `ignore.files`
+    /// (which scopes the symbol index and context chain), these files are
+    /// never sent to the model and never produce a finding. They are listed in
+    /// the review output.
+    pub exclude: Vec<String>,
+    /// A diff larger than this many characters is split into chunks that are
+    /// reviewed one by one and merged. A single file larger than this is split
+    /// at hunk boundaries. Applies in CI mode too.
+    pub max_chunk_chars: usize,
+    /// Exit non-zero when the review did not cover the whole diff (a chunk
+    /// failed, or the model call failed). Default `true`; set `false` to keep
+    /// the old "warn and pass" behaviour.
+    pub fail_on_incomplete: bool,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            exclude: Vec::new(),
+            max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
+            fail_on_incomplete: true,
+        }
+    }
 }
 
 /// Hook configuration.
@@ -187,6 +229,7 @@ impl Default for Config {
             profile: None,
             analysis: AnalysisConfig::default(),
             brain: BrainConfig::default(),
+            review: ReviewConfig::default(),
             update_check: true,
         }
     }
@@ -252,6 +295,14 @@ impl Config {
         }
         if let Err(e) = check_base_url(&self.provider.base_url) {
             errs.push(format!("provider.base_url: {e}"));
+        }
+
+        // ── review ──
+        if self.review.max_chunk_chars < MIN_MAX_CHUNK_CHARS {
+            errs.push(format!(
+                "review.max_chunk_chars must be at least {MIN_MAX_CHUNK_CHARS}, got: {}",
+                self.review.max_chunk_chars
+            ));
         }
 
         // ── llm ──
@@ -488,6 +539,15 @@ pub struct ReviewSection {
     /// Context chain configuration (cross-file dependency extraction).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_chain: Option<crate::engine::context::types::ContextConfig>,
+    /// Globs of files removed from the reviewed diff (#720).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    /// Maximum diff characters per review request; larger diffs are chunked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chunk_chars: Option<usize>,
+    /// Exit non-zero when the review did not cover the whole diff.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_on_incomplete: Option<bool>,
 }
 
 /// Static analysis configuration — inject linter/compiler output as review context.
@@ -827,6 +887,15 @@ impl CoraFile {
             }
             if let Some(cc) = &r.context_chain {
                 config.context_chain.clone_from(cc);
+            }
+            if let Some(v) = &r.exclude {
+                config.review.exclude.clone_from(v);
+            }
+            if let Some(v) = r.max_chunk_chars {
+                config.review.max_chunk_chars = v;
+            }
+            if let Some(v) = r.fail_on_incomplete {
+                config.review.fail_on_incomplete = v;
             }
         }
         if let Some(s) = &self.scan {
@@ -1465,6 +1534,7 @@ review:
                 static_analysis: None,
                 sanitize_comments: None,
                 context_chain: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1483,6 +1553,7 @@ review:
                 static_analysis: None,
                 sanitize_comments: None,
                 context_chain: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1504,6 +1575,7 @@ review:
                 static_analysis: None,
                 sanitize_comments: None,
                 context_chain: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2075,5 +2147,36 @@ ignore:
             err.contains("bug-println") && err.contains("files is empty"),
             "{err}"
         );
+    }
+
+    // ─── #720: review.* large-diff settings ───
+
+    #[test]
+    fn review_defaults_chunk_and_fail_closed() {
+        let cfg = Config::default();
+        assert_eq!(cfg.review.max_chunk_chars, DEFAULT_MAX_CHUNK_CHARS);
+        assert!(cfg.review.fail_on_incomplete);
+        assert!(cfg.review.exclude.is_empty());
+    }
+
+    #[test]
+    fn review_section_merges_into_config() {
+        let cora: CoraFile = serde_yaml_ng::from_str(
+            "review:\n  exclude: [\"CHANGELOG.md\", \"docs/**\"]\n  max_chunk_chars: 20000\n  fail_on_incomplete: false\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.review.exclude, vec!["CHANGELOG.md", "docs/**"]);
+        assert_eq!(cfg.review.max_chunk_chars, 20_000);
+        assert!(!cfg.review.fail_on_incomplete);
+    }
+
+    #[test]
+    fn validate_rejects_tiny_chunk_budget() {
+        let mut cfg = Config::default();
+        cfg.review.max_chunk_chars = 10;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("review.max_chunk_chars"), "err: {err}");
     }
 }

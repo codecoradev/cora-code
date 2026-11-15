@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Large diffs are reviewed in chunks, in CI too (#720).** A diff over `review.max_chunk_chars` (default 48,000 characters, about 1,000 lines) is split into requests of whole files; a file larger than that is split at hunk boundaries. Before, chunking started only above `hook.max_diff_size` (5 MB) and never with `--ci`, so a 1,850-line diff went to the model in one request and failed with `finish_reason=length`.
+- **`review.exclude` (#720).** Globs of files removed from the reviewed diff (`CHANGELOG.md`, `docs/**`, lockfiles). Unlike `ignore.files`, they are never sent to the model and never produce a finding; the output names them.
+- **`review.fail_on_incomplete` (#720, default `true`).** A review that did not cover the whole diff (a chunk failed, or the model call failed and only the deterministic findings remain) names the files it skipped and exits 1. Set it to `false` for the old warn-and-pass behaviour.
+
+### Changed
+
+- A failed model call in `cora review --format sarif` still returns a valid SARIF with a warning, but now exits 1 instead of 0 unless `review.fail_on_incomplete` is `false` (#720).
+
+### Fixed
+
+- **Chunked review lost files (#720).** Splitting a diff cut file headers and glued the blocks of a multi-file chunk together without a newline, so only the last file of each chunk was parsed back. Splitting now follows `diff --git` boundaries and is lossless.
+
 ## [0.20.0] - 2026-10-27
 
 ### Added
