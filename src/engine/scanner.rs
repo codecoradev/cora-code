@@ -77,6 +77,9 @@ pub fn walk_project(
         .git_global(true) // respect core.excludesFile
         .git_exclude(true) // respect .git/info/exclude
         .require_git(false) // apply gitignore rules even outside git repos
+        // readdir order differs per filesystem; sort so the walk (and the
+        // `files_fingerprint` built from it) is the same everywhere.
+        .sort_by_file_name(std::cmp::Ord::cmp)
         .build();
 
     for result in walker {

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`scan` and `scan_prepare` walk the project in a stable order.** The directory walk followed the filesystem's `readdir` order, so `order: path` and the `files_fingerprint` built from it could differ between machines, and the test `finalize_agrees_with_prepare_only_for_the_same_filters` failed in CI whenever the walk happened to match the default `source-first` order. Entries are now sorted by name inside each directory.
+
 ## [0.20.0] - 2026-10-27
 
 ### Added
