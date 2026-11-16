@@ -216,6 +216,7 @@ review:
     include_tests: true         # resolve test files via naming convention
     include_callers: true       # resolve callers of changed code (blast radius)
     use_brain: true             # enrich prompt with symbol-index intelligence
+    auto_index: true            # bring the index up to date first (CI, fresh clones)
     impact_depth: 2             # blast-radius traversal depth (2 = callers of callers)
     prefer_index: true          # prefer symbol index (FTS5 + call graph) over regex
 ```
@@ -227,6 +228,7 @@ review:
 | `follow_depth` | `1` | Outbound recursion depth (`1` = direct references). |
 | `include_tests` | `true` | Map changed source to its test files. |
 | `include_callers` | `true` | Inbound caller resolution. When the symbol index is unavailable (regex fallback): gitignore-aware file scan bounded to ≤400 files and ≤3 call-sites per symbol. When the index is available (default path, `prefer_index: true`): up to 20 call-sites per symbol, filtered by `ignore.files` patterns. |
+| `auto_index` | `true` | Before a review or scan with a judge (an LLM, or an agent through `cora.review_prepare` / `cora.scan_prepare`) builds its context, bring the project's index and vectors up to date (incremental: unchanged files are skipped). Without it a fresh checkout, such as a CI runner, has no code intelligence and the code embedding model goes unused. A `--no-llm` run only reads an existing index. `false` reads an existing index only. |
 | `use_brain` | `true` | Enrich prompt with symbol-index intelligence (impact analysis, affected tests, semantic search). Only active when `cora index` has been run. |
 | `impact_depth` | `2` | Blast-radius traversal depth. See [Impact depth guidance](#impact-depth-guidance) below. |
 | `prefer_index` | `true` | Prefer symbol index (FTS5 + call graph) over regex scanning for outbound resolution. |

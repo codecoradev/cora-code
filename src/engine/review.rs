@@ -108,6 +108,8 @@ pub async fn review_diff_with_judge(
             if diff.trim().is_empty() {
                 return Ok(empty_response());
             }
+            // No judge: nothing reads the context, so the index is only read, not
+            // refreshed (a `--no-llm` run keeps its speed and its findings).
             let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
             let packet = prepare_deterministic(config, diff, &index_bridge);
             review_with(&NoJudge, config, packet).await
@@ -149,7 +151,9 @@ async fn review_diff_inner(
     // Index bridge: one project handle, rooted via resolve_project_root, shared
     // by every index-backed step so a run from a subdirectory agrees with
     // `cora index` (#566).
-    let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd();
+    // The index is brought up to date first (`context_chain.auto_index`), so a
+    // fresh CI checkout gets code intelligence and the code model is used (#765).
+    let index_bridge = crate::engine::index_bridge::IndexBridge::open_cwd_refreshed(config, quiet);
 
     let packet = prepare(config, diff, memory_context, &index_bridge);
     let judge = HttpJudge {
@@ -577,7 +581,11 @@ pub(crate) fn build_brain_context(
         ));
     }
 
-    // ── 3. Semantic Pattern Search ───────────────────────────────────────
+    // ── 3. Related code by meaning ───────────────────────────────────────
+    // Search by what each changed definition *is* (its indexed name and
+    // signature, the text the code model embedded), so a differently named
+    // function that does the same thing, or the convention a sibling follows,
+    // is found. Only the changed symbol itself is left out.
     let mut brain_lines: Vec<String> = Vec::new();
     let mut seen_brain: std::collections::HashSet<String> = std::collections::HashSet::new();
     for def in defs.iter().take(5) {
@@ -585,10 +593,12 @@ pub(crate) fn build_brain_context(
         if def.name.len() < 2 {
             continue;
         }
-        if let Ok(results) = crate::index::brain::brain_search(conn, project_id, &def.name, 3) {
-            for r in results {
-                // Skip results from the same file as the definition
-                if r.file == def.file {
+        let query = meaning_query(conn, project_id, &def.name, &def.file);
+        if let Ok(report) =
+            crate::index::brain::brain_search_report(conn, project_id, &query, 4, true)
+        {
+            for r in report.results {
+                if r.name == def.name && r.file == def.file {
                     continue;
                 }
                 if seen_brain.insert(format!("{}:{}", r.file, r.line)) {
@@ -600,12 +610,15 @@ pub(crate) fn build_brain_context(
                         r.signals.join("+")
                     ));
                 }
+                if brain_lines.len() >= 15 {
+                    break;
+                }
             }
         }
     }
     if !brain_lines.is_empty() {
         sections.push(format!(
-            "### Related Patterns (Semantic Search)\n{}",
+            "### Related Code (by meaning)\n{}",
             brain_lines.join("\n")
         ));
     }
@@ -617,11 +630,33 @@ pub(crate) fn build_brain_context(
     }
 }
 
-/// Build brain context for `cora scan` from a list of files.
-///
-/// Unlike `build_brain_context` (which works on diff chunks), this variant
-/// extracts symbols from the scanned file list and queries the index for
-/// impact analysis, affected tests, and related patterns.
+/// Text that stands for a symbol in a meaning search: what the index embeds for
+/// it (`name signature`), or just the name when the index has no signature.
+fn meaning_query(conn: &rusqlite::Connection, project_id: i64, name: &str, file: &str) -> String {
+    let signature: Option<String> = conn
+        .query_row(
+            "SELECT signature FROM symbols WHERE project_id = ?1 AND name = ?2 AND file = ?3 \
+             ORDER BY line LIMIT 1",
+            rusqlite::params![project_id, name, file],
+            |row| row.get(0),
+        )
+        .ok();
+    match signature {
+        Some(sig) if !sig.is_empty() && sig != name => format!("{name} {sig}"),
+        _ => name.to_string(),
+    }
+}
+
+/// A symbol of a scanned file, as the index knows it.
+struct FileSymbol {
+    name: String,
+    file: String,
+    line: i64,
+}
+
+/// Build brain context for `cora scan` from a list of files: the files' real
+/// symbols from the index, the high-impact ones among them, the tests that call
+/// them, and related code elsewhere found by meaning (the code model).
 ///
 /// Returns `None` if no index is available or no results found.
 pub(crate) fn build_scan_brain_context(
@@ -630,33 +665,37 @@ pub(crate) fn build_scan_brain_context(
     bridge: &crate::engine::index_bridge::IndexBridge,
 ) -> Option<String> {
     let (conn, project_id) = bridge.parts()?;
-
-    // Extract function/type names from each file using simple heuristics.
-    // For scan we don't have tree-sitter AST — we use the index's FTS5
-    // to find symbols defined in these files.
     let mut sections = Vec::new();
-    let file_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
 
-    // ── Single-pass: collect all symbols from scanned files ────────
-    // Query brain_search once per file (capped at 10), then reuse the
-    // collected symbols for both impact analysis and affected-tests lookup.
-    let mut all_symbols: Vec<crate::index::brain::BrainResult> = Vec::new();
-    for file_path in file_paths.iter().take(10) {
-        let query = format!("file:\"{file_path}\"");
-        if let Ok(results) = crate::index::brain::brain_search(conn, project_id, &query, 5) {
-            all_symbols.extend(results.into_iter().filter(|r| r.name.len() >= 2));
+    // ── Symbols of the scanned files (capped: first 10 files, 8 each) ───
+    let mut unique_symbols: Vec<FileSymbol> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for file in files.iter().take(10) {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT name, file, line FROM symbols WHERE project_id = ?1 AND file = ?2 \
+             ORDER BY line LIMIT 8",
+        ) else {
+            continue;
+        };
+        let rows = stmt.query_map(rusqlite::params![project_id, file.path], |row| {
+            Ok(FileSymbol {
+                name: row.get(0)?,
+                file: row.get(1)?,
+                line: row.get(2)?,
+            })
+        });
+        if let Ok(rows) = rows {
+            for s in rows.flatten() {
+                if s.name.len() >= 2 && seen_names.insert(s.name.clone()) {
+                    unique_symbols.push(s);
+                }
+            }
         }
     }
 
-    // Deduplicate by name to avoid redundant impact_analysis calls
-    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let unique_symbols: Vec<_> = all_symbols
-        .into_iter()
-        .filter(|r| seen_names.insert(r.name.clone()))
-        .collect();
-
     // ── 1. Impact Analysis ───────────────────────────────────────────
     let mut impact_lines: Vec<String> = Vec::new();
+    let mut by_impact: Vec<(usize, &FileSymbol)> = Vec::new();
     for r in &unique_symbols {
         if let Ok(nodes) =
             crate::index::graph::impact_analysis(conn, project_id, &r.name, impact_depth)
@@ -670,6 +709,7 @@ pub(crate) fn build_scan_brain_context(
                     nodes.len()
                 ));
             }
+            by_impact.push((nodes.len(), r));
         }
     }
     if !impact_lines.is_empty() {
@@ -680,7 +720,6 @@ pub(crate) fn build_scan_brain_context(
     }
 
     // ── 2. Affected Tests ────────────────────────────────────────────
-    // Reuse the same symbols — no additional brain_search calls needed.
     let mut test_files: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &unique_symbols {
         if let Ok(nodes) = crate::index::graph::impact_analysis(conn, project_id, &r.name, 1) {
@@ -702,6 +741,45 @@ pub(crate) fn build_scan_brain_context(
                 .map(|f| format!("- `{f}`"))
                 .collect::<Vec<_>>()
                 .join("\n")
+        ));
+    }
+
+    // ── 3. Related code by meaning ───────────────────────────────────
+    // For the symbols other code depends on most (then the first ones), find
+    // code elsewhere that does a similar thing, outside the scanned files.
+    by_impact.sort_by_key(|(n, _)| std::cmp::Reverse(*n));
+    let scanned: std::collections::HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let mut related: Vec<String> = Vec::new();
+    let mut seen_related: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, sym) in by_impact.iter().take(6) {
+        let query = meaning_query(conn, project_id, &sym.name, &sym.file);
+        if let Ok(report) =
+            crate::index::brain::brain_search_report(conn, project_id, &query, 4, true)
+        {
+            for r in report.results {
+                if scanned.contains(r.file.as_str()) {
+                    continue;
+                }
+                if seen_related.insert(format!("{}:{}", r.file, r.line)) {
+                    related.push(format!(
+                        "- `{}` in {}:{} is similar to `{}` (signals: {})",
+                        r.name,
+                        r.file,
+                        r.line,
+                        sym.name,
+                        r.signals.join("+")
+                    ));
+                }
+                if related.len() >= 12 {
+                    break;
+                }
+            }
+        }
+    }
+    if !related.is_empty() {
+        sections.push(format!(
+            "### Related Code (by meaning)\n{}",
+            related.join("\n")
         ));
     }
 
