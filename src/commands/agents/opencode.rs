@@ -8,7 +8,8 @@
 //! online docs were not found in that release, so they are not generated.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, remove_file_step, write_if_changed,
+    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
+    write_if_changed,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -83,8 +84,9 @@ fn install_mcp(ctx: &Ctx) -> Step {
         ));
     }
     let path = config(ctx);
-    let mut doc: Value = match std::fs::read_to_string(&path) {
-        Ok(s) if !s.trim().is_empty() => match serde_json::from_str(&s) {
+    let mut doc: Value = match read_existing(&path) {
+        Err(e) => return Step::Failed(e),
+        Ok(Some(s)) if !s.trim().is_empty() => match serde_json::from_str(&s) {
             Ok(v @ Value::Object(_)) => v,
             _ => {
                 return Step::Skipped(format!(
@@ -93,8 +95,14 @@ fn install_mcp(ctx: &Ctx) -> Step {
                 ));
             }
         },
-        _ => json!({ "$schema": "https://opencode.ai/config.json" }),
+        Ok(_) => json!({ "$schema": "https://opencode.ai/config.json" }),
     };
+    if doc.get("mcp").is_some_and(|m| !m.is_object()) {
+        return Step::Failed(format!(
+            "{}: `mcp` is not an object; left untouched",
+            path.display()
+        ));
+    }
     let wanted = mcp_entry(ctx);
     if !doc["mcp"].is_object() {
         doc["mcp"] = json!({});
@@ -118,8 +126,10 @@ fn install_mcp(ctx: &Ctx) -> Step {
 
 fn remove_mcp(ctx: &Ctx) -> Step {
     let path = config(ctx);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Step::Unchanged(format!("{} not present", path.display()));
+    let text = match read_existing(&path) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Step::Unchanged(format!("{} not present", path.display())),
+        Err(e) => return Step::Failed(e),
     };
     let Ok(mut doc) = serde_json::from_str::<Value>(&text) else {
         return Step::Skipped(format!(
@@ -166,12 +176,13 @@ impl Integration for OpenCode {
     fn install(&self, ctx: &Ctx) -> Report {
         let mut r = Report::new("opencode", self.detected(ctx));
         let path = plugin(ctx);
-        let step = match std::fs::read_to_string(&path) {
-            Ok(s) if !s.starts_with(MARK) && !ctx.force => Step::Skipped(format!(
+        let step = match read_existing(&path) {
+            Err(e) => Step::Failed(e),
+            Ok(Some(s)) if !s.starts_with(MARK) && !ctx.force => Step::Skipped(format!(
                 "{} exists and is not managed by cora (use --force to replace it)",
                 path.display()
             )),
-            _ => write_if_changed(&path, &plugin_source(ctx), ctx),
+            Ok(_) => write_if_changed(&path, &plugin_source(ctx), ctx),
         };
         r.push("plugin", step);
         r.push("mcp", install_mcp(ctx));
@@ -184,13 +195,13 @@ impl Integration for OpenCode {
     fn remove(&self, ctx: &Ctx) -> Report {
         let mut r = Report::new("opencode", self.detected(ctx));
         let path = plugin(ctx);
-        if std::fs::read_to_string(&path).is_ok_and(|s| !s.starts_with(MARK)) && !ctx.force {
-            r.push(
+        match read_existing(&path) {
+            Err(e) => r.push("plugin", Step::Failed(e)),
+            Ok(Some(s)) if !s.starts_with(MARK) && !ctx.force => r.push(
                 "plugin",
                 Step::Skipped(format!("{} is not managed by cora, kept", path.display())),
-            );
-        } else {
-            r.push("plugin", remove_file_step(&path, ctx));
+            ),
+            Ok(_) => r.push("plugin", remove_file_step(&path, ctx)),
         }
         r.push("mcp", remove_mcp(ctx));
         r.push("skill", remove_file_step(&skill(ctx), ctx));
@@ -247,6 +258,25 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(config(&c)).unwrap()).unwrap();
         assert_eq!(back, json!({"theme":"dark"}));
         assert!(!plugin(&c).exists() && !skill(&c).exists());
+    }
+
+    #[test]
+    fn unreadable_or_oddly_shaped_files_are_reported_and_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path());
+        std::fs::create_dir_all(plugin(&c).parent().unwrap()).unwrap();
+        std::fs::write(plugin(&c), [0xff, 0xfe]).unwrap(); // not UTF-8
+        std::fs::write(config(&c), r#"{"mcp":[]}"#).unwrap();
+
+        let r = OpenCode.install(&c);
+        assert!(r.failed(), "{}", r.render());
+        assert_eq!(std::fs::read(plugin(&c)).unwrap(), vec![0xff, 0xfe]);
+        assert_eq!(
+            std::fs::read_to_string(config(&c)).unwrap(),
+            r#"{"mcp":[]}"#
+        );
+        OpenCode.remove(&c);
+        assert!(plugin(&c).exists(), "an unreadable file is not removed");
     }
 
     #[test]
