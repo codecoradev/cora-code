@@ -247,9 +247,6 @@ fn install_agent(agent: &AgentInfo, opts: &InstallOptions) -> Result<String> {
     }
 }
 
-/// The `/cora-review` skill for Claude Code (agent-as-reviewer, #647).
-const CLAUDE_SKILL: &str = include_str!("cora_review_skill.md");
-
 /// `~/.claude/skills/cora-review/SKILL.md`, when Claude Code is installed
 /// (`~/.claude` exists).
 fn claude_skill_path() -> Option<PathBuf> {
@@ -268,82 +265,65 @@ fn install_claude_skill(opts: &InstallOptions) -> Option<Result<String>> {
 }
 
 fn install_skill_at(path: &std::path::Path, opts: &InstallOptions) -> Result<String> {
+    use crate::commands::agents::skills::{self, Outcome};
     let name = "claude-code skill /cora-review";
-    if opts.remove {
-        if !path.exists() {
-            return Ok(format!(
-                "{} {} — no skill found",
-                name.bold(),
-                "⏭ ".dimmed()
-            ));
+    let dir = path.parent().context("skill path has no directory")?;
+    let shown = dir.display();
+    let line = |mark: String, what: &str| format!("{} {} {shown} — {what}", name.bold(), mark);
+    let results = if opts.remove {
+        skills::remove_dir(dir, &skills::REVIEW, opts.dry_run, opts.force)
+    } else {
+        skills::install_dir(dir, &skills::REVIEW, opts.dry_run, opts.force)
+    };
+    let (mut installed, mut updated, mut removed, mut kept, mut same, mut would, mut absent) =
+        (0, 0, 0, 0, 0, 0, 0);
+    for (file, result) in results {
+        match result.with_context(|| format!("failed on {}", file.display()))? {
+            Outcome::Installed => installed += 1,
+            Outcome::Updated(_) => updated += 1,
+            Outcome::Removed => removed += 1,
+            Outcome::KeptCustomized => kept += 1,
+            Outcome::UpToDate => same += 1,
+            Outcome::Would(_) => would += 1,
+            Outcome::NotPresent => absent += 1,
         }
-        // Never delete a customized copy: only remove ours (or with --force).
-        if !opts.force && std::fs::read_to_string(path).is_ok_and(|c| c != CLAUDE_SKILL) {
-            return Ok(format!(
-                "{} {} {} — customized, kept (use --force to remove)",
-                name.bold(),
-                "⏭ ".dimmed(),
-                path.display()
-            ));
-        }
-        if opts.dry_run {
-            return Ok(format!(
-                "{} {} {} — would remove",
-                name.bold(),
-                "🔍 ".cyan(),
-                path.display()
-            ));
-        }
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove {}", path.display()))?;
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_dir(dir); // only if empty
-        }
-        return Ok(format!(
-            "{} {} {} — removed",
-            name.bold(),
-            "✓ ".green(),
-            path.display()
-        ));
     }
-
-    if path.exists() && !opts.force {
-        let current = std::fs::read_to_string(path).unwrap_or_default();
-        if current == CLAUDE_SKILL {
-            return Ok(format!(
-                "{} {} {} — up to date",
-                name.bold(),
-                "⏭ ".dimmed(),
-                path.display()
-            ));
-        }
-        return Ok(format!(
-            "{} {} {} — exists and differs (use --force to overwrite)",
-            name.bold(),
-            "⏭ ".dimmed(),
-            path.display()
-        ));
-    }
-    if opts.dry_run {
-        return Ok(format!(
-            "{} {} {} — would write",
-            name.bold(),
-            "🔍 ".cyan(),
-            path.display()
-        ));
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-    }
-    std::fs::write(path, CLAUDE_SKILL)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(format!(
-        "{} {} {} — installed",
-        name.bold(),
-        "✓ ".green(),
-        path.display()
-    ))
+    let note = if kept > 0 {
+        format!(
+            "; {kept} file(s) you edited kept (use --force to {})",
+            if opts.remove { "remove" } else { "overwrite" }
+        )
+    } else {
+        String::new()
+    };
+    Ok(if would > 0 {
+        line(
+            "🔍 ".cyan().to_string(),
+            &format!(
+                "would {}{note}",
+                if opts.remove {
+                    "remove"
+                } else {
+                    "write or update"
+                }
+            ),
+        )
+    } else if installed > 0 && updated == 0 && same == 0 && kept == 0 {
+        line("✓ ".green().to_string(), "installed")
+    } else if installed + updated > 0 {
+        line(
+            "✓ ".green().to_string(),
+            &format!("updated ({} file(s) written){note}", installed + updated),
+        )
+    } else if removed > 0 {
+        line("✓ ".green().to_string(), &format!("removed{note}"))
+    } else if kept > 0 {
+        line("⏭ ".dimmed().to_string(), &format!("kept{note}"))
+    } else if absent > 0 && same == 0 {
+        format!("{} {} — no skill found", name.bold(), "⏭ ".dimmed())
+    } else {
+        line("⏭ ".dimmed().to_string(), "up to date")
+    })
 }
 
 /// Execute the `cora install` subcommand.
@@ -505,7 +485,12 @@ mod tests {
         let path = skill_path(dir.path());
         let msg = install_skill_at(&path, &opts()).unwrap();
         assert!(msg.contains("installed"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), CLAUDE_SKILL);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::commands::agents::skills::render(
+                crate::commands::agents::skills::REVIEW.files[0].text
+            )
+        );
         assert!(
             install_skill_at(&path, &opts())
                 .unwrap()
@@ -522,7 +507,7 @@ mod tests {
         assert!(
             install_skill_at(&path, &opts())
                 .unwrap()
-                .contains("differs")
+                .contains("you edited")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "my own version");
         let force = InstallOptions {
@@ -530,7 +515,12 @@ mod tests {
             ..opts()
         };
         install_skill_at(&path, &force).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), CLAUDE_SKILL);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::commands::agents::skills::render(
+                crate::commands::agents::skills::REVIEW.files[0].text
+            )
+        );
     }
 
     #[test]
@@ -579,10 +569,23 @@ mod tests {
             "cora.scan_prepare",
             "cora.scan_finalize",
         ] {
-            assert!(CLAUDE_SKILL.contains(tool), "skill must mention {tool}");
+            assert!(
+                crate::commands::agents::skills::REVIEW.files[0]
+                    .text
+                    .contains(tool),
+                "skill must mention {tool}"
+            );
         }
-        assert!(CLAUDE_SKILL.starts_with("---\nname: cora-review\n"));
-        assert!(CLAUDE_SKILL.contains("untrusted"));
+        assert!(
+            crate::commands::agents::skills::REVIEW.files[0]
+                .text
+                .starts_with("---\nname: cora-review\n")
+        );
+        assert!(
+            crate::commands::agents::skills::REVIEW.files[0]
+                .text
+                .contains("untrusted")
+        );
     }
 
     #[test]
@@ -598,7 +601,7 @@ mod tests {
         assert!(
             install_skill_at(&path, &remove)
                 .unwrap()
-                .contains("customized")
+                .contains("you edited")
         );
         assert!(path.exists());
         let force = InstallOptions {

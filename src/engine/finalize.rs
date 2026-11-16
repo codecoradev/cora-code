@@ -14,7 +14,6 @@
 //! testable without an LLM; the `save_*` functions never fail a run.
 
 use crate::config::schema::Config;
-use crate::engine::debt_tracker::{self, DebtSnapshot};
 use crate::engine::quality_gate::{self, GateResult, GateStatus};
 use crate::engine::review_store::{self, ReviewRecord};
 use crate::engine::types::{
@@ -149,23 +148,6 @@ fn git_context() -> (Option<String>, Option<String>) {
     (CONTEXT.0.clone(), CONTEXT.1.clone())
 }
 
-/// Save a debt-tracking snapshot (best-effort, no-op when `debt.enabled` is
-/// off).
-pub fn save_debt(
-    config: &Config,
-    issues: &[ReviewIssue],
-    gate: Option<&GateResult>,
-    files_reviewed: usize,
-) {
-    if !config.debt.enabled {
-        return;
-    }
-    let (commit, branch) = git_context();
-    let snapshot =
-        DebtSnapshot::from_review(issues, gate, commit, branch, files_reviewed, None, None);
-    debt_tracker::save_snapshot(&snapshot, config.debt.history_dir.as_deref());
-}
-
 /// What a run records in the review history.
 #[derive(Debug, Clone, Copy)]
 pub struct HistoryEntry<'a> {
@@ -183,7 +165,12 @@ pub struct HistoryEntry<'a> {
 
 /// Save the findings to `cora.db` (best-effort: a history-write failure never
 /// fails the run).
-pub fn save_history(entry: &HistoryEntry<'_>, issues: &[ReviewIssue], shaped: &Shape) {
+pub fn save_history(
+    config: &Config,
+    entry: &HistoryEntry<'_>,
+    issues: &[ReviewIssue],
+    shaped: &Shape,
+) {
     let (commit, branch) = git_context();
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -200,6 +187,7 @@ pub fn save_history(entry: &HistoryEntry<'_>, issues: &[ReviewIssue], shaped: &S
         should_block: shaped.should_block,
         tokens: entry.tokens,
         issues,
+        max_stored_findings: config.debt.max_stored_findings,
     };
     review_store::persist_review_best_effort(&record);
 }
@@ -280,6 +268,7 @@ mod tests {
             tokens_used: None,
             should_block: true, // stale value from the judge
             dropped_findings: 0,
+            judge_failure: None,
         };
         shape(&mut resp, &config("warn", false), &opts(Severity::Major));
         assert!(resp.issues.is_empty());

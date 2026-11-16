@@ -29,9 +29,10 @@
 - 📏 **Custom rule engine** — write your own regex rules in `.cora.yaml`
 - ✂️ **Auto-chunking** — splits large PRs into reviewable chunks automatically
 - 🔍 **Code Intelligence** — index symbols across 15 languages, call graph, trace, impact analysis
-- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + vector KNN + graph) with RRF fusion
+- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33.5 MB model is inside the release binaries (a `cargo install` build downloads it once on first use), no API key, no GPU
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
+- 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
 - 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
 - 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
@@ -56,7 +57,9 @@ curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install-
 cargo install --git https://github.com/codecoradev/cora-code
 ```
 
-> Pin a version: `CORA_VERSION=v0.6.1 curl -fsSL ... | sh`
+> Pin a version: `CORA_VERSION=v0.21.0 curl -fsSL ... | sh`
+
+**The code model.** Release binaries (the installer, `cora upgrade`, the archives on the Releases page) already contain the 33.5 MB `potion-code-16M-v2` model, so semantic search works right after the download, offline included; the first use unpacks it into the data directory. A `cargo install` build does not carry it (the crates.io size limit is 10 MB) and downloads it once on first use.
 
 **Upgrading:** run `cora upgrade` (downloads the latest release, verifies its SHA-256 checksum and, when `cosign` is installed, its Sigstore signature, replaces the binary) or `cora upgrade --check` to just see if one is available. If you installed via `cargo install --path .`, re-run that instead.
 
@@ -215,7 +218,8 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora profile list` | List quality profiles (strict, balanced, lax) |
 | `cora mcp` | Start MCP server (22 tools) for AI coding agents |
 | `cora serve` | Start MCP server + auto-reindex on startup |
-| `cora install` | Auto-detect and configure AI coding agents |
+| `cora install` | Auto-detect and configure AI coding agents (hooks, MCP, skill) |
+| `cora hook context` | Agent prompt hook: code-search results for a prompt |
 | `cora hook install` | Install pre-commit hook |
 | `cora upgrade` | Self-upgrade from GitHub Releases (checksum-verified) |
 
@@ -223,14 +227,14 @@ See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for al
 
 ## Performance
 
-Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64, single-thread baseline → Rayon parallel).
+Measured on the cora-code repository (1,996 symbols, 179 files, release build, with the real `potion-code-16M-v2` model).
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| Cold index (full rebuild) | **~936ms** | Walk + parse + embed + HNSW insert (Rayon parallel) |
-| Incremental (no changes) | **~6ms** | mtime:size fingerprint — skips unchanged files |
-| Brain search (hybrid) | **~5ms** | FTS5 + vector KNN + graph BFS → RRF fusion |
-| Binary size | **10.4 MB** | Single static binary, zero runtime dependencies |
+| Cold index (full rebuild) | **~0.6 s** | Walk + parse + embed every symbol + write the project's vector file |
+| Incremental (no changes) | **~0.13 s** | mtime:size fingerprint — skips unchanged files |
+| `cora brain` (one CLI run) | **~0.2 s** | Loads the 32 MB model, then FTS5 + vector scan + graph BFS → RRF fusion. A long-running `cora mcp` keeps the model loaded |
+| Binary size | **~36 MB** (**~69 MB** release binary with the model, ~38.5 MB as `tar.gz`) | Single binary; release binaries carry the 33.5 MB embedding model, a `cargo install` build downloads it once on first use |
 
 > Measurements are indicative, not contractual. Your numbers will vary with codebase size, CPU cores, and disk I/O.
 

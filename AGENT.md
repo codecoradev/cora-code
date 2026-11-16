@@ -46,6 +46,8 @@ src/
 │   ├── config_cmd.rs    # cora config (show/set/validate)
 │   ├── auth.rs          # cora auth (API key management)
 │   ├── hook_cmd.rs      # cora hook (pre-commit hook install/uninstall)
+│   ├── hook_context.rs  # cora hook context|session (agent prompt hooks)
+│   ├── agents/          # cora install: Claude Code, Hermes, pi, omp, opencode
 │   ├── init.rs          # cora init (project scaffolding)
 │   ├── upload.rs        # cora upload (review upload)
 │   ├── completion.rs    # Shell completion generation
@@ -56,12 +58,12 @@ src/
 │   ├── symbols.rs       # SymbolKind, SymbolQuery, SearchResult types
 │   ├── extract.rs       # 15 language extractors (def + call extraction)
 │   ├── graph.rs         # Call graph (callers, impact, affected)
-│   ├── brain.rs         # Hybrid search: FTS5 + usearch KNN + graph BFS → RRF k=60
-│   └── vector.rs        # CodeVectorIndex using usearch HNSW (256d, Cosine, F32)
-├── embed/               # Embedding engine
-│   ├── mod.rs           # Re-exports
-│   ├── tokens.rs        # Static token embedding (256d, zero-dep bag-of-tokens)
-│   └── token_vocab.rs   # Token vocabulary (reserved for Phase 5 ONNX upgrade)
+│   ├── brain.rs         # Hybrid search: FTS5 + vector KNN + graph BFS → RRF k=60
+│   └── vector.rs        # One vecq file per project and model (<data dir>/vectors/)
+├── embed/               # Embedding engine: the potion-code-16M-v2 code model only
+│   ├── mod.rs           # Backend (Potion | Off), resolve, embed dispatch
+│   ├── model_store.rs   # Pinned, SHA-256-verified one-time model download
+│   └── potion.rs        # Model2Vec static model (model2vec-rs)
 ├── config/
 │   ├── mod.rs
 │   ├── schema.rs        # Config structs & defaults
@@ -118,10 +120,11 @@ src/
 | `config/loader.rs` | Config loading with full priority chain resolution |
 | `config/schema.rs` | All config structs, defaults, serde annotations |
 | `commands/init.rs` | Project scaffolding, `.cora.yaml` generation |
-| `index/brain.rs` | Hybrid search orchestration (FTS5 + usearch + graph → RRF) |
-| `index/vector.rs` | CodeVectorIndex — usearch HNSW wrapper, load/save/insert/search |
+| `index/brain.rs` | Hybrid search orchestration (FTS5 + vectors + graph → RRF) |
+| `index/vector.rs` | Per-project vecq file — build, atomic save, cached load, search |
 | `index/schema.rs` | SQLite schema v4, auto-migration, FTS5 virtual table |
-| `embed/tokens.rs` | Static token embedding (256d, zero-dependency) |
+| `embed/mod.rs` | Embedding backend (code model or off), download policy |
+| `commands/agents/` | Native agent integrations (`Integration` trait, one file per agent) |
 
 ## Testing
 
@@ -259,13 +262,31 @@ Missing any = release blocker.
 ### 1. Code
 
 - [ ] All target issues merged to `develop`
-- [ ] `cargo test` — all 708+ tests pass
+- [ ] `cargo test` — all 1500+ tests pass
 - [ ] `cargo clippy --all-targets -- -D warnings` — clean
 - [ ] `cargo fmt --all -- --check` — clean
 - [ ] `cargo build --release` — no errors
 - [ ] `./target/release/cora --version` — prints correct version
 - [ ] `./target/release/cora mcp --help` — new subcommands work
 - [ ] `./target/release/cora review --staged` — no crash on clean tree
+
+### 1b. Skills (shipped inside the binary)
+
+`src/commands/agents/skills/<name>/SKILL.md` and its `references/` files (`cora-code`,
+`cora-review`) are embedded in the binary and installed into users' agents by
+`cora install`. They follow the Agent Skills layout (short `SKILL.md`, detail in
+`references/`); `cargo test` checks the layout. They name
+CLI commands and MCP tools, so they must move with the code.
+
+- [ ] `cargo test` passes the skill checks (`commands::agents::skills`): every MCP tool,
+      `cora <command>` and `--flag` a skill names exists
+- [ ] Reread both skill texts against this release's CHANGELOG (renamed or new tools,
+      commands, flags, install steps) and update them in the same release
+- [ ] A skill that must stay recognizable after a rewrite: the old text's SHA-256 is added to
+      `LEGACY_REVIEW_SKILLS` only if that text shipped without a marker (v0.19.0 and v0.20.0
+      are already there; newer releases carry the marker and need nothing)
+- [ ] `cora install --dry-run` on a machine with an older install reports the skills as
+      "updated" (cora-written copies) and "kept" (edited copies)
 
 ### 2. Documentation (Every File)
 

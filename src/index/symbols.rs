@@ -2,6 +2,7 @@
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Kind of a symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,7 +21,31 @@ pub enum SymbolKind {
     Variable,
 }
 
+/// Every symbol kind, in display order.
+pub const ALL_KINDS: [SymbolKind; 11] = [
+    SymbolKind::Function,
+    SymbolKind::Struct,
+    SymbolKind::Enum,
+    SymbolKind::Trait,
+    SymbolKind::Interface,
+    SymbolKind::Class,
+    SymbolKind::Method,
+    SymbolKind::Constant,
+    SymbolKind::Module,
+    SymbolKind::TypeAlias,
+    SymbolKind::Variable,
+];
+
 impl SymbolKind {
+    /// Comma-separated list of valid `--kind` values, for error messages.
+    pub fn valid_list() -> String {
+        ALL_KINDS
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Function => "function",
@@ -35,6 +60,13 @@ impl SymbolKind {
             Self::TypeAlias => "type_alias",
             Self::Variable => "variable",
         }
+    }
+
+    /// Strict parse of a user-supplied kind (`type-alias` and `type_alias` both
+    /// work); `None` for an unknown kind.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_lowercase().replace('-', "_");
+        ALL_KINDS.iter().find(|k| k.as_str() == s).cloned()
     }
 
     pub fn from_str(s: &str) -> Self {
@@ -86,6 +118,8 @@ pub struct SymbolQuery {
     pub language: Option<String>,
     /// Maximum results.
     pub limit: usize,
+    /// Also match words in the signature / doc text (default: name only).
+    pub include_docs: bool,
 }
 
 impl SymbolQuery {
@@ -95,6 +129,8 @@ impl SymbolQuery {
         Self {
             text: Some(text.to_string()),
             limit: 50,
+            // Programmatic callers (brain, MCP bridge) keep matching signatures.
+            include_docs: true,
             ..Default::default()
         }
     }
@@ -117,194 +153,210 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+/// Result of a symbol search: the (possibly truncated) ranked results plus the
+/// number of matches before the limit was applied.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    /// Total matches before `limit` was applied (`>= results.len()`).
+    pub total: usize,
+}
+
 /// Execute a symbol search query against the database, scoped to a project.
 pub fn search(
     conn: &Connection,
     project_id: i64,
     query: &SymbolQuery,
 ) -> anyhow::Result<Vec<SearchResult>> {
-    let limit = if query.limit > 0 {
-        query.limit as i64
+    Ok(search_with_total(conn, project_id, query)?.results)
+}
+
+/// Match tier of `name` against the search `text`, lower is better:
+/// 0 exact, 1 prefix, 2 substring, 3 anything else (FTS-only match).
+/// Comparison is case-insensitive.
+pub fn match_tier(name: &str, text: &str) -> u8 {
+    let name = name.to_lowercase();
+    let text = text.to_lowercase();
+    if name == text {
+        0
+    } else if name.starts_with(&text) {
+        1
+    } else if name.contains(&text) {
+        2
     } else {
-        50
-    };
+        3
+    }
+}
 
-    if let Some(text) = &query.text {
-        // FTS5 full-text search
-        let fts_query = sanitize_fts_query(text);
+/// Append the kind / language / file filters of `query` (columns prefixed with
+/// `alias`) to `sql`, numbering bind parameters from `params.len() + 1`.
+fn push_filters(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+    query: &SymbolQuery,
+    alias: &str,
+) {
+    if let Some(kind) = &query.kind {
+        params.push(Box::new(kind.as_str().to_string()));
+        sql.push_str(&format!(" AND {alias}kind = ?{}", params.len()));
+    }
+    if let Some(lang) = &query.language {
+        params.push(Box::new(lang.clone()));
+        sql.push_str(&format!(" AND {alias}language = ?{}", params.len()));
+    }
+    if let Some(prefix) = &query.file_prefix {
+        params.push(Box::new(format!(
+            "{}%",
+            super::queries::escape_like(prefix)
+        )));
+        sql.push_str(&format!(
+            " AND {alias}file LIKE ?{} ESCAPE '\\'",
+            params.len()
+        ));
+    }
+}
 
+fn map_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
+    Ok(IndexedSymbol {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: SymbolKind::from_str(&row.get::<_, String>(2)?),
+        file: row.get(3)?,
+        line: row.get::<_, i64>(4)? as u32,
+        signature: row.get(5)?,
+        language: row.get(6)?,
+    })
+}
+
+/// Like [`search`], but also reports how many matches existed before `limit`.
+///
+/// With a text query, candidates are the union of FTS5 matches (name only,
+/// or name + signature when `include_docs`) and `LIKE %text%` matches on the
+/// name. They are ordered exact name > prefix > substring > FTS rank, so a
+/// symbol named exactly like the query always comes first.
+pub fn search_with_total(
+    conn: &Connection,
+    project_id: i64,
+    query: &SymbolQuery,
+) -> anyhow::Result<SearchOutcome> {
+    let limit = if query.limit > 0 { query.limit } else { 50 };
+
+    let text = query.text.as_deref().map(str::trim).unwrap_or("");
+    if text.is_empty() {
+        return filter_search(conn, project_id, query, limit);
+    }
+
+    // id -> (symbol, raw bm25; 0.0 when only the LIKE pass found it).
+    let mut candidates: HashMap<i64, (IndexedSymbol, f64)> = HashMap::new();
+
+    // Pass 1: FTS5 token matches.
+    let fts_query = sanitize_fts_query(text);
+    if !fts_query.is_empty() {
+        // Without `include_docs`, restrict the match to the `name` column so
+        // words that only occur in the signature / doc text do not match.
+        let match_expr = if query.include_docs {
+            fts_query
+        } else {
+            format!("name : ({fts_query})")
+        };
         let mut sql = String::from(
             "SELECT s.id, s.name, s.kind, s.file, s.line, s.signature, s.language,
-                    bm25(symbols_fts) as score
+                    bm25(symbols_fts)
              FROM symbols_fts
              JOIN symbols s ON s.id = symbols_fts.rowid
              WHERE symbols_fts MATCH ?1 AND s.project_id = ?2",
         );
-
         let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(fts_query.clone()), Box::new(project_id)];
-
-        let mut param_idx = 3;
-
-        if let Some(kind) = &query.kind {
-            sql.push_str(&format!(" AND s.kind = ?{param_idx}"));
-            params.push(Box::new(kind.as_str().to_string()));
-            param_idx += 1;
-        }
-
-        if let Some(lang) = &query.language {
-            sql.push_str(&format!(" AND s.language = ?{param_idx}"));
-            params.push(Box::new(lang.clone()));
-            param_idx += 1;
-        }
-
-        if let Some(prefix) = &query.file_prefix {
-            sql.push_str(&format!(" AND s.file LIKE ?{param_idx}"));
-            params.push(Box::new(format!("{prefix}%")));
-            // param_idx not needed after last push
-        }
-
-        sql.push_str(&format!(" ORDER BY score ASC LIMIT {limit}"));
+            vec![Box::new(match_expr), Box::new(project_id)];
+        push_filters(&mut sql, &mut params, query, "s.");
 
         let mut stmt = conn.prepare(&sql)?;
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(SearchResult {
-                symbol: IndexedSymbol {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    kind: SymbolKind::from_str(&row.get::<_, String>(2)?),
-                    file: row.get(3)?,
-                    line: row.get::<_, i64>(4)? as u32,
-                    signature: row.get(5)?,
-                    language: row.get(6)?,
-                },
-                // bm25 returns negative scores (more negative = better match)
-                // Convert to positive score where higher = better
-                score: {
-                    let raw: f64 = row.get(7)?;
-                    if raw < 0.0 { -raw } else { raw }
-                },
-            })
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            Ok((map_symbol(row)?, row.get::<_, f64>(7)?))
         })?;
-
-        let mut results: Vec<SearchResult> = rows.filter_map(|r| r.ok()).collect();
-
-        // If FTS returns nothing, try LIKE fallback on name
-        if results.is_empty() {
-            results = like_search(conn, project_id, text, query, limit)?;
+        for (sym, raw) in rows.flatten() {
+            candidates.insert(sym.id, (sym, raw));
         }
-
-        Ok(results)
-    } else {
-        // No text query — just filter by kind/file/language
-        filter_search(conn, project_id, query, limit)
     }
-}
 
-/// Fallback: LIKE-based search when FTS5 returns nothing.
-#[allow(unused_assignments)]
-fn like_search(
-    conn: &Connection,
-    project_id: i64,
-    text: &str,
-    query: &SymbolQuery,
-    limit: i64,
-) -> anyhow::Result<Vec<SearchResult>> {
-    let pattern = format!("%{text}%");
-
+    // Pass 2: substring matches on the name (FTS only matches whole tokens).
     let mut sql = String::from(
-        "SELECT id, name, kind, file, line, signature, language
-         FROM symbols WHERE name LIKE ?1 AND project_id = ?2",
+        "SELECT s.id, s.name, s.kind, s.file, s.line, s.signature, s.language
+         FROM symbols s WHERE s.name LIKE ?1 ESCAPE '\\' AND s.project_id = ?2",
     );
-
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(pattern), Box::new(project_id)];
-    let mut idx = 3;
-
-    if let Some(kind) = &query.kind {
-        sql.push_str(&format!(" AND kind = ?{idx}"));
-        params.push(Box::new(kind.as_str().to_string()));
-        idx += 1;
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+        Box::new(format!("%{}%", super::queries::escape_like(text))),
+        Box::new(project_id),
+    ];
+    push_filters(&mut sql, &mut params, query, "s.");
+    let mut stmt = conn.prepare(&sql)?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), map_symbol)?;
+    for sym in rows.flatten() {
+        candidates.entry(sym.id).or_insert((sym, 0.0));
     }
 
-    sql.push_str(&format!(" LIMIT {limit}"));
+    let mut ranked: Vec<(u8, f64, IndexedSymbol)> = candidates
+        .into_values()
+        .map(|(sym, raw)| (match_tier(&sym.name, text), raw, sym))
+        .collect();
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.name.len().cmp(&b.2.name.len()))
+            .then_with(|| a.2.name.cmp(&b.2.name))
+            .then_with(|| a.2.file.cmp(&b.2.file))
+            .then(a.2.line.cmp(&b.2.line))
+    });
 
-    let mut stmt = conn.prepare(&sql)?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let rows = stmt.query_map(param_refs.as_slice(), |row| {
-        Ok(SearchResult {
-            symbol: IndexedSymbol {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: SymbolKind::from_str(&row.get::<_, String>(2)?),
-                file: row.get(3)?,
-                line: row.get::<_, i64>(4)? as u32,
-                signature: row.get(5)?,
-                language: row.get(6)?,
-            },
-            score: 1.0,
+    let total = ranked.len();
+    // bm25 is negative (more negative = better); expose it as a positive score.
+    let results = ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, raw, symbol)| SearchResult {
+            symbol,
+            score: raw.abs(),
         })
-    })?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+        .collect();
+    Ok(SearchOutcome { results, total })
 }
 
-/// Filter-only search (no FTS text).
-#[allow(unused_assignments)]
+/// Filter-only search (no text).
 fn filter_search(
     conn: &Connection,
     project_id: i64,
     query: &SymbolQuery,
-    limit: i64,
-) -> anyhow::Result<Vec<SearchResult>> {
-    let mut sql = String::from(
-        "SELECT id, name, kind, file, line, signature, language FROM symbols WHERE project_id = ?1",
-    );
-
+    limit: usize,
+) -> anyhow::Result<SearchOutcome> {
+    let mut where_sql = String::from(" WHERE s.project_id = ?1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id)];
-    let mut idx = 2;
+    push_filters(&mut where_sql, &mut params, query, "s.");
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-    if let Some(kind) = &query.kind {
-        sql.push_str(&format!(" AND kind = ?{idx}"));
-        params.push(Box::new(kind.as_str().to_string()));
-        idx += 1;
-    }
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM symbols s{where_sql}"),
+        refs.as_slice(),
+        |row| row.get(0),
+    )?;
 
-    if let Some(lang) = &query.language {
-        sql.push_str(&format!(" AND language = ?{idx}"));
-        params.push(Box::new(lang.clone()));
-        idx += 1;
-    }
-
-    if let Some(prefix) = &query.file_prefix {
-        sql.push_str(&format!(" AND file LIKE ?{idx}"));
-        params.push(Box::new(format!("{prefix}%")));
-        idx += 1;
-    }
-
-    sql.push_str(&format!(" LIMIT {limit}"));
-
+    let sql = format!(
+        "SELECT s.id, s.name, s.kind, s.file, s.line, s.signature, s.language
+         FROM symbols s{where_sql} ORDER BY s.name, s.file, s.line LIMIT {limit}"
+    );
     let mut stmt = conn.prepare(&sql)?;
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let rows = stmt.query_map(param_refs.as_slice(), |row| {
+    let rows = stmt.query_map(refs.as_slice(), |row| {
         Ok(SearchResult {
-            symbol: IndexedSymbol {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                kind: SymbolKind::from_str(&row.get::<_, String>(2)?),
-                file: row.get(3)?,
-                line: row.get::<_, i64>(4)? as u32,
-                signature: row.get(5)?,
-                language: row.get(6)?,
-            },
+            symbol: map_symbol(row)?,
             score: 0.0,
         })
     })?;
 
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    Ok(SearchOutcome {
+        results: rows.filter_map(|r| r.ok()).collect(),
+        total: total as usize,
+    })
 }
 
 /// Sanitize a user query for FTS5 MATCH syntax.
@@ -489,5 +541,158 @@ mod tests {
         assert_eq!(split_camel_case("a"), vec!["a"]);
         assert_eq!(split_camel_case(""), Vec::<String>::new());
         assert_eq!(split_camel_case("ABTest"), vec!["AB", "Test"]);
+    }
+
+    fn mem_conn() -> (Connection, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::index::schema::run_migrations(&conn).unwrap();
+        let pid = crate::index::schema::get_or_create_project(&conn, "/tmp/rank-test").unwrap();
+        (conn, pid)
+    }
+
+    fn add_sym(conn: &Connection, pid: i64, name: &str, kind: &str, sig: &str) {
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, signature, language, project_id)
+             VALUES (?1, ?2, 'src/a.rs', 1, ?3, 'rust', ?4)",
+            rusqlite::params![name, kind, sig, pid],
+        )
+        .unwrap();
+    }
+
+    fn names(out: &SearchOutcome) -> Vec<&str> {
+        out.results.iter().map(|r| r.symbol.name.as_str()).collect()
+    }
+
+    #[test]
+    fn test_match_tier() {
+        assert_eq!(match_tier("Search", "search"), 0);
+        assert_eq!(match_tier("search_symbols", "search"), 1);
+        assert_eq!(match_tier("brain_search", "search"), 2);
+        assert_eq!(match_tier("lookup", "search"), 3);
+    }
+
+    #[test]
+    fn test_ranking_exact_prefix_substring_fts() {
+        let (conn, pid) = mem_conn();
+        // Inserted in the reverse of the expected order.
+        add_sym(&conn, pid, "brain_search", "function", "fn brain_search()");
+        add_sym(
+            &conn,
+            pid,
+            "search_symbols",
+            "function",
+            "fn search_symbols()",
+        );
+        add_sym(&conn, pid, "search", "function", "fn search()");
+        add_sym(
+            &conn,
+            pid,
+            "unrelated",
+            "function",
+            "fn unrelated() // search",
+        );
+
+        let mut q = SymbolQuery::text("search");
+        q.include_docs = true;
+        let out = search_with_total(&conn, pid, &q).unwrap();
+        assert_eq!(
+            names(&out),
+            vec!["search", "search_symbols", "brain_search", "unrelated"]
+        );
+        assert_eq!(out.total, 4);
+    }
+
+    #[test]
+    fn test_ranking_substring_without_token_boundary() {
+        let (conn, pid) = mem_conn();
+        add_sym(&conn, pid, "reindexAll", "function", "");
+        add_sym(&conn, pid, "index", "function", "");
+        let q = SymbolQuery {
+            text: Some("index".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        let out = search_with_total(&conn, pid, &q).unwrap();
+        // `reindexAll` is only reachable through the substring pass.
+        assert_eq!(names(&out), vec!["index", "reindexAll"]);
+    }
+
+    #[test]
+    fn test_truncation_reports_total() {
+        let (conn, pid) = mem_conn();
+        for i in 0..7 {
+            add_sym(&conn, pid, &format!("parse_{i}"), "function", "");
+        }
+        let q = SymbolQuery {
+            text: Some("parse".into()),
+            limit: 3,
+            ..Default::default()
+        };
+        let out = search_with_total(&conn, pid, &q).unwrap();
+        assert_eq!(out.results.len(), 3);
+        assert_eq!(out.total, 7);
+
+        // Filter-only path reports a total too.
+        let q = SymbolQuery {
+            kind: Some(SymbolKind::Function),
+            limit: 2,
+            ..Default::default()
+        };
+        let out = search_with_total(&conn, pid, &q).unwrap();
+        assert_eq!((out.results.len(), out.total), (2, 7));
+    }
+
+    #[test]
+    fn test_docs_words_only_match_with_include_docs() {
+        let (conn, pid) = mem_conn();
+        add_sym(
+            &conn,
+            pid,
+            "handler",
+            "function",
+            "fn handler() // validates tokens",
+        );
+
+        let mut q = SymbolQuery {
+            text: Some("validates".into()),
+            limit: 10,
+            ..Default::default()
+        };
+        assert!(
+            search_with_total(&conn, pid, &q)
+                .unwrap()
+                .results
+                .is_empty()
+        );
+
+        q.include_docs = true;
+        assert_eq!(
+            names(&search_with_total(&conn, pid, &q).unwrap()),
+            vec!["handler"]
+        );
+    }
+
+    #[test]
+    fn test_kind_filter_applies_to_text_search() {
+        let (conn, pid) = mem_conn();
+        add_sym(&conn, pid, "Config", "struct", "");
+        add_sym(&conn, pid, "config_path", "function", "");
+        let q = SymbolQuery {
+            text: Some("config".into()),
+            kind: Some(SymbolKind::Struct),
+            limit: 10,
+            ..Default::default()
+        };
+        let out = search_with_total(&conn, pid, &q).unwrap();
+        assert_eq!(names(&out), vec!["Config"]);
+        assert_eq!(out.total, 1);
+    }
+
+    #[test]
+    fn test_symbol_kind_parse_strict() {
+        assert_eq!(SymbolKind::parse("Function"), Some(SymbolKind::Function));
+        assert_eq!(SymbolKind::parse("type-alias"), Some(SymbolKind::TypeAlias));
+        assert_eq!(SymbolKind::parse("nonsense"), None);
     }
 }

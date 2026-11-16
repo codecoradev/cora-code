@@ -571,7 +571,7 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
         "bug-println" => is_cli_output_path(path),
         "bug-todo" => !is_deliberate_todo_marker(line),
         "bug-expect" => is_invariant_expect(line),
-        "sec-hardcoded-url" => is_false_positive_url(line),
+        "sec-hardcoded-url" => is_license_text(path) || is_false_positive_url(line),
         "config/cors-wildcard" => is_false_positive_cors(line),
         "injection/sql-concat" | "sec-sql-concat" => is_false_positive_sql_concat(line),
         "config/debug-enabled" => is_false_positive_debug(line),
@@ -580,6 +580,34 @@ pub fn post_match_filter_for_path(rule_id: &str, line: &str, path: &str) -> bool
         "crypto/ssl-verify-disabled" => is_false_positive_ssl_verify(line),
         _ => false,
     }
+}
+
+/// License and notice texts (`LICENSE`, `LICENSE-APACHE`, `COPYING.md`, `NOTICE`,
+/// `*.license`, anything under a `LICENSES/` directory) quote canonical
+/// `http://` URLs, such as `http://www.apache.org/licenses/LICENSE-2.0`, that
+/// cannot be changed to `https` without altering the license (#719).
+fn is_license_text(path: &str) -> bool {
+    let upper = path.to_ascii_uppercase();
+    if upper.split('/').any(|c| c == "LICENSES") {
+        return true;
+    }
+    let base = upper.rsplit('/').next().unwrap_or(&upper);
+    if base.ends_with(".LICENSE") {
+        return true;
+    }
+    let (stem, ext) = base.split_once('.').unwrap_or((base, ""));
+    // Only a prose or extension-less file: `LICENSE-checker.rs` is source.
+    let prose = matches!(
+        ext,
+        "" | "MD" | "TXT" | "RST" | "ADOC" | "HTML" | "LESSER" | "LIB"
+    );
+    let named = matches!(
+        stem,
+        "LICENSE" | "LICENCE" | "COPYING" | "NOTICE" | "UNLICENSE" | "COPYRIGHT" | "PATENTS"
+    ) || ["LICENSE-", "LICENCE-", "COPYING-"]
+        .iter()
+        .any(|p| stem.starts_with(p));
+    named && prose
 }
 
 /// `bug-todo` fires only on a deliberate marker: an upper-case `TODO`, `FIXME`,
@@ -1159,11 +1187,7 @@ fn is_false_positive_cors(line: &str) -> bool {
 
     // Env var READ patterns (not bare assignments).
     // e.g., env::var("TITEN_CORS_ORIGINS"), getenv("CORS_CONFIG")
-    if lower.contains("env::var(") || lower.contains("getenv(") || lower.contains("os.environ") {
-        return true;
-    }
-
-    false
+    lower.contains("env::var(") || lower.contains("getenv(") || lower.contains("os.environ")
 }
 
 #[cfg(test)]
@@ -1800,5 +1824,72 @@ mod tests {
             !is_in_binary_only_package(b, "docs/readme.md"),
             "outside src/"
         );
+    }
+
+    // ─── #719: license texts are not insecure URLs ───
+
+    #[test]
+    fn license_and_notice_files_are_recognised() {
+        for p in [
+            "LICENSE",
+            "crates/x/LICENSE",
+            "LICENSE.md",
+            "license.txt",
+            "LICENSE-APACHE",
+            "LICENSE-MIT",
+            "COPYING",
+            "COPYING.LESSER",
+            "NOTICE",
+            "NOTICE.txt",
+            "UNLICENSE",
+            "vendor/foo/Foo.LICENSE",
+            "LICENSES/Apache-2.0.txt",
+            "third_party/LICENSES/MIT.txt",
+        ] {
+            assert!(is_license_text(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn other_files_are_not_license_texts() {
+        for p in [
+            "src/license_check.rs",
+            "LICENSE-checker.rs",
+            "src/main.rs",
+            "docs/licensing.md",
+            "NOTICE_board.py",
+            "README.md",
+            "",
+        ] {
+            assert!(!is_license_text(p), "{p}");
+        }
+    }
+
+    #[test]
+    fn the_apache_urls_are_not_flagged_in_a_license_but_are_in_code() {
+        let line = "   http://www.apache.org/licenses/LICENSE-2.0";
+        assert!(post_match_filter_for_path(
+            "sec-hardcoded-url",
+            line,
+            "crates/x/LICENSE"
+        ));
+        assert!(post_match_filter_for_path(
+            "sec-hardcoded-url",
+            line,
+            "LICENSES/Apache-2.0.txt"
+        ));
+        // The same line in code is still reported.
+        let call = "let u = \"http://www.apache.org/licenses/LICENSE-2.0\";";
+        assert!(!post_match_filter_for_path(
+            "sec-hardcoded-url",
+            call,
+            "src/net.rs"
+        ));
+        // Only the url rule is affected.
+        assert!(!post_match_filter_for_path(
+            "sec-sql-concat",
+            "let q = format!(\"SELECT * FROM t WHERE id = {}\", id);",
+            "LICENSE"
+        ));
     }
 }

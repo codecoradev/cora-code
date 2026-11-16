@@ -1,0 +1,245 @@
+[
+ {
+  "q": "split a git diff into one block per file without losing any content",
+  "relevant": [
+   "engine/chunker.rs::split_by_file"
+  ]
+ },
+ {
+  "q": "break a file that is too big into pieces at hunk boundaries",
+  "relevant": [
+   "engine/chunker.rs::split_oversize"
+  ]
+ },
+ {
+  "q": "remove files matching glob patterns from the reviewed diff",
+  "relevant": [
+   "engine/chunker.rs::exclude_paths"
+  ]
+ },
+ {
+  "q": "group diff blocks together up to a size limit",
+  "relevant": [
+   "engine/chunker.rs::group_by_size"
+  ]
+ },
+ {
+  "q": "make a human readable label for a chunk of changed files",
+  "relevant": [
+   "engine/chunker.rs::derive_label"
+  ]
+ },
+ {
+  "q": "check that the line a finding points at really exists in the diff",
+  "relevant": [
+   "engine/judge.rs::line_is_present",
+   "engine/judge.rs::verify_position"
+  ]
+ },
+ {
+  "q": "move a finding to the line that it quotes",
+  "relevant": [
+   "engine/judge.rs::verify_position"
+  ]
+ },
+ {
+  "q": "cut overlong text fields in the model output",
+  "relevant": [
+   "engine/judge.rs::truncate_chars"
+  ]
+ },
+ {
+  "q": "keep only findings for files that are part of the review",
+  "relevant": [
+   "engine/judge.rs::admit"
+  ]
+ },
+ {
+  "q": "delete old findings and stale projects from the database",
+  "relevant": [
+   "engine/review_store.rs::prune"
+  ]
+ },
+ {
+  "q": "mark a finding as dismissed or reopen it",
+  "relevant": [
+   "engine/review_store.rs::dismiss",
+   "engine/review_store.rs::reopen",
+   "engine/review_store.rs::transition"
+  ]
+ },
+ {
+  "q": "compute a stable fingerprint for a finding",
+  "relevant": [
+   "engine/review_store.rs::compute_fingerprint"
+  ]
+ },
+ {
+  "q": "keep only the most severe findings when a run produces too many",
+  "relevant": [
+   "engine/review_store.rs::stored_subset"
+  ]
+ },
+ {
+  "q": "auto resolve findings that are no longer reported",
+  "relevant": [
+   "engine/review_store.rs::resolve_stale"
+  ]
+ },
+ {
+  "q": "who calls this function",
+  "relevant": [
+   "index/graph.rs::find_callers",
+   "index/graph.rs::find_callers_opts"
+  ]
+ },
+ {
+  "q": "what would break if I change this symbol",
+  "relevant": [
+   "index/graph.rs::impact_analysis"
+  ]
+ },
+ {
+  "q": "follow the call path from a symbol up to a given depth",
+  "relevant": [
+   "index/graph.rs::trace_path",
+   "index/graph.rs::trace_path_opts"
+  ]
+ },
+ {
+  "q": "find functions that nothing calls",
+  "relevant": [
+   "index/graph.rs::find_dead_code"
+  ]
+ },
+ {
+  "q": "find imports that are never used",
+  "relevant": [
+   "index/graph.rs::find_unused_imports"
+  ]
+ },
+ {
+  "q": "reduce a question to the words that can name a symbol",
+  "relevant": [
+   "index/brain.rs::question_terms"
+  ]
+ },
+ {
+  "q": "combine keyword vector and graph hits into one ranking",
+  "relevant": [
+   "index/brain.rs::brain_search_report"
+  ]
+ },
+ {
+  "q": "check that the stored vector dimensions match the active embedding",
+  "relevant": [
+   "index/brain.rs::check_dimension_compat"
+  ]
+ },
+ {
+  "q": "ignore findings that are in lockfiles",
+  "relevant": [
+   "engine/reflect.rs::is_lockfile",
+   "engine/reflect.rs::reflect"
+  ]
+ },
+ {
+  "q": "lower the severity by one level",
+  "relevant": [
+   "engine/reflect.rs::step_down"
+  ]
+ },
+ {
+  "q": "extract the findings array from the model reply",
+  "relevant": [
+   "engine/llm/findings.rs::parse_findings"
+  ]
+ },
+ {
+  "q": "recover findings from the reasoning text when the content is empty",
+  "relevant": [
+   "engine/llm/findings.rs::salvage_from_reasoning"
+  ]
+ },
+ {
+  "q": "retry with a bigger token budget when the reply was cut off",
+  "relevant": [
+   "engine/llm/findings.rs::next_budget_on_empty"
+  ]
+ },
+ {
+  "q": "clamp a huge token count so it does not wrap around",
+  "relevant": [
+   "engine/llm/transport.rs::saturate_u32",
+   "engine/llm/transport.rs::parse_usage_value"
+  ]
+ },
+ {
+  "q": "build the JSON body for a chat completion request",
+  "relevant": [
+   "engine/llm/transport.rs::build_request_body_with"
+  ]
+ },
+ {
+  "q": "read the token usage from a streaming response",
+  "relevant": [
+   "engine/llm/transport.rs::extract_stream_usage"
+  ]
+ },
+ {
+  "q": "detect a hardcoded secret assigned in code",
+  "relevant": [
+   "engine/rules/builtin.rs::has_secret_literal"
+  ]
+ },
+ {
+  "q": "decide that a url is not a real hardcoded insecure address",
+  "relevant": [
+   "engine/rules/builtin.rs::is_false_positive_url"
+  ]
+ },
+ {
+  "q": "skip license and notice files for url rules",
+  "relevant": [
+   "engine/rules/builtin.rs::is_license_text"
+  ]
+ },
+ {
+  "q": "check whether a file belongs to a package that only builds a binary",
+  "relevant": [
+   "engine/rules/builtin.rs::is_in_binary_only_package"
+  ]
+ },
+ {
+  "q": "estimate how many hours of technical debt the findings represent",
+  "relevant": [
+   "engine/debt_tracker.rs::estimate_debt_hours"
+  ]
+ },
+ {
+  "q": "calculate a quality score from the findings",
+  "relevant": [
+   "engine/debt_tracker.rs::calculate_quality_score",
+   "engine/review_store.rs::calculate_score"
+  ]
+ },
+ {
+  "q": "generate a badge that shows the debt level",
+  "relevant": [
+   "engine/debt_tracker.rs::generate_badge",
+   "engine/debt_tracker.rs::generate_badge_with_debt"
+  ]
+ },
+ {
+  "q": "tell whether quality got better or worse between two snapshots",
+  "relevant": [
+   "engine/debt_tracker.rs::trend_from_change"
+  ]
+ },
+ {
+  "q": "normalize the category name of an issue",
+  "relevant": [
+   "engine/debt_tracker.rs::normalize_category"
+  ]
+ }
+]

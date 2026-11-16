@@ -84,10 +84,11 @@ pub struct Configured {
 /// and brain code paths.
 pub fn configure(config: Option<&Config>) -> Configured {
     let brain_mode = config
-        .map(|c| c.brain.embedding.to_string())
+        .map(|c| c.brain.embedding.resolver_value().to_string())
         .unwrap_or_else(|| "auto".to_string());
+    warn_removed_embedding_modes(config);
     let backend = crate::embed::resolve_backend(&brain_mode);
-    super::vector::apply_config_store(config);
+    warn_removed_vector_options(config);
     Configured {
         brain_mode,
         backend,
@@ -95,9 +96,104 @@ pub fn configure(config: Option<&Config>) -> Configured {
     }
 }
 
+/// `brain.vector_store` and `brain.vector_bits` no longer do anything (vectors are
+/// one vecq file per project, #750): say so once instead of silently ignoring them.
+fn warn_removed_vector_options(config: Option<&Config>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(c) = config else { return };
+    let set: Vec<&str> = [
+        ("vector_store", &c.brain.vector_store),
+        ("vector_bits", &c.brain.vector_bits),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, _)| k)
+    .collect();
+    if !set.is_empty() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: brain.{} in your config no longer has any effect: vectors are stored as one quantized file per project. Remove it.",
+                set.join(" and brain.")
+            );
+        });
+    }
+}
+
+/// `brain.embedding: hashing|pretrained` were removed (#751): the code model is
+/// used instead (or no vectors when it is not available). Say so once.
+fn warn_removed_embedding_modes(config: Option<&Config>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(c) = config else { return };
+    if c.brain.embedding.is_removed() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: brain.embedding: {} was removed; the code embedding model is used instead \
+                 (set `off` to disable embeddings). Update your config.",
+                c.brain.embedding
+            );
+        });
+    }
+}
+
 /// Load + [`configure`] for read-only brain search (CLI `brain`, MCP brain).
 pub fn configure_for_search(source: ConfigSource<'_>) -> Configured {
     configure(load_config(source).as_ref())
+}
+
+/// What [`refresh_for_context`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextRefresh {
+    /// Symbols the project has in the index now.
+    pub symbols: usize,
+    /// Files parsed again in this run (0 when nothing changed).
+    pub files_updated: usize,
+    /// Whether the code embedding model is active (the vector signal is on).
+    pub model: bool,
+}
+
+impl ContextRefresh {
+    /// One line for a log: what the context is made of.
+    pub fn describe(&self) -> String {
+        let updated = if self.files_updated > 0 {
+            format!(", {} file(s) updated", self.files_updated)
+        } else {
+            String::new()
+        };
+        let model = if self.model {
+            "code model on"
+        } else {
+            "code model off: keyword and call-graph context only"
+        };
+        format!("Code index: {} symbols{updated}; {model}", self.symbols)
+    }
+}
+
+/// Bring the index (and the vectors) of the project containing `start` up to
+/// date before a review or scan reads it (`context_chain.auto_index`). `None`
+/// when disabled or when it could not be done; the caller then reads whatever
+/// index exists, as before.
+pub fn refresh_for_context(start: &Path, config: &Config) -> Option<ContextRefresh> {
+    if !(config.context_chain.use_brain && config.context_chain.auto_index) {
+        return None;
+    }
+    let run = || -> Result<ContextRefresh> {
+        let bridge = IndexBridge::open_or_create(start)?;
+        let session = IndexSession::from_bridge(bridge, Some(config))?;
+        let stats = session.index(false)?;
+        let summary = session.summary()?;
+        Ok(ContextRefresh {
+            symbols: summary.total_symbols,
+            files_updated: stats.files_indexed,
+            model: crate::embed::active_backend() == Backend::Potion,
+        })
+    };
+    match run() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!("could not refresh the code index: {e:#}");
+            None
+        }
+    }
 }
 
 /// An open, configured index for one project.
@@ -207,7 +303,7 @@ mod tests {
         (dir, root)
     }
 
-    const YAML: &str = "brain:\n  embedding: hashing\nignore:\n  files:\n    - \"gen/**\"\nrules_engine:\n  index_skip_files:\n    - \"vendor/**\"\n";
+    const YAML: &str = "brain:\n  embedding: off\nignore:\n  files:\n    - \"gen/**\"\nrules_engine:\n  index_skip_files:\n    - \"vendor/**\"\n";
 
     fn memory_bridge(root: &Path) -> IndexBridge {
         let conn = Connection::open_in_memory().unwrap();
@@ -221,8 +317,8 @@ mod tests {
         let (_d, root) = project(YAML);
         let config = load_project_only(&root).expect("config");
         let configured = configure(Some(&config));
-        assert_eq!(configured.brain_mode, "hashing");
-        assert_eq!(configured.backend, Backend::Hashing);
+        assert_eq!(configured.brain_mode, "off");
+        assert_eq!(configured.backend, Backend::Off);
         let pats = configured.skip_patterns.unwrap();
         assert!(pats.contains(&"gen/**".to_string()), "{pats:?}");
         assert!(pats.contains(&"vendor/**".to_string()), "{pats:?}");
@@ -234,14 +330,14 @@ mod tests {
         // backend string must come from the project's .cora.yaml.
         let (_d, root) = project(YAML);
         let configured = configure_for_search(ConfigSource::ProjectOnlyAt(&root));
-        assert_eq!(configured.brain_mode, "hashing");
-        assert_eq!(configured.backend, Backend::Hashing);
+        assert_eq!(configured.brain_mode, "off");
+        assert_eq!(configured.backend, Backend::Off);
     }
 
     #[test]
     fn explicit_config_path_is_honored_by_full_source() {
         // `cora --config X serve` threads X through ConfigSource::Full.
-        let (_d, root) = project("brain:\n  embedding: hashing\n");
+        let (_d, root) = project("brain:\n  embedding: off\n");
         let other = root.join("other.yaml");
         fs::write(&other, "ignore:\n  files:\n    - \"only-in-explicit/**\"\n").unwrap();
         let config = load_config(ConfigSource::Full(other.to_str())).expect("config");

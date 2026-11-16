@@ -1,190 +1,159 @@
-//! Bag-of-tokens embedding engine.
+//! Code embeddings: the `potion-code-16M-v2` static code model (`potion` +
+//! `model_store`), unpacked from the release binary (`bundled`) or downloaded
+//! once (pinned and checksummed) into the data directory, then used offline.
 //!
-//! Provides two backends:
-//!
-//! 1. **Hashing trick** (`tokens` module) — zero-dependency, 256-dim, fast but
-//!    low-quality.  Suitable for dedup / near-duplicate detection.
-//!
-//! 2. **Pre-trained nomic-embed-code** (`token_vocab` module) — real 768-dim
-//!    embeddings distilled from [nomic-ai/nomic-embed-code](https://huggingface.co/nomic-ai/nomic-embed-code),
-//!    compiled into the binary via `include_bytes!` / `include_str!`.
-//!    Higher quality at the cost of ~30 MB binary size.
-//!
-//! The active backend is selected at **runtime** via [`resolve_backend`],
-//! which reads the `brain.embedding` config value. At compile time, only
-//! the availability of the pretrained path is gated by the `pretrained-embed`
-//! feature flag.
+//! There is no fallback embedding. When the model is not available (offline
+//! and not yet downloaded, `CORA_EMBED_OFFLINE=1`, or `brain.embedding: off`)
+//! the vector signal is off and search answers from keyword and graph signals
+//! alone, with a message that says so (#751). A weak substitute measured
+//! neutral to harmful when fused with keyword search, so it is not offered.
 
-pub mod tokens;
+pub mod bundled;
+pub mod model_store;
+pub mod potion;
 
-// Pre-trained nomic-embed-code module — only compiled when vendored data
-// exists. Excluded from crates.io package (too large for 10 MB upload limit).
-#[cfg(feature = "pretrained-embed")]
-pub mod token_vocab;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-// Re-export tokenizer — used by both backends.
-pub use tokens::EMBEDDING_DIM;
+/// Dimensions of the code model's vectors.
+pub const EMBEDDING_DIM: usize = 256;
 
-// Re-export pretrained constants when feature is enabled.
-#[cfg(feature = "pretrained-embed")]
-pub use token_vocab::{PRETRAINED_DIM, embed_code_pretrained};
-
-/// Runtime embedding backend selector.
-///
-/// Resolved from `brain.embedding` config value at call time.
-/// Falls back gracefully when a requested backend is not compiled.
+/// The embedding backend of this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// 256-dim hashing trick (always available, zero dependency).
-    Hashing,
-    /// 768-dim nomic distilled pretrained (requires `pretrained-embed` feature).
-    #[allow(dead_code)]
-    Pretrained,
+    /// The `potion-code-16M-v2` static code model.
+    Potion,
+    /// No model: the vector signal is off.
+    Off,
 }
 
 impl Backend {
-    /// Returns the embedding dimensionality for this backend.
-    pub const fn dims(self) -> usize {
+    /// Dimensions of this backend's vectors (the model's own once loaded).
+    pub fn dims(self) -> usize {
         match self {
-            Self::Hashing => EMBEDDING_DIM,
-            #[cfg(feature = "pretrained-embed")]
-            Self::Pretrained => PRETRAINED_DIM,
-            #[cfg(not(feature = "pretrained-embed"))]
-            Self::Pretrained => EMBEDDING_DIM, // unreachable — resolve never returns Pretrained without feature
+            Self::Potion => potion::loaded().map_or(EMBEDDING_DIM, potion::PotionModel::dim),
+            Self::Off => 0,
         }
     }
 
-    /// Returns a human-readable label for this backend.
-    pub const fn provider_name(self) -> &'static str {
+    /// Human-readable label.
+    pub fn provider_name(self) -> &'static str {
         match self {
-            Self::Hashing => "hashing-trick (256d, static)",
-            #[cfg(feature = "pretrained-embed")]
-            Self::Pretrained => "nomic-embed-code (768d, pretrained)",
-            #[cfg(not(feature = "pretrained-embed"))]
-            Self::Pretrained => "hashing-trick (256d, pretrained not compiled)",
+            Self::Potion => "potion-code-16M-v2 (256d, static code model)",
+            Self::Off => "none (vector signal off)",
+        }
+    }
+
+    /// Short stable tag: it names the project's vector file, so vectors of
+    /// different models never mix, even when their dimensions are equal.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Potion => "potion-code-v2",
+            Self::Off => "off",
+        }
+    }
+
+    /// Tier label stored with the project.
+    pub fn tier(self) -> &'static str {
+        match self {
+            Self::Potion => "potion",
+            Self::Off => "off",
         }
     }
 }
 
-/// Thread-local active backend — set once at index/brain-search time.
+/// Process-wide backend, set once at index/brain-search time.
 static ACTIVE_BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
 
-/// Resolve the runtime backend from config string.
+/// When set, the model is never downloaded in this process (agent hooks must
+/// not hang on the network).
+static NO_DOWNLOAD: AtomicBool = AtomicBool::new(false);
+
+/// Forbid downloading the model in this process; an already downloaded model
+/// is still used.
+pub fn forbid_download() {
+    NO_DOWNLOAD.store(true, Ordering::Relaxed);
+}
+
+/// Try to make the model available and load it.
+fn try_potion(allow_download: bool) -> Option<Backend> {
+    let allow_download = allow_download && !NO_DOWNLOAD.load(Ordering::Relaxed);
+    match model_store::ensure(allow_download).and_then(|dir| potion::install(&dir).map(|_| ())) {
+        Ok(()) => Some(Backend::Potion),
+        Err(e) => {
+            // Offline by choice: no warning for what the user asked for.
+            if allow_download && !model_store::offline() {
+                eprintln!(
+                    "warning: the code embedding model is not available ({e:#}); \
+                     the vector signal is off until it is (search uses keywords and the call \
+                     graph). CORA_EMBED_OFFLINE=1 silences this."
+                );
+            }
+            tracing::debug!("code embedding model unavailable: {e:#}");
+            None
+        }
+    }
+}
+
+/// Resolve the backend from the `brain.embedding` value.
 ///
-/// Logic:
-/// - `"auto"` → pretrained if compiled, else hashing
-/// - `"hashing"` → always hashing
-/// - `"pretrained"` → pretrained if compiled, else hashing + warning
+/// - `"off"` → no vector signal
+/// - anything else (`"auto"`, and the removed `"potion"`, `"hashing"`,
+///   `"pretrained"`) → the code model, downloaded on first use; off when it
+///   cannot be had
 ///
-/// The result is cached process-wide via `OnceLock`.
+/// Index and search entry points call this once (through the index session);
+/// it may download the model. The result is cached process-wide.
 pub fn resolve_backend(config_embedding: &str) -> Backend {
-    // Already resolved? Return cached value.
+    resolve(config_embedding, true)
+}
+
+fn resolve(config_embedding: &str, allow_download: bool) -> Backend {
     if let Some(&b) = ACTIVE_BACKEND.get() {
         return b;
     }
-
-    let backend = match config_embedding {
-        "hashing" => Backend::Hashing,
-        "pretrained" => {
-            #[cfg(feature = "pretrained-embed")]
-            {
-                Backend::Pretrained
-            }
-            #[cfg(not(feature = "pretrained-embed"))]
-            {
-                tracing::warn!(
-                    "brain.embedding=pretrained but cora was not compiled with --features pretrained-embed; \
-                     falling back to hashing-trick 256d"
-                );
-                Backend::Hashing
-            }
-        }
-        // "auto" or any unknown value
-        _ => {
-            #[cfg(feature = "pretrained-embed")]
-            {
-                Backend::Pretrained
-            }
-            #[cfg(not(feature = "pretrained-embed"))]
-            {
-                Backend::Hashing
-            }
-        }
+    let backend = if config_embedding == "off" {
+        Backend::Off
+    } else {
+        try_potion(allow_download).unwrap_or(Backend::Off)
     };
-
+    // `set` fails when another thread resolved first: use whatever won.
     let _ = ACTIVE_BACKEND.set(backend);
-    tracing::debug!(
-        config = config_embedding,
-        backend = ?backend,
-        "resolved embedding backend"
-    );
+    let backend = ACTIVE_BACKEND.get().copied().unwrap_or(backend);
+    tracing::debug!(config = config_embedding, backend = ?backend, "resolved embedding backend");
     backend
 }
 
-/// Returns the embedding dimensionality used by the active backend.
-///
-/// Convenience wrapper around `resolve_backend().dims()`.
-pub fn active_dims() -> usize {
-    // Use a sensible default if resolve_backend hasn't been called yet.
-    ACTIVE_BACKEND.get().map(|b| b.dims()).unwrap_or_else(|| {
-        #[cfg(feature = "pretrained-embed")]
-        {
-            PRETRAINED_DIM
-        }
-        #[cfg(not(feature = "pretrained-embed"))]
-        {
-            EMBEDDING_DIM
-        }
-    })
-}
-
-/// Returns a human-readable label for the active embedding provider.
-pub fn active_provider_name() -> &'static str {
+/// The active backend; resolves `auto` without downloading when none is set.
+pub fn active_backend() -> Backend {
     ACTIVE_BACKEND
         .get()
-        .map(|b| b.provider_name())
-        .unwrap_or_else(|| {
-            #[cfg(feature = "pretrained-embed")]
-            {
-                "nomic-embed-code (768d, pretrained)"
-            }
-            #[cfg(not(feature = "pretrained-embed"))]
-            {
-                "hashing-trick (256d, static)"
-            }
-        })
+        .copied()
+        .unwrap_or_else(|| resolve("auto", false))
 }
 
-/// Embed a code snippet using the best available backend.
-///
-/// Returns an f32 vector that can be passed directly to usearch.
-///
-/// Dispatches to the backend set by [`resolve_backend`]. If no backend has
-/// been explicitly resolved, falls back to compile-time default.
-pub fn embed_code_dispatch(code: &str) -> Vec<f32> {
-    let backend = ACTIVE_BACKEND.get().copied().unwrap_or_else(|| {
-        // Lazy resolve with "auto" if not yet set
-        resolve_backend("auto")
-    });
+/// Dimensions of the active backend's vectors.
+pub fn active_dims() -> usize {
+    active_backend().dims()
+}
 
-    match backend {
-        Backend::Hashing => {
-            let embedding = tokens::embed_code(code);
-            embedding.as_slice().iter().map(|&v| v as f32).collect()
-        }
-        #[cfg(feature = "pretrained-embed")]
-        Backend::Pretrained => embed_code_pretrained(code),
-        #[cfg(not(feature = "pretrained-embed"))]
-        Backend::Pretrained => {
-            // Should never happen — resolve_backend never returns Pretrained without feature
-            let embedding = tokens::embed_code(code);
-            embedding.as_slice().iter().map(|&v| v as f32).collect()
-        }
+/// Label of the active embedding provider.
+pub fn active_provider_name() -> &'static str {
+    active_backend().provider_name()
+}
+
+/// Embed one snippet. Empty when the vector signal is off.
+pub fn embed_code_dispatch(code: &str) -> Vec<f32> {
+    match (active_backend(), potion::loaded()) {
+        (Backend::Potion, Some(m)) => m.embed(code),
+        _ => Vec::new(),
     }
 }
 
-/// Whether the pretrained embedding backend is available (compile-time).
-#[allow(dead_code)]
-pub const fn has_pretrained() -> bool {
-    cfg!(feature = "pretrained-embed")
+/// Embed many snippets at once (the model batches its lookups). Empty vectors
+/// when the vector signal is off.
+pub fn embed_batch_dispatch(texts: &[String]) -> Vec<Vec<f32>> {
+    match (active_backend(), potion::loaded()) {
+        (Backend::Potion, Some(m)) => m.embed_batch(texts),
+        _ => texts.iter().map(|_| Vec::new()).collect(),
+    }
 }

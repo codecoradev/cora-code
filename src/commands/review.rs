@@ -13,6 +13,8 @@ use crate::formatters::{OutputFormat, formatter_for};
 use crate::git;
 use crate::progress::{ProgressReporter, TokenInfo, diff_stats};
 
+use crate::engine::path_match::PathMatcher;
+use crate::engine::types::EXIT_ERROR;
 /// Exit codes for the review command.
 pub use crate::engine::types::{EXIT_BLOCKED, EXIT_OK};
 
@@ -128,14 +130,54 @@ pub async fn execute_review(
     progress: &ProgressReporter,
     memory_context: Option<&str>,
 ) -> Result<ReviewResult> {
-    // 1. Get the diff
-    let diff = get_diff(opts, config)?;
+    // 1. Get the diff, minus the files `review.exclude` removes (#720)
+    let full_diff = get_diff(opts, config)?;
+    // Dependencies, build output, minified files and lockfiles are out of scope
+    // by default (`ignore.defaults`): nothing about them reaches the scanners or
+    // the model. Say so once, so a missing file in the report is not a mystery.
+    // `full_diff` stays what the commit gate fingerprints: the verdict is
+    // recorded for the whole staged diff, as the hook looks it up (#767).
+    let (diff, skipped_by_default) =
+        crate::engine::review::drop_builtin_ignored(config, &full_diff);
+    if !skipped_by_default.is_empty() && !opts.quiet {
+        eprintln!(
+            "ℹ {} file(s) skipped by the built-in ignores (dependencies, build output, lockfiles; \
+             `ignore.defaults: false` turns them off): {}",
+            skipped_by_default.len(),
+            skipped_by_default
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+                + if skipped_by_default.len() > 5 {
+                    ", …"
+                } else {
+                    ""
+                }
+        );
+    }
+    let matcher = PathMatcher::new(&config.review.exclude);
+    let (diff, excluded) = if matcher.is_empty() {
+        (diff, Vec::new())
+    } else {
+        let out = chunker::exclude_paths(&diff, &matcher);
+        (out.diff, out.excluded)
+    };
 
     if diff.trim().is_empty() {
+        // Everything was excluded: nothing is left to judge, and the commit gate
+        // must not call the staged diff unreviewed.
+        if opts.staged && !full_diff.trim().is_empty() {
+            crate::engine::commit_gate::record_for_diff(&full_diff, "deterministic", false, 0);
+        }
         if opts.quiet {
             return Ok(ReviewResult::empty(EXIT_OK, String::new()));
         }
-        let output = format!("{}\n", "No changes to review.".yellow());
+        let mut output = format!("{}\n", "No changes to review.".yellow());
+        if !excluded.is_empty() {
+            output.push_str(&coverage_note(&excluded, &[]));
+        }
         return Ok(ReviewResult::empty(EXIT_OK, output));
     }
 
@@ -145,23 +187,26 @@ pub async fn execute_review(
         progress.parsing_diff(files_changed, lines_changed);
     }
 
-    // 3. Validate size (skip in CI mode)
+    // 3. Size policy. A diff over the request budget is split and reviewed in
+    //    chunks, in CI mode too (#720); `max_diff_size` stays the hard limit
+    //    for runs that cannot chunk.
     let max_size = opts.max_diff_size.unwrap_or(config.hook.max_diff_size);
+    let budget = config.review.max_chunk_chars.min(max_size).max(1);
+    if opts.auto_chunk && diff.len() > budget {
+        return execute_chunked_review(
+            config,
+            judge,
+            opts,
+            format,
+            progress,
+            &diff,
+            budget,
+            &excluded,
+            memory_context,
+        )
+        .await;
+    }
     if !opts.ci && diff.len() > max_size {
-        if opts.auto_chunk {
-            // Auto-chunk mode: split diff and review each chunk
-            return execute_chunked_review(
-                config,
-                judge,
-                opts,
-                format,
-                progress,
-                &diff,
-                max_size,
-                memory_context,
-            )
-            .await;
-        }
         if config.hook.on_violation == "disallow" {
             // Return blocked result instead of error
             return Ok(ReviewResult::empty(EXIT_BLOCKED, format!(
@@ -200,7 +245,7 @@ pub async fn execute_review(
     let llm_start = std::time::Instant::now();
 
     // 5. Call the LLM engine
-    let response = match crate::engine::review::review_diff_with_judge(
+    let first_try = crate::engine::review::review_diff_with_judge(
         config,
         judge,
         &diff,
@@ -209,8 +254,39 @@ pub async fn execute_review(
         opts.quiet,
         memory_context,
     )
-    .await
-    {
+    .await;
+
+    // The model could not review the whole diff in one request (empty reply at
+    // finish_reason=length, gateway timeout, unparseable reply): do not just
+    // fail, review it in smaller pieces instead (#718).
+    let judge_failed = match &first_try {
+        Err(_) => true,
+        Ok(resp) => resp.judge_failure.is_some(),
+    };
+    if judge_failed && opts.auto_chunk && retry_budget(&diff).is_some() {
+        if !opts.quiet {
+            eprintln!(
+                "{}",
+                "↻ The model could not review the diff in one request; retrying in smaller chunks…"
+                    .yellow()
+            );
+        }
+        let budget = retry_budget(&diff).unwrap_or(budget);
+        return execute_chunked_review(
+            config,
+            judge,
+            opts,
+            format,
+            progress,
+            &diff,
+            budget,
+            &excluded,
+            memory_context,
+        )
+        .await;
+    }
+
+    let response = match first_try {
         Ok(resp) => {
             if progress.is_enabled() {
                 // SAFETY: elapsed ms fits u64 for any reasonable review duration
@@ -250,7 +326,9 @@ pub async fn execute_review(
                         }]
                     }]
                 });
-                return Ok(ReviewResult::empty(EXIT_OK, format!("{warning_output}\n")));
+                // The SARIF stays valid, but an incomplete review is not a pass (#720).
+                let code = incomplete_exit_code(EXIT_OK, true, config.review.fail_on_incomplete);
+                return Ok(ReviewResult::empty(code, format!("{warning_output}\n")));
             }
             return Err(e.into());
         }
@@ -280,13 +358,14 @@ pub async fn execute_review(
     // 7. Format output
     let formatter = formatter_for(format);
     let mut output = formatter.format_review(&filtered_response)?;
+    append_coverage(&mut output, format, &excluded, &[], opts.quiet);
 
     // 8. Quality gate output, debt snapshot, review history (best-effort)
     if let Some(gate) = &shaped.gate {
         output.push_str(&quality_gate::format_gate_output(gate));
     }
-    finalize::save_debt(config, &filtered_response.issues, shaped.gate.as_ref(), 0);
     finalize::save_history(
+        config,
         &HistoryEntry {
             command: review_command(opts),
             summary: &filtered_response.summary,
@@ -297,22 +376,24 @@ pub async fn execute_review(
         &filtered_response.issues,
         &shaped,
     );
-    let exit_code = shaped.exit_code;
+    // A judge that fell back to deterministic findings did not review the diff (#720).
+    let exit_code = incomplete_exit_code(
+        shaped.exit_code,
+        response.judge_failure.is_some(),
+        config.review.fail_on_incomplete,
+    );
 
     // Leave a verifiable trace for the commit gate (#674): a staged diff that
     // was really reviewed (not a failed LLM call) may be committed by the
     // pre-commit hook without a second review.
     // Only a threshold at least as strict as the hook's (major) may stand in for the hook's review.
-    if opts.staged
-        && min_severity >= Severity::Major
-        && !response.summary.starts_with("LLM review failed")
-    {
+    if opts.staged && min_severity >= Severity::Major && response.judge_failure.is_none() {
         let judged_by = match judge {
             JudgeChoice::Llm(_) => "llm",
             JudgeChoice::Deterministic => "deterministic",
         };
         crate::engine::commit_gate::record_for_diff(
-            &diff,
+            &full_diff,
             judged_by,
             shaped.should_block || exit_code == EXIT_BLOCKED,
             filtered_response.issues.len(),
@@ -416,6 +497,7 @@ async fn execute_chunked_review(
     progress: &ProgressReporter,
     diff: &str,
     max_size: usize,
+    excluded: &[String],
     memory_context: Option<&str>,
 ) -> Result<ReviewResult> {
     let chunks = chunker::chunk_diff(diff, max_size);
@@ -430,8 +512,9 @@ async fn execute_chunked_review(
         eprintln!(
             "{}",
             format!(
-                "📦 Diff too large ({} chars), splitting into {} chunks…",
+                "📦 Diff is {} chars (request budget {}), splitting into {} chunks…",
                 diff.len(),
+                max_size,
                 total_chunks
             )
             .cyan()
@@ -448,11 +531,15 @@ async fn execute_chunked_review(
     let mut summaries: Vec<String> = Vec::new();
     let mut total_tokens = crate::engine::types::TokenUsage::default();
     let mut any_error = false;
+    let mut failures: Vec<ChunkFailure> = Vec::new();
     let mut any_success = false;
     let mut should_block = false;
     let mut dropped_findings = 0usize;
 
-    for chunk in &chunks {
+    let mut queue: std::collections::VecDeque<(chunker::DiffChunk, u8)> =
+        chunks.iter().cloned().map(|c| (c, 0)).collect();
+    while let Some((chunk, depth)) = queue.pop_front() {
+        let chunk = &chunk;
         if !opts.quiet {
             eprintln!(
                 "{}",
@@ -503,6 +590,21 @@ async fn execute_chunked_review(
                     total_tokens.estimated_cost_usd += usage.estimated_cost_usd;
                 }
 
+                // The judge fell back to deterministic findings. Try the chunk
+                // again in two halves before giving up on it (#718); the pieces
+                // re-run the deterministic checks, so this attempt is dropped.
+                if resp.judge_failure.is_some() && depth < MAX_RETRY_DEPTH {
+                    if let Some(parts) = split_for_retry(chunk) {
+                        retry_note(opts, chunk, parts.len());
+                        for part in parts.into_iter().rev() {
+                            queue.push_front((part, depth + 1));
+                        }
+                        continue;
+                    }
+                }
+                // Only a chunk that is kept speaks in the merged summary; the
+                // "LLM review failed" text of a chunk that was split and
+                // retried must not survive into a run that then succeeded.
                 if !resp.summary.is_empty() {
                     summaries.push(format!(
                         "[Chunk {}/{} — {}] {}",
@@ -512,8 +614,18 @@ async fn execute_chunked_review(
                         resp.summary
                     ));
                 }
-
                 dropped_findings += resp.dropped_findings;
+                // The judge fell back to deterministic findings: keep them, but
+                // the chunk was not reviewed by the model (#720).
+                if let Some(reason) = &resp.judge_failure {
+                    any_error = true;
+                    failures.push(ChunkFailure {
+                        index: chunk.index,
+                        total: chunk.total,
+                        files: chunk.files.clone(),
+                        error: reason.clone(),
+                    });
+                }
                 all_issues.extend(resp.issues);
                 if resp.should_block {
                     should_block = true;
@@ -524,7 +636,22 @@ async fn execute_chunked_review(
                 if progress.is_enabled() {
                     progress.error(&e.to_string(), "chunked_review");
                 }
+                if depth < MAX_RETRY_DEPTH {
+                    if let Some(parts) = split_for_retry(chunk) {
+                        retry_note(opts, chunk, parts.len());
+                        for part in parts.into_iter().rev() {
+                            queue.push_front((part, depth + 1));
+                        }
+                        continue;
+                    }
+                }
                 any_error = true;
+                failures.push(ChunkFailure {
+                    index: chunk.index,
+                    total: chunk.total,
+                    files: chunk.files.clone(),
+                    error: e.to_string(),
+                });
                 if !opts.quiet {
                     eprintln!(
                         "  {}",
@@ -586,6 +713,7 @@ async fn execute_chunked_review(
         tokens_used: Some(total_tokens),
         should_block,
         dropped_findings,
+        judge_failure: None,
     };
 
     // 6. Filter by severity, decide gate / blocking / exit code
@@ -610,6 +738,7 @@ async fn execute_chunked_review(
     // 7. Format output
     let formatter = formatter_for(format);
     let mut output = formatter.format_review(&filtered_response)?;
+    append_coverage(&mut output, format, excluded, &failures, opts.quiet);
 
     // Add chunking summary header if not quiet and format is pretty
     let files_total: usize = chunks.iter().map(|c| c.file_count).sum();
@@ -622,13 +751,8 @@ async fn execute_chunked_review(
     if let Some(gate) = &shaped.gate {
         output.push_str(&quality_gate::format_gate_output(gate));
     }
-    finalize::save_debt(
-        config,
-        &filtered_response.issues,
-        shaped.gate.as_ref(),
-        files_total,
-    );
     finalize::save_history(
+        config,
         &HistoryEntry {
             command: review_command(opts),
             summary: &filtered_response.summary,
@@ -639,7 +763,12 @@ async fn execute_chunked_review(
         &filtered_response.issues,
         &shaped,
     );
-    let exit_code = shaped.exit_code;
+    // A review that skipped part of the diff is not a pass (#720).
+    let exit_code = incomplete_exit_code(
+        shaped.exit_code,
+        !failures.is_empty(),
+        config.review.fail_on_incomplete,
+    );
 
     // 10. Emit complete event
     if progress.is_enabled() {
@@ -659,6 +788,132 @@ async fn execute_chunked_review(
         output,
         &filtered_response,
     ))
+}
+
+/// A chunk is split again after a model failure only down to this size.
+const MIN_RETRY_SPLIT_CHARS: usize = 4_000;
+
+/// How many times a failing chunk may be halved (so at most 1/4 of its size).
+const MAX_RETRY_DEPTH: u8 = 2;
+
+/// Split a chunk the model failed on into smaller ones, or `None` when it is
+/// already small or is a single hunk that cannot be cut (#718).
+fn split_for_retry(chunk: &chunker::DiffChunk) -> Option<Vec<chunker::DiffChunk>> {
+    if chunk.diff.len() < MIN_RETRY_SPLIT_CHARS {
+        return None;
+    }
+    let parts = chunker::chunk_diff(&chunk.diff, chunk.diff.len() / 2);
+    (parts.len() > 1).then_some(parts)
+}
+
+/// Budget for re-reviewing a whole diff in smaller chunks after a failed
+/// single request: half its size, or `None` when it cannot be split (#718).
+fn retry_budget(diff: &str) -> Option<usize> {
+    if diff.len() < MIN_RETRY_SPLIT_CHARS {
+        return None;
+    }
+    let half = diff.len() / 2;
+    (chunker::chunk_diff(diff, half).len() > 1).then_some(half)
+}
+
+fn retry_note(opts: &ReviewOptions, chunk: &chunker::DiffChunk, pieces: usize) {
+    if !opts.quiet {
+        eprintln!(
+            "  {}",
+            format!(
+                "↻ Chunk {}/{} failed; retrying as {pieces} smaller pieces…",
+                chunk.index + 1,
+                chunk.total
+            )
+            .yellow()
+        );
+    }
+}
+
+/// A chunk the model could not review.
+#[derive(Debug, Clone)]
+struct ChunkFailure {
+    index: usize,
+    total: usize,
+    files: Vec<String>,
+    error: String,
+}
+
+/// Exit code once review coverage is known (#720): a run that did not cover
+/// the whole diff exits 1 instead of 0 when `review.fail_on_incomplete` is on.
+/// A blocking code (2) or an error code is never lowered.
+fn incomplete_exit_code(code: i32, incomplete: bool, fail_on_incomplete: bool) -> i32 {
+    if incomplete && fail_on_incomplete && code == EXIT_OK {
+        EXIT_ERROR
+    } else {
+        code
+    }
+}
+
+/// How many file names a coverage note lists before it says "+N more".
+const COVERAGE_LIST_MAX: usize = 10;
+
+fn name_list(files: &[String]) -> String {
+    let shown: Vec<&str> = files
+        .iter()
+        .take(COVERAGE_LIST_MAX)
+        .map(String::as_str)
+        .collect();
+    let mut s = shown.join(", ");
+    if files.len() > COVERAGE_LIST_MAX {
+        s.push_str(&format!(", +{} more", files.len() - COVERAGE_LIST_MAX));
+    }
+    s
+}
+
+/// Plain-text note naming the files a review did not cover: excluded by
+/// `review.exclude`, or in chunks that failed. Empty when nothing was skipped.
+fn coverage_note(excluded: &[String], failures: &[ChunkFailure]) -> String {
+    let mut note = String::new();
+    if !failures.is_empty() {
+        let mut files: Vec<String> = failures.iter().flat_map(|f| f.files.clone()).collect();
+        files.sort();
+        files.dedup();
+        let chunks: Vec<String> = failures
+            .iter()
+            .map(|f| format!("{}/{}", f.index + 1, f.total))
+            .collect();
+        note.push_str(&format!(
+            "⚠️  Review incomplete: chunk {} failed ({}). Not reviewed: {}\n",
+            chunks.join(", "),
+            failures[0].error.lines().next().unwrap_or("error"),
+            name_list(&files)
+        ));
+    }
+    if !excluded.is_empty() {
+        note.push_str(&format!(
+            "ℹ️  Excluded by review.exclude ({}): {}\n",
+            excluded.len(),
+            name_list(excluded)
+        ));
+    }
+    note
+}
+
+/// Add the coverage note to the output. Machine formats (JSON, SARIF,
+/// compact) must stay parseable, so there it goes to stderr instead.
+fn append_coverage(
+    output: &mut String,
+    format: OutputFormat,
+    excluded: &[String],
+    failures: &[ChunkFailure],
+    quiet: bool,
+) {
+    let note = coverage_note(excluded, failures);
+    if note.is_empty() {
+        return;
+    }
+    if format == OutputFormat::Pretty {
+        output.push('\n');
+        output.push_str(&note);
+    } else if !quiet {
+        eprint!("{note}");
+    }
 }
 
 /// Print the one-line "findings not shown" warning to stderr (#624).
@@ -717,5 +972,107 @@ mod tests {
         ];
         let s = merged_chunk_summary(&summaries, 0, false);
         assert_eq!(s, "[Chunk 1/2 — a] ok\n\n[Chunk 2/2 — b] fine");
+    }
+
+    // ─── #720: incomplete reviews are not passes ───
+
+    #[test]
+    fn incomplete_review_fails_a_clean_run() {
+        assert_eq!(incomplete_exit_code(EXIT_OK, true, true), EXIT_ERROR);
+    }
+
+    #[test]
+    fn incomplete_exit_code_never_lowers_or_changes_other_codes() {
+        assert_eq!(incomplete_exit_code(EXIT_BLOCKED, true, true), EXIT_BLOCKED);
+        assert_eq!(incomplete_exit_code(EXIT_OK, false, true), EXIT_OK);
+        assert_eq!(incomplete_exit_code(EXIT_OK, true, false), EXIT_OK);
+    }
+
+    #[test]
+    fn coverage_note_names_failed_and_excluded_files() {
+        let failures = vec![ChunkFailure {
+            index: 1,
+            total: 3,
+            files: vec!["src/b.rs".into(), "src/a.rs".into()],
+            error: "gateway timeout\nretry later".into(),
+        }];
+        let note = coverage_note(&["CHANGELOG.md".to_string()], &failures);
+        assert!(
+            note.contains("chunk 2/3 failed (gateway timeout)"),
+            "{note}"
+        );
+        assert!(note.contains("Not reviewed: src/a.rs, src/b.rs"), "{note}");
+        assert!(
+            note.contains("Excluded by review.exclude (1): CHANGELOG.md"),
+            "{note}"
+        );
+        assert!(coverage_note(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn coverage_note_caps_long_lists() {
+        let many: Vec<String> = (0..25).map(|i| format!("f{i}.md")).collect();
+        let note = coverage_note(&many, &[]);
+        assert!(note.contains("+15 more"), "{note}");
+    }
+
+    #[test]
+    fn machine_formats_keep_stdout_clean() {
+        let mut out = String::from("{}");
+        append_coverage(&mut out, OutputFormat::Json, &["x.md".into()], &[], true);
+        assert_eq!(out, "{}");
+        let mut pretty = String::from("body");
+        append_coverage(
+            &mut pretty,
+            OutputFormat::Pretty,
+            &["x.md".into()],
+            &[],
+            true,
+        );
+        assert!(pretty.contains("Excluded by review.exclude (1): x.md"));
+    }
+
+    // ─── #718: smaller pieces after a model failure ───
+
+    fn hunky(n: usize) -> String {
+        let mut d =
+            String::from("diff --git a/src/x.rs b/src/x.rs\n--- a/src/x.rs\n+++ b/src/x.rs\n");
+        for i in 0..n {
+            d.push_str(&format!(
+                "@@ -{0},1 +{0},2 @@\n-old line number {i} padding padding padding\n+new line number {i} padding padding padding\n+extra\n",
+                i * 10 + 1
+            ));
+        }
+        d
+    }
+
+    #[test]
+    fn a_failed_big_chunk_is_split_into_smaller_pieces() {
+        let diff = hunky(200);
+        assert!(diff.len() > MIN_RETRY_SPLIT_CHARS);
+        let chunk = chunker::chunk_diff(&diff, usize::MAX).remove(0);
+        let parts = split_for_retry(&chunk).expect("splittable");
+        assert!(parts.len() >= 2);
+        let hunks: usize = parts.iter().map(|p| p.diff.matches("\n@@ ").count()).sum();
+        assert_eq!(hunks, 200, "no hunk lost or duplicated");
+    }
+
+    #[test]
+    fn small_or_indivisible_chunks_are_not_retried() {
+        let small = chunker::chunk_diff(&hunky(2), usize::MAX).remove(0);
+        assert!(split_for_retry(&small).is_none());
+        assert!(retry_budget(&hunky(2)).is_none());
+        // One huge hunk cannot be cut below its own size.
+        let one = format!(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,1 +1,1 @@\n+{}\n",
+            "x".repeat(10_000)
+        );
+        assert!(retry_budget(&one).is_none());
+    }
+
+    #[test]
+    fn retry_budget_is_half_the_diff() {
+        let diff = hunky(200);
+        assert_eq!(retry_budget(&diff), Some(diff.len() / 2));
     }
 }

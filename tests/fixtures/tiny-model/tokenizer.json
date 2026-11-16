@@ -1,0 +1,83 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [],
+ "normalizer": {
+  "type": "Lowercase"
+ },
+ "pre_tokenizer": {
+  "type": "Sequence",
+  "pretokenizers": [
+   {
+    "type": "Split",
+    "pattern": {
+     "Regex": "[^A-Za-z0-9]+"
+    },
+    "behavior": "Removed",
+    "invert": false
+   },
+   {
+    "type": "Whitespace"
+   }
+  ]
+ },
+ "post_processor": null,
+ "decoder": null,
+ "model": {
+  "type": "WordLevel",
+  "vocab": {
+   "[UNK]": 0,
+   "file": 1,
+   "path": 2,
+   "open": 3,
+   "read": 4,
+   "write": 5,
+   "dir": 6,
+   "folder": 7,
+   "disk": 8,
+   "save": 9,
+   "load": 10,
+   "json": 11,
+   "parse": 12,
+   "decode": 13,
+   "yaml": 14,
+   "toml": 15,
+   "deserialize": 16,
+   "format": 17,
+   "string": 18,
+   "text": 19,
+   "http": 20,
+   "request": 21,
+   "url": 22,
+   "send": 23,
+   "response": 24,
+   "client": 25,
+   "server": 26,
+   "socket": 27,
+   "network": 28,
+   "sql": 29,
+   "query": 30,
+   "table": 31,
+   "row": 32,
+   "database": 33,
+   "db": 34,
+   "select": 35,
+   "insert": 36,
+   "index": 37,
+   "the": 38,
+   "a": 39,
+   "of": 40,
+   "to": 41,
+   "for": 42,
+   "and": 43,
+   "fn": 44,
+   "pub": 45,
+   "self": 46,
+   "get": 47,
+   "set": 48,
+   "new": 49
+  },
+  "unk_token": "[UNK]"
+ }
+}

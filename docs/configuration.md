@@ -50,6 +50,7 @@ llm:
   temperature: 0
   max_tokens: 4096
   max_tokens_param: auto       # auto | max_tokens | max_output_tokens | max_completion_tokens
+  reasoning_effort: low        # optional: none | minimal | low | medium | high (sent as `reasoning_effort`)
   timeout: 120
   cache_ttl: 1440
 
@@ -63,6 +64,10 @@ review:
   static_analysis:
     auto_clippy: false       # auto-run `cargo clippy` (Rust only)
     clippy_output_file: ""   # or read clippy output from file
+  # Large diffs (see "Large Diffs")
+  max_chunk_chars: 48000     # split a diff above this many characters
+  exclude: []                # globs removed from the reviewed diff
+  fail_on_incomplete: true   # exit 1 when part of the diff was not reviewed
 
 focus: security, performance, bugs
 
@@ -73,8 +78,10 @@ hook:
   on_violation: warn           # warn | disallow (blocks commit if violations found)
 
 ignore:
+  defaults: true               # built-in ignores: node_modules, vendor, dist, lockfiles, *.min.js ... (see Ignore Files)
+  keep: []                     # built-ins to turn off one by one, e.g. ["**/vendor/**"]
   files:
-    - "vendor/**"
+    - "src/generated/**"       # added to the built-ins
     - "*.generated.ts"
   rules: []                    # rule IDs to skip (e.g. ["no-unwrap", "sql-injection"])
 
@@ -101,7 +108,7 @@ analysis:
     - "resolve_*"
 
 brain:
-  embedding: auto           # auto | hashing | pretrained
+  embedding: auto           # auto | off
 
 profile: clean-code        # security-first | performance | clean-code | beginner-friendly | minimal | rust-strict | typescript-strict | go-pragmatic
 ```
@@ -185,10 +192,11 @@ Requires provider support for structured output. Works with OpenAI, Anthropic, a
 
 ## Anti-Hallucination
 
-cora uses two mechanisms to prevent the LLM from fabricating findings:
+cora uses three mechanisms to prevent the LLM from fabricating findings:
 
 - **File path injection** — Actual file paths are embedded in the prompt, anchoring the LLM to real files in the diff.
 - **Post-parse filtering** — After parsing, any reported file paths or line numbers that don't exist in the actual diff are discarded.
+- **Position validation** — The model also quotes the source line each finding is about (`snippet`). Before a finding is shown or stored, cora checks `line` against that quote. If the quote is on `line`, nothing changes. If it is on exactly one line within 25 lines of `line` (or the only line of the file that holds it when there is no `line`), the finding moves there. If the quote is nowhere to be found, or two lines equally near hold it, the finding becomes file-level instead of pointing at the wrong code. Whitespace and a `+`/`-` diff marker in the quote are ignored, quotes shorter than 4 characters are not trusted, and a finding with no quote keeps the old behaviour. The same check runs for `review`, `scan` and the MCP tools.
 
 ## Cross-File Review Context
 
@@ -210,6 +218,7 @@ review:
     include_tests: true         # resolve test files via naming convention
     include_callers: true       # resolve callers of changed code (blast radius)
     use_brain: true             # enrich prompt with symbol-index intelligence
+    auto_index: true            # bring the index up to date first (CI, fresh clones)
     impact_depth: 2             # blast-radius traversal depth (2 = callers of callers)
     prefer_index: true          # prefer symbol index (FTS5 + call graph) over regex
 ```
@@ -221,6 +230,7 @@ review:
 | `follow_depth` | `1` | Outbound recursion depth (`1` = direct references). |
 | `include_tests` | `true` | Map changed source to its test files. |
 | `include_callers` | `true` | Inbound caller resolution. When the symbol index is unavailable (regex fallback): gitignore-aware file scan bounded to ≤400 files and ≤3 call-sites per symbol. When the index is available (default path, `prefer_index: true`): up to 20 call-sites per symbol, filtered by `ignore.files` patterns. |
+| `auto_index` | `true` | Before a review or scan with a judge (an LLM, or an agent through `cora.review_prepare` / `cora.scan_prepare`) builds its context, bring the project's index and vectors up to date (incremental: unchanged files are skipped). Without it a fresh checkout, such as a CI runner, has no code intelligence and the code embedding model goes unused. A `--no-llm` run only reads an existing index. `false` reads an existing index only. |
 | `use_brain` | `true` | Enrich prompt with symbol-index intelligence (impact analysis, affected tests, semantic search). Only active when `cora index` has been run. |
 | `impact_depth` | `2` | Blast-radius traversal depth. See [Impact depth guidance](#impact-depth-guidance) below. |
 | `prefer_index` | `true` | Prefer symbol index (FTS5 + call graph) over regex scanning for outbound resolution. |
@@ -315,14 +325,17 @@ When `quality_gate.enabled` is `false` (default), quality gate is skipped. The e
 
 ## Debt Tracking
 
-cora tracks review findings over time and reports quality trends. After each review, a lightweight JSON snapshot is saved to `.cora/history/`. Use `cora debt` to view the aggregated report.
+cora tracks review findings over time and reports quality trends. Every review is recorded in the `reviews` table of `cora.db`, and `cora debt` (and the MCP tool `cora.get_debt`) aggregate it. `cora.db` is the only source: the `.cora/history/*.json` snapshots of older versions are no longer written or read, and the directory can be deleted.
 
 ```yaml
 debt:
-  enabled: true              # enable auto-save of review snapshots
-  history_dir: .cora/history # directory for snapshot files
-  retention_days: 90         # auto-cleanup old snapshots
+  enabled: true              # show the debt report (`cora debt`, `cora.get_debt`)
+  history_dir: ""            # deprecated and ignored; still accepted
+  retention_days: 90         # (reserved)
+  max_stored_findings: 500   # findings stored per run, most severe first; 0 = all
 ```
+
+`debt.max_stored_findings` bounds what one review or scan writes to `cora.db`. A full-repository scan can find thousands of issues; storing them all buried the few actionable ones. When a run is cut, its stored summary says how many were left out, and the quality score still uses the whole run. Findings that were not stored are not auto-resolved. To clean an existing database, use `cora findings prune` (see the CLI reference): `--stale-projects` removes projects whose directory is gone, and `--older-than DAYS` removes old resolved findings. Run it with `--dry-run` first. `prune` also deletes the vector files of the projects it removes.
 
 ### CLI Usage
 
@@ -527,24 +540,33 @@ Default `index_skip_files` patterns (bundled with cora):
 
 Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`), wildcard prefix (`vite.*`), and any-directory (`**/main.ts`).
 
-### Brain Embedding Backend
+### Brain Embedding
 
-Control which embedding backend Brain Mode uses for vector search. Selectable at runtime — no recompilation needed to switch.
+Cora uses one embedding model for vector search, `potion-code-16M-v2` (256 dimensions, a 16M-parameter static code model, MIT), inside the release binaries (a `cargo install` build downloads it once, 33.5 MB, on the first `cora index`, `cora brain` or `cora explore`) and then used offline.
 
 ```yaml
 brain:
-  embedding: auto   # auto | hashing | pretrained
+  embedding: auto   # auto | off
 ```
 
-| Value | Dimensions | Description |
-|-------|------------|-------------|
-| `auto` (default) | 256 or 768 | Best available — uses `pretrained` if compiled with `pretrained-embed` feature, otherwise `hashing` |
-| `hashing` | 256 | Force zero-dependency bag-of-tokens hashing. Always available, no model download |
-| `pretrained` | 768 | Force nomic-embed-code distilled embeddings. Requires `pretrained-embed` feature at build time |
+| Value | Description |
+|-------|-------------|
+| `auto` (default) | Use the code model. While it is not available (offline before the first download, `CORA_EMBED_OFFLINE=1`), the vector signal is off: search uses keywords and the call graph and says so |
+| `off` | Never use embeddings |
 
-> **⚠️ Cannot mix dimensions.** 256d and 768d vectors cannot coexist in the same usearch index. After changing this setting, run `cora index --rebuild` to regenerate embeddings with the new backend.
+`potion` still loads and means `auto`. `hashing` and `pretrained` were removed (#751): they load, mean `auto` and print one warning.
 
-> **Note:** If you select `pretrained` but cora was built without the `pretrained-embed` feature, it falls back to `hashing` with a warning.
+**Release binaries carry the model.** The archives published on GitHub Releases are built with the `bundled-model` feature: the first command that needs embeddings unpacks the model from the binary into `<data dir>/models/potion-code-16M-v2/` (size and SHA-256 checked, atomic, no network, `CORA_EMBED_OFFLINE=1` works). Only a binary without it (`cargo install`, a source build) downloads, as below. To build your own bundled binary: `scripts/fetch-model.sh <dir>`, then `CORA_BUNDLED_MODEL_DIR=<dir> cargo build --release --features tree-sitter,bundled-model`.
+
+**The model download.** Without a bundled model, the first command that needs embeddings downloads all three model files in one step into `<data dir>/models/potion-code-16M-v2/` (`~/.codecora/cora-code/models/...`). The revision is pinned and every file is checked against its SHA-256 before it is moved into place, so a download is verified byte for byte. Several concurrent runs wait for one download. If the download fails (offline, blocked network), cora warns, turns the vector signal off and does not retry for an hour.
+
+| Environment variable | Effect |
+|---|---|
+| `CORA_EMBED_MODEL_DIR` | Use a model already on disk (air-gapped machines, a pre-baked image). Any Model2Vec model with `config.json`, `tokenizer.json` and `model.safetensors` works; its dimensions are read from the model. Nothing is downloaded into it |
+| `CORA_EMBED_MODEL_URL` | Fetch the files from this base URL instead of the Hugging Face hub (an internal mirror). The pinned hashes still apply |
+| `CORA_EMBED_OFFLINE=1` | Never touch the network; use the model only if it is already downloaded |
+
+> **One vector file per project and model.** Vectors live in `<data dir>/vectors/<project id>.<model>.vecq` and are rebuilt from the project's symbols after every index run that changed them. Changing `brain.embedding`, or the first run after the code model became available, re-embeds the project on the next `cora index` even when no file changed; the file of a model no longer used is removed. `brain.vector_store` and `brain.vector_bits` were removed: a config that still sets them loads and warns once.
 
 ## Inline Suppression (`cora-ignore`)
 
@@ -569,6 +591,46 @@ const next = compute();
 - `cora review` reads markers from the diff (added and context lines); a marker outside the diff's context window is not seen. `cora scan` reads markers from the full file contents.
 - `cora scan` also runs the deterministic secrets and security scanners on every scanned file and applies `ignore.rules`, so those findings are reported even when the LLM call fails.
 
+## Large Diffs
+
+`cora review` sends the diff to the model in requests of at most
+`review.max_chunk_chars` characters (default 48,000, about 1,000 lines; the
+minimum is 2,000). A larger diff is split into chunks of whole files, a single
+file larger than the budget is split at hunk boundaries (the file header is
+repeated in every piece), and the findings are merged and de-duplicated. This
+also applies with `--ci`; `--no-auto-chunk` turns it off.
+`hook.max_diff_size` remains the hard limit for runs that do not chunk.
+
+`review.exclude` takes the same globs as `ignore.files`, but it filters the
+diff itself: an excluded file is never sent to the model and never produces a
+finding (`ignore.files` only scopes the symbol index and the context chain).
+Use it for `CHANGELOG.md`, `docs/**`, lockfiles and generated code. The pretty
+output names the excluded files; with `json`, `sarif` and `compact` the note
+goes to stderr so stdout stays parseable.
+
+A review that did not cover the whole diff is not a pass. When a chunk fails,
+or the model call fails and only the deterministic findings remain, the
+output says which files were not reviewed and the exit code is 1 instead of 0
+(a blocking code, 2, is never lowered). Set `review.fail_on_incomplete: false`
+to keep the old warn-and-pass behaviour.
+
+### When the model cannot answer a whole request
+
+A reasoning model can spend its entire output budget on thinking and return an
+empty reply with `finish_reason=length`, however large `max_tokens` is. Cora
+first raises `max_tokens` (up to a ceiling). If the reply is still empty, or the
+model call fails, it reviews the diff again in two halves, and halves a failing
+chunk again, down to a quarter of the original; a single hunk cannot be cut
+further. `llm.reasoning_effort` (for example `low`, or `none` where the model
+allows it) is sent with every request and keeps the model from over-thinking in
+the first place. Leave it unset to use the provider default. A provider that
+rejects the field answers HTTP 400, so set it only for models that take it.
+
+A reply whose findings array is followed by more JSON (a duplicate or truncated
+copy) is never shown as a summary: the findings in the array are kept and the
+extra text is dropped, and with an empty array the reply is retried instead of
+reported as "No issues found".
+
 ## Path-scoped ignore rules
 
 `ignore.rules` entries can be plain strings (the rule is silenced everywhere) or objects that silence a rule only under some paths:
@@ -588,16 +650,42 @@ ignore:
 
 ## Ignore Files
 
-Exclude files or directories from **all** cora operations — review, scan, and indexing. This is the broadest exclusion mechanism.
+Files and directories that are out of scope for cora. Ignoring is the first thing to set up in a project: dependencies, build output and generated code are noise for the reviewer, cost tokens, put untrusted third-party text in the prompt, and fill the code index with symbols that are not yours (so "related code" would point into `node_modules`).
+
+### Built-in ignores
+
+Cora ignores these by default in `cora review` (the diff), `cora scan` and `cora index`. Only names that are almost always third-party or generated are on the list; names that are often a project's own code are **not**:
+
+| Kind | Patterns |
+|---|---|
+| Dependencies | `node_modules`, `vendor`, `bower_components`, `__pycache__`, `site-packages`, `.venv`, `Pods` (at any depth, so a monorepo's `packages/app/node_modules` too) |
+| Output | `dist`, `target` and `.git` at the project root; `.next`, `.nuxt`, `.gradle` at any depth |
+| Minified files and source maps | `*.min.js`, `*.min.css`, `*.js.map`, `*.css.map` |
+| Lockfiles | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.sum`, `flake.lock` |
+
+**Not ignored on purpose:** `build`, `out`, `coverage`, `venv`, `docs/_build` and similar. They are often real source or scripts (coveragepy's `coverage/` package is its whole source; a Go `build/` holds scripts). Build and coverage output is normally in `.gitignore`, which `cora scan` and `cora index` follow; list the rest yourself in `ignore.files`. The list was checked against real repositories (Django, Rails, React, Flask, Express, coveragepy, ripgrep, cobra): it hid only vendored libraries, minified files, source maps and lockfiles.
+
+`cora review` says how many files of the diff the built-ins skipped, and which. See the effective list with `cora config show`. Turn built-ins off when one of them is wrong for your project:
+
+```yaml
+ignore:
+  keep:                # turn single built-ins off (written exactly as above)
+    - "**/vendor/**"   # a vendor/ directory that is your own code
+    - "**/Cargo.lock"  # review lockfile changes
+  # defaults: false    # or turn the whole list off
+```
+
+### Your own patterns
 
 ```yaml
 ignore:
   files:
-    - "vendor/**"
-    - "*.min.js"
-    - "**/generated/**"
-    - "*.lock"
+    - "src/generated/**"
+    - "**/*.pb.go"
+    - "*.generated.ts"
 ```
+
+`ignore.files` **adds** to the built-ins. It excludes files from review-time context, `cora scan` and `cora index`.
 
 | Pattern | Matches |
 |---------|---------|
@@ -609,9 +697,20 @@ ignore:
 | `src/engine/**` | Prefix-dir — everything under `src/engine/` |
 | `**/*.test.ts` | Double wildcard ext — any `.test.ts` file anywhere |
 
-**Auto-skipped by default** (gitignore-aware): `node_modules/`, `target/`, `.git/`, `dist/`, `build/`.
+Files that `.gitignore` already excludes are skipped by the walk of `cora scan` and `cora index` as well.
 
-> **`ignore.files` vs `rules_engine.index_skip_files`:** `ignore.files` excludes files from **everything** (review, scan, index). `rules_engine.index_skip_files` excludes files from **index scanners only** (dead code, unused imports) — they're still reviewed by the LLM.
+### Which mechanism for what
+
+| Setting | Effect |
+|---|---|
+| `ignore.defaults` | `false` turns the built-in list off. `ignore.keep` turns single entries off. |
+| `ignore.files` | Out of scope for scan, index and review-time context. Adds to the built-ins. |
+| `review.exclude` | Removed from the reviewed **diff** (never sent to the model, never produces a finding), whatever `ignore.files` says. |
+| `rules_engine.index_skip_files` | Left out of the **index scanners** only (dead code, unused imports); the files are still indexed. |
+| `ignore.rules` | Silences a rule (everywhere, or only under some paths); the files are still reviewed. Give a reason. |
+| `cora-ignore:` comment | Silences one finding at one place. |
+
+Prefer ignoring files over silencing rules, and a narrow `ignore.rules` over a broad one: a silenced rule hides the same mistake in your own code too. Do not ignore your tests or your source to make a report shorter.
 
 ## Static Analysis
 
@@ -676,8 +775,8 @@ cora tracks review history and calculates tech debt metrics over time.
 ```yaml
 debt:
   enabled: true           # default: true
-  history_dir: .cora/history  # snapshot storage
-  retention_days: 90      # auto-cleanup old snapshots
+  # history_dir is deprecated and ignored: history is stored in cora.db
+  retention_days: 90
 ```
 
 ### CLI

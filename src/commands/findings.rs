@@ -61,6 +61,27 @@ pub enum FindingsAction {
         /// Finding ID to reopen
         id: i64,
     },
+
+    /// Remove stale projects and old closed findings from cora.db
+    ///
+    /// Use --dry-run first: it reports exactly what would be removed.
+    #[clap(group(clap::ArgGroup::new("what").required(true).multiple(true)
+        .args(["stale_projects", "older_than"])))]
+    Prune {
+        /// Remove projects whose root directory no longer exists, with their
+        /// index, reviews and findings (worktrees and temp clones pile up)
+        #[clap(long)]
+        stale_projects: bool,
+
+        /// Remove resolved/dismissed findings older than DAYS, and the reviews of
+        /// that age left empty. Open findings are kept.
+        #[clap(long, value_name = "DAYS")]
+        older_than: Option<u64>,
+
+        /// Only report what would be removed
+        #[clap(long)]
+        dry_run: bool,
+    },
 }
 
 /// Execute the `cora findings` subcommand.
@@ -100,6 +121,27 @@ pub fn execute_findings(action: &FindingsAction) -> Result<i32> {
                 return Ok(EXIT_NOT_FOUND);
             };
             dismiss(&ReviewStore::new(&conn), *id, reason.as_deref())
+        }
+        FindingsAction::Prune {
+            stale_projects,
+            older_than,
+            dry_run,
+        } => {
+            let Ok(conn) = review_store::open_write() else {
+                eprintln!("{}", "Error: could not open cora.db for writing".red());
+                return Ok(EXIT_NOT_FOUND);
+            };
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let report = ReviewStore::new(&conn).prune(&review_store::PruneOptions {
+                stale_projects: *stale_projects,
+                older_than_days: *older_than,
+                dry_run: *dry_run,
+                keep_root: Some(&cwd),
+            })?;
+            print_prune(&report);
+            Ok(EXIT_OK)
         }
         FindingsAction::Reopen { id } => {
             let Ok(conn) = review_store::open_write() else {
@@ -168,6 +210,31 @@ fn list_findings(store: &ReviewStore<'_>, filter: &FindingFilter, json: bool) ->
     }
 
     Ok(EXIT_OK)
+}
+
+fn print_prune(r: &review_store::PruneReport) {
+    let verb = if r.dry_run { "Would remove" } else { "Removed" };
+    println!(
+        "{}",
+        if r.dry_run {
+            "Dry run: nothing was changed.".dimmed()
+        } else {
+            "Prune done.".bold()
+        }
+    );
+    println!(
+        "  {verb} {} stale project(s) ({} review(s) with them)",
+        r.stale_projects.len(),
+        r.stale_project_reviews
+    );
+    for root in r.stale_projects.iter().take(10) {
+        println!("    {}", root.dimmed());
+    }
+    if r.stale_projects.len() > 10 {
+        println!("    … and {} more", r.stale_projects.len() - 10);
+    }
+    println!("  {verb} {} closed finding(s) by age", r.closed_findings);
+    println!("  {verb} {} empty review(s) by age", r.empty_reviews);
 }
 
 fn stats(store: &ReviewStore<'_>, json: bool) -> Result<i32> {

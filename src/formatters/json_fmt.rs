@@ -66,6 +66,7 @@ mod tests {
             }),
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         }
     }
 
@@ -76,6 +77,7 @@ mod tests {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         }
     }
 

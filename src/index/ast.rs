@@ -76,6 +76,13 @@ pub struct AstEdge {
     pub target: String,
     pub file: String,
     pub line: u32,
+    /// For call edges: the type or module the callee was reached through
+    /// (`WebSearchTool` in `WebSearchTool::from_env()`, the enclosing impl type
+    /// for `self.m()` and `Self::m()`). `None` when it is not statically
+    /// obvious, which makes the edge ambiguous (#714).
+    pub qualifier: Option<String>,
+    /// For call edges: the impl type of the calling method, when it is one.
+    pub caller_type: Option<String>,
 }
 
 impl From<&AstEdge> for CallSite {
@@ -85,6 +92,8 @@ impl From<&AstEdge> for CallSite {
             callee: e.target.clone(),
             file: e.file.clone(),
             line: e.line,
+            qualifier: e.qualifier.clone(),
+            caller_type: e.caller_type.clone(),
         }
     }
 }
@@ -401,6 +410,8 @@ fn extract_rust(
                         target: trait_n,
                         file: file_path.to_string(),
                         line: (child.start_position().row + 1) as u32,
+                        qualifier: None,
+                        caller_type: None,
                     });
                 }
                 // Extract methods inside impl block
@@ -427,8 +438,15 @@ fn extract_rust(
                                             // edges too — without this,
                                             // cross-crate callers of these
                                             // methods are invisible (#519).
-                                            extract_calls_from_node(
-                                                &gc, source, file_path, &name, &mut edges,
+                                            extract_calls_in_impl(
+                                                &gc,
+                                                source,
+                                                file_path,
+                                                &name,
+                                                Some(&type_n)
+                                                    .filter(|t| !t.is_empty())
+                                                    .map(|t| t.as_str()),
+                                                &mut edges,
                                             );
                                         }
                                     }
@@ -452,6 +470,8 @@ fn extract_rust(
                         target: node_text(&arg, source),
                         file: file_path.to_string(),
                         line: (child.start_position().row + 1) as u32,
+                        qualifier: None,
+                        caller_type: None,
                     });
                 }
             }
@@ -479,11 +499,73 @@ fn extract_calls_from_node(
     caller: &str,
     edges: &mut Vec<AstEdge>,
 ) {
+    extract_calls_in_impl(node, source, file_path, caller, None, edges);
+}
+
+/// Last path segment of a type or module path with generics removed:
+/// `crate::web::WebTool<T>` -> `WebTool`. `None` for `<T as Trait>` forms,
+/// which do not name one type.
+fn path_qualifier(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.starts_with('<') {
+        return None;
+    }
+    // `Type::<u8>` (turbofish) names `Type`.
+    let raw = raw.split("::<").next()?;
+    let last = raw.rsplit("::").next()?;
+    let name = last.split('<').next()?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// The type or module a call is made through, when the source says so:
+/// `Type::f()` and `module::f()` give `Type` / `module`, `Self::f()` and
+/// `self.f()` give the enclosing impl type. A method call on any other value
+/// has an unknown receiver type and gives `None` (ambiguous, #714).
+fn callee_qualifier(
+    fn_node: &tree_sitter::Node,
+    source: &str,
+    self_type: Option<&str>,
+) -> Option<String> {
+    match fn_node.kind() {
+        "scoped_identifier" => {
+            let q = path_qualifier(&node_text(&fn_node.child_by_field_name("path")?, source))?;
+            if q == "Self" {
+                self_type.map(str::to_string)
+            } else if matches!(q.as_str(), "crate" | "super" | "self") {
+                None
+            } else {
+                Some(q)
+            }
+        }
+        "field_expression" => {
+            let value = fn_node.child_by_field_name("value")?;
+            (value.kind() == "self")
+                .then(|| self_type.map(str::to_string))
+                .flatten()
+        }
+        "generic_function" => {
+            callee_qualifier(&fn_node.child_by_field_name("function")?, source, self_type)
+        }
+        _ => None,
+    }
+}
+
+/// `extract_calls_from_node` with the enclosing impl type, so `self.m()` and
+/// `Self::m()` resolve to it.
+fn extract_calls_in_impl(
+    node: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    caller: &str,
+    self_type: Option<&str>,
+    edges: &mut Vec<AstEdge>,
+) {
     fn walk_calls(
         node: &tree_sitter::Node,
         source: &str,
         file_path: &str,
         caller: &str,
+        self_type: Option<&str>,
         edges: &mut Vec<AstEdge>,
     ) {
         if node.kind() == "call_expression" {
@@ -497,21 +579,96 @@ fn extract_calls_from_node(
                         target: callee.to_string(),
                         file: file_path.to_string(),
                         line: (node.start_position().row + 1) as u32,
+                        qualifier: callee_qualifier(&fn_node, source, self_type),
+                        caller_type: self_type.map(str::to_string),
                     });
                 }
             }
         }
+        // The arguments of a macro are a raw `token_tree`, not parsed
+        // expressions, so a call inside `json!(..)`, `vec![..]`, `format!(..)`,
+        // `assert!(..)` has no `call_expression` node (#715).
+        if node.kind() == "token_tree" {
+            token_tree_calls(node, source, file_path, caller, self_type, edges);
+        }
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
-                walk_calls(&cursor.node(), source, file_path, caller, edges);
+                walk_calls(&cursor.node(), source, file_path, caller, self_type, edges);
                 if !cursor.goto_next_sibling() {
                     break;
                 }
             }
         }
     }
-    walk_calls(node, source, file_path, caller, edges);
+    walk_calls(node, source, file_path, caller, self_type, edges);
+}
+
+/// Items that a token tree can declare; an identifier after one of these
+/// followed by `(` is a definition (`fn helper()` inside a `macro_rules!`
+/// body), not a call.
+const DECLARING_TOKENS: &[&str] = &["fn", "struct", "enum", "union", "trait", "mod", "type"];
+
+/// Call edges for `name(` patterns among the direct children of a `token_tree`
+/// (macro arguments): an identifier immediately followed by a parenthesised
+/// token tree. Nested token trees are visited by the caller's walk, so
+/// `json!({ "k": f(x) })` reaches `f` at the inner level. A path (`a::b(x)`)
+/// yields its last segment, a method call (`x.m()`) the method name, the same
+/// as `normalize_callee_name` does for real call expressions.
+fn token_tree_calls(
+    tree: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    caller: &str,
+    self_type: Option<&str>,
+    edges: &mut Vec<AstEdge>,
+) {
+    let mut cursor = tree.walk();
+    let children: Vec<tree_sitter::Node> = tree.children(&mut cursor).collect();
+    for (i, pair) in children.windows(2).enumerate() {
+        let (name, args) = (&pair[0], &pair[1]);
+        if name.kind() != "identifier" || args.kind() != "token_tree" {
+            continue;
+        }
+        if !node_text(args, source).starts_with('(') {
+            continue;
+        }
+        let declared = i
+            .checked_sub(1)
+            .map(|p| node_text(&children[p], source))
+            .is_some_and(|prev| DECLARING_TOKENS.contains(&prev.as_str()));
+        if declared {
+            continue;
+        }
+        let callee = node_text(name, source);
+        // `Type :: name (` — the two tokens before the name are `::` and the
+        // type (`Self` resolves to the enclosing impl type).
+        let qualifier = i
+            .checked_sub(2)
+            .filter(|&q| node_text(&children[q + 1], source) == "::")
+            .map(|q| node_text(&children[q], source))
+            .filter(|t| children[i - 2].kind() == "identifier" || t == "Self")
+            .and_then(|t| {
+                if t == "Self" {
+                    self_type.map(str::to_string)
+                } else if matches!(t.as_str(), "crate" | "super" | "self") {
+                    None
+                } else {
+                    Some(t)
+                }
+            });
+        if !callee.is_empty() {
+            edges.push(AstEdge {
+                source: caller.to_string(),
+                kind: EdgeKind::Calls,
+                target: callee,
+                file: file_path.to_string(),
+                line: (name.start_position().row + 1) as u32,
+                qualifier,
+                caller_type: self_type.map(str::to_string),
+            });
+        }
+    }
 }
 
 // ─── Go ───────────────────────────────────────────────────────────────
@@ -586,6 +743,8 @@ fn extract_go(
                         target: node_text(&path_node, source),
                         file: file_path.to_string(),
                         line: (child.start_position().row + 1) as u32,
+                        qualifier: None,
+                        caller_type: None,
                     });
                 }
             }
@@ -685,6 +844,8 @@ fn extract_python(
                                         target: base_name,
                                         file: file_path.to_string(),
                                         line,
+                                        qualifier: None,
+                                        caller_type: None,
                                     });
                                 }
                                 if !bc.goto_next_sibling() {
@@ -734,6 +895,8 @@ fn extract_python(
                     target: signature_for_node(&child, source),
                     file: file_path.to_string(),
                     line: (child.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             _ => {}
@@ -800,6 +963,8 @@ fn extract_typescript(
                                             target: parent,
                                             file: file_path.to_string(),
                                             line,
+                                            qualifier: None,
+                                            caller_type: None,
                                         });
                                     }
                                 } else if hn.kind() == "implements_clause" {
@@ -819,6 +984,8 @@ fn extract_typescript(
                                                         target: iface,
                                                         file: file_path.to_string(),
                                                         line,
+                                                        qualifier: None,
+                                                        caller_type: None,
                                                     });
                                                 }
                                             }
@@ -843,6 +1010,8 @@ fn extract_typescript(
                                 target: parent,
                                 file: file_path.to_string(),
                                 line,
+                                qualifier: None,
+                                caller_type: None,
                             });
                         }
                         // Also check for implements_clause sibling
@@ -863,6 +1032,8 @@ fn extract_typescript(
                                                 target: iface,
                                                 file: file_path.to_string(),
                                                 line,
+                                                qualifier: None,
+                                                caller_type: None,
                                             });
                                         }
                                     }
@@ -1071,6 +1242,8 @@ fn extract_typescript(
                     target: signature_for_node(node, source),
                     file: file_path.to_string(),
                     line: (node.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             _ => {}
@@ -1302,6 +1475,8 @@ fn extract_java(
                                 target: parent,
                                 file: file_path.to_string(),
                                 line,
+                                qualifier: None,
+                                caller_type: None,
                             });
                         }
                     }
@@ -1318,6 +1493,8 @@ fn extract_java(
                                         target: iface,
                                         file: file_path.to_string(),
                                         line,
+                                        qualifier: None,
+                                        caller_type: None,
                                     });
                                 }
                                 if !ic.goto_next_sibling() {
@@ -1423,6 +1600,8 @@ fn extract_java(
                     target: signature_for_node(node, source),
                     file: file_path.to_string(),
                     line: (node.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             "enum_declaration" => {
@@ -1529,6 +1708,8 @@ fn extract_c(
                                     target: inc,
                                     file: file_path.to_string(),
                                     line: (child.start_position().row + 1) as u32,
+                                    qualifier: None,
+                                    caller_type: None,
                                 });
                             }
                             break;
@@ -1613,6 +1794,8 @@ fn extract_cpp(
                                             target: parent,
                                             file: file_path.to_string(),
                                             line,
+                                            qualifier: None,
+                                            caller_type: None,
                                         });
                                     }
                                 }
@@ -1740,6 +1923,8 @@ fn extract_cpp(
                                     target: inc,
                                     file: file_path.to_string(),
                                     line: (node.start_position().row + 1) as u32,
+                                    qualifier: None,
+                                    caller_type: None,
                                 });
                             }
                             break;
@@ -1821,6 +2006,8 @@ fn extract_csharp(
                                         target: base,
                                         file: file_path.to_string(),
                                         line,
+                                        qualifier: None,
+                                        caller_type: None,
                                     });
                                 }
                                 if !bc.goto_next_sibling() {
@@ -1936,6 +2123,8 @@ fn extract_csharp(
                     target: signature_for_node(node, source),
                     file: file_path.to_string(),
                     line: (node.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             _ => {}
@@ -2068,6 +2257,8 @@ fn extract_ruby(
                                 target: parent,
                                 file: file_path.to_string(),
                                 line,
+                                qualifier: None,
+                                caller_type: None,
                             });
                         }
                     }
@@ -2127,6 +2318,8 @@ fn extract_ruby(
                     target: signature_for_node(node, source),
                     file: file_path.to_string(),
                     line: (node.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             _ => {}
@@ -2173,6 +2366,8 @@ fn extract_php(
                                 target: parent,
                                 file: file_path.to_string(),
                                 line,
+                                qualifier: None,
+                                caller_type: None,
                             });
                         }
                     }
@@ -2193,6 +2388,8 @@ fn extract_php(
                                             target: iface,
                                             file: file_path.to_string(),
                                             line,
+                                            qualifier: None,
+                                            caller_type: None,
                                         });
                                     }
                                 }
@@ -2289,6 +2486,8 @@ fn extract_php(
                     target: signature_for_node(node, source),
                     file: file_path.to_string(),
                     line: (node.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             _ => {}
@@ -2344,6 +2543,8 @@ fn extract_scala(
                                     target: parent,
                                     file: file_path.to_string(),
                                     line,
+                                    qualifier: None,
+                                    caller_type: None,
                                 });
                             }
                         }
@@ -2392,6 +2593,8 @@ fn extract_scala(
                     target: signature_for_node(node, source),
                     file: file_path.to_string(),
                     line: (node.start_position().row + 1) as u32,
+                    qualifier: None,
+                    caller_type: None,
                 });
             }
             "enum_definition" => {
@@ -2661,6 +2864,73 @@ export const processForm = (data: string) => {
         );
     }
 
+    fn call_edges<'a>(edges: &'a [AstEdge], callee: &str) -> Vec<&'a AstEdge> {
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.target == callee)
+            .collect()
+    }
+
+    /// #714: `Type::method()` records the type as the call's qualifier while the
+    /// target stays the bare method name.
+    #[test]
+    fn a_type_path_call_records_the_type_as_qualifier() {
+        let code = r#"
+pub fn roster() {
+    let _a = WebSearchTool::from_env();
+    let _b = crate::web::WebFetchTool::<u8>::from_env();
+    let _c = helper();
+}
+"#;
+        let (_, edges) = extract(code, "rs", "roster.rs");
+        let from_env = call_edges(&edges, "from_env");
+        assert_eq!(from_env.len(), 2);
+        assert_eq!(from_env[0].qualifier.as_deref(), Some("WebSearchTool"));
+        assert_eq!(from_env[1].qualifier.as_deref(), Some("WebFetchTool"));
+        assert_eq!(call_edges(&edges, "helper")[0].qualifier, None);
+    }
+
+    /// #714: `self.m()` and `Self::m()` resolve to the enclosing impl type; a
+    /// method call on any other value stays ambiguous (no qualifier).
+    #[test]
+    fn self_calls_resolve_to_the_impl_type_and_other_receivers_stay_ambiguous() {
+        let code = r#"
+struct A;
+impl A {
+    fn run(&self, other: &B) {
+        self.step();
+        Self::make();
+        other.step();
+    }
+}
+"#;
+        let (_, edges) = extract(code, "rs", "a.rs");
+        let step = call_edges(&edges, "step");
+        assert_eq!(step.len(), 2);
+        assert_eq!(step[0].qualifier.as_deref(), Some("A"));
+        assert_eq!(step[1].qualifier, None);
+        assert_eq!(
+            call_edges(&edges, "make")[0].qualifier.as_deref(),
+            Some("A")
+        );
+        assert!(step.iter().all(|e| e.caller_type.as_deref() == Some("A")));
+    }
+
+    /// #714: a path call inside macro arguments keeps its type too.
+    #[test]
+    fn a_type_path_call_in_a_macro_keeps_its_qualifier() {
+        let code = r#"
+fn f() {
+    let _v = vec![Widget::build(1)];
+}
+"#;
+        let (_, edges) = extract(code, "rs", "m.rs");
+        assert_eq!(
+            call_edges(&edges, "build")[0].qualifier.as_deref(),
+            Some("Widget")
+        );
+    }
+
     /// Regression (#519): method calls (`self.export_full()`,
     /// `manager.remember_with_contradiction()`) and qualified paths
     /// (`std::mem::drop(...)`) must record the FINAL name segment as the
@@ -2861,5 +3131,93 @@ class Repository implements Comparable, Serializable {
             "expected Dog -> Animal Inherits edge, got edges: {:?}",
             edges
         );
+    }
+
+    // ─── #715: calls inside macro arguments ───
+
+    const MACRO_CODE: &str = r#"
+fn tool_kind(t: &str) -> &str { t }
+fn approval_config_option(a: bool) -> u8 { 1 }
+
+fn build(tool: &str, auto: bool, x: Thing) {
+    let v = json!({ "kind": tool_kind(tool), "n": 1 });
+    let o = vec![approval_config_option(auto)];
+    let s = format!("{}", helper_a(tool));
+    assert!(helper_b(1) == 2, "msg {}", helper_c());
+    let m = matches!(helper_d(), Some(_));
+    println!("{}", self::util::helper_e(tool));
+    dbg!(x.method_f(1));
+    plain_call(tool);
+}
+
+macro_rules! gen {
+    () => { fn declared_not_called() {} };
+}
+"#;
+
+    fn macro_targets() -> Vec<String> {
+        let (_, edges) = extract(MACRO_CODE, "rs", "m.rs");
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.source == "build")
+            .map(|e| e.target.clone())
+            .collect()
+    }
+
+    #[test]
+    fn calls_inside_std_and_serde_macros_are_call_edges() {
+        let targets = macro_targets();
+        for want in [
+            "tool_kind",
+            "approval_config_option",
+            "helper_a",
+            "helper_b",
+            "helper_c",
+            "helper_d",
+            "helper_e",
+            "method_f",
+            "plain_call",
+        ] {
+            assert!(
+                targets.iter().any(|t| t == want),
+                "{want} missing: {targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_macro_names_and_declarations_are_not_calls() {
+        let (_, edges) = extract(MACRO_CODE, "rs", "m.rs");
+        let all: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| e.target.as_str())
+            .collect();
+        for not in [
+            "json", "vec", "format", "assert", "matches", "println", "dbg",
+        ] {
+            assert!(!all.contains(&not), "macro `{not}` is not a call: {all:?}");
+        }
+        assert!(
+            !all.contains(&"declared_not_called"),
+            "`fn name()` inside macro_rules! is a definition: {all:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_in_a_macro_is_recorded_once_with_its_own_line() {
+        let targets = macro_targets();
+        assert_eq!(targets.iter().filter(|t| *t == "tool_kind").count(), 1);
+        let (_, edges) = extract(MACRO_CODE, "rs", "m.rs");
+        let e = edges
+            .iter()
+            .find(|e| e.target == "tool_kind" && e.source == "build")
+            .unwrap();
+        let expected = MACRO_CODE
+            .lines()
+            .position(|l| l.contains("json!"))
+            .map(|n| n as u32 + 1)
+            .unwrap();
+        assert_eq!(e.line, expected);
     }
 }

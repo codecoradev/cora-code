@@ -54,6 +54,9 @@ Complete command reference for the cora CLI.
 | `cora hook uninstall` | Remove pre-commit hook |
 | `cora hook verify [--quiet]` | Is the staged diff already reviewed? Exit 0 validated, 10 validated but blocking, 11 not validated |
 | `cora hook claude-guard` | Claude Code `PreToolUse` hook: reads the tool call from stdin, denies (exit 2) an unreviewed or blocking `git commit` and any `--no-verify` |
+| `cora hook context [--agent claude\|hermes] [--prompt TEXT]` | Agent prompt hook: prints code-search results for the prompt (reads the agent's hook JSON from stdin when `--prompt` is absent). Silent for chit-chat and unindexed projects, never downloads, always exits 0 |
+| `cora hook session [--agent claude\|hermes]` | Agent session-start hook: a one-line reminder of the code-search tools |
+| `cora install [--agents claude] [--no-instructions] [--remove] [--dry-run]` | Native setup for Claude Code: hooks, MCP (`alwaysLoad`), `cora-code` skill, `CLAUDE.md` block |
 | `cora completion` `<shell>` | Generate shell completions (bash/zsh/fish/powershell) |
 
 ### Review & Scan
@@ -95,9 +98,9 @@ Complete command reference for the cora CLI.
 | `cora scan --focus` `security` | Override focus areas |
 | `cora scan --batch-files` `N` | Max files per LLM batch (default: 20) |
 | `cora scan --no-continue-on-batch-error` | Abort on batch failure (default: skip and continue) |
-| `cora scan --no-llm` | Deterministic checks only, never call an LLM |
+| `cora scan --no-llm` (alias `--rules-only`) | Deterministic checks only (rules, secrets, security patterns, index scans), never call an LLM: zero tokens, no API key, no network |
 
-**No API key needed for deterministic checks.** `cora review` and `cora scan` run without any LLM configured: with no key they run the deterministic checks only (rules, secrets, security, index scans), print a one-line notice on stderr, and mark the result "Deterministic checks only (no LLM judge)" (in SARIF: `invocations[0].properties["cora.judge"] = "none"`), so a clean result is never mistaken for an AI review. `--no-llm` forces this even when a key exists and silences the notice. `cora commit` still needs a key for the commit message.
+**No API key needed for deterministic checks.** `cora review` and `cora scan` run without any LLM configured: with no key they run the deterministic checks only (rules, secrets, security, index scans), print a one-line notice on stderr, and mark the result "Deterministic checks only (no LLM judge)" (in SARIF: `invocations[0].properties["cora.judge"] = "none"`), so a clean result is never mistaken for an AI review. `--no-llm` forces this even when a key exists and silences the notice. In a normal scan the same deterministic findings are reported when a model batch fails or is skipped (for example a 504), so they are never lost with it. `cora commit` still needs a key for the commit message.
 
 `cora scan` runs the same deterministic checks as `cora review` (built-in and custom rules, secrets, security patterns, plus unused imports and dead code from the index) on every file, then asks the LLM about each batch. Findings are filtered by `ignore.rules` and inline `cora-ignore:` markers and capped by `rules_engine.max_findings`. Unlike `review`, scan has no `--ci`, `--severity`, `--quiet`, `--stream`, `--output-file` or `--no-cache`, does not apply the quality gate, and keeps every finding in the output (`hook.min_severity` only decides the exit code in `block` mode).
 
@@ -114,16 +117,18 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 
 | Command | Description |
 |---------|-------------|
-| `cora index` | Index project symbols into SQLite + usearch |
+| `cora index` | Index project symbols into SQLite and embed them into the project's vector file |
 | `cora index --rebuild` | Rebuild index from scratch |
 | `cora index --watch` | Auto-sync file watcher (2s poll interval) |
 | `cora index --stats` | Show index statistics (symbol count, languages, DB size) |
 | `cora index --prune` | Remove stale entries for deleted files |
-| `cora explore` `<query>` | Keyword search (FTS5) over symbol names |
+| `cora explore` `<query>` | Keyword search (FTS5) over symbol names; a multi-word query is completed with a separate block of matches by meaning |
+| `cora explore --no-semantic` | Keyword results only, even for a multi-word query |
 | `cora explore --kind` `function` | Filter by symbol kind |
 | `cora explore --file` `"src/"` | Filter by file path prefix |
 | `cora explore --language` `rust` | Filter by language |
-| `cora explore --limit` `N` | Max results (default: 50) |
+| `cora explore --limit` `N` | Max results (default: 50); prints "Showing N of M" when cut |
+| `cora explore --docs` | Also match signature / doc words (default: names only) |
 | `cora brain` `<query>` | Hybrid search: FTS5 + vector + graph → RRF fusion |
 | `cora brain --limit N` | Max results (default: 20) |
 | `cora callers` `<symbol>` | Find all callers of a symbol (reverse call graph) |
@@ -133,16 +138,19 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora trace` `<symbol>` | Trace call chains (depth-limited BFS) |
 | `cora trace --direction incoming` | Trace callers instead of callees |
 | `cora trace --depth N` | Max hops (default: 3) |
-| `cora arch` | Architecture overview — modules, edge types, top connectors |
+| `cora arch` | Architecture overview — crates, modules (`--depth N`), calls between them |
 | `cora affected` `<files...>` | Find test files affected by source changes |
 | `cora affected --stdin` | Read changed files from stdin (pipe from `git diff --name-only`) |
 | `cora affected --filter` `"*test*"` | Custom test file glob pattern |
+| `cora affected --depth N` / `--limit N` | Max call-graph hops (default 3) / max files printed (default 50) |
 | `cora dead-code` | Detect dead code — functions/methods with zero callers (public API surface skipped by default; honors ignore.files via the index) |
-| `cora dead-code --include-pub` | Include public API surface (pub/export items) in results |
+| `cora dead-code --include-public` | Include public API surface (pub items of a lib crate, export items) in results |
+| `cora dead-code --include-tests` | Include tests (`#[test]`, `#[cfg(test)]`, tests directories) in results |
 | `cora dead-code --include-tests` | Include test functions in results |
 | `cora dead-code --min-lines N` | Filter out tiny functions |
 | `cora query` `"main -> *"` | Query the code graph with simple patterns |
 | `cora query --limit N` | Max results (default: 50) |
+| `cora query --include-std` | Also show std/core method names (hidden by default) |
 | `cora routes` | List detected HTTP routes (Axum, Actix, Express, FastAPI, Flask, Go) |
 | `cora routes --method GET` | Filter by HTTP method |
 | `cora routes --prefix /api` | Filter by path prefix |
@@ -168,6 +176,9 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora findings dismiss <id>` | Mark finding as won't-fix |
 | `cora findings dismiss <id> --reason "..."` | Dismiss with reason |
 | `cora findings reopen <id>` | Reopen a dismissed/resolved finding |
+| `cora findings prune --stale-projects --dry-run` | Report projects whose root directory no longer exists (worktrees, temp clones), with their index, reviews and findings |
+| `cora findings prune --stale-projects` | Remove them |
+| `cora findings prune --older-than 90` | Remove resolved/dismissed findings older than 90 days and the reviews left empty (open findings are kept) |
 | `cora debt` | Show tech debt report from review history |
 | `cora debt --json` | Debt report as JSON (for CI/dashboards) |
 | `cora debt --trend` | Quality score trend graph |

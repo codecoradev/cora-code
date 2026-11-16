@@ -21,7 +21,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 Pin a specific version:
 
 ```bash
-$ CORA_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
+$ CORA_VERSION=v0.21.0 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
 ```
 
 ## Install via Cargo
@@ -47,18 +47,20 @@ Supported platforms:
 
 ```bash
 # Download and extract (Linux x86_64 example)
-$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-x86_64-unknown-linux-gnu-v0.13.0.tar.gz | tar xz
+$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-x86_64-unknown-linux-gnu-v0.21.0.tar.gz | tar xz
 $ mv cora ~/.local/bin/cora
 ```
+
+**The release archives contain the code embedding model** (`potion-code-16M-v2`, 33.5 MB, pinned and checksum-verified at build time), so `cora index` and `cora brain` work right away with no network. The binary is therefore about 70 MB uncompressed; the first use unpacks the model into `~/.codecora/cora-code/models/`. A binary built with `cargo install` has no model inside and downloads it once on first use.
 
 Asset naming convention: `cora-{target-triple}-{version}.tar.gz` (Linux/macOS) or `.zip` (Windows). Replace the target triple as needed:
 
 | Platform | Asset name |
 |----------|------------|
-| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-v0.13.0.tar.gz` |
-| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-v0.13.0.tar.gz` |
-| macOS ARM64 | `cora-aarch64-apple-darwin-v0.13.0.tar.gz` |
-| Windows x86_64 | `cora-x86_64-pc-windows-msvc-v0.13.0.zip` |
+| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-v0.21.0.tar.gz` |
+| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-v0.21.0.tar.gz` |
+| macOS ARM64 | `cora-aarch64-apple-darwin-v0.21.0.tar.gz` |
+| Windows x86_64 | `cora-x86_64-pc-windows-msvc-v0.21.0.zip` |
 
 ## Build from Source
 

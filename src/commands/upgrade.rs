@@ -301,6 +301,13 @@ pub async fn run(yes: bool, check_only: bool) -> anyhow::Result<i32> {
         "{} Update complete. ({current_version} → {latest_version})",
         "[INFO]".green().bold()
     );
+    // The skills and hooks `cora install` put in your agents belong to the
+    // version that wrote them; `cora install` brings them to this one and only
+    // changes files cora wrote (a skill you edited is kept).
+    println!(
+        "{} If you use cora with AI agents, run `cora install` to refresh their skills.",
+        "[INFO]".cyan()
+    );
 
     Ok(0)
 }

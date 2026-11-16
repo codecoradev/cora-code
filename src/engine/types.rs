@@ -26,6 +26,21 @@ impl Severity {
         }
     }
 
+    /// Map the severity word a model wrote, accepting the common synonyms.
+    /// `None` for a word that is not a severity at all (`"performance"`).
+    pub fn from_model_word(s: &str) -> Option<Self> {
+        let w = s.trim().to_ascii_lowercase();
+        Some(match w.as_str() {
+            "critical" | "blocker" | "fatal" | "severe" => Severity::Critical,
+            "major" | "high" | "error" | "serious" | "important" => Severity::Major,
+            "minor" | "medium" | "moderate" | "warning" | "warn" | "low" => Severity::Minor,
+            "info" | "informational" | "note" | "nit" | "nitpick" | "suggestion" | "trivial" => {
+                Severity::Info
+            }
+            _ => return None,
+        })
+    }
+
     /// Get the label text for this severity.
     pub fn label(self) -> &'static str {
         match self {
@@ -108,12 +123,28 @@ impl IssueType {
     }
 }
 
+/// Read a severity the way a model writes it. A synonym (`high`, `warning`)
+/// maps to its level; a word that is not a severity (`"performance"`, a
+/// category in the wrong field) must not make the whole batch fail to parse, so
+/// it becomes `minor` and is logged (#723).
+fn deserialize_model_severity<'de, D>(d: D) -> Result<Severity, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let word = String::deserialize(d)?;
+    Ok(Severity::from_model_word(&word).unwrap_or_else(|| {
+        tracing::warn!(severity = %word, "unknown severity from the model, using minor");
+        Severity::Minor
+    }))
+}
+
 /// A single review issue found in code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewIssue {
     pub file: String,
     #[serde(default)]
     pub line: Option<u32>,
+    #[serde(deserialize_with = "deserialize_model_severity")]
     pub severity: Severity,
     /// Issue type/category — stored as string since LLM output varies.
     /// Common values: security, performance, bug, `best_practice`, style, suggestion
@@ -133,6 +164,11 @@ pub struct ReviewIssue {
     /// scanner rule still hides the surviving issue. Never serialized.
     #[serde(skip)]
     pub also_matches: Vec<String>,
+    /// The source line the finding is about, as the judge quoted it. Used once,
+    /// by admission, to check (and if needed move) `line`; never serialized
+    /// (#721).
+    #[serde(default, skip_serializing)]
+    pub snippet: Option<String>,
 }
 
 impl ReviewIssue {
@@ -155,6 +191,7 @@ impl ReviewIssue {
             suggested_fix: None,
             rule_id: None,
             also_matches: Vec::new(),
+            snippet: None,
         }
     }
 
@@ -490,6 +527,12 @@ pub struct ReviewResponse {
     /// unchanged; the CLI reports it on stderr.
     #[serde(skip)]
     pub dropped_findings: usize,
+    /// Why the model judge did not run, when the response holds deterministic
+    /// findings only (API error, unparseable reply). `None` when the judge ran
+    /// or was not requested (`--no-llm`). Never serialized (#720): callers use
+    /// it to tell a partial review from a complete one.
+    #[serde(skip)]
+    pub judge_failure: Option<String>,
 }
 
 /// Response from a full project scan
@@ -516,6 +559,10 @@ pub struct LLMConfig {
     /// JSON parameter name for max tokens (resolved from config).
     pub max_tokens_param: String,
     pub timeout: u64,
+    /// `reasoning_effort` sent with every request (`none`, `minimal`, `low`,
+    /// ...), so a reasoning model does not spend the output budget on thinking
+    /// (#718). `None` leaves the provider default.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for LLMConfig {
@@ -529,6 +576,7 @@ impl Default for LLMConfig {
             max_tokens: 4096,
             max_tokens_param: "max_tokens".to_string(),
             timeout: 600,
+            reasoning_effort: None,
         }
     }
 }

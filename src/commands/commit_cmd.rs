@@ -111,9 +111,9 @@ pub async fn execute_commit(
         let gate_result = shaped.gate.clone();
         let gate_failed = shaped.gate_failed();
 
-        // Debt snapshot + review history (best-effort)
-        finalize::save_debt(config, &filtered.issues, gate_result.as_ref(), 0);
+        // Review history in cora.db (best-effort)
         finalize::save_history(
+            config,
             &HistoryEntry {
                 command: "commit",
                 summary: &filtered.summary,

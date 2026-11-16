@@ -35,7 +35,7 @@ Scans your project, extracts symbol definitions (functions, structs, enums, trai
 |-----------|-----------|---------|
 | Symbol table (regex) | Regex extractors (18 languages) | SQLite FTS5 |
 | Symbol table (AST) | Tree-sitter grammars (12+ languages, enabled by default) | SQLite FTS5 |
-| Vector embeddings | Static hashing (256d) or pretrained nomic (768d), runtime-selectable | usearch HNSW index |
+| Vector embeddings | Code embedding model `potion-code-16M-v2` (256d) | One quantized vecq file per project |
 | Call graph | Regex scope tracking + tree-sitter AST edges | SQLite `edges` table |
 
 ```bash
@@ -84,7 +84,8 @@ All projects share a **single global database**:
 ```
 ~/.codecora/cora-code/
 ├── cora.db               # SQLite — symbols, FTS5 index, call edges
-└── cora_index.usearch   # usearch HNSW — 256d vector embeddings
+├── vectors/              # one quantized vecq file per project: <project id>.<model>.vecq
+└── models/               # the code embedding model, unpacked from the release binary or downloaded once
 ```
 
 Index multiple repos and they all become searchable from any directory:
@@ -122,7 +123,7 @@ Combines three search signals into ranked results via **Reciprocal Rank Fusion (
 | Signal | Engine | What it finds |
 --------|--------|--------------|
 | FTS5 | SQLite keyword match | Exact name/signature matches |
-| Vector KNN | usearch HNSW (cosine) | Semantically similar code |
+| Vector KNN | vecq scan of the project's own vector file (cosine) | Semantically similar code |
 | Graph BFS | Call graph traversal | Related symbols (callers/callees) |
 
 ```bash
@@ -151,21 +152,40 @@ The `signals` field shows which search signals matched: `"fts"`, `"vector"`, `"g
 
 #### Embedding Engine
 
-Cora supports multiple embedding backends, selectable at runtime via `brain.embedding` in `.cora.yaml`. No recompilation needed to switch.
+Cora embeds every symbol (its name and signature) locally, with no API key and no GPU, using one model: `potion-code-16M-v2`, a static code model (256 dimensions, MIT). Tokens are looked up in a learned table and averaged. It is inside the release binaries (33.5 MB; a `cargo install` build downloads it once) and used offline; it finds the right function from a description clearly more often than keyword search alone.
 
-| Backend | Dimensions | Method | Feature Flag | When to use |
-|---------|------------|--------|--------------|-------------|
-| `hashing` | 256 | Bag-of-tokens hashing | Always available | Zero-dependency, fast, good for near-duplicate detection |
-| `pretrained` | 768 | Nomic-embed-code distilled | `pretrained-embed` | Better semantic matching, real code embeddings |
-| `auto` (default) | — | Picks best available | — | Uses `pretrained` if compiled, falls back to `hashing` |
+When the model is not available (offline before the first download, `CORA_EMBED_OFFLINE=1`, a blocked network) there is no substitute embedding: the vector signal is off and `cora brain` answers from keyword and call-graph signals, with a warning that says so. `brain.embedding: off` chooses that on purpose.
 
 ```yaml
 # .cora.yaml
 brain:
-  embedding: auto   # auto | hashing | pretrained
+  embedding: auto   # auto | off
 ```
 
-> **Note:** 256d and 768d embeddings cannot be mixed in the same index. Changing the backend requires `cora index --rebuild`. Future phases will add ONNX-based embedding models (see Roadmap).
+**Why this model.** It was chosen by measurement, on 1,639 queries (hand-written questions and doc comments of this repository, of 8 other Rust crates and of the Python standard library) with the documents cora indexes (name and signature). Alone it beat keyword search by +0.07 to +0.12 in MRR@10, with intervals that exclude zero on every set, and fused with keyword search at full weight it is better by +0.04 to +0.09. The embeddings it replaced (a hashing trick and a distilled 768-dimension table) were neutral on this repository and harmful elsewhere (down to -0.09), so they were removed (#751) instead of being kept as a fallback. On `cora brain` itself, on this repository, MRR@10 rose from 0.22 to 0.32 (hand-written questions) and from 0.39 to 0.52 (doc comments).
+
+Embedding is cheap: tens of thousands of symbols per second on a few CPU cores, about 80 MB of memory for the model, and 256-dimensional vectors (about 1 KB per symbol).
+
+#### Where it is stored
+
+| What | Where |
+|---|---|
+| Symbols, edges, call graph, review history, per-project embedding metadata (model, dimensions, time) | SQLite database `cora.db` in the data directory (`~/.codecora/cora-code/`) |
+| Keyword index | An FTS5 virtual table in the same database |
+| Vectors | One quantized (vecq) file per project and model in `vectors/`: `<project id>.potion-code-v2.vecq`, keyed by the symbol's database id. Rebuilt from the project's symbols and replaced atomically after every index run that changed them, so it never holds a vector of a symbol that is gone, and deleted with the project |
+| The model | `models/potion-code-16M-v2/` in the data directory |
+
+**Nothing is written inside your project.** The database, the vector files, the model and the scan cache all live in the data directory (`~/.codecora/cora-code/`, or `CODECORA_HOME`), under the project's database id, so `git status` stays clean after `cora index` and there is nothing to add to `.gitignore`. The only files cora puts in a project are the ones you ask for: `.cora.yaml` and the pre-commit hook from `cora init`.
+
+A search embeds the question, scans the current project's vector file for the nearest symbols (no other project's vectors are read), and fuses them with the keyword and graph results by reciprocal rank fusion.
+
+**Why one file per project.** A single shared index let other projects crowd the current one out of the candidates (on 176 projects the vector signal lost 11 to 29% of its MRR and up to a quarter of the queries found no candidate), never freed the vectors of deleted symbols, and had to be read into memory by every process (+148 MB at 127,000 vectors). One vecq file per project matches the exact ceiling at every size measured, is 4.3 times smaller, loads in 0.1 ms and re-indexes in a few milliseconds. A query scans the file: about 0.06 ms for a typical project, 2 ms at 20,000 symbols and 13 ms at 127,000.
+
+#### Where it is used
+
+- `cora brain` and the MCP tool `cora.brain_search`: the full hybrid, for questions in words.
+- `cora explore` with a multi-word query: the keyword results, completed with a separate block of matches by meaning (`--no-semantic` turns it off; `--json` marks each result `via: keyword | semantic`).
+- `cora review`: related code and tests found for the changed symbols.
 
 ## Call Graph Commands
 
@@ -310,8 +330,9 @@ All code intelligence features are available as MCP tools for AI coding agents:
 │   ├── edges            # Call relationships (caller_id → callee_id)
 │   ├── reviews          # Review history for tech debt tracking
 │   └── findings         # Review findings + finding_events
-└── cora_index.usearch   # usearch HNSW vector index
-    └── cora_index.keys           # Key-to-symbol-id mapping (lock is held on the .usearch file itself, fs2)
+├── vectors/                  # one vecq file per project and model
+│   └── 3.potion-code-v2.vecq
+└── models/                   # downloaded embedding model
 ```
 
 To reset everything:

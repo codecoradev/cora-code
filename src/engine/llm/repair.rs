@@ -42,7 +42,17 @@ pub(super) fn json_value_end(s: &str) -> Option<usize> {
 }
 
 /// Extract JSON and optional summary (after ||| separator).
+#[cfg(test)]
 pub(super) fn extract_json_and_summary(raw: &str) -> (String, String) {
+    let (json, summary, _) = extract_json_and_summary_marked(raw);
+    (json, summary)
+}
+
+/// Like [`extract_json_and_summary`], and also says whether the summary was
+/// introduced by the `|||` separator (`true`) or is just whatever text
+/// followed the JSON (`false`). Unmarked text can be a second, damaged JSON
+/// blob, so callers must vet it before showing it as a summary (#718).
+pub(super) fn extract_json_and_summary_marked(raw: &str) -> (String, String, bool) {
     // Fast path: response starts with a JSON array. Find its end with a
     // string/escape-aware scan so `]` or `|||` inside a string value cannot
     // truncate the JSON.
@@ -50,17 +60,17 @@ pub(super) fn extract_json_and_summary(raw: &str) -> (String, String) {
     if trimmed.starts_with('[') {
         if let Some(end) = json_value_end(trimmed) {
             let rest = trimmed[end..].trim();
-            let summary = match rest.strip_prefix("|||") {
-                Some(s) => s.trim(),
-                None => rest,
+            let (summary, marked) = match rest.strip_prefix("|||") {
+                Some(s) => (s.trim(), true),
+                None => (rest, false),
             };
-            return (trimmed[..end].to_string(), summary.to_string());
+            return (trimmed[..end].to_string(), summary.to_string(), marked);
         }
     }
     if let Some(idx) = raw.find("|||") {
         let json_part = raw[..idx].trim().to_string();
         let summary_part = raw[idx + 3..].trim().to_string();
-        (json_part, summary_part)
+        (json_part, summary_part, true)
     } else {
         // Try to find the JSON array boundaries
         let trimmed = raw.trim();
@@ -84,11 +94,26 @@ pub(super) fn extract_json_and_summary(raw: &str) -> (String, String) {
             if end > 0 {
                 let json_part = trimmed[..end].to_string();
                 let summary_part = trimmed[end..].trim().to_string();
-                return (json_part, summary_part);
+                return (json_part, summary_part, false);
             }
         }
-        (trimmed.to_string(), String::new())
+        (trimmed.to_string(), String::new(), false)
     }
+}
+
+/// True when text that followed the findings array without a `|||` marker is
+/// not prose: a second JSON value or a code fence, typically a duplicated or
+/// truncated copy of the findings (#718).
+pub(super) fn is_stray_json(unmarked_tail: &str) -> bool {
+    let t = unmarked_tail.trim_start();
+    if t.starts_with('{') || t.starts_with("```") {
+        return true;
+    }
+    // `[` opens JSON only when an element or `]` follows; `[INFO] ...` or
+    // `[note]` is prose that happens to start with a bracket.
+    t.strip_prefix('[')
+        .map(str::trim_start)
+        .is_some_and(|r| r.starts_with(['{', '[', ']', '"']))
 }
 
 /// Repair common LLM JSON mistakes before strict parse.
@@ -592,5 +617,16 @@ mod tests {
         let (json, summary) = extract_json_and_summary("[{\"a\":\"x");
         assert_eq!(json, "[{\"a\":\"x");
         assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn stray_json_detection_ignores_bracketed_prose() {
+        assert!(is_stray_json("{\"file\":\"a\""));
+        assert!(is_stray_json("```json\n[]"));
+        assert!(is_stray_json("[{\"file\""));
+        assert!(is_stray_json("[ ]"));
+        assert!(!is_stray_json("[INFO] nothing to flag"));
+        assert!(!is_stray_json("[note] fine"));
+        assert!(!is_stray_json("All good."));
     }
 }

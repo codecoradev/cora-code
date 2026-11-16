@@ -4,14 +4,17 @@
 //! Uses regex-based extraction (same approach as `engine/context/extraction.rs`)
 //! stored in SQLite with FTS5 for fast full-text search.
 
+pub mod arch;
 #[cfg(feature = "tree-sitter")]
 mod ast;
 pub mod brain;
+mod dead_filters;
 mod extract;
 pub mod graph;
 pub mod queries;
 pub mod schema;
 pub mod session;
+pub mod std_names;
 mod symbols;
 pub mod vector;
 
@@ -26,7 +29,7 @@ use tracing::{debug, info};
 
 #[allow(unused_imports)]
 pub use graph::{CallEdge, CalleeResult, CallerResult, ImpactNode};
-pub use symbols::{SearchResult, SymbolKind, SymbolQuery};
+pub use symbols::{SearchOutcome, SearchResult, SymbolKind, SymbolQuery};
 
 /// Open or create the **global** symbol index database.
 ///
@@ -235,7 +238,7 @@ fn index_file_in_tx(
     )?;
     if !extracted.calls.is_empty() {
         let mut stmt = tx.prepare(
-            "INSERT INTO call_graph (caller, callee, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, qualifier, caller_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
         for site in &extracted.calls {
             stmt.execute(rusqlite::params![
@@ -244,6 +247,8 @@ fn index_file_in_tx(
                 site.file,
                 site.line as i64,
                 project_id,
+                site.qualifier,
+                site.caller_type,
             ])?;
         }
     }
@@ -593,7 +598,12 @@ fn index_project_with_id(
     // (legacy pre-0.3.0 vecq file, vecq #542: if all files are unchanged this
     // would be the only chance to re-embed — without it the vector signal
     // stays dead until a file actually changes).
-    if stats.files_indexed > 0 || stats.files_pruned > 0 || brain::vector_index_needs_rebuild() {
+    // A change of embedding model (for example the first run after the code
+    // model became the default) also needs a re-embed, files unchanged or not.
+    if stats.files_indexed > 0
+        || stats.files_pruned > 0
+        || brain::project_needs_embedding(project_id)
+    {
         match brain::embed_project(conn, project_id) {
             Ok(n) => {
                 stats.embedded_symbols = Some(n);
@@ -618,6 +628,15 @@ pub fn search(
     query: &SymbolQuery,
 ) -> anyhow::Result<Vec<SearchResult>> {
     symbols::search(conn, project_id, query)
+}
+
+/// Search the symbol index and report the number of matches before `limit`.
+pub fn search_with_total(
+    conn: &Connection,
+    project_id: i64,
+    query: &SymbolQuery,
+) -> anyhow::Result<SearchOutcome> {
+    symbols::search_with_total(conn, project_id, query)
 }
 
 /// Get index statistics for a specific project.

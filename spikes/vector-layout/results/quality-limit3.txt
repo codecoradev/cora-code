@@ -1,0 +1,13 @@
+== 40 projects in the index (20347 vectors), 12 target projects
+  exact (brute force, ceiling)       MRR@10 0.352  R@10 0.550  returned  6.0/6  empty   0.0%
+  global usearch, cora over-fetch    MRR@10 0.319  R@10 0.486  returned  4.9/6  empty   6.2%
+  global usearch, adaptive fetch     MRR@10 0.345  R@10 0.550  returned  6.0/6  empty   0.0%
+  global usearch, filtered search    MRR@10 0.346  R@10 0.549  returned  6.0/6  empty   0.0%
+  global vecq, cora over-fetch       MRR@10 0.334  R@10 0.517  returned  5.1/6  empty   4.6%
+  global vecq, adaptive fetch        MRR@10 0.348  R@10 0.549  returned  6.0/6  empty   0.0%
+== 176 projects in the index (127400 vectors), 12 target projects
+  exact (brute force, ceiling)       MRR@10 0.352  R@10 0.550  returned  6.0/6  empty   0.0%
+  global usearch, cora over-fetch    MRR@10 0.250  R@10 0.361  returned  3.3/6  empty  26.4%
+  global usearch, adaptive fetch     MRR@10 0.343  R@10 0.547  returned  6.0/6  empty   0.1%
+  global usearch, filtered search    MRR@10 0.346  R@10 0.552  returned  6.0/6  empty   0.1%
+  global vecq, cora over-fetch       MRR@10 0.285  R@10 0.407  returned  3.5/6  empty  20.3%

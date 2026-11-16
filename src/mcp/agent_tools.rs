@@ -243,7 +243,9 @@ pub fn review_prepare(params: &Value) -> ToolResult {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
     };
-    let bridge = IndexBridge::open_cwd();
+    // Same as `cora review`: the index is brought up to date first, so the
+    // agent's prompt carries code intelligence and the code model is used (#765).
+    let bridge = IndexBridge::open_cwd_refreshed(&config, true);
     let packet = review::prepare(&config, diff, None, &bridge);
     // Show what `review_finalize` will report: the same post-processing
     // (`ignore.rules`, inline `cora-ignore` markers, the findings cap) runs here,
@@ -320,6 +322,7 @@ pub fn review_finalize(params: &Value) -> ToolResult {
     let gate_recorded =
         crate::engine::commit_gate::record_for_diff(diff, "agent", should_block, total_found);
     finalize::save_history(
+        &config,
         &HistoryEntry {
             command: "review (agent)",
             summary: &response.summary,
@@ -571,16 +574,28 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         .collect();
     let total_chars: usize = batch_chars.iter().sum();
 
+    // Same context `cora scan` gives its judge: impact, tests and related code by
+    // meaning, from an index that is brought up to date first (#765).
+    let bridge = IndexBridge::open_refreshed(&root, &config, true);
+    let brain_ctx = if config.context_chain.use_brain {
+        let batch_files_only: Vec<_> = batch.to_vec();
+        review::build_scan_brain_context(
+            &batch_files_only,
+            config.context_chain.impact_depth,
+            &bridge,
+        )
+    } else {
+        None
+    };
     let prompts = llm::scan_prompts(
         &format_batch_for_prompt(batch),
         &config.focus,
         &config.rules,
         None,
-        None,
+        brain_ctx.as_deref(),
     );
 
     let deterministic: Vec<Value> = if batch_idx == 0 {
-        let bridge = IndexBridge::open(&root);
         let index = crate::commands::scan::index_findings(&config, &bridge, &files);
         crate::commands::scan::finalize_issues(&config, &files, index)
             .0
@@ -745,6 +760,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         ),
     };
     finalize::save_history(
+        &config,
         &HistoryEntry {
             command: "scan (agent)",
             summary: &summary,
@@ -1276,7 +1292,11 @@ mod tests {
     #[test]
     fn finalize_agrees_with_prepare_only_for_the_same_filters() {
         let dir = mixed();
-        let sel = json!({ "include": ["crates/**/*.rs"], "order": "path" });
+        // `**/*` keeps docs and data files in the set, so `path` (alphabetical
+        // walk) and the default `source-first` order differ by construction.
+        // With only `crates/**/*.rs` the two could coincide depending on the
+        // filesystem's readdir order, which made this test flaky in CI.
+        let sel = json!({ "include": ["**/*"], "order": "path" });
         let out = prep(&dir, sel.clone());
         let fp = out["files_fingerprint"].as_str().unwrap();
         let path = dir.path().to_str().unwrap();
@@ -1290,7 +1310,7 @@ mod tests {
         assert!(r.is_error);
         assert!(text(&r).contains("changed since"));
         let reordered = json!({ "path": path, "issues": [], "files_fingerprint": fp,
-            "include": ["crates/**/*.rs"] });
+            "include": ["**/*"] });
         assert!(scan_finalize(&reordered).is_error);
     }
 
@@ -1312,5 +1332,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_walk_order_does_not_depend_on_the_filesystem() {
+        let dir = mixed();
+        let out = prep(&dir, json!({ "order": "path" }));
+        let n = names(&out);
+        // Entries are ordered by name inside each directory, depth first.
+        assert_eq!(n[0], "Cargo.toml");
+        assert_eq!(n[1], "README.md");
+        assert_eq!(
+            n.iter()
+                .filter(|p| p.starts_with("crates/"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "crates/a/src/lib.rs",
+                "crates/a/tests/t.rs",
+                "crates/b/deep/er/x.rs"
+            ]
+        );
+        assert_eq!(out["order"], "path");
     }
 }

@@ -1418,6 +1418,7 @@ mod tests {
             include_tests: false,
             include_callers: false,
             use_brain: false,
+            auto_index: true,
             impact_depth: 2,
             prefer_index: true,
         };
@@ -1445,6 +1446,7 @@ mod tests {
             include_tests: false,
             include_callers: false,
             use_brain: false,
+            auto_index: true,
             impact_depth: 2,
             prefer_index: true,
         };

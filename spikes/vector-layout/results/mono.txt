@@ -1,0 +1,23 @@
+one big project; 20 results asked, queries from the 12 target crates
+
+== 8990 vectors in one project (build: usearch 1614 ms, vecq 105 ms)
+  exact            MRR@10 0.285  R@10 0.514  returned 20.0/20  empty   0.0%
+  usearch          MRR@10 0.279  R@10 0.504  returned 20.0/20  empty   0.0%   latency 197 / 282 us (median / p95)
+  vecq residual    MRR@10 0.283  R@10 0.517  returned 20.0/20  empty   0.0%   latency 847 / 924 us (median / p95)
+
+== 20347 vectors in one project (build: usearch 3972 ms, vecq 234 ms)
+  exact            MRR@10 0.256  R@10 0.440  returned 20.0/20  empty   0.0%
+  usearch          MRR@10 0.243  R@10 0.414  returned 20.0/20  empty   0.0%   latency 249 / 361 us (median / p95)
+  vecq residual    MRR@10 0.254  R@10 0.443  returned 20.0/20  empty   0.0%   latency 2083 / 2182 us (median / p95)
+
+== 59878 vectors in one project (build: usearch 13905 ms, vecq 779 ms)
+  exact            MRR@10 0.191  R@10 0.356  returned 20.0/20  empty   0.0%
+  usearch          MRR@10 0.170  R@10 0.316  returned 20.0/20  empty   0.0%   latency 312 / 464 us (median / p95)
+  vecq residual    MRR@10 0.202  R@10 0.358  returned 20.0/20  empty   0.0%   latency 6306 / 7894 us (median / p95)
+
+== 127400 vectors in one project (build: usearch 33394 ms, vecq 1810 ms)
+  exact            MRR@10 0.161  R@10 0.289  returned 20.0/20  empty   0.0%
+  usearch          MRR@10 0.137  R@10 0.247  returned 20.0/20  empty   0.0%   latency 324 / 503 us (median / p95)
+  vecq residual    MRR@10 0.169  R@10 0.295  returned 20.0/20  empty   0.0%   latency 12808 / 16612 us (median / p95)
+
+

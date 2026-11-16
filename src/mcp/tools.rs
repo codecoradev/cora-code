@@ -94,7 +94,7 @@ pub fn list_tools() -> Vec<Tool> {
         // ─── Code Intelligence ───
         Tool {
             name: "cora.search_symbols".to_string(),
-            description: "Search the symbol index for code intelligence. Returns matching symbols with file location, kind, and signature. Requires `cora index` to be run first.".to_string(),
+            description: "Search the symbol index by symbol name or keyword. Returns matching symbols with file location, kind, and signature. For a question in words (\"where do we retry a failed request\"), use cora.brain_search instead. Requires `cora index` to be run first.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -201,7 +201,7 @@ pub fn list_tools() -> Vec<Tool> {
         // Brain Mode (Phase 3)
         Tool {
             name: "cora.brain_search".to_string(),
-            description: "Hybrid code search: FTS5 + vector embeddings + graph proximity → RRF fusion. Better than plain text search for semantic code queries.".to_string(),
+            description: "Search code by meaning. Ask in words (\"how does the review store prune old findings\", \"parse the severity from the model reply\"): keyword search, a code embedding model and graph proximity are fused into one ranking. Use cora.search_symbols when you already know the symbol name.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -531,6 +531,8 @@ fn handle_search_symbols(params: &serde_json::Value) -> ToolResult {
         file_prefix,
         language,
         limit,
+        // Keep the MCP tool's historical behaviour: match name and signature.
+        include_docs: true,
     };
 
     match crate::index::search(&conn, project_id, &query) {
@@ -848,17 +850,21 @@ fn handle_review_diff(params: &serde_json::Value) -> ToolResult {
 }
 
 fn handle_get_debt() -> ToolResult {
-    let config = load_project_config().unwrap_or_default();
+    // Same source as `cora debt`: the review history in cora.db (#724).
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let snapshots = crate::engine::debt_tracker::load_snapshots_from_db(&cwd.to_string_lossy());
+    debt_report_result(&snapshots)
+}
 
-    let snapshots = crate::engine::debt_tracker::load_snapshots(config.debt.history_dir.as_deref());
-
+/// The `cora.get_debt` answer for already loaded review history.
+fn debt_report_result(snapshots: &[crate::engine::debt_tracker::DebtSnapshot]) -> ToolResult {
     if snapshots.is_empty() {
         return ToolResult::text(
-            "No debt snapshots found. Run 'cora review' or 'cora commit' to generate history.",
+            "No review history found. Run 'cora review' or 'cora commit' to generate history.",
         );
     }
 
-    let report = crate::engine::debt_tracker::aggregate(&snapshots);
+    let report = crate::engine::debt_tracker::aggregate(snapshots);
 
     let json = serde_json::json!({
         "quality_score": report.quality_score_avg,
@@ -1009,8 +1015,9 @@ fn handle_brain_search(params: &serde_json::Value) -> ToolResult {
     // Same session step as `cora brain` (backend + vector store), but with
     // project-only config: no env/global/API keys (#563).
     crate::index::session::configure_for_search(crate::index::session::ConfigSource::ProjectOnly);
-    match crate::index::brain::brain_search(&conn, project_id, query, limit) {
-        Ok(results) => {
+    match crate::index::brain::brain_search_report(&conn, project_id, query, limit, true) {
+        Ok(report) => {
+            let results = report.results;
             if results.is_empty() {
                 return ToolResult::text(format!("No results found for '{query}'."));
             }
@@ -1121,6 +1128,7 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         include_tests,
         include_pub_api,
         min_lines,
+        project_root: std::env::current_dir().ok(),
     };
 
     match crate::index::queries::find_dead_code(&conn, project_id, &config, flags) {
@@ -1155,7 +1163,7 @@ fn handle_query(params: &serde_json::Value) -> ToolResult {
     };
     let limit = clamped_u64(params, "limit", 50, MAX_LIMIT) as usize;
 
-    match crate::commands::query::execute_query_cli(query, true, limit) {
+    match crate::commands::query::execute_query_cli(query, true, limit, false) {
         Ok(output) => ToolResult::text(output),
         Err(e) => ToolResult::error(format!("Query failed: {e:#}")),
     }
@@ -1543,5 +1551,28 @@ mod tests {
     #[test]
     fn block_on_works_outside_a_runtime() {
         assert_eq!(block_on(async { 2 + 2 }), 4);
+    }
+
+    // ─── #724: get_debt reads the review history from cora.db ───
+
+    #[test]
+    fn get_debt_without_history_says_so() {
+        let r = debt_report_result(&[]);
+        assert!(!r.is_error);
+        assert!(r.content[0].text.contains("No review history found"));
+    }
+
+    #[test]
+    fn get_debt_reports_the_loaded_snapshots() {
+        use crate::engine::debt_tracker::DebtSnapshot;
+        use crate::engine::types::{ReviewIssue, Severity};
+        let issue =
+            ReviewIssue::new("a.rs", Some(1), Severity::Major, "t").with_type("bugs".to_string());
+        let snap = DebtSnapshot::from_review(&[issue], None, None, None, 1, None, None);
+        let r = debt_report_result(&[snap]);
+        assert!(!r.is_error);
+        let v: serde_json::Value = serde_json::from_str(&r.content[0].text).unwrap();
+        assert_eq!(v["total_reviews"], 1);
+        assert_eq!(v["total_findings"], 1);
     }
 }

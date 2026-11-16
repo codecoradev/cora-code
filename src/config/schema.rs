@@ -37,6 +37,10 @@ pub struct Config {
     pub max_tokens: u32,
     /// JSON parameter name for max tokens (e.g. "max_tokens" or "max_output_tokens").
     pub max_tokens_param: String,
+    /// `reasoning_effort` request field (`none`, `minimal`, `low`, `medium`,
+    /// `high`, ...). Unset = provider default (#718).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// HTTP timeout in seconds for LLM requests.
     pub timeout: u64,
     /// Cache TTL in minutes for review caching.
@@ -62,6 +66,10 @@ pub struct Config {
     /// Brain Mode configuration — embedding backend selection.
     #[serde(default, skip_serializing_if = "is_default")]
     pub brain: BrainConfig,
+    /// Large-diff handling for `cora review`: request budget, excluded
+    /// paths, incomplete-review policy (#720).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub review: ReviewConfig,
     /// Enable background update check on startup (default: true).
     #[serde(default = "default_update_check", skip_serializing_if = "is_true")]
     pub update_check: bool,
@@ -85,10 +93,67 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Files cora leaves out of review, scan and the index unless told otherwise:
+/// dependencies, generated output, minified files, lockfiles. They are the main
+/// source of noise and of untrusted text in a prompt.
+///
+/// Only names that are almost always third-party or generated are in it.
+/// Names that are often a project's own code (`coverage`, `venv`, `build`, `out`,
+/// `docs/_build`) are left out on purpose, even at the project root: a pattern
+/// that hides real code is worse than one that lets noise through (checked
+/// against real repositories: coveragepy's `coverage/` is its whole source).
+/// Those directories are normally in `.gitignore`, which scan and index follow. `ignore.defaults: false` turns the list off, `ignore.keep`
+/// turns single entries off, `ignore.files` adds to it.
+pub const BUILTIN_IGNORE: &[&str] = &[
+    // The original four, kept for configs and tests that name them.
+    "node_modules/**",
+    "dist/**",
+    "target/**",
+    ".git/**",
+    // Dependencies, at any depth (monorepos, vendored front-end libraries).
+    "**/node_modules/**",
+    "**/vendor/**",
+    "**/bower_components/**",
+    "**/__pycache__/**",
+    "**/site-packages/**",
+    "**/.venv/**",
+    "**/Pods/**",
+    // Framework caches.
+    "**/.next/**",
+    "**/.nuxt/**",
+    "**/.gradle/**",
+    // Minified files and source maps.
+    "**/*.min.js",
+    "**/*.min.css",
+    "**/*.js.map",
+    "**/*.css.map",
+    // Lockfiles.
+    "**/package-lock.json",
+    "**/yarn.lock",
+    "**/pnpm-lock.yaml",
+    "**/bun.lockb",
+    "**/Cargo.lock",
+    "**/poetry.lock",
+    "**/Pipfile.lock",
+    "**/Gemfile.lock",
+    "**/composer.lock",
+    "**/go.sum",
+    "**/flake.lock",
+];
+
 /// Ignore configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IgnoreConfig {
+    /// Files out of scope for review, scan and the index: the built-ins
+    /// ([`BUILTIN_IGNORE`], unless `defaults` is off) plus the user's patterns.
     pub files: Vec<String>,
+    /// Whether [`BUILTIN_IGNORE`] is part of `files` (`ignore.defaults`, default true).
+    #[serde(default = "default_true")]
+    pub defaults: bool,
     pub rules: Vec<String>,
     /// Rules silenced only for some paths (`ignore.rules` object entries, #680).
     #[serde(default)]
@@ -114,6 +179,44 @@ pub struct ScopedIgnore {
 pub enum IgnoreRuleEntry {
     Plain(String),
     Scoped(ScopedIgnore),
+}
+
+/// Default size of one review request, in diff characters (#720).
+///
+/// Reviews of about 1,000 diff lines (roughly 45 KB) were reliable in the
+/// field while about 1,850 lines (roughly 85 KB) hit `finish_reason=length`
+/// on reasoning models, so the default stays inside the known-good zone.
+pub const DEFAULT_MAX_CHUNK_CHARS: usize = 48_000;
+
+/// Smallest accepted `review.max_chunk_chars`.
+pub const MIN_MAX_CHUNK_CHARS: usize = 2_000;
+
+/// Large-diff handling for `cora review` (#720).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Globs of files removed from the reviewed diff. Unlike `ignore.files`
+    /// (which scopes the symbol index and context chain), these files are
+    /// never sent to the model and never produce a finding. They are listed in
+    /// the review output.
+    pub exclude: Vec<String>,
+    /// A diff larger than this many characters is split into chunks that are
+    /// reviewed one by one and merged. A single file larger than this is split
+    /// at hunk boundaries. Applies in CI mode too.
+    pub max_chunk_chars: usize,
+    /// Exit non-zero when the review did not cover the whole diff (a chunk
+    /// failed, or the model call failed). Default `true`; set `false` to keep
+    /// the old "warn and pass" behaviour.
+    pub fail_on_incomplete: bool,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            exclude: Vec::new(),
+            max_chunk_chars: DEFAULT_MAX_CHUNK_CHARS,
+            fail_on_incomplete: true,
+        }
+    }
 }
 
 /// Hook configuration.
@@ -148,12 +251,8 @@ impl Default for Config {
             ],
             rules: vec![],
             ignore: IgnoreConfig {
-                files: vec![
-                    "node_modules/**".into(),
-                    "dist/**".into(),
-                    "target/**".into(),
-                    ".git/**".into(),
-                ],
+                files: BUILTIN_IGNORE.iter().map(|s| (*s).to_string()).collect(),
+                defaults: true,
                 rules: vec![],
                 scoped: vec![],
             },
@@ -177,6 +276,7 @@ impl Default for Config {
             temperature: 0.0,
             max_tokens: 8192, // #536: reasoning models need headroom above chain-of-thought
             max_tokens_param: "auto".to_string(),
+            reasoning_effort: None,
             timeout: 600,
             cache_ttl: 1440, // 24h in minutes
             static_analysis: StaticAnalysisConfig::default(),
@@ -187,6 +287,7 @@ impl Default for Config {
             profile: None,
             analysis: AnalysisConfig::default(),
             brain: BrainConfig::default(),
+            review: ReviewConfig::default(),
             update_check: true,
         }
     }
@@ -252,6 +353,22 @@ impl Config {
         }
         if let Err(e) = check_base_url(&self.provider.base_url) {
             errs.push(format!("provider.base_url: {e}"));
+        }
+
+        if let Some(e) = &self.reasoning_effort {
+            if e.is_empty() || e.chars().any(char::is_whitespace) {
+                errs.push(format!(
+                    "llm.reasoning_effort must be one word such as none, minimal, low, medium or high, got: {e:?}"
+                ));
+            }
+        }
+
+        // ── review ──
+        if self.review.max_chunk_chars < MIN_MAX_CHUNK_CHARS {
+            errs.push(format!(
+                "review.max_chunk_chars must be at least {MIN_MAX_CHUNK_CHARS}, got: {}",
+                self.review.max_chunk_chars
+            ));
         }
 
         // ── llm ──
@@ -442,6 +559,13 @@ where
 pub struct IgnoreSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
+    /// `false` turns the built-in ignores ([`BUILTIN_IGNORE`]) off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<bool>,
+    /// Built-in patterns to turn off one by one (written exactly as in
+    /// [`BUILTIN_IGNORE`]), for example `"**/Cargo.lock"` to review lockfiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<IgnoreRuleEntry>>,
 }
@@ -488,6 +612,15 @@ pub struct ReviewSection {
     /// Context chain configuration (cross-file dependency extraction).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_chain: Option<crate::engine::context::types::ContextConfig>,
+    /// Globs of files removed from the reviewed diff (#720).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<Vec<String>>,
+    /// Maximum diff characters per review request; larger diffs are chunked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chunk_chars: Option<usize>,
+    /// Exit non-zero when the review did not cover the whole diff.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_on_incomplete: Option<bool>,
 }
 
 /// Static analysis configuration — inject linter/compiler output as review context.
@@ -513,60 +646,31 @@ pub struct AnalysisConfig {
     pub entry_point_patterns: Vec<String>,
 }
 
-/// Brain Mode configuration — controls embedding backend for vector search.
+/// Brain Mode configuration — the code embedding model for vector search.
 ///
-/// By default (`auto`), cora selects the best available backend at runtime:
-/// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
-/// Users can force a specific backend via `.cora.yaml`.
-fn default_vector_store() -> String {
-    "usearch".to_string()
-}
-
-fn default_vector_bits() -> String {
-    "residual".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// By default (`auto`), cora uses the `potion-code-16M-v2` code model
+/// (downloaded once on first use). When the model is not available the vector
+/// signal is off and search uses keywords and the call graph; `off` chooses
+/// that on purpose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct BrainConfig {
-    /// Vector store backend for Brain Mode search.
-    ///
-    /// - `"usearch"` (default) — HNSW graph, f32
-    /// - `"vecq"` — quantized brute-force scan (pure Rust, deterministic,
-    ///   ~5x smaller index; recall trade absorbed by RRF fusion)
-    #[serde(default = "default_vector_store")]
+    /// Removed (#750): vectors are one vecq file per project. Still parsed so an
+    /// old `.cora.yaml` loads; a non-empty value only produces a warning.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_store: String,
-    /// Quantization width for the `vecq` store (ignored by `usearch`).
-    ///
-    /// - `"residual"` (default) — 4-bit base + second-pass residual codes:
-    ///   best recall at 4-bit scan speed on cora's default embeddings
-    /// - `"4"` / `"5"` / `"6"` — plain Lloyd-Max width
-    ///
-    /// Invalid values fall back to `"residual"`. Changing the width rebuilds
-    /// the index once on the next `cora index`.
-    #[serde(default = "default_vector_bits")]
+    /// Removed (#750), see [`Self::vector_store`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_bits: String,
-    /// Embedding backend selection.
+    /// Embedding selection.
     ///
-    /// - `"auto"` (default) — best available: pretrained → hashing
-    /// - `"hashing"` — force 256d hashing trick (zero dependency)
-    /// - `"pretrained"` — force nomic 768d (requires `--features pretrained-embed`)
+    /// - `"auto"` (default) — the potion-code-16M-v2 code model (downloaded
+    ///   once); the vector signal is off while it is not available
+    /// - `"off"` — never use embeddings
     ///
-    /// Invalid values fall back to `"auto"` with a warning.
+    /// `potion`, `hashing` and `pretrained` (removed, #751) still load, mean
+    /// `auto` and print one warning (`hashing`, `pretrained`).
     #[serde(default, skip_serializing_if = "is_default")]
     pub embedding: BrainEmbeddingMode,
-}
-
-// Manual Default so `Config::default()` carries the documented values
-// ("usearch"/"residual") — the derived one would leave empty strings, and
-// the store/width parsers only meet those values leniently.
-impl Default for BrainConfig {
-    fn default() -> Self {
-        Self {
-            vector_store: default_vector_store(),
-            vector_bits: default_vector_bits(),
-            embedding: BrainEmbeddingMode::default(),
-        }
-    }
 }
 
 /// `.cora.yaml` `brain:` section — mirrors the subset of [`BrainConfig`]
@@ -581,23 +685,44 @@ pub struct BrainSection {
     pub embedding: Option<BrainEmbeddingMode>,
 }
 
-/// Embedding backend mode for Brain Mode.
+/// Embedding mode for Brain Mode.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BrainEmbeddingMode {
-    /// Best available backend (pretrained if compiled, else hashing).
+    /// The code model, downloaded once on first use.
     #[default]
+    #[serde(alias = "potion")]
     Auto,
-    /// Force 256d hashing trick (zero dependency).
+    /// No embeddings: keyword and graph search only.
+    Off,
+    /// Removed (#751): behaves as `auto` and warns.
+    #[serde(skip_serializing)]
     Hashing,
-    /// Force nomic 768d pretrained (requires feature flag).
+    /// Removed (#751): behaves as `auto` and warns.
+    #[serde(skip_serializing)]
     Pretrained,
+}
+
+impl BrainEmbeddingMode {
+    /// The value handed to the embedding resolver (`auto` or `off`).
+    pub fn resolver_value(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            _ => "auto",
+        }
+    }
+
+    /// Whether this is a removed value.
+    pub fn is_removed(&self) -> bool {
+        matches!(self, Self::Hashing | Self::Pretrained)
+    }
 }
 
 impl std::fmt::Display for BrainEmbeddingMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
+            Self::Off => write!(f, "off"),
             Self::Hashing => write!(f, "hashing"),
             Self::Pretrained => write!(f, "pretrained"),
         }
@@ -609,11 +734,12 @@ impl std::str::FromStr for BrainEmbeddingMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
+            "auto" | "potion" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
             "hashing" => Ok(Self::Hashing),
             "pretrained" => Ok(Self::Pretrained),
             other => Err(format!(
-                "unknown brain.embedding value '{other}' — expected auto, hashing, or pretrained"
+                "unknown brain.embedding value '{other}' — expected auto or off"
             )),
         }
     }
@@ -646,6 +772,11 @@ pub struct LlmSection {
     /// `"max_output_tokens"`, `"max_completion_tokens"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens_param: Option<String>,
+    /// `reasoning_effort` to send with each request (`none`, `minimal`,
+    /// `low`, `medium`, `high`, ...). Lowering it keeps a reasoning model from
+    /// spending the output budget on thinking (#718).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -758,6 +889,16 @@ impl CoraFile {
             config.rules.clone_from(v);
         }
         if let Some(ig) = &self.ignore {
+            if ig.defaults == Some(false) {
+                config.ignore.defaults = false;
+                config
+                    .ignore
+                    .files
+                    .retain(|f| !BUILTIN_IGNORE.contains(&f.as_str()));
+            }
+            if let Some(keep) = &ig.keep {
+                config.ignore.files.retain(|f| !keep.contains(f));
+            }
             if let Some(v) = &ig.files {
                 // Merge user-specified ignore patterns with defaults.
                 // Previously this used clone_from, which OVERWROTE the default
@@ -828,6 +969,15 @@ impl CoraFile {
             if let Some(cc) = &r.context_chain {
                 config.context_chain.clone_from(cc);
             }
+            if let Some(v) = &r.exclude {
+                config.review.exclude.clone_from(v);
+            }
+            if let Some(v) = r.max_chunk_chars {
+                config.review.max_chunk_chars = v;
+            }
+            if let Some(v) = r.fail_on_incomplete {
+                config.review.fail_on_incomplete = v;
+            }
         }
         if let Some(s) = &self.scan {
             if let Some(v) = &s.system_prompt {
@@ -852,6 +1002,9 @@ impl CoraFile {
             }
             if let Some(ref v) = llm.max_tokens_param {
                 config.max_tokens_param = v.clone();
+            }
+            if let Some(ref v) = llm.reasoning_effort {
+                config.reasoning_effort = Some(v.trim().to_string());
             }
         }
         if let Some(re) = &self.rules_engine {
@@ -899,6 +1052,7 @@ impl CoraFile {
                 config.debt.history_dir.clone_from(&debt.history_dir);
             }
             config.debt.retention_days = debt.retention_days;
+            config.debt.max_stored_findings = debt.max_stored_findings;
         }
         // Resolve profile — load built-in or custom, merge into config
         if let Some(profile_ref) = &self.profile {
@@ -1009,21 +1163,23 @@ mod tests {
     }
 
     #[test]
-    fn brain_vector_bits_defaults_to_residual() {
+    fn the_removed_vector_options_default_to_empty() {
         let cfg = Config::default();
-        assert_eq!(cfg.brain.vector_bits, "residual");
-        assert_eq!(cfg.brain.vector_store, "usearch");
+        assert!(cfg.brain.vector_store.is_empty());
+        assert!(cfg.brain.vector_bits.is_empty());
     }
 
+    /// An old `.cora.yaml` that still sets the removed options keeps loading;
+    /// the values are only kept so the session can warn about them.
     #[test]
-    fn merge_brain_vector_store_and_bits() {
+    fn an_old_config_with_the_removed_vector_options_still_loads() {
         let mut cfg = Config::default();
         let cora = CoraFile::from_str(
             r"
 brain:
   vector_store: vecq
   vector_bits: '6'
-  embedding: hashing
+  embedding: auto
 ",
         )
         .unwrap();
@@ -1032,22 +1188,6 @@ brain:
 
         assert_eq!(cfg.brain.vector_store, "vecq");
         assert_eq!(cfg.brain.vector_bits, "6");
-    }
-
-    #[test]
-    fn merge_brain_vector_bits_absent_keeps_default() {
-        let mut cfg = Config::default();
-        let cora = CoraFile::from_str(
-            r"
-brain:
-  vector_store: vecq
-",
-        )
-        .unwrap();
-
-        cora.merge_into(&mut cfg).unwrap();
-
-        assert_eq!(cfg.brain.vector_bits, "residual");
     }
 
     #[test]
@@ -1146,6 +1286,8 @@ provider: zai
         let mut cfg = Config::default();
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
+                defaults: None,
+                keep: None,
                 files: Some(vec!["vendor/**".to_string()]),
                 rules: Some(vec![IgnoreRuleEntry::Plain("skip-rule-1".to_string())]),
             }),
@@ -1178,12 +1320,68 @@ provider: zai
         assert_eq!(cfg.ignore.rules, vec!["skip-rule-1"]);
     }
 
+    /// Names that are often a project's own code must never be built-in ignores:
+    /// a pattern that hides real code is worse than noise (coveragepy's
+    /// `coverage/` package, a Go `build/` of scripts, a Python `venv` module).
+    #[test]
+    fn built_in_ignores_never_name_directories_that_often_hold_real_code() {
+        for pattern in BUILTIN_IGNORE {
+            for risky in [
+                "coverage", "venv", "build", "out", "src", "lib", "test", "docs", "bin", "scripts",
+            ] {
+                assert!(
+                    !pattern.split('/').any(|segment| segment == risky),
+                    "built-in ignore `{pattern}` names `{risky}`, which is often real source"
+                );
+            }
+            assert!(
+                pattern.ends_with("/**") || pattern.starts_with("**/"),
+                "`{pattern}` is neither a directory nor an any-depth file pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_keep_removes_single_built_ins_and_defaults_false_removes_all() {
+        let mut config = Config::default();
+        assert!(config.ignore.files.contains(&"**/Cargo.lock".to_string()));
+        let cora = CoraFile {
+            ignore: Some(IgnoreSection {
+                files: Some(vec!["mine/**".into()]),
+                defaults: None,
+                keep: Some(vec!["**/Cargo.lock".into()]),
+                rules: None,
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut config).unwrap();
+        assert!(!config.ignore.files.contains(&"**/Cargo.lock".to_string()));
+        assert!(config.ignore.files.contains(&"**/yarn.lock".to_string()));
+        assert!(config.ignore.files.contains(&"mine/**".to_string()));
+
+        let mut config = Config::default();
+        let cora = CoraFile {
+            ignore: Some(IgnoreSection {
+                files: Some(vec!["only/**".into()]),
+                defaults: Some(false),
+                keep: None,
+                rules: None,
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut config).unwrap();
+        assert_eq!(config.ignore.files, vec!["only/**".to_string()]);
+        assert!(!config.ignore.defaults);
+    }
+
     #[test]
     fn merge_ignore_files_dedup() {
         // User lists a pattern that's already a default — should not duplicate.
         let mut cfg = Config::default();
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
+                defaults: None,
+                keep: None,
                 files: Some(vec![
                     "node_modules/**".to_string(), // already a default
                     "my-vendor/**".to_string(),
@@ -1465,6 +1663,7 @@ review:
                 static_analysis: None,
                 sanitize_comments: None,
                 context_chain: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1483,6 +1682,7 @@ review:
                 static_analysis: None,
                 sanitize_comments: None,
                 context_chain: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1504,6 +1704,7 @@ review:
                 static_analysis: None,
                 sanitize_comments: None,
                 context_chain: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1637,6 +1838,7 @@ llm:
                 max_tokens_param: None,
                 timeout: None,
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1658,6 +1860,7 @@ llm:
                 max_tokens_param: None,
                 timeout: None,
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1675,6 +1878,7 @@ llm:
                 max_tokens_param: None,
                 timeout: Some(300),
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1692,6 +1896,7 @@ llm:
                 max_tokens_param: None,
                 timeout: Some(240),
                 cache_ttl: Some(2880),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1737,6 +1942,7 @@ provider:
                 max_tokens_param: None,
                 timeout: Some(60),
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1924,6 +2130,7 @@ bundling:
             max_tokens_param: Some("max_output_tokens".to_string()),
             timeout: Some(300),
             cache_ttl: Some(60),
+            ..Default::default()
         };
         let yaml = serde_yaml_ng::to_string(&section).unwrap();
         let back: LlmSection = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -2075,5 +2282,51 @@ ignore:
             err.contains("bug-println") && err.contains("files is empty"),
             "{err}"
         );
+    }
+
+    // ─── #720: review.* large-diff settings ───
+
+    #[test]
+    fn review_defaults_chunk_and_fail_closed() {
+        let cfg = Config::default();
+        assert_eq!(cfg.review.max_chunk_chars, DEFAULT_MAX_CHUNK_CHARS);
+        assert!(cfg.review.fail_on_incomplete);
+        assert!(cfg.review.exclude.is_empty());
+    }
+
+    #[test]
+    fn review_section_merges_into_config() {
+        let cora: CoraFile = serde_yaml_ng::from_str(
+            "review:\n  exclude: [\"CHANGELOG.md\", \"docs/**\"]\n  max_chunk_chars: 20000\n  fail_on_incomplete: false\n",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.review.exclude, vec!["CHANGELOG.md", "docs/**"]);
+        assert_eq!(cfg.review.max_chunk_chars, 20_000);
+        assert!(!cfg.review.fail_on_incomplete);
+    }
+
+    #[test]
+    fn validate_rejects_tiny_chunk_budget() {
+        let mut cfg = Config::default();
+        cfg.review.max_chunk_chars = 10;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("review.max_chunk_chars"), "err: {err}");
+    }
+
+    // ─── #718: llm.reasoning_effort ───
+
+    #[test]
+    fn reasoning_effort_merges_and_validates() {
+        let cora: CoraFile = serde_yaml_ng::from_str("llm:\n  reasoning_effort: low\n").unwrap();
+        let mut cfg = Config::default();
+        assert!(cfg.reasoning_effort.is_none());
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
+        assert!(cfg.validate().is_ok());
+        cfg.reasoning_effort = Some("very low".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("llm.reasoning_effort"), "err: {err}");
     }
 }

@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 /// Current schema version.
 #[allow(dead_code)]
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 9;
 
 /// Serialises index opening (PRAGMAs + migrations) within a process: several
 /// connections to the same database file (parallel tests, concurrent sessions)
@@ -70,7 +70,31 @@ pub(crate) fn run_migrations_locked(conn: &Connection) -> anyhow::Result<()> {
     if current < 8 {
         migrate_v8(conn)?;
     }
+    if current < 9 {
+        migrate_v9(conn)?;
+    }
 
+    Ok(())
+}
+
+/// Migration v9: type-qualified call edges (#714).
+///
+/// `qualifier` is the type or module a call was reached through
+/// (`WebSearchTool` in `WebSearchTool::from_env()`), `caller_type` the impl
+/// type of the calling method. Both are NULL when the source does not say,
+/// which marks the edge as ambiguous; existing rows keep NULL until the file
+/// is re-indexed.
+fn migrate_v9(conn: &Connection) -> anyhow::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "
+        ALTER TABLE call_graph ADD COLUMN qualifier TEXT;
+        ALTER TABLE call_graph ADD COLUMN caller_type TEXT;
+        CREATE INDEX IF NOT EXISTS idx_cg_qualifier ON call_graph(qualifier);
+        ",
+    )?;
+    tx.execute("INSERT INTO schema_version (version) VALUES (9)", [])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -503,6 +527,8 @@ pub fn delete_project(conn: &Connection, project_id: i64) -> anyhow::Result<usiz
         "DELETE FROM projects WHERE id = ?1",
         rusqlite::params![project_id],
     )?;
+    // Its vectors are not needed any more either.
+    super::vector::remove_project_files(project_id, None);
     Ok(affected)
 }
 
@@ -782,7 +808,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -924,7 +950,7 @@ mod tests {
         let version: i32 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, SCHEMA_VERSION);
 
         let p2 = get_or_create_project(&conn, "/tmp/p2").unwrap();
         conn.execute(
@@ -956,5 +982,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// #714: v9 adds the qualifier columns; rows written before it keep NULL.
+    #[test]
+    fn test_v9_call_graph_qualifier_columns() {
+        let conn = mem_conn();
+        let pid = get_or_create_project(&conn, "/tmp/v9").unwrap();
+        conn.execute(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, qualifier, caller_type) \
+             VALUES ('r', 'from_env', 'a.rs', 1, ?1, 'WebTool', 'Roster')",
+            [pid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id) \
+             VALUES ('old', 'from_env', 'b.rs', 2, ?1)",
+            [pid],
+        )
+        .unwrap();
+        let q: Option<String> = conn
+            .query_row(
+                "SELECT qualifier FROM call_graph WHERE caller = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(q, None);
     }
 }

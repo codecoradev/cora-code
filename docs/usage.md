@@ -41,6 +41,8 @@ If you use an AI coding agent, the agent can be the reviewer: nothing to configu
 
 Behind the scenes the agent calls `cora.review_prepare` (cora's deterministic findings plus the review prompts), judges with its own model, and calls `cora.review_finalize` with its findings. Cora merges them with the deterministic findings, applies `ignore.rules`, inline `cora-ignore:` markers and the quality gate, and returns the verdict. `cora.scan_prepare` / `cora.scan_finalize` do the same for a whole project, one batch at a time.
 
+**Make it a habit before opening a PR.** The `cora-review` and `cora-code` skills tell the agent to review the whole branch (`git diff <base>...HEAD`) with cora before it opens a pull request, and to suggest `cora review` in the project's CI. Cora brings its index up to date first (`review.context_chain.auto_index`), so the prompt already has impact, tests and related code found by meaning, with the code embedding model, and nothing to set up.
+
 This is different from `cora review --no-llm`, which runs the deterministic checks only and never involves a model.
 
 **Security.** The diff is attacker-controlled text and the agent's findings are untrusted input:
@@ -267,12 +269,11 @@ $ cora debt --since v0.4.5
 $ cora debt --branch develop
 ```
 
-Snapshots are saved to `.cora/history/` after each review. Configure in `.cora.yaml`:
+Each review is recorded in `cora.db`; `cora debt` reads it from there. The old `.cora/history/` JSON files are no longer used and can be deleted. Configure in `.cora.yaml`:
 
 ```yaml
 debt:
   enabled: true           # default
-  history_dir: .cora/history
   retention_days: 90
 ```
 

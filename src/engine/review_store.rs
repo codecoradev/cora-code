@@ -53,6 +53,10 @@ pub struct ReviewRecord<'a> {
     pub tokens: Option<&'a TokenUsage>,
     /// The issues/findings to persist.
     pub issues: &'a [ReviewIssue],
+    /// Store at most this many findings (the most severe first); `0` stores
+    /// them all. Fingerprints of the whole run still drive auto-resolution, and
+    /// the score is computed from the whole run (#725).
+    pub max_stored_findings: usize,
 }
 
 /// Filters for [`ReviewStore::list_findings`].
@@ -213,6 +217,69 @@ pub fn load_debt_rows(project_root: &str) -> Vec<ReviewRow> {
     }
 }
 
+// ─── Pruning (#725) ───
+
+/// What `cora findings prune` should remove.
+#[derive(Debug, Clone, Default)]
+pub struct PruneOptions<'a> {
+    /// Remove projects whose root directory no longer exists, with everything
+    /// stored for them (index, reviews, findings).
+    pub stale_projects: bool,
+    /// Remove resolved/dismissed findings older than this many days, then the
+    /// reviews of that age left without findings. Open findings are kept.
+    pub older_than_days: Option<u64>,
+    /// Count what would be removed and change nothing.
+    pub dry_run: bool,
+    /// A project root that is never removed (the current project).
+    pub keep_root: Option<&'a str>,
+}
+
+/// What a prune removed (or would remove, with `dry_run`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct PruneReport {
+    /// Root paths of the removed projects.
+    pub stale_projects: Vec<String>,
+    /// Reviews removed together with those projects.
+    pub stale_project_reviews: usize,
+    /// Resolved/dismissed findings removed by age.
+    pub closed_findings: usize,
+    /// Reviews removed by age because they had no findings left.
+    pub empty_reviews: usize,
+    pub dry_run: bool,
+}
+
+// ─── Bounding what a run stores (#725) ───
+
+/// The findings to store: all of them, or the `max` most severe (stable, so
+/// equal severities keep their order). `max == 0` means no limit.
+fn stored_subset(issues: &[ReviewIssue], max: usize) -> Vec<&ReviewIssue> {
+    let mut all: Vec<&ReviewIssue> = issues.iter().collect();
+    if max > 0 && all.len() > max {
+        // `Severity` derives `Ord` in declaration order: Critical < Major < Minor < Info,
+        // so ascending puts the most severe first.
+        all.sort_by_key(|i| i.severity);
+        all.truncate(max);
+    }
+    all
+}
+
+/// The summary to store; says so when findings were left out.
+fn stored_summary(summary: &str, total: usize, max: usize) -> String {
+    if max > 0 && total > max {
+        let note = format!(
+            "[{} of {total} findings stored; the rest were left out by debt.max_stored_findings = {max}]",
+            max
+        );
+        if summary.is_empty() {
+            note
+        } else {
+            format!("{summary} {note}")
+        }
+    } else {
+        summary.to_string()
+    }
+}
+
 // ─── Store ───
 
 /// All SQL for review history, over a borrowed connection.
@@ -223,6 +290,70 @@ pub struct ReviewStore<'a> {
 impl<'a> ReviewStore<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
+    }
+
+    /// Remove stale projects and/or old closed findings (see [`PruneOptions`]).
+    ///
+    /// Runs in one transaction; with `dry_run` the transaction is rolled back,
+    /// so the report is exactly what a real run would remove.
+    pub fn prune(&self, opts: &PruneOptions<'_>) -> Result<PruneReport> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut report = PruneReport {
+            dry_run: opts.dry_run,
+            ..PruneReport::default()
+        };
+        let mut removed_ids: Vec<i64> = Vec::new();
+
+        if opts.stale_projects {
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare("SELECT id, root_path FROM projects ORDER BY id")?;
+                stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (id, root) in rows {
+                if opts.keep_root == Some(root.as_str()) || std::path::Path::new(&root).exists() {
+                    continue;
+                }
+                let reviews: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM reviews WHERE project_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )?;
+                report.stale_project_reviews += usize::try_from(reviews).unwrap_or(0);
+                // Foreign keys cascade to symbols, files, edges, reviews, findings.
+                tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
+                removed_ids.push(id);
+                report.stale_projects.push(root);
+            }
+        }
+
+        if let Some(days) = opts.older_than_days {
+            let cutoff = format!("-{days} days");
+            let closed = tx.execute(
+                "DELETE FROM findings
+                 WHERE status != 'open' AND created_at < datetime('now', ?1)",
+                [&cutoff],
+            )?;
+            let empty = tx.execute(
+                "DELETE FROM reviews
+                 WHERE created_at < datetime('now', ?1)
+                   AND NOT EXISTS (SELECT 1 FROM findings f WHERE f.review_id = reviews.id)",
+                [&cutoff],
+            )?;
+            report.closed_findings = closed;
+            report.empty_reviews = empty;
+        }
+
+        if opts.dry_run {
+            tx.rollback()?;
+        } else {
+            tx.commit()?;
+            // The vectors of a removed project go with it.
+            for id in removed_ids {
+                crate::index::vector::remove_project_files(id, None);
+            }
+        }
+        Ok(report)
     }
 
     /// Insert a review row plus one `open` finding (and `opened` event) per
@@ -253,7 +384,11 @@ impl<'a> ReviewStore<'a> {
                 record.command,
                 record.commit_hash,
                 record.branch,
-                record.summary,
+                stored_summary(
+                    record.summary,
+                    record.issues.len(),
+                    record.max_stored_findings
+                ),
                 calculate_score(record.issues) as i64,
                 record.gate_status,
                 record.files_scanned as i64,
@@ -278,7 +413,7 @@ impl<'a> ReviewStore<'a> {
                  VALUES (?1, 'opened', NULL)",
             )?;
 
-            for issue in record.issues {
+            for issue in stored_subset(record.issues, record.max_stored_findings) {
                 stmt_findings.execute(rusqlite::params![
                     review_id,
                     issue.file,
@@ -586,6 +721,7 @@ mod tests {
             should_block: false,
             tokens: None,
             issues,
+            max_stored_findings: 0,
         }
     }
 
@@ -922,5 +1058,154 @@ mod tests {
     fn open_read_missing_db_errors() {
         let dir = tempfile::tempdir().unwrap();
         assert!(open_read_at(&dir.path().join("nope.db")).is_err());
+    }
+
+    // ─── #725: bounding what a run stores, and pruning ───
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_run_stores_only_the_most_severe_findings_over_the_cap() {
+        let conn = mem();
+        let issues = vec![
+            make_issue("a.rs", 1, Severity::Info, "i1"),
+            make_issue("a.rs", 2, Severity::Critical, "c1"),
+            make_issue("a.rs", 3, Severity::Minor, "m1"),
+            make_issue("a.rs", 4, Severity::Major, "j1"),
+        ];
+        let mut rec = record("/p", &issues);
+        rec.max_stored_findings = 2;
+        let id = ReviewStore::new(&conn).record_review(&rec).unwrap();
+        let titles: Vec<String> = conn
+            .prepare("SELECT title FROM findings WHERE review_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map([id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(titles, vec!["c1".to_string(), "j1".to_string()]);
+        let summary: String = conn
+            .query_row("SELECT summary FROM reviews WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(summary.contains("2 of 4 findings stored"), "{summary}");
+        // The score still reflects the whole run.
+        let score: i64 = conn
+            .query_row("SELECT score FROM reviews WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(score, calculate_score(&issues) as i64);
+    }
+
+    #[test]
+    fn zero_means_no_cap_and_a_small_run_is_untouched() {
+        let conn = mem();
+        let issues: Vec<ReviewIssue> = (0..5)
+            .map(|i| make_issue("a.rs", i + 1, Severity::Minor, "t"))
+            .collect();
+        let store = ReviewStore::new(&conn);
+        let mut unlimited = record("/p", &issues);
+        unlimited.max_stored_findings = 0;
+        store.record_review(&unlimited).unwrap();
+        let mut roomy = record("/q", &issues);
+        roomy.max_stored_findings = 5;
+        store.record_review(&roomy).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM findings"), 10);
+        let summaries: i64 = count(&conn, "SELECT COUNT(*) FROM reviews WHERE summary = 'sum'");
+        assert_eq!(summaries, 2, "no note when nothing was left out");
+    }
+
+    #[test]
+    fn prune_stale_projects_cascades_and_dry_run_changes_nothing() {
+        let conn = mem();
+        let alive = tempfile::tempdir().unwrap();
+        let alive_root = alive.path().to_string_lossy().to_string();
+        let issues = vec![make_issue("a.rs", 1, Severity::Major, "t")];
+        let store = ReviewStore::new(&conn);
+        store
+            .record_review(&record("/no/such/dir/zombie", &issues))
+            .unwrap();
+        store.record_review(&record(&alive_root, &issues)).unwrap();
+        store
+            .record_review(&record("/no/such/dir/current", &issues))
+            .unwrap();
+
+        let opts = PruneOptions {
+            stale_projects: true,
+            dry_run: true,
+            keep_root: Some("/no/such/dir/current"),
+            ..PruneOptions::default()
+        };
+        let dry = store.prune(&opts).unwrap();
+        assert_eq!(dry.stale_projects, ["/no/such/dir/zombie"]);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 3, "dry run");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM findings"), 3, "dry run");
+
+        let real = store
+            .prune(&PruneOptions {
+                dry_run: false,
+                ..opts
+            })
+            .unwrap();
+        assert_eq!(real.stale_projects, dry.stale_projects);
+        assert_eq!(real.stale_project_reviews, 1);
+        // Gone with the project: reviews, findings and finding events.
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM reviews"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM findings"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM finding_events"), 2);
+    }
+
+    #[test]
+    fn prune_by_age_keeps_open_findings_and_removes_only_closed_and_empty() {
+        let conn = mem();
+        let store = ReviewStore::new(&conn);
+        let a = vec![make_issue("a.rs", 1, Severity::Minor, "closed-old")];
+        let b = vec![make_issue("b.rs", 1, Severity::Minor, "open-old")];
+        let c = vec![make_issue("c.rs", 1, Severity::Minor, "closed-new")];
+        let ra = store.record_review(&record("/p", &a)).unwrap();
+        let rb = store.record_review(&record("/p", &b)).unwrap();
+        let rc = store.record_review(&record("/p", &c)).unwrap();
+        for id in [1i64, 3] {
+            store.dismiss(id, Some("test")).unwrap();
+        }
+        // Reviews/findings a and b are 200 days old; c is recent.
+        for r in [ra, rb] {
+            conn.execute(
+                "UPDATE reviews SET created_at = datetime('now', '-200 days') WHERE id = ?1",
+                [r],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE findings SET created_at = datetime('now', '-200 days') WHERE review_id = ?1",
+                [r],
+            )
+            .unwrap();
+        }
+        let _ = rc;
+        let rep = store
+            .prune(&PruneOptions {
+                older_than_days: Some(90),
+                ..PruneOptions::default()
+            })
+            .unwrap();
+        assert_eq!(rep.closed_findings, 1, "only closed-old");
+        assert_eq!(rep.empty_reviews, 1, "review a is now empty");
+        let titles: Vec<String> = conn
+            .prepare("SELECT title FROM findings ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["open-old".to_string(), "closed-new".to_string()]
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM reviews"), 2);
     }
 }

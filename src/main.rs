@@ -132,6 +132,14 @@ enum Command {
         #[clap(long, default_value = "50")]
         limit: usize,
 
+        /// Also match words in signatures / doc text (default: symbol names only)
+        #[clap(long)]
+        docs: bool,
+
+        /// Do not add meaning-based matches to a multi-word query
+        #[clap(long)]
+        no_semantic: bool,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -139,12 +147,17 @@ enum Command {
 
     /// Find all callers of a symbol (who calls this?)
     Callers {
-        /// Symbol name to search for
+        /// Symbol to search for: `name`, `Type::name` or a type name
         symbol: String,
 
         /// Maximum results
         #[clap(long, default_value = "50")]
         limit: usize,
+
+        /// Leave out ambiguous calls (receiver type unknown) for a
+        /// `Type::name` query
+        #[clap(long)]
+        strict: bool,
 
         /// Output as JSON
         #[clap(long)]
@@ -167,7 +180,7 @@ enum Command {
 
     /// Trace execution paths through the codebase
     Trace {
-        /// Symbol name to start tracing from
+        /// Symbol to start tracing from: `name` or `Type::name`
         symbol: String,
 
         /// Trace direction: outgoing (callees) or incoming (callers)
@@ -178,13 +191,22 @@ enum Command {
         #[clap(long, default_value = "3")]
         depth: u32,
 
+        /// Leave out ambiguous calls (receiver or caller type unknown) once a
+        /// node has a known type
+        #[clap(long)]
+        strict: bool,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
     },
 
-    /// Show architecture overview (modules, edge types, structure)
+    /// Show architecture overview (crates, modules, calls between them)
     Arch {
+        /// Module path components shown per module (e.g. 2 -> index::graph)
+        #[clap(long, default_value = "2")]
+        depth: usize,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -216,6 +238,14 @@ enum Command {
         /// Test file glob pattern (default: *test*, *spec*)
         #[clap(long)]
         filter: Option<String>,
+
+        /// Max call-graph hops from a changed symbol to a test
+        #[clap(long, default_value_t = index::queries::DEFAULT_AFFECTED_DEPTH)]
+        depth: u32,
+
+        /// Max test files to print (the JSON output is never truncated)
+        #[clap(long, default_value = "50")]
+        limit: usize,
 
         /// Output as JSON
         #[clap(long)]
@@ -392,8 +422,8 @@ enum Command {
         min_severity: Option<String>,
 
         /// Deterministic checks only: never call an LLM (also the automatic
-        /// behavior when no API key is configured)
-        #[clap(long)]
+        /// behavior when no API key is configured). Also `--rules-only`.
+        #[clap(long, visible_alias = "rules-only")]
         no_llm: bool,
     },
 
@@ -541,18 +571,22 @@ enum Command {
         /// Validate agent configs after install/remove
         #[clap(long)]
         validate: bool,
+        /// Do not touch instruction files (CLAUDE.md, AGENTS.md)
+        #[clap(long)]
+        no_instructions: bool,
     },
 
     /// Detect dead code — functions/methods with no callers
     DeadCode {
-        /// Include test functions (test_*, _test) in results
+        /// Include tests in results: #[test] fns, #[cfg(test)] modules, files
+        /// in tests directories or *_tests.rs, and test_* / *_test names.
         #[clap(long)]
         include_tests: bool,
-        /// Include public API surface (pub/export items) in results.
-        /// By default they are skipped: they are consumed externally, so
-        /// missing internal callers does not make them dead (#520).
-        #[clap(long)]
-        include_pub: bool,
+        /// Include public API surface (pub items of a lib crate, export
+        /// items) in results. By default they are skipped: they are consumed
+        /// externally, so missing internal callers does not make them dead.
+        #[clap(long, alias = "include-pub")]
+        include_public: bool,
         /// Minimum lines of code (filter out tiny functions)
         #[clap(long)]
         min_lines: Option<u32>,
@@ -568,6 +602,9 @@ enum Command {
         /// Maximum results
         #[clap(long, default_value = "50")]
         limit: usize,
+        /// Include std/core method names (unwrap, clone, iter, ...) hidden by default
+        #[clap(long)]
+        include_std: bool,
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -625,6 +662,36 @@ enum HookAction {
     /// Denies `git commit --no-verify` and commits of an unreviewed staged diff;
     /// allows everything else.
     ClaudeGuard,
+    /// Agent prompt hook: print code context (matching symbols) for the prompt
+    ///
+    /// Reads the hook JSON on stdin (or `--prompt`). Never fails, never
+    /// downloads the model, stays silent for prompts that are not about code
+    /// and for projects that are not indexed. Used by `cora install` for Claude
+    /// Code (`UserPromptSubmit`), Hermes (`pre_llm_call`) and the pi / omp /
+    /// opencode extensions.
+    Context {
+        /// Output format: plain (Claude Code, extensions) or hermes (JSON)
+        #[clap(long, default_value = "plain")]
+        agent: String,
+        /// The prompt, instead of reading it from stdin
+        #[clap(long)]
+        prompt: Option<String>,
+        /// Maximum size of the printed block, in characters
+        #[clap(long, default_value = "1500")]
+        max_chars: usize,
+        /// Maximum number of symbols
+        #[clap(long, default_value = "5")]
+        limit: usize,
+        /// Time budget in seconds; nothing is printed when it is exceeded
+        #[clap(long, default_value = "6")]
+        budget: u64,
+    },
+    /// Agent session-start hook: print a short reminder that code search exists
+    Session {
+        /// Output format: plain or hermes (JSON)
+        #[clap(long, default_value = "plain")]
+        agent: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -796,11 +863,34 @@ async fn main() -> Result<()> {
             file,
             language,
             limit,
+            docs,
+            no_semantic,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
-            let sym_kind = kind.as_deref().map(index::SymbolKind::from_str);
+            let sym_kind = match kind.as_deref() {
+                None => None,
+                Some(k) => match index::SymbolKind::parse(k) {
+                    Some(parsed) => Some(parsed),
+                    None => {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "Unknown --kind '{k}'. Valid kinds: {}",
+                                index::SymbolKind::valid_list()
+                            )
+                            .red()
+                        );
+                        std::process::exit(2);
+                    }
+                },
+            };
+
+            let semantic_text = query.clone().filter(|t| t.split_whitespace().count() >= 2);
+            let semantic_kind = kind.clone();
+            let semantic_file = file.clone();
+            let semantic_wanted = !no_semantic && semantic_text.is_some() && language.is_none();
 
             let q = index::SymbolQuery {
                 text: query,
@@ -808,9 +898,35 @@ async fn main() -> Result<()> {
                 file_prefix: file,
                 language,
                 limit,
+                include_docs: docs,
             };
 
-            let results = index::search(&conn, project_id, &q)?;
+            let outcome = index::search_with_total(&conn, project_id, &q)?;
+            let total = outcome.total;
+            let results = outcome.results;
+
+            // A question rarely has every word in one symbol name. When the
+            // keyword search leaves room, complete it with matches by meaning
+            // (the same hybrid `cora brain` uses), listed separately.
+            let semantic: Vec<index::brain::BrainResult> = match (&semantic_text, semantic_wanted) {
+                (Some(text), true) if results.len() < limit => {
+                    index::session::configure_for_search(index::session::ConfigSource::Full(
+                        cli.global.config.as_deref(),
+                    ));
+                    let seen: std::collections::HashSet<i64> =
+                        results.iter().map(|r| r.symbol.id).collect();
+                    index::brain::semantic_matches(
+                        &conn,
+                        project_id,
+                        text,
+                        &seen,
+                        semantic_kind.as_deref(),
+                        semantic_file.as_deref(),
+                        limit - results.len(),
+                    )
+                }
+                _ => Vec::new(),
+            };
 
             if json {
                 let json_results: Vec<serde_json::Value> = results
@@ -824,32 +940,73 @@ async fn main() -> Result<()> {
                             "signature": r.symbol.signature,
                             "language": r.symbol.language,
                             "score": r.score,
+                            "via": "keyword",
                         })
                     })
+                    .chain(semantic.iter().map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "kind": r.kind,
+                            "file": r.file,
+                            "line": r.line,
+                            "signature": r.signature,
+                            "score": r.score,
+                            "via": "semantic",
+                        })
+                    }))
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json_results)?);
-            } else if results.is_empty() {
+                if total > results.len() {
+                    eprintln!(
+                        "{}",
+                        commands::index_cmd::explore_header(results.len(), total).dimmed()
+                    );
+                }
+            } else if results.is_empty() && semantic.is_empty() {
                 eprintln!("{}", "No symbols found.".yellow());
             } else {
-                println!("{}", format!("Found {} symbols:", results.len()).cyan());
-                println!(
-                    "{}",
-                    "───────────────────────────────────────────────".dimmed()
-                );
-                for r in &results {
+                if !results.is_empty() {
                     println!(
-                        "  {} {} {}:{}",
-                        r.symbol.kind.as_str().blue(),
-                        r.symbol.name.white().bold(),
-                        r.symbol.file.dimmed(),
-                        r.symbol.line
+                        "{}",
+                        commands::index_cmd::explore_header(results.len(), total).cyan()
                     );
-                    if !r.symbol.signature.is_empty() {
+                    println!(
+                        "{}",
+                        "───────────────────────────────────────────────".dimmed()
+                    );
+                    for r in &results {
                         println!(
-                            "    {} {}",
-                            "→".dimmed(),
-                            r.symbol.signature.trim().dimmed()
+                            "  {} {} {}:{}",
+                            r.symbol.kind.as_str().blue(),
+                            r.symbol.name.white().bold(),
+                            r.symbol.file.dimmed(),
+                            r.symbol.line
                         );
+                        if let Some(sig) = r.symbol.signature.lines().next().map(str::trim) {
+                            if !sig.is_empty() {
+                                println!("    {} {}", "→".dimmed(), sig.dimmed());
+                            }
+                        }
+                    }
+                }
+                if !semantic.is_empty() {
+                    println!(
+                        "{}",
+                        format!("{} matches by meaning (not by name):", semantic.len()).cyan()
+                    );
+                    for r in &semantic {
+                        println!(
+                            "  {} {} {}:{}",
+                            r.kind.blue(),
+                            r.name.white().bold(),
+                            r.file.dimmed(),
+                            r.line
+                        );
+                        if let Some(sig) = r.signature.lines().next().map(str::trim) {
+                            if !sig.is_empty() {
+                                println!("    {} {}", "→".dimmed(), sig.dimmed());
+                            }
+                        }
                     }
                 }
             }
@@ -859,10 +1016,12 @@ async fn main() -> Result<()> {
         Command::Callers {
             symbol,
             limit,
+            strict,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
-            let callers = index::graph::find_callers(&conn, project_id, &symbol, limit)?;
+            let callers =
+                index::graph::find_callers_opts(&conn, project_id, &symbol, limit, strict)?;
 
             // Cross-project fallback: if no callers in current project,
             // search across all indexed projects.
@@ -973,6 +1132,7 @@ async fn main() -> Result<()> {
             symbol,
             direction,
             depth,
+            strict,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
@@ -982,7 +1142,8 @@ async fn main() -> Result<()> {
                 _ => index::graph::TraceDirection::Outgoing,
             };
 
-            let nodes = index::graph::trace_path(&conn, project_id, &symbol, depth, dir)?;
+            let nodes =
+                index::graph::trace_path_opts(&conn, project_id, &symbol, depth, dir, strict)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&nodes)?);
@@ -1025,10 +1186,10 @@ async fn main() -> Result<()> {
             0
         }
 
-        Command::Arch { json } => {
+        Command::Arch { depth, json } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
-            let overview = index::graph::arch_overview(&conn, project_id)?;
+            let overview = index::arch::arch_overview(&conn, project_id, depth)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&overview)?);
@@ -1036,19 +1197,7 @@ async fn main() -> Result<()> {
                 println!("{}", "ARCHITECTURE OVERVIEW".cyan().bold());
                 println!("{}", "─".repeat(50).dimmed());
                 println!();
-                println!(
-                    "  {}  {}  {}",
-                    "MODULE".bold(),
-                    "SYMBOLS".bold(),
-                    "EDGE TYPES".bold()
-                );
-                println!("  {}", "─".repeat(45).dimmed());
-                for m in &overview.modules {
-                    println!(
-                        "  {:<30} {:>6}  {:>10}",
-                        m.name, m.symbol_count, m.edge_types
-                    );
-                }
+                println!("{}", index::arch::format_text(&overview, 20));
                 println!();
                 if !overview.edge_counts.is_empty() {
                     println!("  {}", "EDGE DISTRIBUTION".cyan().bold());
@@ -1074,7 +1223,27 @@ async fn main() -> Result<()> {
             index::session::configure_for_search(index::session::ConfigSource::Full(
                 cli.global.config.as_deref(),
             ));
-            let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
+            let report =
+                index::brain::brain_search_report(&conn, project_id, &query_str, limit, true)?;
+            let diag = &report.diagnostics;
+            let results = report.results;
+
+            // Which signals answered, and which cannot be trusted, always go to
+            // stderr so `--json` output stays a plain array.
+            eprintln!(
+                "{}",
+                format!(
+                    "signals: keyword={} vector={} graph={} (terms: {})",
+                    diag.fts_hits,
+                    diag.vector_hits,
+                    diag.graph_hits,
+                    diag.terms.join(", ")
+                )
+                .dimmed()
+            );
+            for w in diag.warnings() {
+                eprintln!("{} {}", "warning:".yellow(), w);
+            }
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
@@ -1107,6 +1276,8 @@ async fn main() -> Result<()> {
             files,
             stdin,
             filter,
+            depth,
+            limit,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
@@ -1144,21 +1315,35 @@ async fn main() -> Result<()> {
 
             let opts = index::queries::AffectedOptions {
                 test_file_markers: filter.map(|f| vec![f]),
+                depth,
             };
-            let sorted = index::queries::find_affected_tests(&conn, project_id, &changed, &opts)?;
+            let hits = index::queries::find_affected(&conn, project_id, &changed, &opts)?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&sorted)?);
-            } else if sorted.is_empty() {
+                let mut files: Vec<&str> = hits.iter().map(|h| h.file.as_str()).collect();
+                files.sort_unstable();
+                println!("{}", serde_json::to_string_pretty(&files)?);
+            } else if hits.is_empty() {
                 eprintln!("{}", "No affected test files found.".yellow());
             } else {
                 println!(
                     "{}",
-                    format!("Affected test files ({}):", sorted.len()).cyan()
+                    format!("Affected test files ({}):", hits.len()).cyan()
                 );
                 println!("{}", "\u{2500}".repeat(50).dimmed());
-                for f in &sorted {
-                    println!("  {}", f.white().bold());
+                for h in hits.iter().take(limit) {
+                    println!("  {}", h.file.white().bold());
+                    println!("    {}", h.path.join(" <- ").dimmed());
+                }
+                if hits.len() > limit {
+                    println!(
+                        "{}",
+                        format!(
+                            "showing {limit} of {} (raise --limit to see the rest)",
+                            hits.len()
+                        )
+                        .yellow()
+                    );
                 }
             }
             0
@@ -1314,6 +1499,24 @@ async fn main() -> Result<()> {
             }
             HookAction::Verify { quiet } => hook_cmd::execute_hook_verify(quiet)?,
             HookAction::ClaudeGuard => hook_cmd::execute_claude_guard()?,
+            HookAction::Context {
+                agent,
+                prompt,
+                max_chars,
+                limit,
+                budget,
+            } => commands::hook_context::run_context(
+                commands::hook_context::AgentFormat::parse(&agent),
+                &commands::hook_context::ContextOptions {
+                    prompt,
+                    max_chars,
+                    limit,
+                    budget: std::time::Duration::from_secs(budget),
+                },
+            ),
+            HookAction::Session { agent } => commands::hook_context::run_session(
+                commands::hook_context::AgentFormat::parse(&agent),
+            ),
         },
         Command::Auth { action } => {
             match action {
@@ -1415,7 +1618,13 @@ async fn main() -> Result<()> {
             yes,
             remove,
             validate,
+            no_instructions,
         } => {
+            let native = if list {
+                String::new()
+            } else {
+                commands::agents::run(agents.as_deref(), dry_run, force, no_instructions, remove)?
+            };
             let opts = commands::install::InstallOptions {
                 list,
                 agents,
@@ -1425,19 +1634,25 @@ async fn main() -> Result<()> {
                 remove,
                 validate,
             };
+            if !native.is_empty() {
+                println!("{native}");
+            }
             let output = commands::install::execute_install(&opts)?;
-            println!("{output}");
+            // A native setup that ran has already said what it did.
+            if native.is_empty() || !output.starts_with("No AI coding agents detected") {
+                println!("{output}");
+            }
             0
         }
         Command::DeadCode {
             include_tests,
-            include_pub,
+            include_public,
             min_lines,
             json,
         } => {
             // Resolve the project root the same way `cora index` does, so
             // dead-code queries the workspace the index actually built (#522).
-            let (conn, project_id, _project_root) =
+            let (conn, project_id, project_root) =
                 engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
             // Load config for entry_point_patterns
@@ -1452,8 +1667,9 @@ async fn main() -> Result<()> {
             .unwrap_or_default();
             let flags = index::queries::DeadCodeFlags {
                 include_tests,
-                include_pub_api: include_pub,
+                include_pub_api: include_public,
                 min_lines,
+                project_root: Some(project_root.clone()),
             };
             let results = index::queries::find_dead_code(&conn, project_id, &config, flags)?;
             if json {
@@ -1476,8 +1692,13 @@ async fn main() -> Result<()> {
             }
             0
         }
-        Command::Query { query, limit, json } => {
-            let output = commands::query::execute_query_cli(&query, json, limit)?;
+        Command::Query {
+            query,
+            limit,
+            include_std,
+            json,
+        } => {
+            let output = commands::query::execute_query_cli(&query, json, limit, include_std)?;
             println!("{output}");
             0
         }
