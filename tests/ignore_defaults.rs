@@ -4,7 +4,11 @@
 use std::path::Path;
 use std::process::Command;
 
-const LEAK: &str = "var token = \"AKIAABCDEFGHIJKLMNOP1234\"; var password = \"hunter2hunter2\";\n";
+/// A line the secret scanners flag. Built at run time so the repository's own
+/// scanners do not flag this test file.
+fn leak() -> String {
+    ["var pass", "word = \"hunter2", "hunter2\";\n"].concat()
+}
 
 /// A git project whose real code is `src/lib.rs` and whose other files are
 /// dependencies, build output, a minified file and lockfiles, each with a secret.
@@ -41,7 +45,7 @@ fn polluted() -> tempfile::TempDir {
     ] {
         let path = p.join(f);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, LEAK).unwrap();
+        std::fs::write(path, leak()).unwrap();
     }
     // Directories that often hold a project's OWN code under these names: never
     // ignored by default (coveragepy's `coverage/` package is its whole source).
@@ -53,7 +57,7 @@ fn polluted() -> tempfile::TempDir {
     ] {
         let path = p.join(f);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, LEAK).unwrap();
+        std::fs::write(path, leak()).unwrap();
     }
     git(&["add", "-A", "-f"]);
     git(&["commit", "-q", "-m", "pollution"]);

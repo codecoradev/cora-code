@@ -27,10 +27,17 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
+      # The config comes from the base branch, not from the PR (see below).
+      - name: Use the base branch's .cora.yaml
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git show "$BASE_SHA:.cora.yaml" > .cora.yaml 2>/dev/null || rm -f .cora.yaml
       - uses: codecoradev/cora-review-action@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cora-api-key: ${{ secrets.CORA_API_KEY }}
+          cora-base-url: ${{ secrets.CORA_BASE_URL }}
+          cora-model: ${{ secrets.CORA_MODEL }}
 ```
 
 The action downloads cora, runs `cora review` on the PR diff, comments on the PR, uploads SARIF to Code Scanning and fails the job on blocking findings. The model, provider and base URL are inputs (`cora-model`, `cora-base-url`); the key is a repository secret, never a file in the repo.
@@ -42,6 +49,7 @@ Run `cora review --base origin/<target-branch> --ci` with `CORA_API_KEY` set as 
 ## Things to get right
 
 - Commit the `.cora.yaml` ignores first (see "Before the first review: ignore" in SKILL.md): CI should not review generated or vendored files.
-- `pull_request_target` gives pull requests from forks the secrets, so the job checks out the PR head to read it: never install, build or run anything from that checkout, and keep `persist-credentials: false`. cora only reads the files.
+- `pull_request_target` gives pull requests from forks the secrets, so the job checks out the PR head to read it: never install, build or run anything from that checkout, and keep `persist-credentials: false`.
+- cora reads `.cora.yaml` from the checkout, so a pull request can change its own review: `ignore.files` or `review.exclude` to hide files, `provider.base_url` to receive the API key (cora ignores a base URL from an untrusted project config, but pin it anyway with the `cora-base-url` and `cora-model` inputs or `CORA_BASE_URL` and `CORA_MODEL`), prompts and rules. Take the config from the base branch as in the workflow above, and review a change to `.cora.yaml` by hand.
 - The log shows `Code index: N symbols; code model on`. `code model off` means only keyword and call-graph context was used.
 - More examples (GitLab, Gitea, Bitbucket, pre-commit): the project's `docs/examples.md`.
