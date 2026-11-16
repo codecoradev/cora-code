@@ -50,7 +50,8 @@ fn brain_fresh_process_emits_vector_signal() {
     run(cora_cmd()
         .args(["index"])
         .current_dir(&proj)
-        .env("CODECORA_HOME", &home));
+        .env("CODECORA_HOME", &home)
+        .env("CORA_EMBED_OFFLINE", "1"));
 
     let db_dir = home.join("cora-code");
     assert!(
@@ -62,7 +63,8 @@ fn brain_fresh_process_emits_vector_signal() {
     let out = run(cora_cmd()
         .args(["brain", "alpha"])
         .current_dir(&proj)
-        .env("CODECORA_HOME", &home));
+        .env("CODECORA_HOME", &home)
+        .env("CORA_EMBED_OFFLINE", "1"));
 
     assert!(
         out.contains("vector"),
@@ -79,7 +81,8 @@ fn brain_vecq_backend_uses_own_extension() {
     run(cora_cmd()
         .args(["index"])
         .current_dir(&proj)
-        .env("CODECORA_HOME", &home));
+        .env("CODECORA_HOME", &home)
+        .env("CORA_EMBED_OFFLINE", "1"));
 
     let db_dir = home.join("cora-code");
     assert!(

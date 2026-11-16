@@ -151,21 +151,40 @@ The `signals` field shows which search signals matched: `"fts"`, `"vector"`, `"g
 
 #### Embedding Engine
 
-Cora supports multiple embedding backends, selectable at runtime via `brain.embedding` in `.cora.yaml`. No recompilation needed to switch.
+Cora embeds every symbol (its name and signature) locally, with no API key and no GPU. The backend is selectable via `brain.embedding` in `.cora.yaml`.
 
-| Backend | Dimensions | Method | Feature Flag | When to use |
-|---------|------------|--------|--------------|-------------|
-| `hashing` | 256 | Bag-of-tokens hashing | Always available | Zero-dependency, fast, good for near-duplicate detection |
-| `pretrained` | 768 | Nomic-embed-code distilled | `pretrained-embed` | Better semantic matching, real code embeddings |
-| `auto` (default) | — | Picks best available | — | Uses `pretrained` if compiled, falls back to `hashing` |
+| Backend | Dimensions | Method | When to use |
+|---------|------------|--------|-------------|
+| `potion` (default via `auto`) | 256 | `potion-code-16M-v2`, a static code model: tokens are looked up in a learned table and averaged. Downloaded once (33.5 MB) | Almost always: it finds the right function from a description clearly more often than keyword search alone |
+| `hashing` | 256 | Bag-of-tokens hashing | Offline fallback, near-duplicate detection. A weak signal for search |
+| `pretrained` | 768 | nomic-embed-code distilled (needs the `pretrained-embed` build feature) | Legacy |
 
 ```yaml
 # .cora.yaml
 brain:
-  embedding: auto   # auto | hashing | pretrained
+  embedding: auto   # auto | potion | hashing | pretrained
 ```
 
-> **Note:** 256d and 768d embeddings cannot be mixed in the same index. Changing the backend requires `cora index --rebuild`. Future phases will add ONNX-based embedding models (see Roadmap).
+**Why this model.** It was chosen by measurement, on 1,639 queries (hand-written questions and doc comments of this repository, of 8 other Rust crates and of the Python standard library) with the documents cora indexes (name and signature). Alone it beat keyword search by +0.07 to +0.12 in MRR@10, with intervals that exclude zero on every set, and fused with keyword search at full weight it is better by +0.04 to +0.09. The previous embeddings were neutral on this repository and harmful elsewhere (down to -0.09), which is why `hashing` and `pretrained` now count for a quarter of a vote. On `cora brain` itself, on this repository, MRR@10 rose from 0.22 to 0.32 (hand-written questions) and from 0.39 to 0.52 (doc comments).
+
+Embedding is cheap: tens of thousands of symbols per second on a few CPU cores, about 80 MB of memory for the model, and 256-dimensional vectors (about 1 KB per symbol).
+
+#### Where it is stored
+
+| What | Where |
+|---|---|
+| Symbols, edges, call graph, review history, per-project embedding metadata (model, dimensions, time) | SQLite database `cora.db` in the data directory (`~/.codecora/cora-code/`) |
+| Keyword index | An FTS5 virtual table in the same database |
+| Vectors | One file per model next to the database, keyed by the symbol's database id: `cora_index.potion-code-v2.usearch` (HNSW graph over f32 vectors, via usearch) or, with `brain.vector_store: vecq`, a `.vecq` file (quantized brute-force scan, about 5x smaller). The file is shared by all projects and a lock serializes writers |
+| The model | `models/potion-code-16M-v2/` in the data directory |
+
+A search embeds the question, asks the vector file for the nearest symbols, keeps those of the current project, and fuses them with the keyword and graph results by reciprocal rank fusion. A symbol is re-embedded only when its name, signature or the model changed.
+
+#### Where it is used
+
+- `cora brain` and the MCP tool `cora.brain_search`: the full hybrid, for questions in words.
+- `cora explore` with a multi-word query: the keyword results, completed with a separate block of matches by meaning (`--no-semantic` turns it off; `--json` marks each result `via: keyword | semantic`).
+- `cora review`: related code and tests found for the changed symbols.
 
 ## Call Graph Commands
 

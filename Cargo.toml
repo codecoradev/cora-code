@@ -71,6 +71,9 @@ chrono = { version = "0.4.44", features = ["serde"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Vector search (Phase 3 — Brain Mode)
+# Static code embedding model (potion-code-16M-v2); pure-Rust tokenizer, no network
+# in the crate itself: the model is fetched by `embed::model_store`.
+model2vec-rs = { version = "0.4", default-features = false, features = ["fancy-regex", "local-only"] }
 usearch = "2"
 vecq-core = "0.3.0"
 fs2 = "0.4"

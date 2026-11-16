@@ -538,20 +538,29 @@ Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`),
 
 ### Brain Embedding Backend
 
-Control which embedding backend Brain Mode uses for vector search. Selectable at runtime — no recompilation needed to switch.
+Control which embedding backend Brain Mode uses for vector search. Selectable at runtime, no recompilation needed.
 
 ```yaml
 brain:
-  embedding: auto   # auto | hashing | pretrained
+  embedding: auto   # auto | potion | hashing | pretrained
 ```
 
 | Value | Dimensions | Description |
 |-------|------------|-------------|
-| `auto` (default) | 256 or 768 | Best available — uses `pretrained` if compiled with `pretrained-embed` feature, otherwise `hashing` |
-| `hashing` | 256 | Force zero-dependency bag-of-tokens hashing. Always available, no model download |
-| `pretrained` | 768 | Force nomic-embed-code distilled embeddings. Requires `pretrained-embed` feature at build time |
+| `auto` (default) | 256 | The `potion` code model; falls back to `pretrained` (if compiled in) and then `hashing` when the model cannot be downloaded |
+| `potion` | 256 | `potion-code-16M-v2`, a 16M-parameter static code embedding (MIT). Downloaded once (33.5 MB) on the first `cora index`, `cora brain` or `cora explore`, then used offline |
+| `hashing` | 256 | Zero-dependency bag-of-tokens hashing. Always available, no download. A weak signal: it counts for a quarter of a vote in `cora brain` |
+| `pretrained` | 768 | nomic-embed-code distilled vectors. Requires the `pretrained-embed` feature at build time |
 
-> **⚠️ Cannot mix dimensions.** 256d and 768d vectors cannot coexist in the same usearch index. After changing this setting, run `cora index --rebuild` to regenerate embeddings with the new backend.
+**The model download.** The first command that needs embeddings downloads all three model files in one step into `<data dir>/models/potion-code-16M-v2/` (`~/.codecora/cora-code/models/...`). The revision is pinned and every file is checked against its SHA-256 before it is moved into place, so a download is verified byte for byte. Several concurrent runs wait for one download. If the download fails (offline, blocked network), cora warns, uses the fallback embedding and does not retry for an hour.
+
+| Environment variable | Effect |
+|---|---|
+| `CORA_EMBED_MODEL_DIR` | Use a model already on disk (air-gapped machines, a pre-baked image). Any Model2Vec model with `config.json`, `tokenizer.json` and `model.safetensors` works; its dimensions are read from the model. Nothing is downloaded into it |
+| `CORA_EMBED_MODEL_URL` | Fetch the files from this base URL instead of the Hugging Face hub (an internal mirror). The pinned hashes still apply |
+| `CORA_EMBED_OFFLINE=1` | Never touch the network; use the model only if it is already downloaded |
+
+> **Models do not mix.** Each model has its own vector index file (`cora_index.potion-code-v2.usearch` for `potion`, `cora_index.usearch` for `hashing` and `pretrained`), and every symbol's embedding fingerprint includes the model. Changing `brain.embedding`, or the first run after the code model became available, re-embeds the project on the next `cora index` even when no file changed. `cora index --rebuild` is no longer needed for this.
 
 > **Note:** If you select `pretrained` but cora was built without the `pretrained-embed` feature, it falls back to `hashing` with a warning.
 

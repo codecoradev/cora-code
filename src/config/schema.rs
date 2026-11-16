@@ -588,8 +588,9 @@ pub struct AnalysisConfig {
 
 /// Brain Mode configuration — controls embedding backend for vector search.
 ///
-/// By default (`auto`), cora selects the best available backend at runtime:
-/// pretrained 768d (if compiled with `pretrained-embed` feature) → hashing 256d fallback.
+/// By default (`auto`), cora selects the best available backend at runtime: the
+/// `potion-code-16M-v2` code model (downloaded once on first use) → pretrained
+/// 768d (if compiled with `pretrained-embed`) → hashing 256d fallback.
 /// Users can force a specific backend via `.cora.yaml`.
 fn default_vector_store() -> String {
     "usearch".to_string()
@@ -620,7 +621,8 @@ pub struct BrainConfig {
     pub vector_bits: String,
     /// Embedding backend selection.
     ///
-    /// - `"auto"` (default) — best available: pretrained → hashing
+    /// - `"auto"` (default) — best available: potion → pretrained → hashing
+    /// - `"potion"` — the potion-code-16M-v2 code model (downloaded once)
     /// - `"hashing"` — force 256d hashing trick (zero dependency)
     /// - `"pretrained"` — force nomic 768d (requires `--features pretrained-embed`)
     ///
@@ -658,9 +660,11 @@ pub struct BrainSection {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BrainEmbeddingMode {
-    /// Best available backend (pretrained if compiled, else hashing).
+    /// Best available backend (potion, else pretrained if compiled, else hashing).
     #[default]
     Auto,
+    /// The potion-code-16M-v2 code model (downloaded once on first use).
+    Potion,
     /// Force 256d hashing trick (zero dependency).
     Hashing,
     /// Force nomic 768d pretrained (requires feature flag).
@@ -671,6 +675,7 @@ impl std::fmt::Display for BrainEmbeddingMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
+            Self::Potion => write!(f, "potion"),
             Self::Hashing => write!(f, "hashing"),
             Self::Pretrained => write!(f, "pretrained"),
         }
@@ -683,10 +688,11 @@ impl std::str::FromStr for BrainEmbeddingMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
+            "potion" => Ok(Self::Potion),
             "hashing" => Ok(Self::Hashing),
             "pretrained" => Ok(Self::Pretrained),
             other => Err(format!(
-                "unknown brain.embedding value '{other}' — expected auto, hashing, or pretrained"
+                "unknown brain.embedding value '{other}' — expected auto, potion, hashing, or pretrained"
             )),
         }
     }
