@@ -1,6 +1,6 @@
 //! Code embeddings: the `potion-code-16M-v2` static code model (`potion` +
-//! `model_store`), downloaded once into the data directory (pinned and
-//! checksummed) and then used offline.
+//! `model_store`), unpacked from the release binary (`bundled`) or downloaded
+//! once (pinned and checksummed) into the data directory, then used offline.
 //!
 //! There is no fallback embedding. When the model is not available (offline
 //! and not yet downloaded, `CORA_EMBED_OFFLINE=1`, or `brain.embedding: off`)

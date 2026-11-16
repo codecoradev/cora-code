@@ -542,7 +542,7 @@ Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`),
 
 ### Brain Embedding
 
-Cora uses one embedding model for vector search, `potion-code-16M-v2` (256 dimensions, a 16M-parameter static code model, MIT), downloaded once (33.5 MB) on the first `cora index`, `cora brain` or `cora explore` and then used offline.
+Cora uses one embedding model for vector search, `potion-code-16M-v2` (256 dimensions, a 16M-parameter static code model, MIT), inside the release binaries (a `cargo install` build downloads it once, 33.5 MB, on the first `cora index`, `cora brain` or `cora explore`) and then used offline.
 
 ```yaml
 brain:
