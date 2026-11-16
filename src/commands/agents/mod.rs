@@ -8,6 +8,7 @@
 //! honors `--dry-run`, and never rewrites a file that would not change.
 
 pub mod claude;
+pub mod hermes;
 pub mod pi;
 
 use anyhow::{Context, Result};
@@ -165,6 +166,7 @@ pub trait Integration {
 pub fn all() -> Vec<Box<dyn Integration>> {
     vec![
         Box::new(claude::Claude),
+        Box::new(hermes::Hermes),
         Box::new(pi::PI),
         Box::new(pi::OMP),
     ]
