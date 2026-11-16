@@ -1125,6 +1125,7 @@ fn handle_dead_code(params: &serde_json::Value) -> ToolResult {
         include_tests,
         include_pub_api,
         min_lines,
+        project_root: std::env::current_dir().ok(),
     };
 
     match crate::index::queries::find_dead_code(&conn, project_id, &config, flags) {

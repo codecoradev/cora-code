@@ -222,6 +222,14 @@ enum Command {
         #[clap(long)]
         filter: Option<String>,
 
+        /// Max call-graph hops from a changed symbol to a test
+        #[clap(long, default_value_t = index::queries::DEFAULT_AFFECTED_DEPTH)]
+        depth: u32,
+
+        /// Max test files to print (the JSON output is never truncated)
+        #[clap(long, default_value = "50")]
+        limit: usize,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -550,14 +558,15 @@ enum Command {
 
     /// Detect dead code — functions/methods with no callers
     DeadCode {
-        /// Include test functions (test_*, _test) in results
+        /// Include tests in results: #[test] fns, #[cfg(test)] modules, files
+        /// in tests directories or *_tests.rs, and test_* / *_test names.
         #[clap(long)]
         include_tests: bool,
-        /// Include public API surface (pub/export items) in results.
-        /// By default they are skipped: they are consumed externally, so
-        /// missing internal callers does not make them dead (#520).
-        #[clap(long)]
-        include_pub: bool,
+        /// Include public API surface (pub items of a lib crate, export
+        /// items) in results. By default they are skipped: they are consumed
+        /// externally, so missing internal callers does not make them dead.
+        #[clap(long, alias = "include-pub")]
+        include_public: bool,
         /// Minimum lines of code (filter out tiny functions)
         #[clap(long)]
         min_lines: Option<u32>,
@@ -1114,6 +1123,8 @@ async fn main() -> Result<()> {
             files,
             stdin,
             filter,
+            depth,
+            limit,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
@@ -1151,21 +1162,35 @@ async fn main() -> Result<()> {
 
             let opts = index::queries::AffectedOptions {
                 test_file_markers: filter.map(|f| vec![f]),
+                depth,
             };
-            let sorted = index::queries::find_affected_tests(&conn, project_id, &changed, &opts)?;
+            let hits = index::queries::find_affected(&conn, project_id, &changed, &opts)?;
 
             if json {
-                println!("{}", serde_json::to_string_pretty(&sorted)?);
-            } else if sorted.is_empty() {
+                let mut files: Vec<&str> = hits.iter().map(|h| h.file.as_str()).collect();
+                files.sort_unstable();
+                println!("{}", serde_json::to_string_pretty(&files)?);
+            } else if hits.is_empty() {
                 eprintln!("{}", "No affected test files found.".yellow());
             } else {
                 println!(
                     "{}",
-                    format!("Affected test files ({}):", sorted.len()).cyan()
+                    format!("Affected test files ({}):", hits.len()).cyan()
                 );
                 println!("{}", "\u{2500}".repeat(50).dimmed());
-                for f in &sorted {
-                    println!("  {}", f.white().bold());
+                for h in hits.iter().take(limit) {
+                    println!("  {}", h.file.white().bold());
+                    println!("    {}", h.path.join(" <- ").dimmed());
+                }
+                if hits.len() > limit {
+                    println!(
+                        "{}",
+                        format!(
+                            "showing {limit} of {} (raise --limit to see the rest)",
+                            hits.len()
+                        )
+                        .yellow()
+                    );
                 }
             }
             0
@@ -1438,13 +1463,13 @@ async fn main() -> Result<()> {
         }
         Command::DeadCode {
             include_tests,
-            include_pub,
+            include_public,
             min_lines,
             json,
         } => {
             // Resolve the project root the same way `cora index` does, so
             // dead-code queries the workspace the index actually built (#522).
-            let (conn, project_id, _project_root) =
+            let (conn, project_id, project_root) =
                 engine::index_bridge::IndexBridge::open_or_create_cwd()?.into_strict_parts()?;
 
             // Load config for entry_point_patterns
@@ -1459,8 +1484,9 @@ async fn main() -> Result<()> {
             .unwrap_or_default();
             let flags = index::queries::DeadCodeFlags {
                 include_tests,
-                include_pub_api: include_pub,
+                include_pub_api: include_public,
                 min_lines,
+                project_root: Some(project_root.clone()),
             };
             let results = index::queries::find_dead_code(&conn, project_id, &config, flags)?;
             if json {
