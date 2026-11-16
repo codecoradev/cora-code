@@ -1,0 +1,16 @@
+# Throwaway spike (not part of the cora build): can potion-code-16M-v2 run
+# through model2vec-rs, and what does it cost in CPU and RAM?
+[package]
+name = "potion-code-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+model2vec-rs = "0.4"
+
+[profile.release]
+debug = false
