@@ -67,7 +67,12 @@ fn set_hook(
 
 /// Remove our entries for `event`; empty containers are removed too.
 fn drop_hook(doc: &mut Value, event: &str, mark: &str) -> bool {
-    let Some(arr) = doc["hooks"][event].as_array_mut() else {
+    // `get_mut`, not indexing: indexing a missing key inserts `null`.
+    let Some(arr) = doc
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
         return false;
     };
     let before = arr.len();
@@ -304,6 +309,30 @@ mod tests {
         assert!(drop_hook(&mut doc, PROMPT_EVENT, PROMPT_MARK));
         assert_eq!(doc["hooks"][PROMPT_EVENT].as_array().unwrap().len(), 1);
         assert_eq!(doc["hooks"][PROMPT_EVENT][0]["hooks"][0]["command"], "mine");
+    }
+
+    #[test]
+    fn dropping_a_hook_that_is_not_there_changes_nothing() {
+        // Only one of the two cora hooks exists (the other was never added or
+        // the user removed it): the second drop must not insert a null.
+        let mut doc = json!({"model":"x"});
+        set_hook(
+            &mut doc,
+            PROMPT_EVENT,
+            PROMPT_MARK,
+            "cora hook context --agent claude",
+            10,
+            false,
+        );
+        assert!(!drop_hook(&mut doc, SESSION_EVENT, SESSION_MARK));
+        assert!(doc["hooks"].get(SESSION_EVENT).is_none(), "{doc}");
+        assert!(drop_hook(&mut doc, PROMPT_EVENT, PROMPT_MARK));
+        assert!(!drop_hook(&mut doc, SESSION_EVENT, SESSION_MARK));
+        assert_eq!(doc, json!({"model":"x"}));
+        // No hooks key at all.
+        let mut bare = json!({});
+        assert!(!drop_hook(&mut bare, PROMPT_EVENT, PROMPT_MARK));
+        assert_eq!(bare, json!({}));
     }
 
     #[test]
