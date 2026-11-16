@@ -132,6 +132,10 @@ enum Command {
         #[clap(long, default_value = "50")]
         limit: usize,
 
+        /// Also match words in signatures / doc text (default: symbol names only)
+        #[clap(long)]
+        docs: bool,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -188,8 +192,12 @@ enum Command {
         json: bool,
     },
 
-    /// Show architecture overview (modules, edge types, structure)
+    /// Show architecture overview (crates, modules, calls between them)
     Arch {
+        /// Module path components shown per module (e.g. 2 -> index::graph)
+        #[clap(long, default_value = "2")]
+        depth: usize,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -582,6 +590,9 @@ enum Command {
         /// Maximum results
         #[clap(long, default_value = "50")]
         limit: usize,
+        /// Include std/core method names (unwrap, clone, iter, ...) hidden by default
+        #[clap(long)]
+        include_std: bool,
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -810,11 +821,28 @@ async fn main() -> Result<()> {
             file,
             language,
             limit,
+            docs,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
-            let sym_kind = kind.as_deref().map(index::SymbolKind::from_str);
+            let sym_kind = match kind.as_deref() {
+                None => None,
+                Some(k) => match index::SymbolKind::parse(k) {
+                    Some(parsed) => Some(parsed),
+                    None => {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "Unknown --kind '{k}'. Valid kinds: {}",
+                                index::SymbolKind::valid_list()
+                            )
+                            .red()
+                        );
+                        std::process::exit(2);
+                    }
+                },
+            };
 
             let q = index::SymbolQuery {
                 text: query,
@@ -822,9 +850,12 @@ async fn main() -> Result<()> {
                 file_prefix: file,
                 language,
                 limit,
+                include_docs: docs,
             };
 
-            let results = index::search(&conn, project_id, &q)?;
+            let outcome = index::search_with_total(&conn, project_id, &q)?;
+            let total = outcome.total;
+            let results = outcome.results;
 
             if json {
                 let json_results: Vec<serde_json::Value> = results
@@ -842,10 +873,19 @@ async fn main() -> Result<()> {
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json_results)?);
+                if total > results.len() {
+                    eprintln!(
+                        "{}",
+                        commands::index_cmd::explore_header(results.len(), total).dimmed()
+                    );
+                }
             } else if results.is_empty() {
                 eprintln!("{}", "No symbols found.".yellow());
             } else {
-                println!("{}", format!("Found {} symbols:", results.len()).cyan());
+                println!(
+                    "{}",
+                    commands::index_cmd::explore_header(results.len(), total).cyan()
+                );
                 println!(
                     "{}",
                     "───────────────────────────────────────────────".dimmed()
@@ -858,12 +898,10 @@ async fn main() -> Result<()> {
                         r.symbol.file.dimmed(),
                         r.symbol.line
                     );
-                    if !r.symbol.signature.is_empty() {
-                        println!(
-                            "    {} {}",
-                            "→".dimmed(),
-                            r.symbol.signature.trim().dimmed()
-                        );
+                    if let Some(sig) = r.symbol.signature.lines().next().map(str::trim) {
+                        if !sig.is_empty() {
+                            println!("    {} {}", "→".dimmed(), sig.dimmed());
+                        }
                     }
                 }
             }
@@ -1041,10 +1079,10 @@ async fn main() -> Result<()> {
             0
         }
 
-        Command::Arch { json } => {
+        Command::Arch { depth, json } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
 
-            let overview = index::graph::arch_overview(&conn, project_id)?;
+            let overview = index::arch::arch_overview(&conn, project_id, depth)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&overview)?);
@@ -1052,19 +1090,7 @@ async fn main() -> Result<()> {
                 println!("{}", "ARCHITECTURE OVERVIEW".cyan().bold());
                 println!("{}", "─".repeat(50).dimmed());
                 println!();
-                println!(
-                    "  {}  {}  {}",
-                    "MODULE".bold(),
-                    "SYMBOLS".bold(),
-                    "EDGE TYPES".bold()
-                );
-                println!("  {}", "─".repeat(45).dimmed());
-                for m in &overview.modules {
-                    println!(
-                        "  {:<30} {:>6}  {:>10}",
-                        m.name, m.symbol_count, m.edge_types
-                    );
-                }
+                println!("{}", index::arch::format_text(&overview, 20));
                 println!();
                 if !overview.edge_counts.is_empty() {
                     println!("  {}", "EDGE DISTRIBUTION".cyan().bold());
@@ -1509,8 +1535,13 @@ async fn main() -> Result<()> {
             }
             0
         }
-        Command::Query { query, limit, json } => {
-            let output = commands::query::execute_query_cli(&query, json, limit)?;
+        Command::Query {
+            query,
+            limit,
+            include_std,
+            json,
+        } => {
+            let output = commands::query::execute_query_cli(&query, json, limit, include_std)?;
             println!("{output}");
             0
         }

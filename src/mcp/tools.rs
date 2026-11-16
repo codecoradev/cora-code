@@ -531,6 +531,8 @@ fn handle_search_symbols(params: &serde_json::Value) -> ToolResult {
         file_prefix,
         language,
         limit,
+        // Keep the MCP tool's historical behaviour: match name and signature.
+        include_docs: true,
     };
 
     match crate::index::search(&conn, project_id, &query) {
@@ -1160,7 +1162,7 @@ fn handle_query(params: &serde_json::Value) -> ToolResult {
     };
     let limit = clamped_u64(params, "limit", 50, MAX_LIMIT) as usize;
 
-    match crate::commands::query::execute_query_cli(query, true, limit) {
+    match crate::commands::query::execute_query_cli(query, true, limit, false) {
         Ok(output) => ToolResult::text(output),
         Err(e) => ToolResult::error(format!("Query failed: {e:#}")),
     }

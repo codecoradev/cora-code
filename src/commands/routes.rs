@@ -26,6 +26,65 @@ pub struct Route {
     pub line: u32,
 }
 
+/// Route frameworks the detector understands, keyed by the indexed language.
+const ROUTE_FRAMEWORKS: &[(&[&str], &[&str])] = &[
+    (&["rs"], &["Axum", "Actix-web"]),
+    (&["go"], &["net/http", "chi/gin"]),
+    (&["ts", "tsx", "javascript", "jsx"], &["Express", "Fastify"]),
+    (&["python"], &["Flask", "FastAPI"]),
+];
+
+/// What `cora routes` looked at: the frameworks it can detect in the
+/// languages present in the project, and how many indexed files it scanned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteScan {
+    pub frameworks: Vec<String>,
+    pub files_scanned: usize,
+}
+
+/// Summarise which frameworks were searched and how many files that covered.
+pub fn route_scan(conn: &Connection, project_id: i64) -> anyhow::Result<RouteScan> {
+    let mut stmt = conn
+        .prepare("SELECT language, COUNT(*) FROM files WHERE project_id = ?1 GROUP BY language")?;
+    let rows = stmt.query_map(rusqlite::params![project_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+    })?;
+    let per_language: Vec<(String, usize)> = rows.collect::<Result<_, _>>()?;
+
+    let mut scan = RouteScan {
+        frameworks: Vec::new(),
+        files_scanned: 0,
+    };
+    for (languages, frameworks) in ROUTE_FRAMEWORKS {
+        let files: usize = per_language
+            .iter()
+            .filter(|(lang, _)| languages.contains(&lang.as_str()))
+            .map(|(_, n)| n)
+            .sum();
+        if files > 0 {
+            scan.files_scanned += files;
+            scan.frameworks
+                .extend(frameworks.iter().map(|f| f.to_string()));
+        }
+    }
+    Ok(scan)
+}
+
+/// One-line description of a [`RouteScan`] for the text output.
+fn describe_scan(scan: &RouteScan) -> String {
+    if scan.frameworks.is_empty() {
+        "Searched 0 files: no indexed file is in a language with route detection \
+         (Rust, Go, TypeScript/JavaScript, Python)."
+            .to_string()
+    } else {
+        format!(
+            "Searched {} files for: {}.",
+            scan.files_scanned,
+            scan.frameworks.join(", ")
+        )
+    }
+}
+
 /// Query ROUTE edges for a project, with optional filters.
 ///
 /// - `method_filter`: case-insensitive method match (e.g. `GET`). Empty = all.
@@ -106,7 +165,8 @@ pub fn execute_routes_cli(
     if json_flag {
         Ok(serde_json::to_string_pretty(&routes)?)
     } else {
-        format_routes(&routes, method, prefix)
+        let scan = route_scan(&conn, project_id)?;
+        format_routes(&routes, method, prefix, &scan)
     }
 }
 
@@ -115,6 +175,7 @@ fn format_routes(
     routes: &[Route],
     method: Option<&str>,
     prefix: Option<&str>,
+    scan: &RouteScan,
 ) -> anyhow::Result<String> {
     if routes.is_empty() {
         let mut msg = "No routes detected. Run `cora index` first.".to_string();
@@ -124,11 +185,14 @@ fn format_routes(
         if let Some(p) = prefix {
             msg.push_str(&format!(" (filtered by prefix={})", p));
         }
+        msg.push('\n');
+        msg.push_str(&describe_scan(scan));
         return Ok(msg);
     }
 
     let mut lines = Vec::new();
     lines.push(format!("Detected HTTP routes ({})", routes.len()));
+    lines.push(describe_scan(scan));
     lines.push("──────────────────────────────────────────────────────".to_string());
 
     // Column widths for alignment
@@ -188,5 +252,57 @@ mod tests {
     fn split_lowercase_method_still_splits() {
         let (m, _p) = split_target("post /login");
         assert_eq!(m, "post");
+    }
+
+    fn mem_conn() -> (Connection, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::index::schema::run_migrations(&conn).unwrap();
+        let pid = crate::index::schema::get_or_create_project(&conn, "/tmp/routes-test").unwrap();
+        (conn, pid)
+    }
+
+    fn add_file(conn: &Connection, pid: i64, path: &str, language: &str) {
+        conn.execute(
+            "INSERT INTO files (path, fingerprint, last_indexed, language, project_id)
+             VALUES (?1, 'fp', 'now', ?2, ?3)",
+            rusqlite::params![path, language, pid],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn route_scan_lists_frameworks_and_counts_files() {
+        let (conn, pid) = mem_conn();
+        add_file(&conn, pid, "src/a.rs", "rs");
+        add_file(&conn, pid, "src/b.rs", "rs");
+        add_file(&conn, pid, "web/app.ts", "ts");
+        add_file(&conn, pid, "README.md", "markdown");
+        let scan = route_scan(&conn, pid).unwrap();
+        assert_eq!(scan.files_scanned, 3);
+        assert_eq!(
+            scan.frameworks,
+            vec!["Axum", "Actix-web", "Express", "Fastify"]
+        );
+    }
+
+    #[test]
+    fn empty_result_names_what_was_searched() {
+        let scan = RouteScan {
+            frameworks: vec!["Axum".into(), "Actix-web".into()],
+            files_scanned: 41,
+        };
+        let msg = format_routes(&[], None, None, &scan).unwrap();
+        assert!(msg.contains("No routes detected"));
+        assert!(msg.contains("Searched 41 files for: Axum, Actix-web."));
+    }
+
+    #[test]
+    fn route_scan_with_no_supported_language() {
+        let (conn, pid) = mem_conn();
+        add_file(&conn, pid, "README.md", "markdown");
+        let scan = route_scan(&conn, pid).unwrap();
+        assert_eq!(scan.files_scanned, 0);
+        assert!(describe_scan(&scan).starts_with("Searched 0 files"));
     }
 }

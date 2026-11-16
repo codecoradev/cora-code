@@ -577,45 +577,8 @@ struct EdgeRow {
     line: u32,
 }
 
-/// Architecture overview: module statistics and edge density.
-pub fn arch_overview(conn: &Connection, project_id: i64) -> anyhow::Result<ArchOverview> {
-    // Module = directory component of file path (e.g., "src/index" from "src/index/mod.rs")
-    let mut stmt = conn.prepare(
-        "SELECT
-            CASE
-                WHEN instr(file, '/') > 0 THEN substr(file, 1, instr(file, '/') - 1)
-                ELSE file
-            END AS module,
-            COUNT(*) AS symbol_count,
-            COUNT(DISTINCT kind) AS edge_types
-         FROM symbols
-         WHERE project_id = ?1
-         GROUP BY module
-         ORDER BY symbol_count DESC",
-    )?;
-
-    let modules: Vec<ModuleInfo> = stmt
-        .query_map(rusqlite::params![project_id], |row| {
-            Ok(ModuleInfo {
-                name: row.get(0)?,
-                symbol_count: row.get::<_, i64>(1)? as usize,
-                edge_types: row.get::<_, i64>(2)? as usize,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    // Edge type distribution
-    let edge_counts = get_edge_kind_counts(conn, project_id);
-
-    Ok(ArchOverview {
-        modules,
-        edge_counts,
-    })
-}
-
 /// Count edges by kind.
-fn get_edge_kind_counts(conn: &Connection, project_id: i64) -> Vec<(String, i64)> {
+pub(super) fn get_edge_kind_counts(conn: &Connection, project_id: i64) -> Vec<(String, i64)> {
     let mut counts = Vec::new();
 
     if let Ok(mut s) = conn.prepare(
@@ -641,21 +604,6 @@ fn get_edge_kind_counts(conn: &Connection, project_id: i64) -> Vec<(String, i64)
     }
 
     counts
-}
-
-/// Architecture overview result.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ArchOverview {
-    pub modules: Vec<ModuleInfo>,
-    pub edge_counts: Vec<(String, i64)>,
-}
-
-/// Module-level statistics.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ModuleInfo {
-    pub name: String,
-    pub symbol_count: usize,
-    pub edge_types: usize,
 }
 
 /// A dead-code detection result entry.
@@ -1377,35 +1325,6 @@ mod tests {
         let syms: Vec<&str> = nodes.iter().map(|n| n.symbol.as_str()).collect();
         assert!(syms.contains(&"a"));
         assert!(syms.contains(&"b"));
-    }
-
-    #[test]
-    fn test_arch_overview() {
-        let conn = mem_conn();
-        let pid = test_project(&conn);
-
-        store_edges(
-            &conn,
-            &[CallEdge {
-                caller: "main".into(),
-                callee: "run".into(),
-                file: "src/main.rs".into(),
-                line: 1,
-            }],
-            pid,
-        )
-        .unwrap();
-
-        // Insert a symbol so arch has data
-        conn.execute(
-            "INSERT INTO symbols (name, kind, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["main", "function", "src/main.rs", 1i64, pid],
-        )
-        .unwrap();
-
-        let overview = arch_overview(&conn, pid).unwrap();
-        assert_eq!(overview.modules.len(), 1);
-        assert_eq!(overview.modules[0].name, "src");
     }
 
     #[test]

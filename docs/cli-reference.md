@@ -123,7 +123,8 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora explore --kind` `function` | Filter by symbol kind |
 | `cora explore --file` `"src/"` | Filter by file path prefix |
 | `cora explore --language` `rust` | Filter by language |
-| `cora explore --limit` `N` | Max results (default: 50) |
+| `cora explore --limit` `N` | Max results (default: 50); prints "Showing N of M" when cut |
+| `cora explore --docs` | Also match signature / doc words (default: names only) |
 | `cora brain` `<query>` | Hybrid search: FTS5 + vector + graph → RRF fusion |
 | `cora brain --limit N` | Max results (default: 20) |
 | `cora callers` `<symbol>` | Find all callers of a symbol (reverse call graph) |
@@ -133,7 +134,7 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora trace` `<symbol>` | Trace call chains (depth-limited BFS) |
 | `cora trace --direction incoming` | Trace callers instead of callees |
 | `cora trace --depth N` | Max hops (default: 3) |
-| `cora arch` | Architecture overview — modules, edge types, top connectors |
+| `cora arch` | Architecture overview — crates, modules (`--depth N`), calls between them |
 | `cora affected` `<files...>` | Find test files affected by source changes |
 | `cora affected --stdin` | Read changed files from stdin (pipe from `git diff --name-only`) |
 | `cora affected --filter` `"*test*"` | Custom test file glob pattern |
@@ -145,6 +146,7 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora dead-code --min-lines N` | Filter out tiny functions |
 | `cora query` `"main -> *"` | Query the code graph with simple patterns |
 | `cora query --limit N` | Max results (default: 50) |
+| `cora query --include-std` | Also show std/core method names (hidden by default) |
 | `cora routes` | List detected HTTP routes (Axum, Actix, Express, FastAPI, Flask, Go) |
 | `cora routes --method GET` | Filter by HTTP method |
 | `cora routes --prefix /api` | Filter by path prefix |

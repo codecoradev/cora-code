@@ -4,6 +4,7 @@
 //! Uses regex-based extraction (same approach as `engine/context/extraction.rs`)
 //! stored in SQLite with FTS5 for fast full-text search.
 
+pub mod arch;
 #[cfg(feature = "tree-sitter")]
 mod ast;
 pub mod brain;
@@ -13,6 +14,7 @@ pub mod graph;
 pub mod queries;
 pub mod schema;
 pub mod session;
+pub mod std_names;
 mod symbols;
 pub mod vector;
 
@@ -27,7 +29,7 @@ use tracing::{debug, info};
 
 #[allow(unused_imports)]
 pub use graph::{CallEdge, CalleeResult, CallerResult, ImpactNode};
-pub use symbols::{SearchResult, SymbolKind, SymbolQuery};
+pub use symbols::{SearchOutcome, SearchResult, SymbolKind, SymbolQuery};
 
 /// Open or create the **global** symbol index database.
 ///
@@ -621,6 +623,15 @@ pub fn search(
     query: &SymbolQuery,
 ) -> anyhow::Result<Vec<SearchResult>> {
     symbols::search(conn, project_id, query)
+}
+
+/// Search the symbol index and report the number of matches before `limit`.
+pub fn search_with_total(
+    conn: &Connection,
+    project_id: i64,
+    query: &SymbolQuery,
+) -> anyhow::Result<SearchOutcome> {
+    symbols::search_with_total(conn, project_id, query)
 }
 
 /// Get index statistics for a specific project.
