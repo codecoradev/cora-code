@@ -1159,11 +1159,7 @@ fn is_false_positive_cors(line: &str) -> bool {
 
     // Env var READ patterns (not bare assignments).
     // e.g., env::var("TITEN_CORS_ORIGINS"), getenv("CORS_CONFIG")
-    if lower.contains("env::var(") || lower.contains("getenv(") || lower.contains("os.environ") {
-        return true;
-    }
-
-    false
+    lower.contains("env::var(") || lower.contains("getenv(") || lower.contains("os.environ")
 }
 
 #[cfg(test)]

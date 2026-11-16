@@ -303,7 +303,13 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     conn.execute(
         "UPDATE projects SET embedding_tier = ?3, embedding_dims = ?1, \
          embedding_provider = ?4, last_embedded_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![active, project_id, tier, provider],
+        // rusqlite 0.41 binds only i64; dims and limits are small.
+        rusqlite::params![
+            i64::try_from(active).unwrap_or(i64::MAX),
+            project_id,
+            tier,
+            provider
+        ],
     )?;
 
     tracing::info!(
@@ -519,7 +525,12 @@ fn graph_proximity_search(
 
     let ids: Vec<(i64, f32)> = stmt
         .query_map(
-            rusqlite::params![top_name, project_id, top_id, limit],
+            rusqlite::params![
+                top_name,
+                project_id,
+                top_id,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ],
             |row| row.get(0),
         )
         .ok()

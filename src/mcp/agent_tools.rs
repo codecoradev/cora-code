@@ -1276,7 +1276,11 @@ mod tests {
     #[test]
     fn finalize_agrees_with_prepare_only_for_the_same_filters() {
         let dir = mixed();
-        let sel = json!({ "include": ["crates/**/*.rs"], "order": "path" });
+        // `**/*` keeps docs and data files in the set, so `path` (alphabetical
+        // walk) and the default `source-first` order differ by construction.
+        // With only `crates/**/*.rs` the two could coincide depending on the
+        // filesystem's readdir order, which made this test flaky in CI.
+        let sel = json!({ "include": ["**/*"], "order": "path" });
         let out = prep(&dir, sel.clone());
         let fp = out["files_fingerprint"].as_str().unwrap();
         let path = dir.path().to_str().unwrap();
@@ -1290,7 +1294,7 @@ mod tests {
         assert!(r.is_error);
         assert!(text(&r).contains("changed since"));
         let reordered = json!({ "path": path, "issues": [], "files_fingerprint": fp,
-            "include": ["crates/**/*.rs"] });
+            "include": ["**/*"] });
         assert!(scan_finalize(&reordered).is_error);
     }
 
@@ -1312,5 +1316,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_walk_order_does_not_depend_on_the_filesystem() {
+        let dir = mixed();
+        let out = prep(&dir, json!({ "order": "path" }));
+        let n = names(&out);
+        // Entries are ordered by name inside each directory, depth first.
+        assert_eq!(n[0], "Cargo.toml");
+        assert_eq!(n[1], "README.md");
+        assert_eq!(
+            n.iter()
+                .filter(|p| p.starts_with("crates/"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                "crates/a/src/lib.rs",
+                "crates/a/tests/t.rs",
+                "crates/b/deep/er/x.rs"
+            ]
+        );
+        assert_eq!(out["order"], "path");
     }
 }
