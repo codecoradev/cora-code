@@ -27,13 +27,14 @@ rules: []
 #   - "Ensure all public functions have error handling"
 
 # Ignore patterns
+# Dependencies (node_modules, vendor, ...), build output (dist, build, target, ...),
+# minified files and lockfiles are ignored by default, at any depth.
+# Add your own generated or vendored paths here; `defaults: false` turns the
+# built-ins off.
 ignore:
-  files:
-    - "*.lock"
-    - "package-lock.json"
-    - "yarn.lock"
-    - "vendor/"
-    - "node_modules/"
+  files: []
+#   files:
+#     - "src/generated/**"
   rules: []
 #   rules:
 #     - "style"  # ignore style issues
