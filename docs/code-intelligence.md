@@ -175,6 +175,8 @@ Embedding is cheap: tens of thousands of symbols per second on a few CPU cores, 
 | Vectors | One quantized (vecq) file per project and model in `vectors/`: `<project id>.potion-code-v2.vecq`, keyed by the symbol's database id. Rebuilt from the project's symbols and replaced atomically after every index run that changed them, so it never holds a vector of a symbol that is gone, and deleted with the project |
 | The model | `models/potion-code-16M-v2/` in the data directory |
 
+**Nothing is written inside your project.** The database, the vector files, the model and the scan cache all live in the data directory (`~/.codecora/cora-code/`, or `CODECORA_HOME`), under the project's database id, so `git status` stays clean after `cora index` and there is nothing to add to `.gitignore`. The only files cora puts in a project are the ones you ask for: `.cora.yaml` and the pre-commit hook from `cora init`.
+
 A search embeds the question, scans the current project's vector file for the nearest symbols (no other project's vectors are read), and fuses them with the keyword and graph results by reciprocal rank fusion.
 
 **Why one file per project.** A single shared index let other projects crowd the current one out of the candidates (on 176 projects the vector signal lost 11 to 29% of its MRR and up to a quarter of the queries found no candidate), never freed the vectors of deleted symbols, and had to be read into memory by every process (+148 MB at 127,000 vectors). One vecq file per project matches the exact ceiling at every size measured, is 4.3 times smaller, loads in 0.1 ms and re-indexes in a few milliseconds. A query scans the file: about 0.06 ms for a typical project, 2 ms at 20,000 symbols and 13 ms at 127,000.

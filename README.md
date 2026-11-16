@@ -32,6 +32,7 @@
 - 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33 MB model downloads once on first use, no API key, no GPU
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
+- 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
 - 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
 - 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
@@ -215,7 +216,8 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora profile list` | List quality profiles (strict, balanced, lax) |
 | `cora mcp` | Start MCP server (22 tools) for AI coding agents |
 | `cora serve` | Start MCP server + auto-reindex on startup |
-| `cora install` | Auto-detect and configure AI coding agents |
+| `cora install` | Auto-detect and configure AI coding agents (hooks, MCP, skill) |
+| `cora hook context` | Agent prompt hook: code-search results for a prompt |
 | `cora hook install` | Install pre-commit hook |
 | `cora upgrade` | Self-upgrade from GitHub Releases (checksum-verified) |
 
@@ -223,14 +225,14 @@ See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for al
 
 ## Performance
 
-Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64, single-thread baseline → Rayon parallel).
+Measured on the cora-code repository (1,996 symbols, 179 files, release build, with the real `potion-code-16M-v2` model).
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| Cold index (full rebuild) | **~936ms** | Walk + parse + embed + HNSW insert (Rayon parallel) |
-| Incremental (no changes) | **~6ms** | mtime:size fingerprint — skips unchanged files |
-| Brain search (hybrid) | **~5ms** | FTS5 + vector KNN + graph BFS → RRF fusion |
-| Binary size | **10.4 MB** | Single static binary, zero runtime dependencies |
+| Cold index (full rebuild) | **~0.6 s** | Walk + parse + embed every symbol + write the project's vector file |
+| Incremental (no changes) | **~0.13 s** | mtime:size fingerprint — skips unchanged files |
+| `cora brain` (one CLI run) | **~0.2 s** | Loads the 32 MB model, then FTS5 + vector scan + graph BFS → RRF fusion. A long-running `cora mcp` keeps the model loaded |
+| Binary size | **~36 MB** | Single binary; the embedding model (33.5 MB) is downloaded once on first use, not bundled |
 
 > Measurements are indicative, not contractual. Your numbers will vary with codebase size, CPU cores, and disk I/O.
 
