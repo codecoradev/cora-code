@@ -367,9 +367,36 @@ pub struct ImpactNode {
     pub depth: u32,
 }
 
+/// What the call graph knows about one call site: the type the call went
+/// through and the impl type of the calling method. `(None, None)` when the
+/// row is missing, which makes the edge ambiguous.
+fn call_site_types(
+    conn: &Connection,
+    project_id: i64,
+    edge: &EdgeRow,
+) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT qualifier, caller_type FROM call_graph
+         WHERE caller = ?1 AND callee = ?2 AND file = ?3 AND line = ?4 AND project_id = ?5
+         LIMIT 1",
+        rusqlite::params![
+            edge.source,
+            edge.target,
+            edge.file,
+            edge.line as i64,
+            project_id
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap_or((None, None))
+}
+
+#[allow(dead_code)]
 /// Trace the execution path from a symbol — BFS over call_graph + edges.
 ///
-/// Returns a tree-like structure showing outgoing call chains.
+/// `symbol_name` may be `Type::name`; each hop then carries the type of the
+/// node it reached (the qualifier of a call, the impl type of a calling
+/// method), so same-named methods of other types are not merged (#743).
 pub fn trace_path(
     conn: &Connection,
     project_id: i64,
@@ -377,42 +404,87 @@ pub fn trace_path(
     depth: u32,
     direction: TraceDirection,
 ) -> anyhow::Result<Vec<TraceNode>> {
+    trace_path_opts(conn, project_id, symbol_name, depth, direction, false)
+}
+
+/// `trace_path` with `strict`: leave out ambiguous call edges (receiver or
+/// caller type unknown) once a node has a known type.
+pub fn trace_path_opts(
+    conn: &Connection,
+    project_id: i64,
+    symbol_name: &str,
+    depth: u32,
+    direction: TraceDirection,
+    strict: bool,
+) -> anyhow::Result<Vec<TraceNode>> {
+    let key = |name: &str, ty: Option<&str>| match ty {
+        Some(t) => format!("{t}::{name}"),
+        None => name.to_string(),
+    };
+    let seed = CalleeQuery::parse(symbol_name);
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut result = Vec::new();
-    let mut current_level = vec![(symbol_name.to_string(), 0u32)];
+    let mut current_level: Vec<(String, Option<String>, u32)> =
+        vec![(seed.name.clone(), seed.qualifier.clone(), 0u32)];
 
-    visited.insert(symbol_name.to_string());
+    visited.insert(key(&seed.name, seed.qualifier.as_deref()));
 
     while !current_level.is_empty() {
         let mut next_level = Vec::new();
 
-        for (sym, d) in &current_level {
+        for (sym, ty, d) in &current_level {
             if *d >= depth {
                 continue;
             }
 
+            // A typed node needs a wider scan: same-named methods of other
+            // types fill the cap before the right ones are reached.
+            let limit = if ty.is_some() { 2000 } else { 100 };
             let neighbors = match direction {
-                TraceDirection::Outgoing => find_callees_edges(conn, project_id, sym, 100)?,
-                TraceDirection::Incoming => find_callers_edges(conn, project_id, sym, 100)?,
+                TraceDirection::Outgoing => find_callees_edges(conn, project_id, sym, limit)?,
+                TraceDirection::Incoming => find_callers_edges(conn, project_id, sym, limit)?,
             };
 
             for neighbor in neighbors {
+                // The type the neighbor is reached as; `None` is unknown.
+                let mut next_ty: Option<String> = None;
+                if neighbor.kind == "CALLS" {
+                    let (qualifier, caller_type) = call_site_types(conn, project_id, &neighbor);
+                    let (matches_ty, reached_as) = match direction {
+                        // Calls to `sym` must have gone through `ty`; the
+                        // caller is the node reached, as its impl type.
+                        TraceDirection::Incoming => (qualifier.clone(), caller_type.clone()),
+                        // Calls made by `sym` must come from a method of `ty`;
+                        // the callee is reached through the qualifier.
+                        TraceDirection::Outgoing => (caller_type.clone(), qualifier.clone()),
+                    };
+                    if let Some(want) = ty.as_deref() {
+                        match matches_ty.as_deref() {
+                            Some(have) if have != want => continue,
+                            None if strict => continue,
+                            _ => {}
+                        }
+                    }
+                    next_ty = reached_as;
+                }
+
                 let name = match direction {
                     TraceDirection::Outgoing => neighbor.target,
                     TraceDirection::Incoming => neighbor.source,
                 };
 
-                let is_new = visited.insert(name.clone());
+                let is_new = visited.insert(key(&name, next_ty.as_deref()));
                 let node = TraceNode {
                     symbol: name.clone(),
                     file: neighbor.file,
                     line: neighbor.line,
                     kind: neighbor.kind,
                     depth: d + 1,
+                    qualifier: next_ty.clone(),
                 };
 
                 if is_new {
-                    next_level.push((name.clone(), d + 1));
+                    next_level.push((name.clone(), next_ty, d + 1));
                 }
                 result.push(node);
             }
@@ -440,6 +512,9 @@ pub struct TraceNode {
     pub line: u32,
     pub kind: String,
     pub depth: u32,
+    /// Type the node was reached as, when the call graph knows it (#743).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
 }
 
 /// Find outgoing edges from a symbol (uses edges table, falls back to call_graph).
@@ -1433,6 +1508,19 @@ pub fn remember_with_contradiction(content: &str) -> usize { content.len() }
 pub fn maintenance() -> usize {
     let store = Store;
     store.remember_with_contradiction("note")
+}
+"#,
+            "rs",
+        )
+        .unwrap();
+
+        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
+        assert!(
+            !dead.iter().any(|d| d.name == "remember_with_contradiction"),
+            "cross-crate method call must prevent false-positive dead code, got: {:?}",
+            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+    }
 
     fn call(caller: &str, callee: &str, file: &str) -> CallEdge {
         CallEdge {
@@ -1469,7 +1557,10 @@ pub fn maintenance() -> usize {
             n.sort();
             n
         };
-        assert_eq!(names(find_callers(&conn, pid, "from_env", 50).unwrap()).len(), 3);
+        assert_eq!(
+            names(find_callers(&conn, pid, "from_env", 50).unwrap()).len(),
+            3
+        );
         assert_eq!(
             names(find_callers(&conn, pid, "WebSearchTool::from_env", 50).unwrap()),
             ["roster_a", "untyped"]
@@ -1485,9 +1576,25 @@ pub fn maintenance() -> usize {
     fn test_find_callers_of_a_type_name() {
         let conn = mem_conn();
         let pid = test_project(&conn);
-        typed_call(&conn, pid, "roster", "from_env", Some("WebFetchTool"));
-        typed_call(&conn, pid, "roster", "default", Some("WebFetchTool"));
-        typed_call(&conn, pid, "elsewhere", "default", Some("Other"));
+        typed_edge(
+            &conn,
+            pid,
+            "roster",
+            None,
+            "from_env",
+            Some("WebFetchTool"),
+            1,
+        );
+        typed_edge(
+            &conn,
+            pid,
+            "roster",
+            None,
+            "default",
+            Some("WebFetchTool"),
+            2,
+        );
+        typed_edge(&conn, pid, "elsewhere", None, "default", Some("Other"), 3);
 
         let callers = find_callers(&conn, pid, "WebFetchTool", 50).unwrap();
         assert_eq!(callers.len(), 2);
@@ -1510,10 +1617,89 @@ pub fn maintenance() -> usize {
         assert_eq!(syms, ["a_user", "top_a"]);
     }
 
+    fn typed_edge(
+        conn: &Connection,
+        pid: i64,
+        caller: &str,
+        caller_type: Option<&str>,
+        callee: &str,
+        qualifier: Option<&str>,
+        line: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, qualifier, caller_type) \
+             VALUES (?1, ?2, 'a.rs', ?3, ?4, ?5, ?6)",
+            rusqlite::params![caller, callee, line, pid, qualifier, caller_type],
+        )
+        .unwrap();
+    }
+
+    /// #743: tracing callers of `A::from_env` follows only calls through `A`,
+    /// and each hop continues from the caller's own type.
+    #[test]
+    fn test_trace_incoming_follows_typed_nodes() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        typed_edge(&conn, pid, "run", Some("RosterA"), "from_env", Some("A"), 1);
+        typed_edge(&conn, pid, "run", Some("RosterB"), "from_env", Some("B"), 2);
+        typed_edge(&conn, pid, "top_a", None, "run", Some("RosterA"), 3);
+        typed_edge(&conn, pid, "top_b", None, "run", Some("RosterB"), 4);
+
+        let nodes = trace_path(&conn, pid, "A::from_env", 3, TraceDirection::Incoming).unwrap();
+        let lines: Vec<u32> = nodes.iter().map(|n| n.line).collect();
+        assert_eq!(lines, [1, 3], "only the A chain: {nodes:?}");
+
+        // The bare name still merges every type, as before.
+        let all = trace_path(&conn, pid, "from_env", 1, TraceDirection::Incoming).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    /// #743: tracing callees of `RosterA::run` ignores another type's `run`.
+    #[test]
+    fn test_trace_outgoing_follows_typed_nodes() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        typed_edge(&conn, pid, "run", Some("RosterA"), "build", Some("A"), 1);
+        typed_edge(&conn, pid, "run", Some("RosterB"), "build", Some("B"), 2);
+        typed_edge(&conn, pid, "build", Some("A"), "leaf_a", None, 3);
+        typed_edge(&conn, pid, "build", Some("B"), "leaf_b", None, 4);
+
+        let nodes = trace_path(&conn, pid, "RosterA::run", 3, TraceDirection::Outgoing).unwrap();
+        let lines: Vec<u32> = nodes.iter().map(|n| n.line).collect();
+        assert_eq!(lines, [1, 3], "only RosterA's chain: {nodes:?}");
+    }
+
+    /// #743: `--strict` drops calls whose type is unknown for a typed node.
+    #[test]
+    fn test_trace_strict_drops_ambiguous_edges() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        typed_edge(&conn, pid, "known", None, "from_env", Some("A"), 1);
+        typed_edge(&conn, pid, "untyped", None, "from_env", None, 2);
+
+        let loose = trace_path_opts(
+            &conn,
+            pid,
+            "A::from_env",
+            1,
+            TraceDirection::Incoming,
+            false,
+        )
+        .unwrap();
+        let strict =
+            trace_path_opts(&conn, pid, "A::from_env", 1, TraceDirection::Incoming, true).unwrap();
+        assert_eq!(loose.len(), 2);
+        assert_eq!(strict.len(), 1);
+        assert_eq!(strict[0].symbol, "known");
+    }
+
     #[test]
     fn test_callee_query_parse() {
         let q = CalleeQuery::parse("crate::web::WebTool<T>::run");
-        assert_eq!((q.name.as_str(), q.qualifier.as_deref()), ("run", Some("WebTool")));
+        assert_eq!(
+            (q.name.as_str(), q.qualifier.as_deref()),
+            ("run", Some("WebTool"))
+        );
         let q = CalleeQuery::parse("run");
         assert_eq!((q.name.as_str(), q.qualifier), ("run", None));
     }
@@ -1524,13 +1710,13 @@ pub fn maintenance() -> usize {
         let pid = test_project(&conn);
         store_edges(
             &conn,
-            pid,
             &[
                 call("a", "run", "a.rs"),
                 call("b", "rerun", "b.rs"),
                 call("c", "get_users", "c.rs"),
                 call("d", "getXusers", "d.rs"),
             ],
+            pid,
         )
         .unwrap();
 
@@ -1545,10 +1731,12 @@ pub fn maintenance() -> usize {
 
         // `%` must not match everything.
         assert!(find_callers(&conn, pid, "%", 100).unwrap().is_empty());
-        assert!(find_callers_cross_project(&conn, "run", 100)
-            .unwrap()
-            .iter()
-            .all(|r| r.caller == "a"));
+        assert!(
+            find_callers_cross_project(&conn, "run", 100)
+                .unwrap()
+                .iter()
+                .all(|r| r.caller == "a")
+        );
     }
 
     /// Exact matching must not break transitive traversal.
@@ -1558,12 +1746,12 @@ pub fn maintenance() -> usize {
         let pid = test_project(&conn);
         store_edges(
             &conn,
-            pid,
             &[
                 call("mid", "run", "m.rs"),
                 call("top", "mid", "t.rs"),
                 call("other", "rerun", "o.rs"),
             ],
+            pid,
         )
         .unwrap();
 
@@ -1574,19 +1762,6 @@ pub fn maintenance() -> usize {
         let trace = trace_path(&conn, pid, "run", 3, TraceDirection::Incoming).unwrap();
         let names: Vec<&str> = trace.iter().map(|n| n.symbol.as_str()).collect();
         assert_eq!(names, vec!["mid", "top"]);
-    }
-}
-"#,
-            "rs",
-        )
-        .unwrap();
-
-        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
-        assert!(
-            !dead.iter().any(|d| d.name == "remember_with_contradiction"),
-            "cross-crate method call must prevent false-positive dead code, got: {:?}",
-            dead.iter().map(|d| &d.name).collect::<Vec<_>>()
-        );
     }
 
     /// Regression (#520): public API surface is skipped by default — missing

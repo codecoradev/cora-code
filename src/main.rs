@@ -176,7 +176,7 @@ enum Command {
 
     /// Trace execution paths through the codebase
     Trace {
-        /// Symbol name to start tracing from
+        /// Symbol to start tracing from: `name` or `Type::name`
         symbol: String,
 
         /// Trace direction: outgoing (callees) or incoming (callers)
@@ -186,6 +186,11 @@ enum Command {
         /// Traversal depth (max hops)
         #[clap(long, default_value = "3")]
         depth: u32,
+
+        /// Leave out ambiguous calls (receiver or caller type unknown) once a
+        /// node has a known type
+        #[clap(long)]
+        strict: bool,
 
         /// Output as JSON
         #[clap(long)]
@@ -1027,6 +1032,7 @@ async fn main() -> Result<()> {
             symbol,
             direction,
             depth,
+            strict,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
@@ -1036,7 +1042,8 @@ async fn main() -> Result<()> {
                 _ => index::graph::TraceDirection::Outgoing,
             };
 
-            let nodes = index::graph::trace_path(&conn, project_id, &symbol, depth, dir)?;
+            let nodes =
+                index::graph::trace_path_opts(&conn, project_id, &symbol, depth, dir, strict)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&nodes)?);
