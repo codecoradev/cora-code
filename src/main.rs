@@ -1123,7 +1123,27 @@ async fn main() -> Result<()> {
             index::session::configure_for_search(index::session::ConfigSource::Full(
                 cli.global.config.as_deref(),
             ));
-            let results = index::brain::brain_search(&conn, project_id, &query_str, limit)?;
+            let report =
+                index::brain::brain_search_report(&conn, project_id, &query_str, limit, true)?;
+            let diag = &report.diagnostics;
+            let results = report.results;
+
+            // Which signals answered, and which cannot be trusted, always go to
+            // stderr so `--json` output stays a plain array.
+            eprintln!(
+                "{}",
+                format!(
+                    "signals: keyword={} vector={} graph={} (terms: {})",
+                    diag.fts_hits,
+                    diag.vector_hits,
+                    diag.graph_hits,
+                    diag.terms.join(", ")
+                )
+                .dimmed()
+            );
+            for w in diag.warnings() {
+                eprintln!("{} {}", "warning:".yellow(), w);
+            }
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&results)?);
