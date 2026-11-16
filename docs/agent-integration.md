@@ -32,7 +32,7 @@ Everything is written under your home directory, never inside a project.
 
 ## Skills stay in step with cora
 
-The skills (`cora-code`, and `cora-review` for Claude Code) ship inside the binary and carry a marker with the cora version that wrote them. After an upgrade, `cora install` refreshes the copies cora wrote; a skill you edited is kept (use `--force` to replace it). The build fails if a skill names an MCP tool, command or flag that cora does not have.
+The skills (`cora-code`, and `cora-review` for Claude Code) follow the Agent Skills layout: a short `SKILL.md` plus `references/` files the agent loads only when needed (`ignore.md`, `tools.md`, `scan.md`, `ci.md`). They teach the agent to set up ignores before the first review or scan, to review the whole branch with cora before opening a pull request, and to suggest `cora review` in CI. They ship inside the binary and carry a marker with the cora version that wrote them. After an upgrade, `cora install` refreshes the copies cora wrote; a skill you edited is kept (use `--force` to replace it). The build fails if a skill names an MCP tool, command or flag that cora does not have.
 
 ## Things to know
 

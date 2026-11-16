@@ -247,9 +247,6 @@ fn install_agent(agent: &AgentInfo, opts: &InstallOptions) -> Result<String> {
     }
 }
 
-/// The `/cora-review` skill for Claude Code (agent-as-reviewer, #647).
-const CLAUDE_SKILL: &str = include_str!("cora_review_skill.md");
-
 /// `~/.claude/skills/cora-review/SKILL.md`, when Claude Code is installed
 /// (`~/.claude` exists).
 fn claude_skill_path() -> Option<PathBuf> {
@@ -270,40 +267,62 @@ fn install_claude_skill(opts: &InstallOptions) -> Option<Result<String>> {
 fn install_skill_at(path: &std::path::Path, opts: &InstallOptions) -> Result<String> {
     use crate::commands::agents::skills::{self, Outcome};
     let name = "claude-code skill /cora-review";
-    let shown = path.display();
+    let dir = path.parent().context("skill path has no directory")?;
+    let shown = dir.display();
     let line = |mark: String, what: &str| format!("{} {} {shown} — {what}", name.bold(), mark);
-    let legacy = skills::LEGACY_REVIEW_SKILLS;
-    let outcome = if opts.remove {
-        skills::remove(path, CLAUDE_SKILL, legacy, opts.dry_run, opts.force)?
+    let results = if opts.remove {
+        skills::remove_dir(dir, &skills::REVIEW, opts.dry_run, opts.force)
     } else {
-        skills::install(path, CLAUDE_SKILL, legacy, opts.dry_run, opts.force)?
+        skills::install_dir(dir, &skills::REVIEW, opts.dry_run, opts.force)
     };
-    Ok(match outcome {
-        Outcome::NotPresent => format!("{} {} — no skill found", name.bold(), "⏭ ".dimmed()),
-        Outcome::UpToDate => line("⏭ ".dimmed().to_string(), "up to date"),
-        Outcome::KeptCustomized if opts.remove => line(
-            "⏭ ".dimmed().to_string(),
-            "customized, kept (use --force to remove)",
-        ),
-        Outcome::KeptCustomized => line(
-            "⏭ ".dimmed().to_string(),
-            "exists and differs (you edited it; use --force to overwrite)",
-        ),
-        Outcome::Installed => line("✓ ".green().to_string(), "installed"),
-        Outcome::Updated(Some(v)) => line(
-            "✓ ".green().to_string(),
-            &format!("updated (was written by cora {v})"),
-        ),
-        Outcome::Updated(None) => line("✓ ".green().to_string(), "updated"),
-        Outcome::Removed => line("✓ ".green().to_string(), "removed"),
-        Outcome::Would(inner) => line(
+    let (mut installed, mut updated, mut removed, mut kept, mut same, mut would, mut absent) =
+        (0, 0, 0, 0, 0, 0, 0);
+    for (file, result) in results {
+        match result.with_context(|| format!("failed on {}", file.display()))? {
+            Outcome::Installed => installed += 1,
+            Outcome::Updated(_) => updated += 1,
+            Outcome::Removed => removed += 1,
+            Outcome::KeptCustomized => kept += 1,
+            Outcome::UpToDate => same += 1,
+            Outcome::Would(_) => would += 1,
+            Outcome::NotPresent => absent += 1,
+        }
+    }
+    let note = if kept > 0 {
+        format!(
+            "; {kept} file(s) you edited kept (use --force to {})",
+            if opts.remove { "remove" } else { "overwrite" }
+        )
+    } else {
+        String::new()
+    };
+    Ok(if would > 0 {
+        line(
             "🔍 ".cyan().to_string(),
-            match *inner {
-                Outcome::Removed => "would remove",
-                Outcome::Updated(_) => "would update",
-                _ => "would write",
-            },
-        ),
+            &format!(
+                "would {}{note}",
+                if opts.remove {
+                    "remove"
+                } else {
+                    "write or update"
+                }
+            ),
+        )
+    } else if installed > 0 && updated == 0 && same == 0 && kept == 0 {
+        line("✓ ".green().to_string(), "installed")
+    } else if installed + updated > 0 {
+        line(
+            "✓ ".green().to_string(),
+            &format!("updated ({} file(s) written){note}", installed + updated),
+        )
+    } else if removed > 0 {
+        line("✓ ".green().to_string(), &format!("removed{note}"))
+    } else if kept > 0 {
+        line("⏭ ".dimmed().to_string(), &format!("kept{note}"))
+    } else if absent > 0 && same == 0 {
+        format!("{} {} — no skill found", name.bold(), "⏭ ".dimmed())
+    } else {
+        line("⏭ ".dimmed().to_string(), "up to date")
     })
 }
 
@@ -468,7 +487,9 @@ mod tests {
         assert!(msg.contains("installed"));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            crate::commands::agents::skills::render(CLAUDE_SKILL)
+            crate::commands::agents::skills::render(
+                crate::commands::agents::skills::REVIEW.files[0].text
+            )
         );
         assert!(
             install_skill_at(&path, &opts())
@@ -486,7 +507,7 @@ mod tests {
         assert!(
             install_skill_at(&path, &opts())
                 .unwrap()
-                .contains("differs")
+                .contains("you edited")
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "my own version");
         let force = InstallOptions {
@@ -496,7 +517,9 @@ mod tests {
         install_skill_at(&path, &force).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            crate::commands::agents::skills::render(CLAUDE_SKILL)
+            crate::commands::agents::skills::render(
+                crate::commands::agents::skills::REVIEW.files[0].text
+            )
         );
     }
 
@@ -546,10 +569,23 @@ mod tests {
             "cora.scan_prepare",
             "cora.scan_finalize",
         ] {
-            assert!(CLAUDE_SKILL.contains(tool), "skill must mention {tool}");
+            assert!(
+                crate::commands::agents::skills::REVIEW.files[0]
+                    .text
+                    .contains(tool),
+                "skill must mention {tool}"
+            );
         }
-        assert!(CLAUDE_SKILL.starts_with("---\nname: cora-review\n"));
-        assert!(CLAUDE_SKILL.contains("untrusted"));
+        assert!(
+            crate::commands::agents::skills::REVIEW.files[0]
+                .text
+                .starts_with("---\nname: cora-review\n")
+        );
+        assert!(
+            crate::commands::agents::skills::REVIEW.files[0]
+                .text
+                .contains("untrusted")
+        );
     }
 
     #[test]
@@ -565,7 +601,7 @@ mod tests {
         assert!(
             install_skill_at(&path, &remove)
                 .unwrap()
-                .contains("customized")
+                .contains("you edited")
         );
         assert!(path.exists());
         let force = InstallOptions {
