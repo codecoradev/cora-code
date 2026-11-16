@@ -1,20 +1,21 @@
 //! Debt Tracker — aggregates review findings across runs and tracks quality trends.
 //!
-//! Stores lightweight JSON snapshots in `.cora/history/` after each review.
-//! Provides aggregation and trend analysis across multiple reviews.
+//! Review history lives in `cora.db` (the `reviews` table); [`load_snapshots_from_db`]
+//! turns its rows into [`DebtSnapshot`]s. This module aggregates them and tracks
+//! quality trends across reviews. The old `.cora/history/*.json` files are no
+//! longer written or read (#724).
 
+#[cfg(test)]
 use crate::engine::quality_gate::GateResult;
 use crate::engine::review_store::ReviewRow;
+#[cfg(test)]
 use crate::engine::types::{ReviewIssue, Severity};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use tracing::{debug, warn};
 
 // ─── Default config values ───
 
-const DEFAULT_HISTORY_DIR: &str = ".cora/history";
 const DEFAULT_RETENTION_DAYS: u64 = 90;
 
 // ─── Category mapping ───
@@ -34,6 +35,7 @@ fn normalize_category(raw: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 /// Build category → count map from a list of issues.
 fn count_by_category(issues: &[ReviewIssue]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
@@ -48,6 +50,7 @@ fn count_by_category(issues: &[ReviewIssue]) -> HashMap<String, usize> {
     counts
 }
 
+#[cfg(test)]
 /// Build severity → count map from a list of issues.
 fn count_by_severity(issues: &[ReviewIssue]) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
@@ -60,7 +63,7 @@ fn count_by_severity(issues: &[ReviewIssue]) -> HashMap<String, usize> {
 
 // ─── DebtSnapshot — one file per review run ───
 
-/// A single review snapshot stored in `.cora/history/`.
+/// One review of a project, as aggregated by [`aggregate`] (built from `cora.db` rows).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebtSnapshot {
     /// ISO-8601 timestamp of the review.
@@ -86,10 +89,12 @@ pub struct DebtSnapshot {
 }
 
 impl DebtSnapshot {
-    /// Build a snapshot from review results.
+    /// Build a snapshot from review results (test helper; production snapshots
+    /// come from `cora.db` rows via [`snapshots_from_rows`]).
     ///
     /// `files_reviewed` and `lines_reviewed` are best-effort (may be 0/None).
     /// `duration_ms` is the wall-clock time for the review call.
+    #[cfg(test)]
     pub fn from_review(
         issues: &[ReviewIssue],
         gate_result: Option<&GateResult>,
@@ -121,6 +126,7 @@ impl DebtSnapshot {
     }
 }
 
+#[cfg(test)]
 /// Calculate a quality score from 0-10 based on issue severities.
 ///
 /// 10 = no issues. Each finding reduces the score:
@@ -145,7 +151,6 @@ fn calculate_quality_score(issues: &[ReviewIssue]) -> f64 {
 // ─── DebtReport — aggregated across snapshots ───
 
 /// Aggregated debt report from multiple snapshots.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebtReport {
     /// Number of reviews analyzed.
@@ -171,7 +176,6 @@ pub struct DebtReport {
 }
 
 /// Per-category report with trend indicator.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CategoryReport {
     /// Category name.
@@ -188,7 +192,6 @@ pub struct CategoryReport {
 
 /// Trend direction based on change value.
 /// Trend direction based on change value.
-#[allow(dead_code)]
 fn trend_from_change(change: i64) -> &'static str {
     if change < -1 {
         "improving"
@@ -197,154 +200,6 @@ fn trend_from_change(change: i64) -> &'static str {
     } else {
         "stable"
     }
-}
-
-// ─── File I/O ───
-
-/// Generate a filename for a snapshot using a content-based hash for uniqueness.
-/// Format: `YYYY-MM-DD_{short_hash}_{content_hash}.json`
-fn snapshot_filename(snapshot: &DebtSnapshot) -> String {
-    let date = snapshot.timestamp.format("%Y-%m-%d");
-    let hash = snapshot.commit.as_deref().unwrap_or("unknown");
-    // Take first 7 chars of commit hash
-    let short_hash = if hash.len() > 7 { &hash[..7] } else { hash };
-    // Content-based uniqueness: hash the findings + categories + timestamp
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    snapshot.timestamp.hash(&mut hasher);
-    {
-        let mut findings_sorted: Vec<_> = snapshot.findings.iter().collect();
-        findings_sorted.sort_by_key(|(k, _)| *k);
-        for (k, v) in findings_sorted {
-            k.hash(&mut hasher);
-            v.hash(&mut hasher);
-        }
-        let mut categories_sorted: Vec<_> = snapshot.categories.iter().collect();
-        categories_sorted.sort_by_key(|(k, _)| *k);
-        for (k, v) in categories_sorted {
-            k.hash(&mut hasher);
-            v.hash(&mut hasher);
-        }
-    }
-    let content_hash = format!("{:08x}", hasher.finish());
-    format!("{date}_{short_hash}_{content_hash}.json")
-}
-
-/// Resolve the history directory path.
-/// Checks for `.cora/history` relative to CWD.
-fn history_dir(custom_dir: Option<&str>) -> PathBuf {
-    if let Some(dir) = custom_dir {
-        PathBuf::from(dir)
-    } else {
-        PathBuf::from(DEFAULT_HISTORY_DIR)
-    }
-}
-
-/// Save a snapshot to the history directory.
-///
-/// Creates the directory if it doesn't exist. Best-effort — errors are logged
-/// but don't fail the review.
-pub fn save_snapshot(snapshot: &DebtSnapshot, custom_dir: Option<&str>) {
-    let dir = history_dir(custom_dir);
-
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!("failed to create history directory {}: {e}", dir.display());
-        return;
-    }
-
-    let filename = snapshot_filename(snapshot);
-    let path = dir.join(&filename);
-
-    match serde_json::to_string_pretty(snapshot) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                warn!("failed to write snapshot {}: {e}", path.display());
-            } else {
-                debug!("saved debt snapshot: {}", path.display());
-            }
-        }
-        Err(e) => {
-            warn!("failed to serialize snapshot: {e}");
-        }
-    }
-}
-
-/// Load all snapshots from the history directory.
-///
-/// Returns snapshots sorted by timestamp (oldest first).
-/// Malformed files are skipped with a warning.
-/// Load all snapshots from the history directory.
-///
-/// Returns snapshots sorted by timestamp (oldest first).
-/// Malformed files are skipped with a warning.
-#[allow(dead_code)]
-pub fn load_snapshots(custom_dir: Option<&str>) -> Vec<DebtSnapshot> {
-    let dir = history_dir(custom_dir);
-
-    if !dir.is_dir() {
-        return Vec::new();
-    }
-
-    let mut snapshots = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str::<DebtSnapshot>(&content) {
-                        Ok(snapshot) => snapshots.push(snapshot),
-                        Err(e) => {
-                            warn!("skipping malformed snapshot {}: {e}", path.display());
-                        }
-                    },
-                    Err(e) => {
-                        warn!("failed to read snapshot {}: {e}", path.display());
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort oldest first
-    snapshots.sort_by_key(|s| s.timestamp);
-    snapshots
-}
-
-/// Clean up snapshots older than `retention_days`.
-///
-/// Returns the number of files removed.
-/// Clean up snapshots older than `retention_days`.
-///
-/// Returns the number of files removed.
-#[allow(dead_code)]
-pub fn cleanup_old_snapshots(custom_dir: Option<&str>, retention_days: u64) -> usize {
-    let dir = history_dir(custom_dir);
-
-    if !dir.is_dir() {
-        return 0;
-    }
-
-    let cutoff = Utc::now() - chrono::Duration::days(retention_days as i64);
-    let mut removed = 0;
-
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(snapshot) = serde_json::from_str::<DebtSnapshot>(&content) {
-                        if snapshot.timestamp < cutoff && std::fs::remove_file(&path).is_ok() {
-                            removed += 1;
-                            debug!("removed old snapshot: {}", path.display());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    removed
 }
 
 // ─── Aggregation ───
@@ -357,7 +212,6 @@ pub fn cleanup_old_snapshots(custom_dir: Option<&str>, retention_days: u64) -> u
 ///
 /// If there are enough snapshots, splits into "recent" and "previous" halves
 /// to calculate trends. Otherwise, reports totals with "stable" trends.
-#[allow(dead_code)]
 pub fn aggregate(snapshots: &[DebtSnapshot]) -> DebtReport {
     if snapshots.is_empty() {
         return DebtReport {
@@ -551,7 +405,8 @@ pub struct DebtConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Directory to store history snapshots (default: `.cora/history`).
+    /// Deprecated and ignored: history is stored in `cora.db`, not in files
+    /// (#724). Still accepted so existing `.cora.yaml` files keep loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_dir: Option<String>,
 
@@ -578,20 +433,6 @@ fn default_retention_days() -> u64 {
     DEFAULT_RETENTION_DAYS
 }
 
-impl DebtConfig {
-    /// Get the effective history directory.
-    #[allow(dead_code)]
-    pub fn history_dir(&self) -> &str {
-        self.history_dir.as_deref().unwrap_or(DEFAULT_HISTORY_DIR)
-    }
-
-    /// Get the effective retention days.
-    #[allow(dead_code)]
-    pub fn retention_days(&self) -> u64 {
-        self.retention_days
-    }
-}
-
 // ─── Debt estimation ───
 
 /// Estimated fix time in hours per severity level.
@@ -601,7 +442,6 @@ const DEBT_HOURS_MINOR: f64 = 0.25;
 const DEBT_HOURS_INFO: f64 = 0.1;
 
 /// Estimate total fix time from severity counts.
-#[allow(dead_code)]
 pub fn estimate_debt_hours(findings: &HashMap<String, usize>) -> f64 {
     let critical = findings.get("critical").copied().unwrap_or(0) as f64;
     let major = findings.get("major").copied().unwrap_or(0) as f64;
@@ -615,7 +455,6 @@ pub fn estimate_debt_hours(findings: &HashMap<String, usize>) -> f64 {
 }
 
 /// Format debt hours as human-readable string.
-#[allow(dead_code)]
 pub fn format_debt_hours(hours: f64) -> String {
     if hours < 1.0 {
         format!("~{:.0}min", hours * 60.0)
@@ -644,8 +483,6 @@ pub struct BadgeData {
     /// Badge color: green/yellow/red.
     pub color: String,
 }
-
-#[allow(dead_code)]
 pub fn generate_badge(report: &DebtReport) -> BadgeData {
     let score = report.quality_score_avg;
     let trend_arrow = match report.trend.as_str() {
@@ -670,7 +507,6 @@ pub fn generate_badge(report: &DebtReport) -> BadgeData {
 }
 
 /// Generate a badge that includes debt estimation.
-#[allow(dead_code)]
 pub fn generate_badge_with_debt(report: &DebtReport) -> BadgeData {
     let score = report.quality_score_avg;
     let hours = estimate_debt_hours(&report.findings);
@@ -970,61 +806,6 @@ mod tests {
         assert_eq!(back.gate_status, snap.gate_status);
     }
 
-    // ─── snapshot_filename ───
-
-    #[test]
-    fn snapshot_filename_format() {
-        let snap = DebtSnapshot::from_review(
-            &[],
-            None,
-            Some("abcdef1234567890".to_string()),
-            None,
-            0,
-            None,
-            None,
-        );
-        let name = snapshot_filename(&snap);
-        // Should be like: 2026-06-10_123456_abcdef1_000000000.json
-        assert!(name.starts_with("2026"));
-        assert!(name.contains("_abcdef1"));
-        assert!(name.ends_with(".json"));
-        // Should have 3 underscore-separated segments before .json
-        let stem = name.trim_end_matches(".json");
-        let parts: Vec<&str> = stem.split('_').collect();
-        assert!(
-            parts.len() >= 3,
-            "expected at least 3 parts, got: {parts:?}"
-        );
-    }
-
-    #[test]
-    fn snapshot_filename_no_commit() {
-        let snap = DebtSnapshot::from_review(&[], None, None, None, 0, None, None);
-        let name = snapshot_filename(&snap);
-        assert!(name.contains("unknown"));
-    }
-
-    // ─── trend_from_change ───
-
-    #[test]
-    fn trend_improving() {
-        assert_eq!(trend_from_change(-5), "improving");
-        assert_eq!(trend_from_change(-2), "improving");
-    }
-
-    #[test]
-    fn trend_stable() {
-        assert_eq!(trend_from_change(0), "stable");
-        assert_eq!(trend_from_change(1), "stable");
-        assert_eq!(trend_from_change(-1), "stable");
-    }
-
-    #[test]
-    fn trend_worsening() {
-        assert_eq!(trend_from_change(2), "worsening");
-        assert_eq!(trend_from_change(10), "worsening");
-    }
-
     // ─── aggregate ───
 
     #[test]
@@ -1123,97 +904,10 @@ mod tests {
     }
 
     #[test]
-    fn debt_config_history_dir_default() {
-        let config = DebtConfig::default();
-        assert_eq!(config.history_dir(), ".cora/history");
-    }
-
-    #[test]
-    fn debt_config_custom_history_dir() {
-        let config = DebtConfig {
-            history_dir: Some("custom/dir".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(config.history_dir(), "custom/dir");
-    }
-
-    // ─── save/load roundtrip ───
-
-    #[test]
-    fn save_and_load_snapshots() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let dir_str = tmp_dir.path().to_string_lossy().to_string();
-
-        let snap1 = DebtSnapshot::from_review(
-            &[make_issue(Severity::Critical, "security")],
-            None,
-            Some("aaa1111".to_string()),
-            Some("main".to_string()),
-            2,
-            Some(100),
-            Some(500),
-        );
-
-        let snap2 = DebtSnapshot::from_review(
-            &[make_issue(Severity::Minor, "style")],
-            None,
-            Some("bbb2222".to_string()),
-            Some("develop".to_string()),
-            1,
-            None,
-            Some(300),
-        );
-
-        save_snapshot(&snap1, Some(&dir_str));
-        save_snapshot(&snap2, Some(&dir_str));
-
-        let loaded = load_snapshots(Some(&dir_str));
-        assert_eq!(loaded.len(), 2);
-        // Should be sorted by timestamp
-        assert!(loaded[0].timestamp <= loaded[1].timestamp);
-    }
-
-    // ─── cleanup ───
-
-    #[test]
-    fn cleanup_removes_old_snapshots() {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let dir_str = tmp_dir.path().to_string_lossy().to_string();
-
-        // Create an old snapshot
-        let mut old_snap = DebtSnapshot::from_review(
-            &[make_issue(Severity::Critical, "security")],
-            None,
-            Some("old1111".to_string()),
-            None,
-            1,
-            None,
-            None,
-        );
-        old_snap.timestamp = Utc::now() - chrono::Duration::days(100);
-
-        // Create a recent snapshot
-        let recent_snap = DebtSnapshot::from_review(
-            &[make_issue(Severity::Minor, "style")],
-            None,
-            Some("new2222".to_string()),
-            None,
-            1,
-            None,
-            None,
-        );
-
-        save_snapshot(&old_snap, Some(&dir_str));
-        save_snapshot(&recent_snap, Some(&dir_str));
-
-        // Cleanup with 90-day retention
-        let removed = cleanup_old_snapshots(Some(&dir_str), 90);
-        assert_eq!(removed, 1);
-
-        // Only the recent one should remain
-        let remaining = load_snapshots(Some(&dir_str));
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].commit.as_deref(), Some("new2222"));
+    fn debt_config_still_accepts_the_deprecated_history_dir() {
+        // `history_dir` no longer does anything (#724) but must keep parsing.
+        let config: DebtConfig = serde_yaml_ng::from_str("history_dir: custom/dir\n").unwrap();
+        assert_eq!(config.history_dir.as_deref(), Some("custom/dir"));
     }
 
     // ─── estimate_debt_hours ───

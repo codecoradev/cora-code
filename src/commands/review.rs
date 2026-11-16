@@ -334,7 +334,6 @@ pub async fn execute_review(
     if let Some(gate) = &shaped.gate {
         output.push_str(&quality_gate::format_gate_output(gate));
     }
-    finalize::save_debt(config, &filtered_response.issues, shaped.gate.as_ref(), 0);
     finalize::save_history(
         &HistoryEntry {
             command: review_command(opts),
@@ -721,12 +720,6 @@ async fn execute_chunked_review(
     if let Some(gate) = &shaped.gate {
         output.push_str(&quality_gate::format_gate_output(gate));
     }
-    finalize::save_debt(
-        config,
-        &filtered_response.issues,
-        shaped.gate.as_ref(),
-        files_total,
-    );
     finalize::save_history(
         &HistoryEntry {
             command: review_command(opts),
