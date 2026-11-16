@@ -27,6 +27,7 @@ export default createConfig({
           { text: 'Usage', link: '/usage' },
           { text: 'Configuration', link: '/configuration' },
           { text: 'Code Intelligence', link: '/code-intelligence' },
+          { text: 'AI Agent Integration', link: '/agent-integration' },
           { text: 'Providers', link: '/providers' },
           { text: 'CLI Reference', link: '/cli-reference' },
           { text: 'Examples', link: '/examples' },

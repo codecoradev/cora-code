@@ -32,6 +32,7 @@
 - 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33 MB model downloads once on first use, no API key, no GPU
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
+- 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
 - 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
 - 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
@@ -215,7 +216,8 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora profile list` | List quality profiles (strict, balanced, lax) |
 | `cora mcp` | Start MCP server (22 tools) for AI coding agents |
 | `cora serve` | Start MCP server + auto-reindex on startup |
-| `cora install` | Auto-detect and configure AI coding agents |
+| `cora install` | Auto-detect and configure AI coding agents (hooks, MCP, skill) |
+| `cora hook context` | Agent prompt hook: code-search results for a prompt |
 | `cora hook install` | Install pre-commit hook |
 | `cora upgrade` | Self-upgrade from GitHub Releases (checksum-verified) |
 

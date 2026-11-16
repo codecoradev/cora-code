@@ -186,7 +186,7 @@ Cora is a single crate with modular source layout:
 | `src/commands/` | CLI subcommands (review, scan, index, config, etc.) |
 | `src/engine/` | Review + scan pipeline, LLM abstraction, types |
 | `src/index/` | Symbol indexing, FTS5, code graph, schema migration |
-| `src/embed/` | ONNX embedding (nomic-embed-code, vendored) |
+| `src/embed/` | Code embedding model (potion-code-16M-v2, downloaded once) |
 | `src/config/` | YAML config resolution chain + merge logic |
 | `src/mcp/` | MCP server — tool registration + handlers |
 | `src/formatters/` | Output formatting (pretty, json, compact, sarif) |
@@ -232,7 +232,7 @@ src/
 
 - **SQLite-first indexing** — Symbol data, FTS5, and code graph all live in a single `cora.db` per project
 - **Tree-sitter for parsing** — Language-agnostic AST extraction for symbol indexing
-- **Vendored nomic-embed-code** — No external embedding API dependency; ONNX runtime bundled
+- **Local code embedding model** — `potion-code-16M-v2` is downloaded once (pinned, SHA-256-verified) and runs locally; no embedding API. Without it the vector signal is off and search uses keywords and the call graph
 - **Schema versioning** — Integer counter; auto-migration on upgrade (current: v6)
 - **Config merge chain** — Global → project `.cora.yaml` → CLI flags, with profile overlay
 - **Pre-commit hook** — Cora runs as a git pre-commit hook reviewing staged diff via LLM

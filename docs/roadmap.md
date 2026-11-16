@@ -170,7 +170,7 @@ Fixes for FTS5 search and dead-code false positives.
 
 Runtime embedding backend selection — no recompilation needed to switch.
 
-- `brain.embedding` config (`auto` | `hashing` | `pretrained`) in `.cora.yaml` — ✓ Done
+- `brain.embedding` config in `.cora.yaml` — ✓ Done (now `auto` | `off`; hashing and pretrained were removed in #751)
 - `Backend` enum + `resolve_backend()` with `OnceLock` caching — ✓ Done
 - Incremental per-symbol embedding via `embed_fingerprint` — ✓ Done
 - `BrainConfig` + `BrainEmbeddingMode` in config schema — ✓ Done

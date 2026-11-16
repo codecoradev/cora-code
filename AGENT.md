@@ -46,6 +46,8 @@ src/
 │   ├── config_cmd.rs    # cora config (show/set/validate)
 │   ├── auth.rs          # cora auth (API key management)
 │   ├── hook_cmd.rs      # cora hook (pre-commit hook install/uninstall)
+│   ├── hook_context.rs  # cora hook context|session (agent prompt hooks)
+│   ├── agents/          # cora install: Claude Code, Hermes, pi, omp, opencode
 │   ├── init.rs          # cora init (project scaffolding)
 │   ├── upload.rs        # cora upload (review upload)
 │   ├── completion.rs    # Shell completion generation
@@ -56,12 +58,12 @@ src/
 │   ├── symbols.rs       # SymbolKind, SymbolQuery, SearchResult types
 │   ├── extract.rs       # 15 language extractors (def + call extraction)
 │   ├── graph.rs         # Call graph (callers, impact, affected)
-│   ├── brain.rs         # Hybrid search: FTS5 + usearch KNN + graph BFS → RRF k=60
-│   └── vector.rs        # CodeVectorIndex using usearch HNSW (256d, Cosine, F32)
-├── embed/               # Embedding engine
-│   ├── mod.rs           # Re-exports
-│   ├── tokens.rs        # Static token embedding (256d, zero-dep bag-of-tokens)
-│   └── token_vocab.rs   # Token vocabulary (reserved for Phase 5 ONNX upgrade)
+│   ├── brain.rs         # Hybrid search: FTS5 + vector KNN + graph BFS → RRF k=60
+│   └── vector.rs        # One vecq file per project and model (<data dir>/vectors/)
+├── embed/               # Embedding engine: the potion-code-16M-v2 code model only
+│   ├── mod.rs           # Backend (Potion | Off), resolve, embed dispatch
+│   ├── model_store.rs   # Pinned, SHA-256-verified one-time model download
+│   └── potion.rs        # Model2Vec static model (model2vec-rs)
 ├── config/
 │   ├── mod.rs
 │   ├── schema.rs        # Config structs & defaults
@@ -118,10 +120,11 @@ src/
 | `config/loader.rs` | Config loading with full priority chain resolution |
 | `config/schema.rs` | All config structs, defaults, serde annotations |
 | `commands/init.rs` | Project scaffolding, `.cora.yaml` generation |
-| `index/brain.rs` | Hybrid search orchestration (FTS5 + usearch + graph → RRF) |
-| `index/vector.rs` | CodeVectorIndex — usearch HNSW wrapper, load/save/insert/search |
+| `index/brain.rs` | Hybrid search orchestration (FTS5 + vectors + graph → RRF) |
+| `index/vector.rs` | Per-project vecq file — build, atomic save, cached load, search |
 | `index/schema.rs` | SQLite schema v4, auto-migration, FTS5 virtual table |
-| `embed/tokens.rs` | Static token embedding (256d, zero-dependency) |
+| `embed/mod.rs` | Embedding backend (code model or off), download policy |
+| `commands/agents/` | Native agent integrations (`Integration` trait, one file per agent) |
 
 ## Testing
 
