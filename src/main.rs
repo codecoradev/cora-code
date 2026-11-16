@@ -392,8 +392,8 @@ enum Command {
         min_severity: Option<String>,
 
         /// Deterministic checks only: never call an LLM (also the automatic
-        /// behavior when no API key is configured)
-        #[clap(long)]
+        /// behavior when no API key is configured). Also `--rules-only`.
+        #[clap(long, visible_alias = "rules-only")]
         no_llm: bool,
     },
 
