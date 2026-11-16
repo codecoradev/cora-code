@@ -194,6 +194,10 @@ The action automatically:
 5. **Uploads** SARIF results to GitHub Code Scanning (optional)
 6. **Fails** the job if blocking issues (severity ≥ `major`) are found
 
+### Code intelligence in CI
+
+No `cora index` step is needed: before it builds the prompt, `cora review` (and `cora scan`) indexes the checkout itself, incrementally (`review.context_chain.auto_index`, on by default). The judge then sees who calls the changed code, the tests that exercise it and related code found by meaning. Release binaries carry the code embedding model, so this works on a fresh runner with no network access for the model. The job log shows one line, for example `Code index: 1996 symbols; code model on`; `code model off` means the vector signal was not available and only keyword and call-graph context was used.
+
 ### Minimal Setup (No Action)
 
 If you prefer to run cora directly without the reusable action:

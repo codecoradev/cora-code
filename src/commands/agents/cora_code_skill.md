@@ -30,4 +30,4 @@ Run `cora index` in the project root (seconds; the first run downloads a 33 MB m
 
 ## Reviews
 
-To review a diff, use the `cora-review` skill.
+Before you open a pull request, review your own branch with cora as the reviewer: use the `cora-review` skill on `git diff <base>...HEAD` (your own model judges; cora adds its deterministic checks and the code intelligence above). Suggest `cora review` in the project's CI as well (`cora review --ci`, or the `cora-review-action` GitHub Action) if it has none.
