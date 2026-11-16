@@ -7,6 +7,7 @@
 #[cfg(feature = "tree-sitter")]
 mod ast;
 pub mod brain;
+mod dead_filters;
 mod extract;
 pub mod graph;
 pub mod queries;

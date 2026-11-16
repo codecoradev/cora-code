@@ -25,11 +25,64 @@ const TEST_EXTENSIONS: &[&str] = &["rs", "go", "py", "ts", "tsx", "js", "jsx"];
 const SQL_CHUNK: usize = 500;
 
 /// Options for [`find_affected_tests`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AffectedOptions {
     /// Override for the substrings that identify a test file when scanning
     /// callers (CLI `--filter`). `None` uses [`DEFAULT_TEST_FILE_MARKERS`].
     pub test_file_markers: Option<Vec<String>>,
+    /// Max call-graph hops from a changed symbol to a test (CLI `--depth`).
+    pub depth: u32,
+}
+
+impl Default for AffectedOptions {
+    fn default() -> Self {
+        Self {
+            test_file_markers: None,
+            depth: DEFAULT_AFFECTED_DEPTH,
+        }
+    }
+}
+
+/// Default `--depth` of `cora affected`.
+pub const DEFAULT_AFFECTED_DEPTH: u32 = 3;
+
+/// A test file reached from a changed file, with why it was included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AffectedHit {
+    pub file: String,
+    /// Call-graph hops (0 for a naming-convention match).
+    pub depth: u32,
+    /// Shortest chain from a changed symbol to the test, as `file::symbol`
+    /// labels; a single `naming convention` entry for a name match.
+    pub path: Vec<String>,
+}
+
+/// Module name a file is addressed by in a path qualifier
+/// (`src/index/graph.rs` -> `graph`, `src/index/mod.rs` -> `index`).
+fn module_name(file: &str) -> Option<&str> {
+    let stem = file_stem(file)?;
+    if stem == "mod" || stem == "lib" || stem == "main" {
+        return Path::new(file)
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str());
+    }
+    Some(stem)
+}
+
+/// Whether a call edge reaches the symbol defined in `file` (impl type `ty`
+/// when known). A name defined in a single file is resolved by name; a name
+/// defined in several files only by an edge whose qualifier is the symbol's
+/// type or module. An edge without qualifier (receiver type unknown) is not
+/// followed then, so `x.new()` does not link every `new` in the project (#716).
+fn edge_resolves(unique: bool, qualifier: Option<&str>, ty: Option<&str>, file: &str) -> bool {
+    if unique {
+        return true;
+    }
+    match qualifier {
+        None => false,
+        Some(q) => ty == Some(q) || module_name(file) == Some(q),
+    }
 }
 
 /// Reject an oversized changed-file list (for untrusted callers such as MCP).
@@ -91,63 +144,190 @@ fn as_refs(params: &[Box<dyn ToSql>]) -> Vec<&dyn ToSql> {
     params.iter().map(|p| p.as_ref()).collect()
 }
 
-fn placeholders(n: usize) -> String {
-    vec!["?"; n].join(",")
-}
-
 /// Find test files affected by a set of changed source files.
 ///
-/// Two strategies, unioned and returned sorted and deduplicated:
-/// 1. symbols defined in the changed files whose callers live in test files;
-/// 2. test files matching the naming conventions of [`test_name_candidates`].
+/// Files only, sorted and deduplicated; see [`find_affected`] for the reason
+/// each file is included.
 pub fn find_affected_tests(
     conn: &Connection,
     project_id: i64,
     changed: &[String],
     opts: &AffectedOptions,
 ) -> anyhow::Result<Vec<String>> {
-    let mut affected: BTreeSet<String> = BTreeSet::new();
+    let mut files: Vec<String> = find_affected(conn, project_id, changed, opts)?
+        .into_iter()
+        .map(|h| h.file)
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+struct WalkNode {
+    name: String,
+    ty: Option<String>,
+    file: String,
+    /// A type defined in a changed file: reached by `Type::name` calls.
+    is_type: bool,
+}
+
+type EdgeRow = (String, Option<String>, String, Option<String>);
+
+fn label(file: &str, ty: Option<&str>, name: &str) -> String {
+    match ty {
+        Some(t) => format!("{file}::{t}::{name}"),
+        None => format!("{file}::{name}"),
+    }
+}
+
+/// Find test files affected by a set of changed source files.
+///
+/// Two strategies, unioned:
+/// 1. a breadth-first walk up the call graph from the symbols defined in the
+///    changed files, at most `opts.depth` hops, following only edges that
+///    resolve to the symbol by type or module (see `edge_resolves`); every
+///    caller living in a test file is a hit, recorded with the shortest path;
+/// 2. test files matching the naming conventions of [`test_name_candidates`].
+///
+/// Sorted by depth, then file.
+pub fn find_affected(
+    conn: &Connection,
+    project_id: i64,
+    changed: &[String],
+    opts: &AffectedOptions,
+) -> anyhow::Result<Vec<AffectedHit>> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut hits: HashMap<String, AffectedHit> = HashMap::new();
     let default_markers: Vec<String> = DEFAULT_TEST_FILE_MARKERS
         .iter()
         .map(|s| (*s).to_string())
         .collect();
     let markers = opts.test_file_markers.as_ref().unwrap_or(&default_markers);
 
-    // Strategy 1: symbols in changed files -> caller files that are tests.
-    let mut symbols: BTreeSet<String> = BTreeSet::new();
-    for chunk in changed.chunks(SQL_CHUNK) {
-        let sql = format!(
-            "SELECT DISTINCT name FROM symbols WHERE file IN ({}) AND project_id = ?",
-            placeholders(chunk.len())
-        );
-        let mut params: Vec<Box<dyn ToSql>> = chunk
-            .iter()
-            .map(|f| Box::new(f.clone()) as Box<dyn ToSql>)
+    // Strategy 1 seeds: symbols of the changed files, with the impl type of
+    // the ones that make calls (the call graph records it on the caller).
+    let mut queue: VecDeque<(WalkNode, u32, Vec<String>)> = VecDeque::new();
+    let mut seen: HashSet<(String, Option<String>, String)> = HashSet::new();
+    for file in changed {
+        let mut types: HashMap<String, Vec<String>> = HashMap::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT caller, caller_type FROM call_graph
+             WHERE file = ?1 AND project_id = ?2 AND caller_type IS NOT NULL",
+        )?;
+        for r in stmt.query_map(rusqlite::params![file, project_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (n, t) = r?;
+            types.entry(n).or_default().push(t);
+        }
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT name, kind FROM symbols WHERE file = ?1 AND project_id = ?2",
+        )?;
+        let syms: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![file, project_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .filter_map(|r| r.ok())
             .collect();
-        params.push(Box::new(project_id));
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(as_refs(&params).as_slice(), |r| r.get::<_, String>(0))?;
-        for r in rows {
-            symbols.insert(r?);
+        for (name, kind) in syms {
+            let is_type = matches!(
+                kind.as_str(),
+                "struct" | "enum" | "trait" | "class" | "interface" | "type_alias"
+            );
+            let tys: Vec<Option<String>> = match types.get(&name) {
+                Some(v) => v.iter().cloned().map(Some).collect(),
+                None => vec![None],
+            };
+            for ty in tys {
+                if seen.insert((name.clone(), ty.clone(), file.clone())) {
+                    let path = vec![label(file, ty.as_deref(), &name)];
+                    queue.push_back((
+                        WalkNode {
+                            name: name.clone(),
+                            ty,
+                            file: file.clone(),
+                            is_type,
+                        },
+                        0,
+                        path,
+                    ));
+                }
+            }
         }
     }
-    let symbols: Vec<String> = symbols.into_iter().collect();
-    for chunk in symbols.chunks(SQL_CHUNK) {
-        let sql = format!(
-            "SELECT DISTINCT file FROM call_graph WHERE callee IN ({}) AND project_id = ?",
-            placeholders(chunk.len())
-        );
-        let mut params: Vec<Box<dyn ToSql>> = chunk
-            .iter()
-            .map(|s| Box::new(s.clone()) as Box<dyn ToSql>)
-            .collect();
-        params.push(Box::new(project_id));
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(as_refs(&params).as_slice(), |r| r.get::<_, String>(0))?;
-        for r in rows {
-            let file = r?;
+
+    let mut def_files: HashMap<String, bool> = HashMap::new();
+    let mut is_unique = |name: &str| -> anyhow::Result<bool> {
+        if let Some(u) = def_files.get(name) {
+            return Ok(*u);
+        }
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT file) FROM symbols
+             WHERE name = ?1 AND project_id = ?2
+               AND kind IN ('function', 'method', 'procedure')",
+            rusqlite::params![name, project_id],
+            |r| r.get(0),
+        )?;
+        def_files.insert(name.to_string(), n <= 1);
+        Ok(n <= 1)
+    };
+
+    while let Some((node, depth, path)) = queue.pop_front() {
+        if depth >= opts.depth {
+            continue;
+        }
+        let unique = is_unique(&node.name)?;
+        let mut edges: Vec<EdgeRow> = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT caller, caller_type, file, qualifier FROM call_graph
+             WHERE callee = ?1 AND project_id = ?2 LIMIT 1000",
+        )?;
+        for r in stmt.query_map(rusqlite::params![node.name, project_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })? {
+            let row: EdgeRow = r?;
+            if edge_resolves(
+                unique && !node.is_type,
+                row.3.as_deref(),
+                node.ty.as_deref(),
+                &node.file,
+            ) {
+                edges.push(row);
+            }
+        }
+        // A type is also reached by every call made through it (`Type::new()`).
+        if node.is_type {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT caller, caller_type, file, qualifier FROM call_graph
+                 WHERE qualifier = ?1 AND project_id = ?2 LIMIT 1000",
+            )?;
+            for r in stmt.query_map(rusqlite::params![node.name, project_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })? {
+                edges.push(r?);
+            }
+        }
+        for (caller, cty, file, _) in edges {
+            let mut next_path = path.clone();
+            next_path.push(label(&file, cty.as_deref(), &caller));
             if markers.iter().any(|m| file.contains(m.as_str())) {
-                affected.insert(file);
+                hits.entry(file.clone()).or_insert_with(|| AffectedHit {
+                    file: file.clone(),
+                    depth: depth + 1,
+                    path: next_path.clone(),
+                });
+            }
+            if seen.insert((caller.clone(), cty.clone(), file.clone())) {
+                queue.push_back((
+                    WalkNode {
+                        name: caller,
+                        ty: cty,
+                        file,
+                        is_type: false,
+                    },
+                    depth + 1,
+                    next_path,
+                ));
             }
         }
     }
@@ -171,20 +351,29 @@ pub fn find_affected_tests(
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(as_refs(&params).as_slice(), |r| r.get::<_, String>(0))?;
         for r in rows {
-            affected.insert(r?);
+            let file = r?;
+            hits.entry(file.clone()).or_insert_with(|| AffectedHit {
+                file,
+                depth: 0,
+                path: vec!["naming convention".to_string()],
+            });
         }
     }
 
-    Ok(affected.into_iter().collect())
+    let mut out: Vec<AffectedHit> = hits.into_values().collect();
+    out.sort_by(|a, b| a.depth.cmp(&b.depth).then_with(|| a.file.cmp(&b.file)));
+    Ok(out)
 }
 
 /// Caller-controlled dead-code flags (the config-derived part is added by
 /// [`dead_code_options`]).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DeadCodeFlags {
     pub include_tests: bool,
     pub include_pub_api: bool,
     pub min_lines: Option<u32>,
+    /// Project root, to read Rust sources for the test / trait-impl rules.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Build [`DeadCodeOptions`] from caller flags plus `analysis.entry_point_patterns`
@@ -198,6 +387,7 @@ pub fn dead_code_options(
         min_lines: flags.min_lines,
         entry_point_patterns: config.analysis.entry_point_patterns.clone(),
         include_pub_api: flags.include_pub_api,
+        project_root: flags.project_root,
     }
 }
 
@@ -343,6 +533,7 @@ mod tests {
 
         let opts = AffectedOptions {
             test_file_markers: Some(s(&["main"])),
+            ..Default::default()
         };
         let got = find_affected_tests(&conn, pid, &s(&["src/lib.rs"]), &opts).unwrap();
         assert_eq!(got, s(&["src/main.rs"]));
@@ -390,7 +581,7 @@ mod tests {
             ..Default::default()
         };
         let names = |cfg: &crate::config::schema::Config| -> Vec<String> {
-            find_dead_code(&conn, pid, cfg, flags)
+            find_dead_code(&conn, pid, cfg, flags.clone())
                 .unwrap()
                 .into_iter()
                 .map(|r| r.name)
@@ -405,11 +596,158 @@ mod tests {
         let mut cfg = crate::config::schema::Config::default();
         cfg.analysis.entry_point_patterns = s(&["plugin_hook_*"]);
         assert_eq!(
-            dead_code_options(&cfg, flags).entry_point_patterns,
+            dead_code_options(&cfg, flags.clone()).entry_point_patterns,
             s(&["plugin_hook_*"])
         );
         let n = names(&cfg);
         assert!(!n.contains(&"plugin_hook_entry".to_string()));
         assert!(n.contains(&"orphan_fn".to_string()));
+    }
+
+    fn edge(conn: &Connection, pid: i64, caller: &str, callee: &str, file: &str, q: Option<&str>) {
+        conn.execute(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, qualifier)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+            rusqlite::params![caller, callee, file, pid, q],
+        )
+        .unwrap();
+    }
+
+    fn affected(conn: &Connection, pid: i64, changed: &str, depth: u32) -> Vec<AffectedHit> {
+        let opts = AffectedOptions {
+            depth,
+            ..Default::default()
+        };
+        find_affected(conn, pid, &s(&[changed]), &opts).unwrap()
+    }
+
+    /// #716: the walk follows callers transitively up to `--depth`, and each
+    /// hit carries the shortest edge path.
+    #[test]
+    fn depth_limit_and_shortest_path() {
+        let (conn, pid) = setup();
+        add_symbol(&conn, pid, "leaf", "src/a.rs");
+        add_symbol(&conn, pid, "mid", "src/b.rs");
+        add_symbol(&conn, pid, "top", "src/c.rs");
+        edge(&conn, pid, "mid", "leaf", "src/b.rs", None);
+        edge(&conn, pid, "top", "mid", "src/c.rs", None);
+        edge(&conn, pid, "it_works", "top", "tests/it.rs", None);
+        // A shorter route to the same test must win over the long one.
+        edge(&conn, pid, "it_works", "leaf", "tests/it.rs", None);
+
+        let hits = affected(&conn, pid, "src/a.rs", 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file, "tests/it.rs");
+        assert_eq!(hits[0].depth, 1);
+        assert_eq!(
+            hits[0].path,
+            s(&["src/a.rs::leaf", "tests/it.rs::it_works"])
+        );
+
+        // Without the direct edge the test is three hops away.
+        conn.execute(
+            "DELETE FROM call_graph WHERE callee = 'leaf' AND file = 'tests/it.rs'",
+            [],
+        )
+        .unwrap();
+        let hits = affected(&conn, pid, "src/a.rs", 3);
+        assert_eq!(hits[0].depth, 3);
+        assert_eq!(
+            hits[0].path,
+            s(&[
+                "src/a.rs::leaf",
+                "src/b.rs::mid",
+                "src/c.rs::top",
+                "tests/it.rs::it_works"
+            ])
+        );
+        assert!(affected(&conn, pid, "src/a.rs", 2).is_empty());
+        assert!(affected(&conn, pid, "src/a.rs", 0).is_empty());
+    }
+
+    /// Regression: call cycles terminate.
+    #[test]
+    fn cycles_terminate() {
+        let (conn, pid) = setup();
+        add_symbol(&conn, pid, "ping", "src/a.rs");
+        add_symbol(&conn, pid, "pong", "src/b.rs");
+        edge(&conn, pid, "pong", "ping", "src/b.rs", None);
+        edge(&conn, pid, "ping", "pong", "src/a.rs", None);
+        edge(&conn, pid, "t", "pong", "tests/c.rs", None);
+        assert_eq!(affected(&conn, pid, "src/a.rs", 10).len(), 1);
+    }
+
+    /// Regression (#716): an unqualified call to a name defined in several
+    /// files (`new`) must not link a test to every definition.
+    #[test]
+    fn ambiguous_names_need_a_resolving_qualifier() {
+        let (conn, pid) = setup();
+        add_symbol(&conn, pid, "new", "src/a.rs");
+        add_symbol(&conn, pid, "new", "src/b.rs");
+        edge(&conn, pid, "t1", "new", "tests/x.rs", None);
+        assert!(affected(&conn, pid, "src/a.rs", 3).is_empty());
+        assert!(affected(&conn, pid, "src/b.rs", 3).is_empty());
+
+        // Reached through the module `a`: only a.rs is affected.
+        edge(&conn, pid, "t2", "new", "tests/y.rs", Some("a"));
+        let hits = affected(&conn, pid, "src/a.rs", 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file, "tests/y.rs");
+        assert!(affected(&conn, pid, "src/b.rs", 3).is_empty());
+    }
+
+    /// Regression (#716): two types with the same method name stay apart;
+    /// the caller type recorded in the changed file picks the right edges.
+    #[test]
+    fn type_qualifier_selects_the_right_impl() {
+        let (conn, pid) = setup();
+        add_symbol(&conn, pid, "from_env", "src/a.rs");
+        add_symbol(&conn, pid, "from_env", "src/b.rs");
+        conn.execute(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, caller_type)
+             VALUES ('from_env', 'helper', 'src/a.rs', 1, ?1, 'Alpha')",
+            [pid],
+        )
+        .unwrap();
+        edge(&conn, pid, "t", "from_env", "tests/x.rs", Some("Alpha"));
+        edge(&conn, pid, "u", "from_env", "tests/z.rs", Some("Beta"));
+
+        let hits = affected(&conn, pid, "src/a.rs", 3);
+        assert_eq!(
+            hits.iter().map(|h| h.file.as_str()).collect::<Vec<_>>(),
+            vec!["tests/x.rs"]
+        );
+    }
+
+    /// A type defined in a changed file is reached by `Type::method()` calls
+    /// even when the method itself is ambiguous.
+    #[test]
+    fn changed_type_is_reached_through_its_qualifier() {
+        let (conn, pid) = setup();
+        conn.execute(
+            "INSERT INTO symbols (name, kind, file, line, project_id)
+             VALUES ('Alpha', 'struct', 'src/a.rs', 1, ?1)",
+            [pid],
+        )
+        .unwrap();
+        add_symbol(&conn, pid, "new", "src/a.rs");
+        add_symbol(&conn, pid, "new", "src/b.rs");
+        edge(&conn, pid, "t", "new", "tests/x.rs", Some("Alpha"));
+        let hits = affected(&conn, pid, "src/a.rs", 3);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].file, "tests/x.rs");
+    }
+
+    #[test]
+    fn naming_hits_have_depth_zero_and_sort_first() {
+        let (conn, pid) = setup();
+        add_symbol(&conn, pid, "work", "src/foo.rs");
+        add_file(&conn, pid, "tests/foo.rs");
+        edge(&conn, pid, "t", "work", "tests/aaa.rs", None);
+        let hits = affected(&conn, pid, "src/foo.rs", 3);
+        assert_eq!(hits[0].file, "tests/foo.rs");
+        assert_eq!(hits[0].depth, 0);
+        assert_eq!(hits[0].path, s(&["naming convention"]));
+        assert_eq!(hits[1].file, "tests/aaa.rs");
     }
 }

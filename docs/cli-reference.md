@@ -137,8 +137,10 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora affected` `<files...>` | Find test files affected by source changes |
 | `cora affected --stdin` | Read changed files from stdin (pipe from `git diff --name-only`) |
 | `cora affected --filter` `"*test*"` | Custom test file glob pattern |
+| `cora affected --depth N` / `--limit N` | Max call-graph hops (default 3) / max files printed (default 50) |
 | `cora dead-code` | Detect dead code — functions/methods with zero callers (public API surface skipped by default; honors ignore.files via the index) |
-| `cora dead-code --include-pub` | Include public API surface (pub/export items) in results |
+| `cora dead-code --include-public` | Include public API surface (pub items of a lib crate, export items) in results |
+| `cora dead-code --include-tests` | Include tests (`#[test]`, `#[cfg(test)]`, tests directories) in results |
 | `cora dead-code --include-tests` | Include test functions in results |
 | `cora dead-code --min-lines N` | Filter out tiny functions |
 | `cora query` `"main -> *"` | Query the code graph with simple patterns |

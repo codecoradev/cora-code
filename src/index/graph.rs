@@ -5,6 +5,7 @@
 
 use rusqlite::Connection;
 
+use super::dead_filters;
 #[allow(unused_imports)]
 use super::symbols::{IndexedSymbol, SymbolKind};
 
@@ -683,6 +684,9 @@ pub struct DeadCodeOptions {
     /// By default these are skipped: their purpose is external consumption,
     /// so absence of internal callers does not make them dead (#520).
     pub include_pub_api: bool,
+    /// Project root, used to read Rust sources for the `#[test]`, `cfg(test)`
+    /// and trait-impl rules. Without it only the path/name rules apply.
+    pub project_root: Option<std::path::PathBuf>,
 }
 
 /// Well-known symbol names that should not be flagged as dead code even when
@@ -878,19 +882,6 @@ pub fn find_dead_code(
         sql.push_str(" AND s.name NOT LIKE 'test_%' AND s.name NOT LIKE '%_test'");
     }
 
-    // Exclude public API surface unless explicitly requested (#520): `pub`
-    // (Rust, incl. `pub(crate)`) and `export` (TS/JS) items are consumed
-    // externally, so missing internal callers does not make them dead.
-    if !opts.include_pub_api {
-        sql.push_str(
-            " AND (s.signature IS NULL OR (
-                   s.signature NOT LIKE 'pub %'
-                   AND s.signature NOT LIKE 'pub(%'
-                   AND s.signature NOT LIKE 'export %'
-               ))",
-        );
-    }
-
     // Exclude symbols with `// cora: keep` suppression marker in their signature.
     sql.push_str(" AND (s.signature IS NULL OR s.signature NOT LIKE '%cora: keep%')");
 
@@ -945,9 +936,52 @@ pub fn find_dead_code(
         })
     })?;
 
+    // Default exclusions that need more than SQL (#716).
+    let known_files = if opts.include_pub_api {
+        Default::default()
+    } else {
+        dead_filters::load_known_files(conn, project_id)?
+    };
+    let mut sources = opts
+        .project_root
+        .as_deref()
+        .map(dead_filters::SourceCache::new);
+    let mut rows: Vec<DeadCodeResult> = rows.filter_map(|r| r.ok()).collect();
+    rows.retain(|r| {
+        let sig = r.signature.as_deref().unwrap_or("");
+        let is_rust = r.file.ends_with(".rs");
+        if !opts.include_tests && dead_filters::is_test_path(&r.file) {
+            return false;
+        }
+        // Public API: a Rust `pub` item is external surface only when its
+        // crate has a lib target; in a bin-only crate nothing is consumed
+        // from outside. `export` (TS/JS) is always public.
+        if !opts.include_pub_api && dead_filters::is_public_signature(sig) {
+            let exposed = if is_rust && !sig.trim_start().starts_with("export ") {
+                dead_filters::lib_root_for(&r.file).is_some_and(|l| known_files.contains(&l))
+            } else {
+                true
+            };
+            if exposed {
+                return false;
+            }
+        }
+        if is_rust
+            && let Some(ctx) = sources
+                .as_mut()
+                .and_then(|s| s.rust_context(&r.file, r.line))
+        {
+            // Trait methods are reached through dispatch: always skipped.
+            if ctx.is_trait_method || (ctx.is_test && !opts.include_tests) {
+                return false;
+            }
+        }
+        true
+    });
+
     // Post-filter by user-configured entry_point_patterns (safe LIKE matching).
     let results: Vec<DeadCodeResult> = rows
-        .filter_map(|r| r.ok())
+        .into_iter()
         .filter(|r| {
             // Skip if any user pattern matches
             let name_lower = r.name.to_lowercase();
@@ -1684,5 +1718,163 @@ fn internal_only_helper() -> u8 { 7 }
         let names_all: Vec<&str> = all.iter().map(|d| d.name.as_str()).collect();
         assert!(names_all.contains(&"chunk_markdown_embed_aware"));
         assert!(names_all.contains(&"internal_only_helper"));
+    }
+
+    /// Index `files` (path, source) under a temp project root and return the
+    /// dead-code names for `opts`.
+    fn dead_names(files: &[(&str, &str)], opts: DeadCodeOptions) -> Vec<String> {
+        use super::super::index_file;
+        let dir = tempfile::tempdir().unwrap();
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        for (path, src) in files {
+            let full = dir.path().join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, src).unwrap();
+            index_file(&conn, pid, path, src, "rs").unwrap();
+        }
+        let opts = DeadCodeOptions {
+            project_root: Some(dir.path().to_path_buf()),
+            ..opts
+        };
+        find_dead_code(&conn, pid, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    const MIXED_SRC: &str = "\
+fn orphan() {}
+
+#[test]
+fn checks_thing() {}
+
+struct S;
+
+impl S {
+    fn inherent_orphan(&self) {}
+}
+
+impl Visitor for S {
+    fn visit_thing(&self) {}
+}
+
+#[cfg(test)]
+fn gated_helper() {}
+
+#[cfg(test)]
+mod tests {
+    fn helper_fn() {}
+}
+";
+
+    /// #716: tests, `#[cfg(test)]` modules, test directories and trait-impl
+    /// methods are not dead code by default.
+    #[test]
+    fn test_dead_code_skips_tests_and_trait_impls_by_default() {
+        let files = [
+            ("src/a.rs", MIXED_SRC),
+            ("tests/integ.rs", "fn fixture_orphan() {}\n"),
+            ("src/foo_tests.rs", "fn suite_orphan() {}\n"),
+        ];
+        let names = dead_names(&files, DeadCodeOptions::default());
+        assert!(names.contains(&"orphan".to_string()), "{names:?}");
+        assert!(names.contains(&"inherent_orphan".to_string()), "{names:?}");
+        for skipped in [
+            "checks_thing",
+            "gated_helper",
+            "helper_fn",
+            "fixture_orphan",
+            "suite_orphan",
+            "visit_thing",
+        ] {
+            assert!(
+                !names.contains(&skipped.to_string()),
+                "{skipped}: {names:?}"
+            );
+        }
+
+        // --include-tests brings tests back, but never trait-impl methods.
+        let names = dead_names(
+            &files,
+            DeadCodeOptions {
+                include_tests: true,
+                ..Default::default()
+            },
+        );
+        for back in [
+            "checks_thing",
+            "gated_helper",
+            "fixture_orphan",
+            "suite_orphan",
+        ] {
+            assert!(names.contains(&back.to_string()), "{back}: {names:?}");
+        }
+        assert!(!names.contains(&"visit_thing".to_string()));
+    }
+
+    /// Regression: an inherent impl whose methods contain `for` loops must
+    /// not be mistaken for a trait impl.
+    #[test]
+    fn test_dead_code_inherent_impl_with_for_loop_still_flagged() {
+        let src = "\
+struct R;
+
+impl R {
+    fn spin(&self) {
+        for _ in 0..3 {}
+    }
+
+    fn lonely(&self) {}
+}
+";
+        let names = dead_names(&[("src/r.rs", src)], DeadCodeOptions::default());
+        assert!(names.contains(&"spin".to_string()), "{names:?}");
+        assert!(names.contains(&"lonely".to_string()), "{names:?}");
+    }
+
+    /// Regression: without the project root the source rules cannot run, but
+    /// the path rule still applies.
+    #[test]
+    fn test_dead_code_without_root_keeps_path_rules() {
+        use super::super::index_file;
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        index_file(&conn, pid, "tests/x.rs", "fn in_tests() {}\n", "rs").unwrap();
+        index_file(&conn, pid, "src/y.rs", "fn plain() {}\n", "rs").unwrap();
+        let dead = find_dead_code(&conn, pid, &DeadCodeOptions::default()).unwrap();
+        let names: Vec<&str> = dead.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["plain"]);
+    }
+
+    /// #716: `pub` is API surface only for a crate with a lib target; in a
+    /// bin-only crate it is dead like any private fn. `pub(crate)` is never
+    /// API surface.
+    #[test]
+    fn test_dead_code_pub_only_skipped_in_lib_crates() {
+        let bin = [("src/main.rs", "pub fn only_in_bin() {}\nfn main() {}\n")];
+        let names = dead_names(&bin, DeadCodeOptions::default());
+        assert!(names.contains(&"only_in_bin".to_string()), "{names:?}");
+
+        let lib = [
+            (
+                "src/lib.rs",
+                "pub fn api_item() {}\npub(crate) fn crate_only() {}\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+        ];
+        let names = dead_names(&lib, DeadCodeOptions::default());
+        assert!(!names.contains(&"api_item".to_string()), "{names:?}");
+        assert!(names.contains(&"crate_only".to_string()), "{names:?}");
+
+        let names = dead_names(
+            &lib,
+            DeadCodeOptions {
+                include_pub_api: true,
+                ..Default::default()
+            },
+        );
+        assert!(names.contains(&"api_item".to_string()), "{names:?}");
     }
 }
