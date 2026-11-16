@@ -98,6 +98,11 @@ tempfile = "3"
 
 [features]
 default = ["tree-sitter"]
+# Compile the code embedding model into the binary (release builds). Needs
+# CORA_BUNDLED_MODEL_DIR to name a directory with config.json, tokenizer.json and
+# model.safetensors (scripts/fetch-model.sh). Off by default: the model is 33.5 MB
+# and the crates.io package limit is 10 MB.
+bundled-model = []
 tree-sitter = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",

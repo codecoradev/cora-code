@@ -27,6 +27,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --features tree-sitter
+      # The release build compiles the model in; keep that code path building.
+      - name: Check the bundled-model build
+        run: CORA_BUNDLED_MODEL_DIR="$PWD/tests/fixtures/tiny-model" cargo check --features tree-sitter,bundled-model
 
   fmt:
     name: Format

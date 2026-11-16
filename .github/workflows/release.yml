@@ -82,12 +82,41 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # The release binary carries the code embedding model (feature
+      # `bundled-model`), so a fresh download works with no network. The files are
+      # fetched at the pinned revision and verified against their SHA-256 (#761).
+      - name: Fetch the code model to bundle
+        shell: bash
+        run: |
+          dir="${RUNNER_TEMP//\\//}/potion-model"
+          scripts/fetch-model.sh "$dir"
+          echo "CORA_BUNDLED_MODEL_DIR=$dir" >> "$GITHUB_ENV"
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} --features tree-sitter
+        run: cargo build --release --target ${{ matrix.target }} --features tree-sitter,bundled-model
 
       - name: Strip binary (Unix)
         if: runner.os != 'Windows'
         run: strip target/${{ matrix.target }}/release/cora
+
+      # Offline, empty data directory: the model must come from the binary itself.
+      - name: Smoke test the bundled model
+        shell: bash
+        run: |
+          bin="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/cora"
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          proj="${RUNNER_TEMP//\\//}/smoke-project"
+          home="${RUNNER_TEMP//\\//}/smoke-home"
+          mkdir -p "$proj" "$home"
+          printf '[package]\nname = "smoke"\nversion = "0.1.0"\nedition = "2021"\n' > "$proj/Cargo.toml"
+          printf 'pub fn load_settings_file(path: &str) {}\npub fn send_request_to_server(url: &str) {}\n' > "$proj/lib.rs"
+          cd "$proj"
+          export CODECORA_HOME="$home" CORA_EMBED_OFFLINE=1
+          "$bin" index
+          out=$("$bin" brain "send a network request" --json)
+          echo "$out"
+          echo "$out" | grep -q send_request_to_server
+          echo "$out" | grep -q '"vector"'
 
       - name: Extract version
         id: version

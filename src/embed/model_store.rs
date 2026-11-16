@@ -20,6 +20,10 @@
 //! - `CORA_EMBED_MODEL_URL`: base URL to fetch the files from instead of the
 //!   Hugging Face hub (an internal mirror); the pinned hashes still apply.
 //! - `CORA_EMBED_OFFLINE=1`: never touch the network.
+//!
+//! Release binaries carry the model (feature `bundled-model`, see `bundled`):
+//! the first use installs it from the binary, verified like a download, with no
+//! network at all.
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
@@ -120,6 +124,12 @@ pub fn ensure(allow_download: bool) -> Result<PathBuf> {
     if is_installed_in(&dir, FILES) {
         return Ok(dir);
     }
+    // A binary that carries the model installs it from itself: no network, so
+    // this also applies to `CORA_EMBED_OFFLINE` and to hooks that never download.
+    if let Some(bundled) = super::bundled::files() {
+        install_bundled(&dir, bundled, FILES)?;
+        return Ok(dir);
+    }
     if !allow_download || cfg!(test) {
         bail!("the {MODEL_NAME} model is not downloaded yet");
     }
@@ -217,6 +227,62 @@ pub fn download_to(dir: &Path, base_url: &str, files: &[ModelFile]) -> Result<()
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir).with_context(|| format!("install {}", dir.display()))?;
     eprintln!("Model ready in {}", dir.display());
+    Ok(())
+}
+
+/// Install the model files carried by the binary into `dir`: each file checked
+/// against its size and SHA-256, written to a temporary directory and moved into
+/// place in one rename, under the same lock as a download.
+pub fn install_bundled(
+    dir: &Path,
+    bundled: &[super::bundled::BundledFile],
+    files: &[ModelFile],
+) -> Result<()> {
+    let parent = dir.parent().context("model directory has no parent")?;
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let lock_path = parent.join(".download.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&lock).context("lock the model install")?;
+    if is_installed_in(dir, files) {
+        return Ok(());
+    }
+
+    let tmp = parent.join(format!(".install-{}-{}", std::process::id(), now_secs()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let result = (|| -> Result<()> {
+        for f in files {
+            let (_, bytes) = bundled
+                .iter()
+                .find(|(name, _)| *name == f.name)
+                .ok_or_else(|| anyhow!("{} is not bundled in this binary", f.name))?;
+            if bytes.len() as u64 != f.size {
+                bail!(
+                    "bundled {} is {} bytes, expected {}",
+                    f.name,
+                    bytes.len(),
+                    f.size
+                );
+            }
+            let digest = format!("{:x}", Sha256::digest(bytes));
+            if digest != f.sha256 {
+                bail!("bundled {} failed its checksum (got {digest})", f.name);
+            }
+            std::fs::write(tmp.join(f.name), bytes).with_context(|| format!("write {}", f.name))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e.context(format!("install the bundled {MODEL_NAME} model")));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::rename(&tmp, dir).with_context(|| format!("install {}", dir.display()))?;
     Ok(())
 }
 
@@ -448,5 +514,75 @@ mod tests {
         )
         .unwrap();
         assert!(recent_failure(tmp.path()).is_none());
+    }
+
+    /// A binary that carries the model installs it from itself: verified, atomic,
+    /// idempotent, and a corrupted bundle is refused without leaving files.
+    #[test]
+    fn bundled_files_are_verified_and_installed_once() {
+        let a = b"{}".to_vec();
+        let b = b"tokenizer".to_vec();
+        let files = [
+            ModelFile {
+                name: "config.json",
+                size: a.len() as u64,
+                sha256: Box::leak(sha(&a).into_boxed_str()),
+            },
+            ModelFile {
+                name: "tokenizer.json",
+                size: b.len() as u64,
+                sha256: Box::leak(sha(&b).into_boxed_str()),
+            },
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("models").join("m");
+        let a_static: &'static [u8] = Box::leak(a.clone().into_boxed_slice());
+        let b_static: &'static [u8] = Box::leak(b.clone().into_boxed_slice());
+        let bundled = [("config.json", a_static), ("tokenizer.json", b_static)];
+
+        install_bundled(&dir, &bundled, &files).unwrap();
+        assert!(is_installed_in(&dir, &files));
+        assert_eq!(std::fs::read(dir.join("tokenizer.json")).unwrap(), b);
+        // Second call: nothing to do.
+        install_bundled(&dir, &bundled, &files).unwrap();
+
+        // A bundle whose bytes do not match the pins is refused and leaves nothing.
+        let other = tmp.path().join("models").join("bad");
+        let evil: &'static [u8] = Box::leak(b"XX".to_vec().into_boxed_slice());
+        let err = install_bundled(
+            &other,
+            &[("config.json", evil), ("tokenizer.json", b_static)],
+            &files,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum"), "{err:#}");
+        assert!(!other.exists());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path().join("models"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".install-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A missing file is named.
+        let missing = tmp.path().join("models").join("miss");
+        let err = install_bundled(&missing, &[("config.json", a_static)], &files).unwrap_err();
+        assert!(format!("{err:#}").contains("tokenizer.json"), "{err:#}");
+    }
+
+    /// The release script pins the same revision and hashes as this module.
+    #[test]
+    fn the_fetch_script_pins_match_the_module() {
+        let script = include_str!("../../scripts/fetch-model.sh");
+        assert!(script.contains(REVISION), "revision differs");
+        for f in FILES {
+            let line = format!("fetch {} {} {}", f.name, f.size, f.sha256);
+            assert!(
+                script.contains(&line),
+                "scripts/fetch-model.sh differs for {}",
+                f.name
+            );
+        }
     }
 }
