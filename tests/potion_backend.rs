@@ -42,6 +42,17 @@ fn sandbox() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (guard, proj, home)
 }
 
+/// Names of the per-project vector files.
+fn vector_files(home: &Path) -> Vec<String> {
+    std::fs::read_dir(home.join("cora-code").join("vectors"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn stdout(c: &mut Command) -> String {
     String::from_utf8(c.assert().success().get_output().stdout.clone()).unwrap()
 }
@@ -57,10 +68,12 @@ fn the_code_model_gets_its_own_index_and_answers_a_semantic_question() {
             .env("CORA_EMBED_MODEL_DIR", &model),
     );
 
-    let data = home.join("cora-code");
     assert!(
-        data.join("cora_index.potion-code-v2.usearch").exists(),
-        "the code model must not share the hashing index file"
+        vector_files(&home)
+            .iter()
+            .any(|f| f.ends_with(".potion-code-v2.vecq")),
+        "the code model has its own per-project file: {:?}",
+        vector_files(&home)
     );
 
     // No word of the question is in the function name: only the model links them.
@@ -86,15 +99,22 @@ fn the_code_model_gets_its_own_index_and_answers_a_semantic_question() {
 fn switching_the_model_re_embeds_without_any_file_change() {
     let (_g, proj, home) = sandbox();
 
-    // 1. Offline: the hashing fallback fills the historical index file.
+    // 1. Offline: the hashing fallback fills the project's own file.
     stdout(
         cora(&proj, &home)
             .arg("index")
             .env("CORA_EMBED_OFFLINE", "1"),
     );
-    let data = home.join("cora-code");
-    assert!(data.join("cora_index.usearch").exists());
-    assert!(!data.join("cora_index.potion-code-v2.usearch").exists());
+    assert!(
+        vector_files(&home)
+            .iter()
+            .any(|f| f.ends_with(".hashing.vecq"))
+    );
+    assert!(
+        !vector_files(&home)
+            .iter()
+            .any(|f| f.ends_with(".potion-code-v2.vecq"))
+    );
 
     // 2. The model becomes available; no source file changed.
     stdout(
@@ -102,9 +122,14 @@ fn switching_the_model_re_embeds_without_any_file_change() {
             .arg("index")
             .env("CORA_EMBED_MODEL_DIR", fixture_model()),
     );
+    let files = vector_files(&home);
     assert!(
-        data.join("cora_index.potion-code-v2.usearch").exists(),
-        "a new model must re-embed even when no file changed"
+        files.iter().any(|f| f.ends_with(".potion-code-v2.vecq")),
+        "a new model must re-embed even when no file changed: {files:?}"
+    );
+    assert!(
+        !files.iter().any(|f| f.ends_with(".hashing.vecq")),
+        "the file of the model no longer used is removed: {files:?}"
     );
 
     let out = stdout(
@@ -132,7 +157,11 @@ fn a_missing_model_degrades_to_hashing_without_failing() {
         .clone();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not available"), "{err}");
-    assert!(home.join("cora-code").join("cora_index.usearch").exists());
+    assert!(
+        vector_files(&home)
+            .iter()
+            .any(|f| f.ends_with(".hashing.vecq"))
+    );
 }
 
 #[test]
@@ -195,4 +224,66 @@ fn explore_no_semantic_keeps_the_keyword_search_only() {
     );
     let results: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(results.as_array().unwrap().is_empty(), "{out}");
+}
+
+#[test]
+fn re_indexing_leaves_no_vector_of_a_deleted_function() {
+    let (_g, proj, home) = sandbox();
+    let model = fixture_model();
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    let q = ["brain", "run a table query on the database", "--json"];
+    let before = stdout(
+        cora(&proj, &home)
+            .args(q)
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    assert!(before.contains("run_table_query"), "{before}");
+
+    // delete the function and index again
+    std::fs::write(
+        proj.join("lib.rs"),
+        "pub fn load_settings_file(path: &str) {}\npub fn decode_json_text(text: &str) {}\n",
+    )
+    .unwrap();
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    let after = stdout(
+        cora(&proj, &home)
+            .args(q)
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    assert!(!after.contains("run_table_query"), "{after}");
+}
+
+#[test]
+fn the_former_shared_index_is_removed_after_the_first_index() {
+    let (_g, proj, home) = sandbox();
+    let data = home.join("cora-code");
+    std::fs::create_dir_all(&data).unwrap();
+    for f in [
+        "cora_index.usearch",
+        "cora_index.keys",
+        "cora_index.potion-code-v2.usearch",
+    ] {
+        std::fs::write(data.join(f), b"old").unwrap();
+    }
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", fixture_model()),
+    );
+    for f in [
+        "cora_index.usearch",
+        "cora_index.keys",
+        "cora_index.potion-code-v2.usearch",
+    ] {
+        assert!(!data.join(f).exists(), "{f} should be gone");
+    }
 }

@@ -87,11 +87,34 @@ pub fn configure(config: Option<&Config>) -> Configured {
         .map(|c| c.brain.embedding.to_string())
         .unwrap_or_else(|| "auto".to_string());
     let backend = crate::embed::resolve_backend(&brain_mode);
-    super::vector::apply_config_store(config);
+    warn_removed_vector_options(config);
     Configured {
         brain_mode,
         backend,
         skip_patterns: super::skip_patterns_from_config(config),
+    }
+}
+
+/// `brain.vector_store` and `brain.vector_bits` no longer do anything (vectors are
+/// one vecq file per project, #750): say so once instead of silently ignoring them.
+fn warn_removed_vector_options(config: Option<&Config>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(c) = config else { return };
+    let set: Vec<&str> = [
+        ("vector_store", &c.brain.vector_store),
+        ("vector_bits", &c.brain.vector_bits),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, _)| k)
+    .collect();
+    if !set.is_empty() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: brain.{} in your config no longer has any effect: vectors are stored as one quantized file per project. Remove it.",
+                set.join(" and brain.")
+            );
+        });
     }
 }
 

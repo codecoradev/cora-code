@@ -53,10 +53,15 @@ fn brain_fresh_process_emits_vector_signal() {
         .env("CODECORA_HOME", &home)
         .env("CORA_EMBED_OFFLINE", "1"));
 
-    let db_dir = home.join("cora-code");
+    let vectors = home.join("cora-code").join("vectors");
+    let files: Vec<String> = std::fs::read_dir(&vectors)
+        .expect("a vectors directory after `cora index`")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
     assert!(
-        db_dir.join("cora_index.usearch").exists(),
-        "usearch index file should exist after `cora index`"
+        files.iter().any(|f| f.ends_with(".hashing.vecq")),
+        "one vecq file per project after `cora index`, got {files:?}"
     );
 
     // 2. Search in a FRESH process — vector signal must fire.
@@ -72,25 +77,31 @@ fn brain_fresh_process_emits_vector_signal() {
     );
 }
 
+/// `brain.vector_store` and `brain.vector_bits` were removed (#750): an old
+/// config still loads, warns once, and the vectors are per-project vecq files.
 #[test]
-fn brain_vecq_backend_uses_own_extension() {
-    let (_guard, proj, home) = sandbox("vecq");
+fn removed_vector_options_warn_and_do_not_break_indexing() {
+    let (_guard, proj, home) = sandbox("old-config");
 
-    std::fs::write(proj.join(".cora.yaml"), "brain:\n  vector_store: vecq\n").unwrap();
+    std::fs::write(
+        proj.join(".cora.yaml"),
+        "brain:\n  vector_store: usearch\n  vector_bits: '6'\n",
+    )
+    .unwrap();
 
-    run(cora_cmd()
+    let out = cora_cmd()
         .args(["index"])
         .current_dir(&proj)
         .env("CODECORA_HOME", &home)
-        .env("CORA_EMBED_OFFLINE", "1"));
+        .env("CORA_EMBED_OFFLINE", "1")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("no longer has any effect"), "{err}");
 
     let db_dir = home.join("cora-code");
-    assert!(
-        db_dir.join("cora_index.vecq").exists(),
-        "vecq config must produce a .vecq index file (config wiring #543)"
-    );
-    assert!(
-        !db_dir.join("cora_index.usearch").exists(),
-        "vecq config must not create a usearch file"
-    );
+    assert!(!db_dir.join("cora_index.usearch").exists());
+    assert!(db_dir.join("vectors").is_dir());
 }

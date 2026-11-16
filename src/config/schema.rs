@@ -592,32 +592,14 @@ pub struct AnalysisConfig {
 /// `potion-code-16M-v2` code model (downloaded once on first use) → pretrained
 /// 768d (if compiled with `pretrained-embed`) → hashing 256d fallback.
 /// Users can force a specific backend via `.cora.yaml`.
-fn default_vector_store() -> String {
-    "usearch".to_string()
-}
-
-fn default_vector_bits() -> String {
-    "residual".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct BrainConfig {
-    /// Vector store backend for Brain Mode search.
-    ///
-    /// - `"usearch"` (default) — HNSW graph, f32
-    /// - `"vecq"` — quantized brute-force scan (pure Rust, deterministic,
-    ///   ~5x smaller index; recall trade absorbed by RRF fusion)
-    #[serde(default = "default_vector_store")]
+    /// Removed (#750): vectors are one vecq file per project. Still parsed so an
+    /// old `.cora.yaml` loads; a non-empty value only produces a warning.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_store: String,
-    /// Quantization width for the `vecq` store (ignored by `usearch`).
-    ///
-    /// - `"residual"` (default) — 4-bit base + second-pass residual codes:
-    ///   best recall at 4-bit scan speed on cora's default embeddings
-    /// - `"4"` / `"5"` / `"6"` — plain Lloyd-Max width
-    ///
-    /// Invalid values fall back to `"residual"`. Changing the width rebuilds
-    /// the index once on the next `cora index`.
-    #[serde(default = "default_vector_bits")]
+    /// Removed (#750), see [`Self::vector_store`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_bits: String,
     /// Embedding backend selection.
     ///
@@ -629,19 +611,6 @@ pub struct BrainConfig {
     /// Invalid values fall back to `"auto"` with a warning.
     #[serde(default, skip_serializing_if = "is_default")]
     pub embedding: BrainEmbeddingMode,
-}
-
-// Manual Default so `Config::default()` carries the documented values
-// ("usearch"/"residual") — the derived one would leave empty strings, and
-// the store/width parsers only meet those values leniently.
-impl Default for BrainConfig {
-    fn default() -> Self {
-        Self {
-            vector_store: default_vector_store(),
-            vector_bits: default_vector_bits(),
-            embedding: BrainEmbeddingMode::default(),
-        }
-    }
 }
 
 /// `.cora.yaml` `brain:` section — mirrors the subset of [`BrainConfig`]
@@ -1106,21 +1075,23 @@ mod tests {
     }
 
     #[test]
-    fn brain_vector_bits_defaults_to_residual() {
+    fn the_removed_vector_options_default_to_empty() {
         let cfg = Config::default();
-        assert_eq!(cfg.brain.vector_bits, "residual");
-        assert_eq!(cfg.brain.vector_store, "usearch");
+        assert!(cfg.brain.vector_store.is_empty());
+        assert!(cfg.brain.vector_bits.is_empty());
     }
 
+    /// An old `.cora.yaml` that still sets the removed options keeps loading;
+    /// the values are only kept so the session can warn about them.
     #[test]
-    fn merge_brain_vector_store_and_bits() {
+    fn an_old_config_with_the_removed_vector_options_still_loads() {
         let mut cfg = Config::default();
         let cora = CoraFile::from_str(
             r"
 brain:
   vector_store: vecq
   vector_bits: '6'
-  embedding: hashing
+  embedding: auto
 ",
         )
         .unwrap();
@@ -1129,22 +1100,6 @@ brain:
 
         assert_eq!(cfg.brain.vector_store, "vecq");
         assert_eq!(cfg.brain.vector_bits, "6");
-    }
-
-    #[test]
-    fn merge_brain_vector_bits_absent_keeps_default() {
-        let mut cfg = Config::default();
-        let cora = CoraFile::from_str(
-            r"
-brain:
-  vector_store: vecq
-",
-        )
-        .unwrap();
-
-        cora.merge_into(&mut cfg).unwrap();
-
-        assert_eq!(cfg.brain.vector_bits, "residual");
     }
 
     #[test]

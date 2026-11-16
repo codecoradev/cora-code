@@ -1,39 +1,22 @@
-//! Brain Mode — hybrid search combining FTS5 + usearch vectors + graph proximity.
+//! Brain Mode — hybrid search combining FTS5 + a code embedding model + graph proximity.
 //!
 //! RRF fusion (k=60) merges 3 signal sources into ranked results.
 //! Pattern adopted from uteke `doc_search_hybrid()`.
 //!
-//! Embedding backend is selected at compile time:
-//! - `pretrained-embed` feature → nomic-embed-code 768-dim vectors
-//! - default → hashing-trick 256-dim vectors
-//!
-//! A dimension mismatch between an existing on-disk index and the current
-//! compile-time backend triggers a warning and advises re-indexing.
+//! Vectors are stored one vecq file per project and model (`index::vector`), rebuilt
+//! from the project's symbols after every index run that changed them.
 
 use crate::embed::{
     active_backend, active_dims, active_provider_name, embed_batch_dispatch, embed_code_dispatch,
 };
 use crate::index::symbols::SymbolQuery;
-use crate::index::vector::{CodeVectorIndex, cosine_distance_to_similarity};
+use crate::index::vector::{self, Loaded, ProjectVectors};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
-use std::sync::{LazyLock, RwLock};
 
 /// RRF constant (standard value from Cormack et al. 2009).
 const RRF_K: f32 = 60.0;
-
-// ── Process-lifetime caches ─────────────────────────────────────────────
-
-/// Cached vector index — loaded once from disk, reused for all searches.
-/// Write-locked during embed_project (indexing), read-locked during search.
-static VECTOR_CACHE: LazyLock<RwLock<Option<CodeVectorIndex>>> =
-    LazyLock::new(|| RwLock::new(None));
-
-/// Cached project → symbol ID sets, used to filter vector results without
-/// a full DB scan per query. Invalidated when a project is re-indexed.
-static PROJECT_ID_CACHE: LazyLock<RwLock<HashMap<i64, HashSet<i64>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// A brain search result with provenance information.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -157,265 +140,64 @@ pub fn question_terms(query: &str) -> Vec<String> {
     terms
 }
 
-/// Path to the usearch vector index file.
-fn vector_index_path() -> std::path::PathBuf {
-    let dir = crate::data_dir::cora_data_dir();
-    // Hashing and pretrained vectors keep the historical file name (their
-    // dimensions differ, which the dimension check handles). The potion model
-    // has the same 256 dimensions as hashing but means something else, so it
-    // gets a file of its own: vectors of different models never mix.
-    match active_backend() {
-        crate::embed::Backend::Potion => {
-            dir.join(format!("cora_index.{}.usearch", active_backend().tag()))
-        }
-        _ => dir.join("cora_index.usearch"),
-    }
+/// Vector file of a project for the active model.
+fn project_vector_path(project_id: i64) -> std::path::PathBuf {
+    vector::project_file(project_id, active_backend().tag())
 }
 
-/// Check if an existing on-disk vector index has compatible dimensions.
+/// Embed every symbol of a project and replace its vector file.
 ///
-/// If the index was created with different dimensions (e.g. 256d hashing-trick
-/// but now running with 768d pretrained), logs a warning advising re-indexing.
-///
-/// The index file contains usearch binary data — we can't easily read the
-/// dimensionality without loading it. Instead, we check the `embedding_dims`
-/// column in the projects table, which is written during embedding.
-fn check_dimension_compat(vi_path: &std::path::Path, expected_dims: usize) -> bool {
-    // Attempt to load the index just to check its dimensions.
-    // If it fails (empty, corrupt, etc.), we'll create fresh — no warning needed.
-    // Returns true when a stale index was removed: the vector index is a
-    // single file shared by every project, so its fingerprints are now all
-    // stale and callers must clear them.
-    let Ok(file) = std::fs::File::open(vi_path) else {
-        return false;
-    };
-    let Ok(metadata) = file.metadata() else {
-        return false;
-    };
-    if metadata.len() == 0 {
-        return false; // Empty file — will create fresh
-    }
-
-    // Try to load and check dims
-    let result = std::panic::catch_unwind(|| {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = file;
-        let _ = file.seek(SeekFrom::Start(0));
-        let mut buffer = Vec::new();
-        let _ = file.read_to_end(&mut buffer);
-        if buffer.is_empty() {
-            return None;
-        }
-        let index = usearch::Index::restore_from_buffer(&buffer).ok()?;
-        Some(index.dimensions())
-    });
-
-    match result {
-        Ok(Some(disk_dims)) if disk_dims != expected_dims => {
-            tracing::warn!(
-                "⚠ Vector index dimension mismatch: on-disk={disk_dims}, current={expected_dims} ({})",
-                active_provider_name()
-            );
-            tracing::warn!(
-                "  The vector index was built with a different embedding backend. \
-                 Run `cora index` to re-index with the current backend."
-            );
-            // Delete the stale index so embed_project creates a fresh one
-            if let Err(e) = std::fs::remove_file(vi_path) {
-                tracing::warn!("  Failed to remove stale index: {e}");
-                false
-            } else {
-                let keys_path = vi_path.with_extension("keys");
-                let _ = std::fs::remove_file(&keys_path);
-                tracing::info!("  Removed stale vector index — will create fresh on next index");
-                true
-            }
-        }
-        Ok(Some(_)) => {
-            // Dimensions match — all good
-            false
-        }
-        _ => {
-            // Couldn't read dimensions (corrupt, unsupported, etc.)
-            // embed_project will handle creation
-            false
-        }
-    }
-}
-
-/// Embed all symbols for a project into the vector index.
-///
-/// Uses the embedding backend selected at runtime via [`resolve_backend`]:
-/// - `"pretrained"` → nomic-embed-code 768-dim vectors
-/// - `"hashing"` → hashing-trick 256-dim vectors
-/// - `"auto"` → best available
-///
-/// **Incremental**: Only symbols whose `name + signature` fingerprint has
-/// changed since the last embed are re-embedded. This dramatically reduces
-/// embedding time when a single file is modified (e.g. 10 changed symbols
-/// out of 1100 total).
-///
-/// Detects dimension mismatch between existing on-disk index and current
-/// backend, warning the user to re-index if dimensions changed.
-/// Call after `index_project`.
+/// The project's whole vector file is rebuilt (embedding is tens of thousands
+/// of symbols per second), so it never holds a vector of a symbol that no longer
+/// exists, and nothing is shared with other projects. Returns the number of
+/// symbols embedded.
 pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
-    let vi_path = vector_index_path();
-    let active = active_dims();
-
-    // Check for existing index with mismatched dimensions (e.g. user rebuilt
-    // with/without pretrained-embed feature). Warn but continue — the index
-    // will be corrupted for searches until re-indexed.
-    let dims_stale = if vi_path.exists() {
-        check_dimension_compat(&vi_path, active)
-    } else {
-        false
-    };
-
-    // Acquire write lock — block searches while embedding.
-    // This is fine because embedding only happens during `cora index`,
-    // never during `cora brain_search`.
-    let mut cache = VECTOR_CACHE.write().unwrap();
-
-    // Load or create the vector index (reuses cache if available)
-    let vi = if let Some(ref mut cached) = *cache {
-        cached
-    } else {
-        let vi = CodeVectorIndex::load_or_create(&vi_path, active).context("load vector index")?;
-        *cache = Some(vi);
-        cache.as_mut().unwrap()
-    };
-
-    // ── Self-heal after a global index rebuild (#542, vecq#32) ───────
-    // The vector index is one shared file across projects. A vecq reload
-    // that had to rebuild it (legacy pre-0.3.0 file, width change, dim
-    // change, corruption) or a stale usearch index removed for a dims
-    // mismatch leaves every project's vectors gone while their stored
-    // fingerprints still say "embedded" — the incremental path would skip
-    // those symbols forever. Clear fingerprints for ALL projects: the
-    // current project re-embeds in this run; every other project re-embeds
-    // on its next `cora index` run that reaches embed_project
-    // (cross-project scheduling: #545).
-    if dims_stale || (vi.is_dirty() && vi.is_empty()) {
-        let cleared = conn.execute("UPDATE symbols SET embed_fingerprint = NULL", [])?;
-        tracing::info!(
-            cleared,
-            "vector index rebuilt from empty — all projects re-embed on their next index run"
-        );
-    }
-
-    // ── Incremental: fetch stored fingerprints ──────────────────────
-    // Only re-embed symbols whose name+signature has changed.
-    let mut stmt = conn.prepare(
-        "SELECT id, name, kind, signature, embed_fingerprint \
-         FROM symbols WHERE project_id = ?1",
-    )?;
-    let rows: Vec<(i64, String, String, String, Option<String>)> = stmt
+    let path = project_vector_path(project_id);
+    let mut stmt =
+        conn.prepare("SELECT id, name, signature FROM symbols WHERE project_id = ?1 ORDER BY id")?;
+    let rows: Vec<(i64, String, String)> = stmt
         .query_map(rusqlite::params![project_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-            ))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    // Compute current fingerprints and filter to only changed symbols
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let backend_tag = active_backend().tag();
+    if rows.is_empty() {
+        // A project without symbols has no vectors.
+        vector::forget(&path);
+        let _ = std::fs::remove_file(&path);
+        return Ok(0);
+    }
 
-    let changed: Vec<(i64, String)> = rows
+    let texts: Vec<String> = rows
         .iter()
-        .filter_map(|(sym_id, name, _kind, signature, stored_fp)| {
-            let text = if signature.is_empty() || signature == name {
+        .map(|(_, name, signature)| {
+            if signature.is_empty() || signature == name {
                 name.clone()
             } else {
                 format!("{name} {signature}")
-            };
-            let mut hasher = DefaultHasher::new();
-            // The model is part of the fingerprint: switching it re-embeds
-            // every symbol instead of trusting vectors of another model.
-            backend_tag.hash(&mut hasher);
-            text.hash(&mut hasher);
-            let current_fp = format!("{:016x}", hasher.finish());
-
-            if stored_fp.as_deref() == Some(&current_fp) {
-                None // unchanged — skip
-            } else {
-                Some((*sym_id, text))
             }
         })
         .collect();
 
-    let total_symbols = rows.len();
-    let skipped = total_symbols - changed.len();
-    if skipped > 0 {
-        tracing::info!(
-            "Incremental embed: {total_symbols} total, {skipped} unchanged (skipped), {} changed (re-embedding)",
-            changed.len()
-        );
-    }
-
-    // ── Parallel embedding computation (Rayon) ─────────────────────────
-    // embed_code_dispatch is pure + CPU-bound. usearch insert is serial.
     let t_compute = std::time::Instant::now();
-    let texts: Vec<String> = changed.iter().map(|(_, text)| text.clone()).collect();
     let vectors = embed_batch_dispatch(&texts);
-    let embedded: Vec<(i64, Vec<f32>)> = changed
-        .iter()
-        .map(|(sym_id, _)| *sym_id)
-        .zip(vectors)
-        .collect();
     let compute_ms = t_compute.elapsed().as_millis();
+    let dims = vectors.first().map_or_else(active_dims, Vec::len);
+    let count = rows.len();
 
-    // ── Serial usearch insert ────────────────────────────────────────
-    let t_insert = std::time::Instant::now();
-    let mut count = 0;
-    let mut new_ids: HashSet<i64> = HashSet::with_capacity(rows.len());
-    // Populate new_ids with ALL symbol IDs for this project (for search filtering)
-    for (sym_id, _, _, _, _) in &rows {
-        new_ids.insert(*sym_id);
-    }
-    for (sym_id, vec) in &embedded {
-        vi.insert(*sym_id, vec).context("insert symbol embedding")?;
-        count += 1;
-    }
-    let insert_ms = t_insert.elapsed().as_millis();
+    let t_write = std::time::Instant::now();
+    ProjectVectors::build(dims, rows.iter().map(|r| r.0).zip(vectors))
+        .save(&path)
+        .context("save the project's vectors")?;
+    vector::forget(&path);
+    let write_ms = t_write.elapsed().as_millis();
 
-    tracing::debug!(
-        "embed_compute={}ms, usearch_insert={}ms, re-embedded={}, total={}, skipped={}, dims={}, provider={}",
-        compute_ms,
-        insert_ms,
-        count,
-        total_symbols,
-        skipped,
-        active,
-        active_provider_name()
-    );
+    // The file of a model this project no longer uses, and the former shared
+    // index (nothing reads it any more), are dead weight.
+    vector::remove_project_files(project_id, Some(active_backend().tag()));
+    vector::remove_legacy_shared_index();
 
-    if vi.is_dirty() {
-        vi.save().context("save vector index")?;
-    }
-
-    // ── Update fingerprints for embedded symbols ─────────────────────
-    let mut update_fp = conn.prepare("UPDATE symbols SET embed_fingerprint = ?2 WHERE id = ?1")?;
-    for (sym_id, text) in &changed {
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        let fp = format!("{:016x}", hasher.finish());
-        update_fp.execute(rusqlite::params![sym_id, fp])?;
-    }
-
-    // Cache project → symbol IDs for fast search-time filtering
-    PROJECT_ID_CACHE
-        .write()
-        .unwrap()
-        .insert(project_id, new_ids);
-
-    // Determine tier label
     let provider = active_provider_name();
     let tier = active_backend().tier();
     conn.execute(
@@ -423,7 +205,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
          embedding_provider = ?4, last_embedded_at = datetime('now') WHERE id = ?2",
         // rusqlite 0.41 binds only i64; dims and limits are small.
         rusqlite::params![
-            i64::try_from(active).unwrap_or(i64::MAX),
+            i64::try_from(dims).unwrap_or(i64::MAX),
             project_id,
             tier,
             provider
@@ -431,12 +213,12 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     )?;
 
     tracing::info!(
-        "Embedded {count}/{total_symbols} symbols for project {project_id} ({skipped} unchanged, provider={provider}, dims={active})",
+        "Embedded {count} symbols for project {project_id} (embed {compute_ms} ms, write {write_ms} ms, provider={provider}, dims={dims})",
     );
     Ok(count)
 }
 
-/// Hybrid brain search: FTS5 + usearch KNN + graph proximity → RRF fusion.
+/// Hybrid brain search: FTS5 + vector KNN + graph proximity → RRF fusion.
 pub fn brain_search(
     conn: &Connection,
     project_id: i64,
@@ -472,7 +254,7 @@ pub fn brain_search_report(
     } else {
         fts5_search(conn, project_id, query, fetch_limit)
     };
-    let (vec_hits, vector_state) = vector_search_state(conn, project_id, query, fetch_limit);
+    let (vec_hits, vector_state) = vector_search_state(project_id, query, fetch_limit);
     let graph_hits = graph_proximity_search(conn, project_id, &fts_hits, fetch_limit);
 
     let embedding_tier: Option<String> = conn
@@ -607,18 +389,15 @@ fn fts5_terms_search(
         .collect()
 }
 
-/// True when the on-disk vector index exists but will be discarded on reload —
-/// i.e. vecq backend whose `.vecq` file predates keyed persistence (vecq#32),
-/// is unreadable, or was built with different dims. `cora index` uses this to
-/// force a re-embed even when no files changed, so the vector signal heals
-/// instead of staying empty. Healthy keyed files (vecq-core 0.3.0+) reload
-/// as-is and return false.
-pub fn vector_index_needs_rebuild() -> bool {
-    if crate::index::vector::current_vector_store() != crate::index::vector::VectorStoreKind::Vecq {
-        return false;
-    }
-    let path = vector_index_path().with_extension("vecq");
-    path.exists() && crate::index::vector::vecq_file_needs_rebuild(&path, active_dims())
+/// True when the project's vector file for the active model is missing, from an
+/// older format or built with other dimensions: it must be (re)built even if no
+/// source file changed since the last `cora index`, for example on the first run
+/// after the model changed.
+pub fn project_needs_embedding(project_id: i64) -> bool {
+    !matches!(
+        vector::load_cached(&project_vector_path(project_id), active_dims()),
+        Loaded::Ready(_)
+    )
 }
 
 /// Meaning-based matches for a multi-word query, to complete a keyword search
@@ -651,115 +430,38 @@ pub fn semantic_matches(
         .collect()
 }
 
-/// True when the project was embedded by another model than the active one (or
-/// never): its vectors are in a different index and must be rebuilt, even if no
-/// file changed since the last `cora index`.
-pub fn embedding_provider_changed(conn: &Connection, project_id: i64) -> bool {
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT embedding_provider FROM projects WHERE id = ?1",
-            [project_id],
-            |r| r.get(0),
-        )
-        .ok()
-        .flatten();
-    stored.as_deref() != Some(active_provider_name())
-}
-
-/// Return a read guard over the vector index cache, loading the on-disk
-/// index once per process if needed (#545). VECTOR_CACHE used to be
-/// populated only by `embed_project` (i.e. `cora index`), so a fresh search
-/// process (`cora brain`, MCP tools) always saw an empty cache and the
-/// vector signal never fired. Load failures degrade gracefully: the cache
-/// stays `None` and search falls back to FTS + graph signals.
-///
-/// `RwLockWriteGuard::downgrade` is still unstable, so this drops the write
-/// guard and re-acquires a read lock; a concurrent reader may load twice,
-/// which is idempotent (same file, same result).
-fn ensure_vector_cache() -> std::sync::RwLockReadGuard<'static, Option<CodeVectorIndex>> {
-    {
-        let cache = VECTOR_CACHE.read().unwrap();
-        if cache.is_some() {
-            return cache;
-        }
-    }
-
-    let mut cache = VECTOR_CACHE.write().unwrap();
-    if cache.is_none() {
-        let dims = active_dims();
-        match CodeVectorIndex::load_or_create(&vector_index_path(), dims) {
-            Ok(vi) => *cache = Some(vi),
-            Err(e) => tracing::warn!("vector index load failed (search degrades to FTS): {e}"),
-        }
-    }
-    drop(cache);
-
-    VECTOR_CACHE.read().unwrap()
-}
-
-/// usearch vector search → (symbol_id, cosine_similarity) pairs, filtered to project.
-/// Uses cached vector index and cached project ID set — no disk I/O per query.
+/// Nearest symbols of the project by meaning → (symbol_id, cosine_similarity)
+/// pairs, with how the vector signal fared. Loads only this project's vector
+/// file (cached per process, reloaded when the file changes).
 fn vector_search_state(
-    conn: &Connection,
     project_id: i64,
     query: &str,
     limit: usize,
 ) -> (Vec<(i64, f32)>, VectorState) {
-    // Read-lock the cached vector index — lazy-loads from disk on the first
-    // search in this process (#545).
-    let cache = ensure_vector_cache();
-    let vi = match cache.as_ref() {
-        Some(v) if !v.is_empty() => v,
-        _ => return (Vec::new(), VectorState::IndexEmpty),
-    };
-
-    let vec = embed_code_dispatch(query);
-
-    // Dimension mismatch (e.g. embedding provider switched since the index
-    // was built) would panic inside the backend — degrade to other signals.
-    if vi.dims() != vec.len() {
-        return (Vec::new(), VectorState::DimsMismatch);
-    }
-
-    // Over-fetch to compensate for post-filter by project_id.
-    let over_fetch = (limit * 5).max(50);
-    let raw = vi.search(&vec, over_fetch);
-
-    // Use cached project ID set — avoids full DB scan per query.
-    // Falls back to DB query only on cache miss (first search after process start).
-    let project_ids = {
-        let cache = PROJECT_ID_CACHE.read().unwrap();
-        cache.get(&project_id).cloned()
-    };
-
-    let project_ids = match project_ids {
-        Some(ids) => ids,
-        None => {
-            // Cache miss — load from DB and cache for future queries
-            let mut stmt = match conn.prepare("SELECT id FROM symbols WHERE project_id = ?1") {
-                Ok(s) => s,
-                Err(_) => return (Vec::new(), VectorState::NoHits),
-            };
-            let rows: Vec<i64> = stmt
-                .query_map([project_id], |r| r.get(0))
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default();
-            let ids: HashSet<i64> = rows.into_iter().collect();
-            PROJECT_ID_CACHE
-                .write()
-                .unwrap()
-                .insert(project_id, ids.clone());
-            ids
+    let dims = active_dims();
+    let vectors = match vector::load_cached(&project_vector_path(project_id), dims) {
+        Loaded::Ready(v) if v.len() > 0 => v,
+        Loaded::Ready(_) | Loaded::Missing => return (Vec::new(), VectorState::IndexEmpty),
+        Loaded::Unreadable(why) => {
+            tracing::warn!(
+                "vector file of project {project_id} is unreadable ({why}); run `cora index` to rebuild it"
+            );
+            return (Vec::new(), VectorState::IndexEmpty);
+        }
+        Loaded::DimsMismatch { file, wanted } => {
+            tracing::warn!(
+                "vector file of project {project_id} has {file} dimensions, the model has {wanted}; run `cora index` to rebuild it"
+            );
+            return (Vec::new(), VectorState::DimsMismatch);
         }
     };
 
-    let hits: Vec<(i64, f32)> = raw
-        .into_iter()
-        .filter(|(sym_id, _)| project_ids.contains(sym_id))
-        .take(limit)
-        .map(|(sym_id, dist)| (sym_id, cosine_distance_to_similarity(dist)))
-        .collect();
+    let vec = embed_code_dispatch(query);
+    if vec.len() != vectors.dim() {
+        return (Vec::new(), VectorState::DimsMismatch);
+    }
+
+    let hits = vectors.search(&vec, limit);
     let state = if hits.is_empty() {
         VectorState::NoHits
     } else {

@@ -331,7 +331,7 @@ debt:
   max_stored_findings: 500   # findings stored per run, most severe first; 0 = all
 ```
 
-`debt.max_stored_findings` bounds what one review or scan writes to `cora.db`. A full-repository scan can find thousands of issues; storing them all buried the few actionable ones. When a run is cut, its stored summary says how many were left out, and the quality score still uses the whole run. Findings that were not stored are not auto-resolved. To clean an existing database, use `cora findings prune` (see the CLI reference): `--stale-projects` removes projects whose directory is gone, and `--older-than DAYS` removes old resolved findings. Run it with `--dry-run` first. `prune` only edits `cora.db`: the shared vector index file (`cora_index.usearch`) is left as it is, so vectors of removed projects stay in it until the index is rebuilt.
+`debt.max_stored_findings` bounds what one review or scan writes to `cora.db`. A full-repository scan can find thousands of issues; storing them all buried the few actionable ones. When a run is cut, its stored summary says how many were left out, and the quality score still uses the whole run. Findings that were not stored are not auto-resolved. To clean an existing database, use `cora findings prune` (see the CLI reference): `--stale-projects` removes projects whose directory is gone, and `--older-than DAYS` removes old resolved findings. Run it with `--dry-run` first. `prune` also deletes the vector files of the projects it removes.
 
 ### CLI Usage
 
@@ -560,7 +560,7 @@ brain:
 | `CORA_EMBED_MODEL_URL` | Fetch the files from this base URL instead of the Hugging Face hub (an internal mirror). The pinned hashes still apply |
 | `CORA_EMBED_OFFLINE=1` | Never touch the network; use the model only if it is already downloaded |
 
-> **Models do not mix.** Each model has its own vector index file (`cora_index.potion-code-v2.usearch` for `potion`, `cora_index.usearch` for `hashing` and `pretrained`), and every symbol's embedding fingerprint includes the model. Changing `brain.embedding`, or the first run after the code model became available, re-embeds the project on the next `cora index` even when no file changed. `cora index --rebuild` is no longer needed for this.
+> **One vector file per project and model.** Vectors live in `<data dir>/vectors/<project id>.<model>.vecq` and are rebuilt from the project's symbols after every index run that changed them. Changing `brain.embedding`, or the first run after the code model became available, re-embeds the project on the next `cora index` even when no file changed; the file of a model no longer used is removed. `brain.vector_store` and `brain.vector_bits` were removed: a config that still sets them loads and warns once.
 
 > **Note:** If you select `pretrained` but cora was built without the `pretrained-embed` feature, it falls back to `hashing` with a warning.
 
