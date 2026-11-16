@@ -8,6 +8,7 @@
 //! honors `--dry-run`, and never rewrites a file that would not change.
 
 pub mod claude;
+pub mod hermes;
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -162,7 +163,7 @@ pub trait Integration {
 
 /// Every native integration.
 pub fn all() -> Vec<Box<dyn Integration>> {
-    vec![Box::new(claude::Claude)]
+    vec![Box::new(claude::Claude), Box::new(hermes::Hermes)]
 }
 
 /// Install (or remove) the native integrations for the detected agents, or for
