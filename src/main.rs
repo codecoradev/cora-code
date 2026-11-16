@@ -1638,7 +1638,10 @@ async fn main() -> Result<()> {
                 println!("{native}");
             }
             let output = commands::install::execute_install(&opts)?;
-            println!("{output}");
+            // A native setup that ran has already said what it did.
+            if native.is_empty() || !output.starts_with("No AI coding agents detected") {
+                println!("{output}");
+            }
             0
         }
         Command::DeadCode {

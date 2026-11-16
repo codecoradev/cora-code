@@ -60,6 +60,24 @@ pub fn cora_command() -> String {
         .unwrap_or_else(|| "cora".to_string())
 }
 
+impl Ctx {
+    /// `cora` as a word in a shell command line: quoted when the path needs it.
+    pub fn cora_shell(&self) -> String {
+        if self
+            .cora
+            .chars()
+            .any(|c| c.is_whitespace() || "\"'$`\\&;|<>()*?[]{}#~".contains(c))
+        {
+            format!(
+                "\"{}\"",
+                self.cora.replace('\\', "\\\\").replace('"', "\\\"")
+            )
+        } else {
+            self.cora.clone()
+        }
+    }
+}
+
 /// What happened to one thing an installer manages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -390,6 +408,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(backup).unwrap(), "mine\n");
         assert!(matches!(remove_instruction_block(&path, &c), Step::Done(_)));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+    }
+
+    #[test]
+    fn a_binary_path_with_spaces_is_quoted_for_the_shell() {
+        let mut c = ctx(Path::new("/h"));
+        c.cora = "/Users/Jane Doe/bin/cora".into();
+        assert_eq!(c.cora_shell(), "\"/Users/Jane Doe/bin/cora\"");
+        c.cora = "cora".into();
+        assert_eq!(c.cora_shell(), "cora");
     }
 
     #[test]

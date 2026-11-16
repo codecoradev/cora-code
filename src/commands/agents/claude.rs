@@ -186,8 +186,8 @@ impl Integration for Claude {
         match read_settings(ctx) {
             Err(e) => r.push("hooks", Step::Failed(e)),
             Ok(mut doc) => {
-                let p = format!("{} hook context --agent claude", ctx.cora);
-                let s = format!("{} hook session --agent claude", ctx.cora);
+                let p = format!("{} hook context --agent claude", ctx.cora_shell());
+                let s = format!("{} hook session --agent claude", ctx.cora_shell());
                 let a = set_hook(&mut doc, PROMPT_EVENT, PROMPT_MARK, &p, 10, ctx.force);
                 let b = set_hook(&mut doc, SESSION_EVENT, SESSION_MARK, &s, 10, ctx.force);
                 r.push(
@@ -203,6 +203,13 @@ impl Integration for Claude {
 
         register_mcp(ctx, &mut r);
         r.push("skill", write_if_changed(&skill_path(ctx), CODE_SKILL, ctx));
+        r.todo.push(
+            "headless runs (`claude -p`) ask before using MCP tools: allow the read-only ones with \
+             permissions.allow [\"mcp__cora__cora_brain_search\", \"mcp__cora__cora_search_symbols\", \
+             \"mcp__cora__cora_find_callers\", \"mcp__cora__cora_find_impact\", \
+             \"mcp__cora__cora_find_affected_tests\"] if you want that"
+                .to_string(),
+        );
         if ctx.no_instructions {
             r.push("instructions", Step::Skipped("--no-instructions".into()));
         } else {
