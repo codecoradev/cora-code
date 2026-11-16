@@ -37,7 +37,7 @@ The action downloads cora, runs `cora review` on the PR diff, comments on the PR
 
 ## Any other CI
 
-Run `cora review --base origin/<target-branch> --ci` (an LLM judge, SARIF output, a blocking exit code) with `CORA_API_KEY` set as a secret, or `cora review --no-llm` for the deterministic checks only. Fetch enough history for the base branch (`fetch-depth: 0` or an explicit fetch). No `cora index` step is needed: cora indexes the checkout itself before building the prompt, and release binaries carry the code embedding model, so it works on a fresh runner.
+Run `cora review --base origin/<target-branch> --ci` with `CORA_API_KEY` set as a secret (an LLM judge; `--ci` lifts the diff size limit and exits with 2 when there are findings; add `--format sarif` for Code Scanning), or `cora review --no-llm` for the deterministic checks only. Fetch enough history for the base branch (`fetch-depth: 0` or an explicit fetch). No `cora index` step is needed: cora indexes the checkout itself before building the prompt, and release binaries carry the code embedding model, so it works on a fresh runner.
 
 ## Things to get right
 
