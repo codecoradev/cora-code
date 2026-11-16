@@ -501,6 +501,12 @@ fn extract_calls_from_node(
                 }
             }
         }
+        // The arguments of a macro are a raw `token_tree`, not parsed
+        // expressions, so a call inside `json!(..)`, `vec![..]`, `format!(..)`,
+        // `assert!(..)` has no `call_expression` node (#715).
+        if node.kind() == "token_tree" {
+            token_tree_calls(node, source, file_path, caller, edges);
+        }
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
@@ -512,6 +518,54 @@ fn extract_calls_from_node(
         }
     }
     walk_calls(node, source, file_path, caller, edges);
+}
+
+/// Items that a token tree can declare; an identifier after one of these
+/// followed by `(` is a definition (`fn helper()` inside a `macro_rules!`
+/// body), not a call.
+const DECLARING_TOKENS: &[&str] = &["fn", "struct", "enum", "union", "trait", "mod", "type"];
+
+/// Call edges for `name(` patterns among the direct children of a `token_tree`
+/// (macro arguments): an identifier immediately followed by a parenthesised
+/// token tree. Nested token trees are visited by the caller's walk, so
+/// `json!({ "k": f(x) })` reaches `f` at the inner level. A path (`a::b(x)`)
+/// yields its last segment, a method call (`x.m()`) the method name, the same
+/// as `normalize_callee_name` does for real call expressions.
+fn token_tree_calls(
+    tree: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    caller: &str,
+    edges: &mut Vec<AstEdge>,
+) {
+    let mut cursor = tree.walk();
+    let children: Vec<tree_sitter::Node> = tree.children(&mut cursor).collect();
+    for (i, pair) in children.windows(2).enumerate() {
+        let (name, args) = (&pair[0], &pair[1]);
+        if name.kind() != "identifier" || args.kind() != "token_tree" {
+            continue;
+        }
+        if !node_text(args, source).starts_with('(') {
+            continue;
+        }
+        let declared = i
+            .checked_sub(1)
+            .map(|p| node_text(&children[p], source))
+            .is_some_and(|prev| DECLARING_TOKENS.contains(&prev.as_str()));
+        if declared {
+            continue;
+        }
+        let callee = node_text(name, source);
+        if !callee.is_empty() {
+            edges.push(AstEdge {
+                source: caller.to_string(),
+                kind: EdgeKind::Calls,
+                target: callee,
+                file: file_path.to_string(),
+                line: (name.start_position().row + 1) as u32,
+            });
+        }
+    }
 }
 
 // ─── Go ───────────────────────────────────────────────────────────────
@@ -2861,5 +2915,93 @@ class Repository implements Comparable, Serializable {
             "expected Dog -> Animal Inherits edge, got edges: {:?}",
             edges
         );
+    }
+
+    // ─── #715: calls inside macro arguments ───
+
+    const MACRO_CODE: &str = r#"
+fn tool_kind(t: &str) -> &str { t }
+fn approval_config_option(a: bool) -> u8 { 1 }
+
+fn build(tool: &str, auto: bool, x: Thing) {
+    let v = json!({ "kind": tool_kind(tool), "n": 1 });
+    let o = vec![approval_config_option(auto)];
+    let s = format!("{}", helper_a(tool));
+    assert!(helper_b(1) == 2, "msg {}", helper_c());
+    let m = matches!(helper_d(), Some(_));
+    println!("{}", self::util::helper_e(tool));
+    dbg!(x.method_f(1));
+    plain_call(tool);
+}
+
+macro_rules! gen {
+    () => { fn declared_not_called() {} };
+}
+"#;
+
+    fn macro_targets() -> Vec<String> {
+        let (_, edges) = extract(MACRO_CODE, "rs", "m.rs");
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.source == "build")
+            .map(|e| e.target.clone())
+            .collect()
+    }
+
+    #[test]
+    fn calls_inside_std_and_serde_macros_are_call_edges() {
+        let targets = macro_targets();
+        for want in [
+            "tool_kind",
+            "approval_config_option",
+            "helper_a",
+            "helper_b",
+            "helper_c",
+            "helper_d",
+            "helper_e",
+            "method_f",
+            "plain_call",
+        ] {
+            assert!(
+                targets.iter().any(|t| t == want),
+                "{want} missing: {targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_macro_names_and_declarations_are_not_calls() {
+        let (_, edges) = extract(MACRO_CODE, "rs", "m.rs");
+        let all: Vec<&str> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls)
+            .map(|e| e.target.as_str())
+            .collect();
+        for not in [
+            "json", "vec", "format", "assert", "matches", "println", "dbg",
+        ] {
+            assert!(!all.contains(&not), "macro `{not}` is not a call: {all:?}");
+        }
+        assert!(
+            !all.contains(&"declared_not_called"),
+            "`fn name()` inside macro_rules! is a definition: {all:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_in_a_macro_is_recorded_once_with_its_own_line() {
+        let targets = macro_targets();
+        assert_eq!(targets.iter().filter(|t| *t == "tool_kind").count(), 1);
+        let (_, edges) = extract(MACRO_CODE, "rs", "m.rs");
+        let e = edges
+            .iter()
+            .find(|e| e.target == "tool_kind" && e.source == "build")
+            .unwrap();
+        let expected = MACRO_CODE
+            .lines()
+            .position(|l| l.contains("json!"))
+            .map(|n| n as u32 + 1)
+            .unwrap();
+        assert_eq!(e.line, expected);
     }
 }

@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Raw model JSON printed after "No issues found" (#718).** Text after the findings array that was not marked with `|||` was shown as the summary, so a duplicated or truncated JSON blob appeared under a clean verdict. It is now dropped when the array has findings, and an empty array followed by JSON is retried instead of reported as clean.
 - **Chunked review lost files (#720).** Splitting a diff cut file headers and glued the blocks of a multi-file chunk together without a newline, so only the last file of each chunk was parsed back. Splitting now follows `diff --git` boundaries and is lossless.
 - **MCP `cora.get_debt` read only the old JSON snapshots (#724).** It now reads the review history from `cora.db`, like `cora debt`, so agents get data on repositories whose history exists only in the database.
+- **Calls inside Rust macro arguments are indexed (#715).** The arguments of `json!`, `vec!`, `format!`, `assert!`, `matches!`, `println!` and any other macro are a raw token tree in the grammar, so a call such as `json!({ "kind": tool_kind(tool) })` never became a call edge and `cora dead-code` reported live functions as unused (`callers`, `impact` and `trace` missed them too). A token tree is now scanned for `name(` patterns; paths (`a::b(x)`) and method calls (`x.m()`) yield their last segment like real calls, and `fn name()` inside a `macro_rules!` body stays a definition. Re-run `cora index` to pick this up.
 
 ## [0.20.0] - 2026-10-27
 
