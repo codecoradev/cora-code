@@ -10,7 +10,8 @@
 //! of writing it.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, remove_file_step, write_if_changed,
+    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
+    write_if_changed,
 };
 use std::path::PathBuf;
 
@@ -107,7 +108,13 @@ fn strip_block(text: &str) -> String {
 
 fn install_config(ctx: &Ctx, r: &mut Report) {
     let path = config(ctx);
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = match read_existing(&path) {
+        Ok(text) => text.unwrap_or_default(),
+        Err(e) => {
+            r.push("config", Step::Failed(e));
+            return;
+        }
+    };
     let base = strip_block(&existing);
 
     let mut body = String::new();
@@ -157,12 +164,19 @@ fn install_config(ctx: &Ctx, r: &mut Report) {
 
 fn remove_config(ctx: &Ctx, r: &mut Report) {
     let path = config(ctx);
-    let Ok(existing) = std::fs::read_to_string(&path) else {
-        r.push(
-            "config",
-            Step::Unchanged(format!("{} not present", path.display())),
-        );
-        return;
+    let existing = match read_existing(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            r.push(
+                "config",
+                Step::Unchanged(format!("{} not present", path.display())),
+            );
+            return;
+        }
+        Err(e) => {
+            r.push("config", Step::Failed(e));
+            return;
+        }
     };
     let stripped = strip_block(&existing);
     if stripped == existing {
@@ -289,6 +303,17 @@ mod tests {
                 .trim()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn an_unreadable_config_is_reported_and_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path());
+        std::fs::create_dir_all(root(&c)).unwrap();
+        std::fs::write(config(&c), [0xff, 0xfe]).unwrap(); // not UTF-8
+        assert!(Hermes.install(&c).failed());
+        assert!(Hermes.remove(&c).failed());
+        assert_eq!(std::fs::read(config(&c)).unwrap(), vec![0xff, 0xfe]);
     }
 
     #[test]
