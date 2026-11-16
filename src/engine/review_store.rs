@@ -302,6 +302,7 @@ impl<'a> ReviewStore<'a> {
             dry_run: opts.dry_run,
             ..PruneReport::default()
         };
+        let mut removed_ids: Vec<i64> = Vec::new();
 
         if opts.stale_projects {
             let rows: Vec<(i64, String)> = {
@@ -321,6 +322,7 @@ impl<'a> ReviewStore<'a> {
                 report.stale_project_reviews += usize::try_from(reviews).unwrap_or(0);
                 // Foreign keys cascade to symbols, files, edges, reviews, findings.
                 tx.execute("DELETE FROM projects WHERE id = ?1", [id])?;
+                removed_ids.push(id);
                 report.stale_projects.push(root);
             }
         }
@@ -346,6 +348,10 @@ impl<'a> ReviewStore<'a> {
             tx.rollback()?;
         } else {
             tx.commit()?;
+            // The vectors of a removed project go with it.
+            for id in removed_ids {
+                crate::index::vector::remove_project_files(id, None);
+            }
         }
         Ok(report)
     }

@@ -10,7 +10,6 @@ keywords = ["cli", "code-review", "ai", "git", "pre-commit"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.89"
 exclude = [
-    "vendored/",
     "docs/",
     ".github/",
     "tests/",
@@ -74,7 +73,6 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 # Static code embedding model (potion-code-16M-v2); pure-Rust tokenizer, no network
 # in the crate itself: the model is fetched by `embed::model_store`.
 model2vec-rs = { version = "0.4", default-features = false, features = ["fancy-regex", "local-only"] }
-usearch = "2"
 vecq-core = "0.3.0"
 fs2 = "0.4"
 
@@ -100,7 +98,6 @@ tempfile = "3"
 
 [features]
 default = ["tree-sitter"]
-pretrained-embed = []
 tree-sitter = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",

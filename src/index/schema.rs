@@ -527,6 +527,8 @@ pub fn delete_project(conn: &Connection, project_id: i64) -> anyhow::Result<usiz
         "DELETE FROM projects WHERE id = ?1",
         rusqlite::params![project_id],
     )?;
+    // Its vectors are not needed any more either.
+    super::vector::remove_project_files(project_id, None);
     Ok(affected)
 }
 

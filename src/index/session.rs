@@ -84,14 +84,54 @@ pub struct Configured {
 /// and brain code paths.
 pub fn configure(config: Option<&Config>) -> Configured {
     let brain_mode = config
-        .map(|c| c.brain.embedding.to_string())
+        .map(|c| c.brain.embedding.resolver_value().to_string())
         .unwrap_or_else(|| "auto".to_string());
+    warn_removed_embedding_modes(config);
     let backend = crate::embed::resolve_backend(&brain_mode);
-    super::vector::apply_config_store(config);
+    warn_removed_vector_options(config);
     Configured {
         brain_mode,
         backend,
         skip_patterns: super::skip_patterns_from_config(config),
+    }
+}
+
+/// `brain.vector_store` and `brain.vector_bits` no longer do anything (vectors are
+/// one vecq file per project, #750): say so once instead of silently ignoring them.
+fn warn_removed_vector_options(config: Option<&Config>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(c) = config else { return };
+    let set: Vec<&str> = [
+        ("vector_store", &c.brain.vector_store),
+        ("vector_bits", &c.brain.vector_bits),
+    ]
+    .into_iter()
+    .filter(|(_, v)| !v.is_empty())
+    .map(|(k, _)| k)
+    .collect();
+    if !set.is_empty() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: brain.{} in your config no longer has any effect: vectors are stored as one quantized file per project. Remove it.",
+                set.join(" and brain.")
+            );
+        });
+    }
+}
+
+/// `brain.embedding: hashing|pretrained` were removed (#751): the code model is
+/// used instead (or no vectors when it is not available). Say so once.
+fn warn_removed_embedding_modes(config: Option<&Config>) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let Some(c) = config else { return };
+    if c.brain.embedding.is_removed() {
+        ONCE.call_once(|| {
+            eprintln!(
+                "warning: brain.embedding: {} was removed; the code embedding model is used instead \
+                 (set `off` to disable embeddings). Update your config.",
+                c.brain.embedding
+            );
+        });
     }
 }
 
@@ -207,7 +247,7 @@ mod tests {
         (dir, root)
     }
 
-    const YAML: &str = "brain:\n  embedding: hashing\nignore:\n  files:\n    - \"gen/**\"\nrules_engine:\n  index_skip_files:\n    - \"vendor/**\"\n";
+    const YAML: &str = "brain:\n  embedding: off\nignore:\n  files:\n    - \"gen/**\"\nrules_engine:\n  index_skip_files:\n    - \"vendor/**\"\n";
 
     fn memory_bridge(root: &Path) -> IndexBridge {
         let conn = Connection::open_in_memory().unwrap();
@@ -221,8 +261,8 @@ mod tests {
         let (_d, root) = project(YAML);
         let config = load_project_only(&root).expect("config");
         let configured = configure(Some(&config));
-        assert_eq!(configured.brain_mode, "hashing");
-        assert_eq!(configured.backend, Backend::Hashing);
+        assert_eq!(configured.brain_mode, "off");
+        assert_eq!(configured.backend, Backend::Off);
         let pats = configured.skip_patterns.unwrap();
         assert!(pats.contains(&"gen/**".to_string()), "{pats:?}");
         assert!(pats.contains(&"vendor/**".to_string()), "{pats:?}");
@@ -234,14 +274,14 @@ mod tests {
         // backend string must come from the project's .cora.yaml.
         let (_d, root) = project(YAML);
         let configured = configure_for_search(ConfigSource::ProjectOnlyAt(&root));
-        assert_eq!(configured.brain_mode, "hashing");
-        assert_eq!(configured.backend, Backend::Hashing);
+        assert_eq!(configured.brain_mode, "off");
+        assert_eq!(configured.backend, Backend::Off);
     }
 
     #[test]
     fn explicit_config_path_is_honored_by_full_source() {
         // `cora --config X serve` threads X through ConfigSource::Full.
-        let (_d, root) = project("brain:\n  embedding: hashing\n");
+        let (_d, root) = project("brain:\n  embedding: off\n");
         let other = root.join("other.yaml");
         fs::write(&other, "ignore:\n  files:\n    - \"only-in-explicit/**\"\n").unwrap();
         let config = load_config(ConfigSource::Full(other.to_str())).expect("config");

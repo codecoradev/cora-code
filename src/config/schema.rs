@@ -586,62 +586,31 @@ pub struct AnalysisConfig {
     pub entry_point_patterns: Vec<String>,
 }
 
-/// Brain Mode configuration — controls embedding backend for vector search.
+/// Brain Mode configuration — the code embedding model for vector search.
 ///
-/// By default (`auto`), cora selects the best available backend at runtime: the
-/// `potion-code-16M-v2` code model (downloaded once on first use) → pretrained
-/// 768d (if compiled with `pretrained-embed`) → hashing 256d fallback.
-/// Users can force a specific backend via `.cora.yaml`.
-fn default_vector_store() -> String {
-    "usearch".to_string()
-}
-
-fn default_vector_bits() -> String {
-    "residual".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// By default (`auto`), cora uses the `potion-code-16M-v2` code model
+/// (downloaded once on first use). When the model is not available the vector
+/// signal is off and search uses keywords and the call graph; `off` chooses
+/// that on purpose.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct BrainConfig {
-    /// Vector store backend for Brain Mode search.
-    ///
-    /// - `"usearch"` (default) — HNSW graph, f32
-    /// - `"vecq"` — quantized brute-force scan (pure Rust, deterministic,
-    ///   ~5x smaller index; recall trade absorbed by RRF fusion)
-    #[serde(default = "default_vector_store")]
+    /// Removed (#750): vectors are one vecq file per project. Still parsed so an
+    /// old `.cora.yaml` loads; a non-empty value only produces a warning.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_store: String,
-    /// Quantization width for the `vecq` store (ignored by `usearch`).
-    ///
-    /// - `"residual"` (default) — 4-bit base + second-pass residual codes:
-    ///   best recall at 4-bit scan speed on cora's default embeddings
-    /// - `"4"` / `"5"` / `"6"` — plain Lloyd-Max width
-    ///
-    /// Invalid values fall back to `"residual"`. Changing the width rebuilds
-    /// the index once on the next `cora index`.
-    #[serde(default = "default_vector_bits")]
+    /// Removed (#750), see [`Self::vector_store`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_bits: String,
-    /// Embedding backend selection.
+    /// Embedding selection.
     ///
-    /// - `"auto"` (default) — best available: potion → pretrained → hashing
-    /// - `"potion"` — the potion-code-16M-v2 code model (downloaded once)
-    /// - `"hashing"` — force 256d hashing trick (zero dependency)
-    /// - `"pretrained"` — force nomic 768d (requires `--features pretrained-embed`)
+    /// - `"auto"` (default) — the potion-code-16M-v2 code model (downloaded
+    ///   once); the vector signal is off while it is not available
+    /// - `"off"` — never use embeddings
     ///
-    /// Invalid values fall back to `"auto"` with a warning.
+    /// `potion`, `hashing` and `pretrained` (removed, #751) still load, mean
+    /// `auto` and print one warning (`hashing`, `pretrained`).
     #[serde(default, skip_serializing_if = "is_default")]
     pub embedding: BrainEmbeddingMode,
-}
-
-// Manual Default so `Config::default()` carries the documented values
-// ("usearch"/"residual") — the derived one would leave empty strings, and
-// the store/width parsers only meet those values leniently.
-impl Default for BrainConfig {
-    fn default() -> Self {
-        Self {
-            vector_store: default_vector_store(),
-            vector_bits: default_vector_bits(),
-            embedding: BrainEmbeddingMode::default(),
-        }
-    }
 }
 
 /// `.cora.yaml` `brain:` section — mirrors the subset of [`BrainConfig`]
@@ -656,26 +625,44 @@ pub struct BrainSection {
     pub embedding: Option<BrainEmbeddingMode>,
 }
 
-/// Embedding backend mode for Brain Mode.
+/// Embedding mode for Brain Mode.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BrainEmbeddingMode {
-    /// Best available backend (potion, else pretrained if compiled, else hashing).
+    /// The code model, downloaded once on first use.
     #[default]
+    #[serde(alias = "potion")]
     Auto,
-    /// The potion-code-16M-v2 code model (downloaded once on first use).
-    Potion,
-    /// Force 256d hashing trick (zero dependency).
+    /// No embeddings: keyword and graph search only.
+    Off,
+    /// Removed (#751): behaves as `auto` and warns.
+    #[serde(skip_serializing)]
     Hashing,
-    /// Force nomic 768d pretrained (requires feature flag).
+    /// Removed (#751): behaves as `auto` and warns.
+    #[serde(skip_serializing)]
     Pretrained,
+}
+
+impl BrainEmbeddingMode {
+    /// The value handed to the embedding resolver (`auto` or `off`).
+    pub fn resolver_value(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            _ => "auto",
+        }
+    }
+
+    /// Whether this is a removed value.
+    pub fn is_removed(&self) -> bool {
+        matches!(self, Self::Hashing | Self::Pretrained)
+    }
 }
 
 impl std::fmt::Display for BrainEmbeddingMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
-            Self::Potion => write!(f, "potion"),
+            Self::Off => write!(f, "off"),
             Self::Hashing => write!(f, "hashing"),
             Self::Pretrained => write!(f, "pretrained"),
         }
@@ -687,12 +674,12 @@ impl std::str::FromStr for BrainEmbeddingMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "potion" => Ok(Self::Potion),
+            "auto" | "potion" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
             "hashing" => Ok(Self::Hashing),
             "pretrained" => Ok(Self::Pretrained),
             other => Err(format!(
-                "unknown brain.embedding value '{other}' — expected auto, potion, hashing, or pretrained"
+                "unknown brain.embedding value '{other}' — expected auto or off"
             )),
         }
     }
@@ -1106,21 +1093,23 @@ mod tests {
     }
 
     #[test]
-    fn brain_vector_bits_defaults_to_residual() {
+    fn the_removed_vector_options_default_to_empty() {
         let cfg = Config::default();
-        assert_eq!(cfg.brain.vector_bits, "residual");
-        assert_eq!(cfg.brain.vector_store, "usearch");
+        assert!(cfg.brain.vector_store.is_empty());
+        assert!(cfg.brain.vector_bits.is_empty());
     }
 
+    /// An old `.cora.yaml` that still sets the removed options keeps loading;
+    /// the values are only kept so the session can warn about them.
     #[test]
-    fn merge_brain_vector_store_and_bits() {
+    fn an_old_config_with_the_removed_vector_options_still_loads() {
         let mut cfg = Config::default();
         let cora = CoraFile::from_str(
             r"
 brain:
   vector_store: vecq
   vector_bits: '6'
-  embedding: hashing
+  embedding: auto
 ",
         )
         .unwrap();
@@ -1129,22 +1118,6 @@ brain:
 
         assert_eq!(cfg.brain.vector_store, "vecq");
         assert_eq!(cfg.brain.vector_bits, "6");
-    }
-
-    #[test]
-    fn merge_brain_vector_bits_absent_keeps_default() {
-        let mut cfg = Config::default();
-        let cora = CoraFile::from_str(
-            r"
-brain:
-  vector_store: vecq
-",
-        )
-        .unwrap();
-
-        cora.merge_into(&mut cfg).unwrap();
-
-        assert_eq!(cfg.brain.vector_bits, "residual");
     }
 
     #[test]

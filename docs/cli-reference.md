@@ -117,7 +117,7 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 
 | Command | Description |
 |---------|-------------|
-| `cora index` | Index project symbols into SQLite + usearch |
+| `cora index` | Index project symbols into SQLite and embed them into the project's vector file |
 | `cora index --rebuild` | Rebuild index from scratch |
 | `cora index --watch` | Auto-sync file watcher (2s poll interval) |
 | `cora index --stats` | Show index statistics (symbol count, languages, DB size) |

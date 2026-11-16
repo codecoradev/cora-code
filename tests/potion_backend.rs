@@ -42,6 +42,17 @@ fn sandbox() -> (tempfile::TempDir, PathBuf, PathBuf) {
     (guard, proj, home)
 }
 
+/// Names of the per-project vector files.
+fn vector_files(home: &Path) -> Vec<String> {
+    std::fs::read_dir(home.join("cora-code").join("vectors"))
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn stdout(c: &mut Command) -> String {
     String::from_utf8(c.assert().success().get_output().stdout.clone()).unwrap()
 }
@@ -57,10 +68,12 @@ fn the_code_model_gets_its_own_index_and_answers_a_semantic_question() {
             .env("CORA_EMBED_MODEL_DIR", &model),
     );
 
-    let data = home.join("cora-code");
     assert!(
-        data.join("cora_index.potion-code-v2.usearch").exists(),
-        "the code model must not share the hashing index file"
+        vector_files(&home)
+            .iter()
+            .any(|f| f.ends_with(".potion-code-v2.vecq")),
+        "the code model has its own per-project file: {:?}",
+        vector_files(&home)
     );
 
     // No word of the question is in the function name: only the model links them.
@@ -83,18 +96,23 @@ fn the_code_model_gets_its_own_index_and_answers_a_semantic_question() {
 }
 
 #[test]
-fn switching_the_model_re_embeds_without_any_file_change() {
+fn without_the_model_there_are_no_vectors_and_the_model_arriving_builds_them() {
     let (_g, proj, home) = sandbox();
 
-    // 1. Offline: the hashing fallback fills the historical index file.
+    // 1. Offline, no model: no vector file, keyword search still answers.
     stdout(
         cora(&proj, &home)
             .arg("index")
             .env("CORA_EMBED_OFFLINE", "1"),
     );
-    let data = home.join("cora-code");
-    assert!(data.join("cora_index.usearch").exists());
-    assert!(!data.join("cora_index.potion-code-v2.usearch").exists());
+    assert!(vector_files(&home).is_empty(), "{:?}", vector_files(&home));
+    let out = stdout(
+        cora(&proj, &home)
+            .args(["brain", "decode_json_text", "--json"])
+            .env("CORA_EMBED_OFFLINE", "1"),
+    );
+    let results: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(results[0]["name"], "decode_json_text", "{out}");
 
     // 2. The model becomes available; no source file changed.
     stdout(
@@ -102,9 +120,10 @@ fn switching_the_model_re_embeds_without_any_file_change() {
             .arg("index")
             .env("CORA_EMBED_MODEL_DIR", fixture_model()),
     );
+    let files = vector_files(&home);
     assert!(
-        data.join("cora_index.potion-code-v2.usearch").exists(),
-        "a new model must re-embed even when no file changed"
+        files.iter().any(|f| f.ends_with(".potion-code-v2.vecq")),
+        "the model arriving must build vectors even when no file changed: {files:?}"
     );
 
     let out = stdout(
@@ -117,7 +136,7 @@ fn switching_the_model_re_embeds_without_any_file_change() {
 }
 
 #[test]
-fn a_missing_model_degrades_to_hashing_without_failing() {
+fn a_missing_model_turns_the_vector_signal_off_without_failing() {
     let (_g, proj, home) = sandbox();
     let empty = home.join("no-model");
     std::fs::create_dir_all(&empty).unwrap();
@@ -132,7 +151,39 @@ fn a_missing_model_degrades_to_hashing_without_failing() {
         .clone();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not available"), "{err}");
-    assert!(home.join("cora-code").join("cora_index.usearch").exists());
+    assert!(err.contains("vector signal is off"), "{err}");
+    assert!(vector_files(&home).is_empty());
+}
+
+#[test]
+fn off_disables_embeddings_and_removed_values_warn() {
+    let (_g, proj, home) = sandbox();
+    let model = fixture_model();
+
+    std::fs::write(proj.join(".cora.yaml"), "brain:\n  embedding: off\n").unwrap();
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    assert!(vector_files(&home).is_empty(), "off must build no vectors");
+
+    // A removed value still loads: it means auto, with one warning.
+    std::fs::write(proj.join(".cora.yaml"), "brain:\n  embedding: hashing\n").unwrap();
+    let out = cora(&proj, &home)
+        .arg("index")
+        .env("CORA_EMBED_MODEL_DIR", &model)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("was removed"), "{err}");
+    assert!(
+        vector_files(&home)
+            .iter()
+            .any(|f| f.ends_with(".potion-code-v2.vecq"))
+    );
 }
 
 #[test]
@@ -195,4 +246,66 @@ fn explore_no_semantic_keeps_the_keyword_search_only() {
     );
     let results: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert!(results.as_array().unwrap().is_empty(), "{out}");
+}
+
+#[test]
+fn re_indexing_leaves_no_vector_of_a_deleted_function() {
+    let (_g, proj, home) = sandbox();
+    let model = fixture_model();
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    let q = ["brain", "run a table query on the database", "--json"];
+    let before = stdout(
+        cora(&proj, &home)
+            .args(q)
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    assert!(before.contains("run_table_query"), "{before}");
+
+    // delete the function and index again
+    std::fs::write(
+        proj.join("lib.rs"),
+        "pub fn load_settings_file(path: &str) {}\npub fn decode_json_text(text: &str) {}\n",
+    )
+    .unwrap();
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    let after = stdout(
+        cora(&proj, &home)
+            .args(q)
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    assert!(!after.contains("run_table_query"), "{after}");
+}
+
+#[test]
+fn the_former_shared_index_is_removed_after_the_first_index() {
+    let (_g, proj, home) = sandbox();
+    let data = home.join("cora-code");
+    std::fs::create_dir_all(&data).unwrap();
+    for f in [
+        "cora_index.usearch",
+        "cora_index.keys",
+        "cora_index.potion-code-v2.usearch",
+    ] {
+        std::fs::write(data.join(f), b"old").unwrap();
+    }
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", fixture_model()),
+    );
+    for f in [
+        "cora_index.usearch",
+        "cora_index.keys",
+        "cora_index.potion-code-v2.usearch",
+    ] {
+        assert!(!data.join(f).exists(), "{f} should be gone");
+    }
 }
