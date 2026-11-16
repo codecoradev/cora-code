@@ -49,6 +49,112 @@ pub struct BrainResult {
     pub signals: Vec<String>,
 }
 
+/// Why the vector signal did or did not contribute to a search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorState {
+    /// The index answered with at least one symbol of this project.
+    Used,
+    /// The index answered, but nothing of this project was near the query.
+    NoHits,
+    /// No vector index is loaded, or it is empty (`cora index` builds it).
+    IndexEmpty,
+    /// The index was built with other dimensions than the active embedding.
+    DimsMismatch,
+}
+
+/// How a brain search was answered: which signals found how much.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainDiagnostics {
+    /// Search terms the question was reduced to (natural-language mode).
+    pub terms: Vec<String>,
+    pub fts_hits: usize,
+    pub vector_hits: usize,
+    pub graph_hits: usize,
+    pub vector: VectorState,
+    /// Embedding tier the project was indexed with (`static` is text-only).
+    pub embedding_tier: Option<String>,
+}
+
+impl BrainDiagnostics {
+    /// Human-readable warnings about a signal that cannot be trusted.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.vector {
+            VectorState::IndexEmpty => out.push(
+                "vector index is empty or not loaded: results come from keyword and graph \
+                 signals only (run `cora index`)"
+                    .to_string(),
+            ),
+            VectorState::DimsMismatch => out.push(
+                "vector index was built with other dimensions than the active embedding: \
+                 vector signal skipped (run `cora index --rebuild`)"
+                    .to_string(),
+            ),
+            VectorState::Used if self.embedding_tier.as_deref() == Some("static") => out.push(
+                "vector hits come from a static text embedding and may be unrelated to the \
+                 question; configure an embedding provider for semantic matches"
+                    .to_string(),
+            ),
+            _ => {}
+        }
+        if self.fts_hits == 0 && self.vector_hits > 0 {
+            out.push("no keyword matches: every result comes from the vector signal".to_string());
+        }
+        out
+    }
+}
+
+/// Results of a brain search plus how they were found.
+#[derive(Debug, Clone)]
+pub struct BrainReport {
+    pub results: Vec<BrainResult>,
+    pub diagnostics: BrainDiagnostics,
+}
+
+/// Words that carry no symbol name in a question.
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from", "how",
+    "i", "in", "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was", "what",
+    "when", "where", "which", "who", "why", "with",
+];
+
+/// Most terms a question is reduced to.
+const MAX_TERMS: usize = 8;
+
+/// Reduce a natural-language question to the words that can name a symbol:
+/// lowercased, stop words dropped, and each `snake_case` word kept whole and
+/// split (`web_search` -> `web_search`, `web`, `search`). Falls back to the
+/// whole query when nothing is left.
+pub fn question_terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    let push = |t: String, terms: &mut Vec<String>| {
+        if t.len() >= 2 && !STOP_WORDS.contains(&t.as_str()) && !terms.contains(&t) {
+            terms.push(t);
+        }
+    };
+    for raw in query.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+        let word = raw.trim_matches('_').to_lowercase();
+        if word.is_empty() {
+            continue;
+        }
+        push(word.clone(), &mut terms);
+        if word.contains('_') {
+            for part in word.split('_') {
+                push(part.to_string(), &mut terms);
+            }
+        }
+    }
+    terms.truncate(MAX_TERMS);
+    if terms.is_empty() {
+        let whole = query.trim().to_string();
+        if !whole.is_empty() {
+            terms.push(whole);
+        }
+    }
+    terms
+}
+
 /// Path to the usearch vector index file.
 fn vector_index_path() -> std::path::PathBuf {
     crate::data_dir::cora_data_dir().join("cora_index.usearch")
@@ -325,12 +431,51 @@ pub fn brain_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<BrainResult>> {
+    Ok(brain_search_report(conn, project_id, query, limit, false)?.results)
+}
+
+/// `brain_search` that also reports which signals found what.
+///
+/// With `natural`, the query is a question: it is reduced to its content words
+/// and a symbol matching more of them ranks higher. The plain mode requires
+/// every word in one symbol name, which finds nothing for a sentence and left
+/// only the (noisy) vector signal (#717).
+pub fn brain_search_report(
+    conn: &Connection,
+    project_id: i64,
+    query: &str,
+    limit: usize,
+    natural: bool,
+) -> Result<BrainReport> {
     let limit = limit.min(50);
     let fetch_limit = limit * 2;
 
-    let fts_hits = fts5_search(conn, project_id, query, fetch_limit);
-    let vec_hits = vector_search(conn, project_id, query, fetch_limit);
+    let terms = if natural {
+        question_terms(query)
+    } else {
+        Vec::new()
+    };
+    let fts_hits = if natural {
+        fts5_terms_search(conn, project_id, query, &terms, fetch_limit)
+    } else {
+        fts5_search(conn, project_id, query, fetch_limit)
+    };
+    let (vec_hits, vector_state) = vector_search_state(conn, project_id, query, fetch_limit);
     let graph_hits = graph_proximity_search(conn, project_id, &fts_hits, fetch_limit);
+
+    let embedding_tier: Option<String> = conn
+        .query_row(
+            "SELECT embedding_tier FROM projects WHERE id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .ok();
+    // A static (text-only) embedding is a weak signal; count it for half.
+    let vector_weight = if embedding_tier.as_deref() == Some("static") {
+        0.5
+    } else {
+        1.0
+    };
 
     // ── RRF Fusion ──────────────────────────────────────────────────────
     let mut fused: HashMap<i64, (f32, Vec<String>)> = HashMap::new();
@@ -343,7 +488,7 @@ pub fn brain_search(
     }
 
     for (rank, (id, _sim)) in vec_hits.iter().enumerate() {
-        let rrf = 1.0 / (RRF_K + (rank as f32 + 1.0));
+        let rrf = vector_weight / (RRF_K + (rank as f32 + 1.0));
         let entry = fused.entry(*id).or_insert((0.0, Vec::new()));
         entry.0 += rrf;
         entry.1.push("vector".into());
@@ -361,13 +506,24 @@ pub fn brain_search(
         b.1.0
             .partial_cmp(&a.1.0)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
     });
     ranked.truncate(limit);
 
     // Batch fetch all symbol rows in a single query (was N+1 individual queries)
     let results = batch_get_symbols(conn, &ranked);
 
-    Ok(results)
+    Ok(BrainReport {
+        results,
+        diagnostics: BrainDiagnostics {
+            terms,
+            fts_hits: fts_hits.len(),
+            vector_hits: vec_hits.len(),
+            graph_hits: graph_hits.len(),
+            vector: vector_state,
+            embedding_tier,
+        },
+    })
 }
 
 // ── Signal sources ───────────────────────────────────────────────────────
@@ -386,6 +542,55 @@ fn fts5_search(conn: &Connection, project_id: i64, query: &str, limit: usize) ->
             Vec::new()
         }
     }
+}
+
+/// FTS5 search for a question: the whole query first (all words in one name),
+/// then each content word on its own. A symbol is ranked by how many of the
+/// words it matches, then by its best rank for any of them.
+fn fts5_terms_search(
+    conn: &Connection,
+    project_id: i64,
+    query: &str,
+    terms: &[String],
+    limit: usize,
+) -> Vec<(i64, f64)> {
+    // id -> (terms matched, best position, best score)
+    let mut found: HashMap<i64, (usize, usize, f64)> = HashMap::new();
+    if terms.len() > 1 {
+        for (pos, (id, score)) in fts5_search(conn, project_id, query, limit)
+            .into_iter()
+            .enumerate()
+        {
+            found.insert(id, (terms.len(), pos, score));
+        }
+    }
+    for term in terms {
+        for (pos, (id, score)) in fts5_search(conn, project_id, term, limit)
+            .into_iter()
+            .enumerate()
+        {
+            let e = found.entry(id).or_insert((0, pos, score));
+            if e.0 < terms.len() {
+                e.0 += 1;
+            }
+            if pos < e.1 {
+                e.1 = pos;
+                e.2 = score;
+            }
+        }
+    }
+    let mut ranked: Vec<(i64, (usize, usize, f64))> = found.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.0
+            .cmp(&a.1.0)
+            .then_with(|| a.1.1.cmp(&b.1.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(id, (_, _, score))| (id, score))
+        .collect()
 }
 
 /// True when the on-disk vector index exists but will be discarded on reload —
@@ -435,13 +640,18 @@ fn ensure_vector_cache() -> std::sync::RwLockReadGuard<'static, Option<CodeVecto
 
 /// usearch vector search → (symbol_id, cosine_similarity) pairs, filtered to project.
 /// Uses cached vector index and cached project ID set — no disk I/O per query.
-fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) -> Vec<(i64, f32)> {
+fn vector_search_state(
+    conn: &Connection,
+    project_id: i64,
+    query: &str,
+    limit: usize,
+) -> (Vec<(i64, f32)>, VectorState) {
     // Read-lock the cached vector index — lazy-loads from disk on the first
     // search in this process (#545).
     let cache = ensure_vector_cache();
     let vi = match cache.as_ref() {
         Some(v) if !v.is_empty() => v,
-        _ => return Vec::new(),
+        _ => return (Vec::new(), VectorState::IndexEmpty),
     };
 
     let vec = embed_code_dispatch(query);
@@ -449,7 +659,7 @@ fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) 
     // Dimension mismatch (e.g. embedding provider switched since the index
     // was built) would panic inside the backend — degrade to other signals.
     if vi.dims() != vec.len() {
-        return Vec::new();
+        return (Vec::new(), VectorState::DimsMismatch);
     }
 
     // Over-fetch to compensate for post-filter by project_id.
@@ -469,7 +679,7 @@ fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) 
             // Cache miss — load from DB and cache for future queries
             let mut stmt = match conn.prepare("SELECT id FROM symbols WHERE project_id = ?1") {
                 Ok(s) => s,
-                Err(_) => return Vec::new(),
+                Err(_) => return (Vec::new(), VectorState::NoHits),
             };
             let rows: Vec<i64> = stmt
                 .query_map([project_id], |r| r.get(0))
@@ -485,11 +695,18 @@ fn vector_search(conn: &Connection, project_id: i64, query: &str, limit: usize) 
         }
     };
 
-    raw.into_iter()
+    let hits: Vec<(i64, f32)> = raw
+        .into_iter()
         .filter(|(sym_id, _)| project_ids.contains(sym_id))
         .take(limit)
         .map(|(sym_id, dist)| (sym_id, cosine_distance_to_similarity(dist)))
-        .collect()
+        .collect();
+    let state = if hits.is_empty() {
+        VectorState::NoHits
+    } else {
+        VectorState::Used
+    };
+    (hits, state)
 }
 
 /// Graph proximity from top FTS result → (symbol_id, proximity) pairs.
@@ -613,5 +830,196 @@ fn batch_get_symbols(conn: &Connection, ranked: &[(i64, (f32, Vec<String>))]) ->
         })
         .unwrap_or_default();
 
+    // `IN (...)` returns rows in table order, not in rank order: restore the
+    // fused ranking, best first, ties by symbol id so the order is stable.
+    let mut results = results;
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.symbol_id.cmp(&b.symbol_id))
+    });
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn db() -> (Connection, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        crate::index::schema::run_migrations(&conn).unwrap();
+        let pid = crate::index::schema::get_or_create_project(&conn, "/tmp/brain-fixture").unwrap();
+        (conn, pid)
+    }
+
+    /// A small project shaped like the web-search question of #717: the
+    /// symbols that answer it, and short unrelated ones that matched before.
+    fn fixture() -> (Connection, i64) {
+        let (conn, pid) = db();
+        let src = r#"
+pub fn web_search(query: &str) -> String { pick_backend(query) }
+pub fn pick_backend(query: &str) -> String { read_env(query) }
+pub fn read_env(name: &str) -> String { name.to_string() }
+pub fn commit() {}
+pub fn is_at_eof() -> bool { true }
+pub fn tzif() {}
+"#;
+        crate::index::index_file(&conn, pid, "src/net.rs", src, "rs").unwrap();
+        (conn, pid)
+    }
+
+    #[test]
+    fn a_question_is_reduced_to_its_content_words() {
+        let t = question_terms("how does web_search pick its backend and read env");
+        assert_eq!(
+            t,
+            [
+                "web_search",
+                "web",
+                "search",
+                "pick",
+                "backend",
+                "read",
+                "env"
+            ]
+        );
+    }
+
+    /// The fused ranking survives the symbol lookup: results come back best
+    /// first, not in table order.
+    #[test]
+    fn results_are_returned_best_first() {
+        let (conn, pid) = fixture();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM symbols WHERE project_id = ?1 ORDER BY id")
+            .unwrap()
+            .query_map([pid], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        // Ranked against table order: the last symbol scores highest.
+        let ranked: Vec<(i64, (f32, Vec<String>))> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, (i as f32, vec!["fts".to_string()])))
+            .collect();
+        let out = batch_get_symbols(&conn, &ranked);
+        let scores: Vec<f32> = out.iter().map(|r| r.score).collect();
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+        assert_eq!(out[0].symbol_id, *ids.last().unwrap());
+    }
+
+    #[test]
+    fn a_query_of_only_stop_words_keeps_the_whole_query() {
+        assert_eq!(question_terms("how is it"), ["how is it"]);
+        assert!(question_terms("   ").is_empty());
+    }
+
+    /// Regression set (#717): the question that returned only unrelated
+    /// vector hits now finds the symbols that answer it through keywords.
+    #[test]
+    fn the_web_search_question_finds_its_answer_by_keyword() {
+        let (conn, pid) = fixture();
+        let q = "how does web_search pick its backend and read env";
+        let report = brain_search_report(&conn, pid, q, 5, true).unwrap();
+        // Only the keyword signal is under test: a vector index on disk (the
+        // developer's own) may add hits that carry no `fts` signal.
+        let got: Vec<&str> = report
+            .results
+            .iter()
+            .filter(|r| r.signals.iter().any(|s| s == "fts"))
+            .map(|r| r.name.as_str())
+            .collect();
+        assert!(got.len() >= 3, "{got:?}");
+        // The function the question names and the one it asks about lead;
+        // which of the two is first depends on the graph signal.
+        assert!(
+            got[..2].contains(&"web_search") && got[..2].contains(&"pick_backend"),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&"pick_backend") && got.contains(&"read_env"),
+            "{got:?}"
+        );
+        for noise in ["commit", "is_at_eof", "tzif"] {
+            assert!(
+                !got.contains(&noise),
+                "{noise} must not match by keyword: {got:?}"
+            );
+        }
+        assert!(report.diagnostics.fts_hits >= 3);
+    }
+
+    /// The plain mode needs every word in one name, so the same sentence finds
+    /// nothing by keyword; that is the failure the natural mode fixes.
+    #[test]
+    fn plain_mode_finds_nothing_for_a_sentence() {
+        let (conn, pid) = fixture();
+        let q = "how does web_search pick its backend and read env";
+        let plain = brain_search_report(&conn, pid, q, 5, false).unwrap();
+        assert_eq!(plain.diagnostics.fts_hits, 0);
+    }
+
+    #[test]
+    fn an_empty_or_mismatched_vector_index_is_reported() {
+        let base = BrainDiagnostics {
+            terms: vec![],
+            fts_hits: 2,
+            vector_hits: 0,
+            graph_hits: 0,
+            vector: VectorState::IndexEmpty,
+            embedding_tier: None,
+        };
+        assert!(
+            base.warnings()
+                .iter()
+                .any(|w| w.contains("vector index is empty"))
+        );
+        let mismatch = BrainDiagnostics {
+            vector: VectorState::DimsMismatch,
+            ..base.clone()
+        };
+        assert!(
+            mismatch
+                .warnings()
+                .iter()
+                .any(|w| w.contains("other dimensions"))
+        );
+        let healthy = BrainDiagnostics {
+            vector: VectorState::Used,
+            vector_hits: 3,
+            embedding_tier: Some("provider".to_string()),
+            ..base
+        };
+        assert!(healthy.warnings().is_empty());
+    }
+
+    /// A search reports its diagnostics whatever state the vector index is in.
+    #[test]
+    fn a_search_reports_the_signals_that_answered() {
+        let (conn, pid) = fixture();
+        let report = brain_search_report(&conn, pid, "web_search", 5, true).unwrap();
+        assert!(report.diagnostics.fts_hits >= 1);
+        assert_eq!(report.diagnostics.terms[0], "web_search");
+    }
+
+    #[test]
+    fn static_embedding_and_vector_only_results_are_warned_about() {
+        let diag = BrainDiagnostics {
+            terms: vec![],
+            fts_hits: 0,
+            vector_hits: 4,
+            graph_hits: 0,
+            vector: VectorState::Used,
+            embedding_tier: Some("static".to_string()),
+        };
+        let w = diag.warnings();
+        assert!(w.iter().any(|m| m.contains("static text embedding")));
+        assert!(
+            w.iter()
+                .any(|m| m.contains("every result comes from the vector"))
+        );
+    }
 }
