@@ -54,6 +54,9 @@ Complete command reference for the cora CLI.
 | `cora hook uninstall` | Remove pre-commit hook |
 | `cora hook verify [--quiet]` | Is the staged diff already reviewed? Exit 0 validated, 10 validated but blocking, 11 not validated |
 | `cora hook claude-guard` | Claude Code `PreToolUse` hook: reads the tool call from stdin, denies (exit 2) an unreviewed or blocking `git commit` and any `--no-verify` |
+| `cora hook context [--agent claude\|hermes] [--prompt TEXT]` | Agent prompt hook: prints code-search results for the prompt (reads the agent's hook JSON from stdin when `--prompt` is absent). Silent for chit-chat and unindexed projects, never downloads, always exits 0 |
+| `cora hook session [--agent claude\|hermes]` | Agent session-start hook: a one-line reminder of the code-search tools |
+| `cora install [--agents claude] [--no-instructions] [--remove] [--dry-run]` | Native setup for Claude Code: hooks, MCP (`alwaysLoad`), `cora-code` skill, `CLAUDE.md` block |
 | `cora completion` `<shell>` | Generate shell completions (bash/zsh/fish/powershell) |
 
 ### Review & Scan

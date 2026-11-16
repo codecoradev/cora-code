@@ -571,6 +571,9 @@ enum Command {
         /// Validate agent configs after install/remove
         #[clap(long)]
         validate: bool,
+        /// Do not touch instruction files (CLAUDE.md, AGENTS.md)
+        #[clap(long)]
+        no_instructions: bool,
     },
 
     /// Detect dead code — functions/methods with no callers
@@ -659,6 +662,36 @@ enum HookAction {
     /// Denies `git commit --no-verify` and commits of an unreviewed staged diff;
     /// allows everything else.
     ClaudeGuard,
+    /// Agent prompt hook: print code context (matching symbols) for the prompt
+    ///
+    /// Reads the hook JSON on stdin (or `--prompt`). Never fails, never
+    /// downloads the model, stays silent for prompts that are not about code
+    /// and for projects that are not indexed. Used by `cora install` for Claude
+    /// Code (`UserPromptSubmit`), Hermes (`pre_llm_call`) and the pi / omp /
+    /// opencode extensions.
+    Context {
+        /// Output format: plain (Claude Code, extensions) or hermes (JSON)
+        #[clap(long, default_value = "plain")]
+        agent: String,
+        /// The prompt, instead of reading it from stdin
+        #[clap(long)]
+        prompt: Option<String>,
+        /// Maximum size of the printed block, in characters
+        #[clap(long, default_value = "1500")]
+        max_chars: usize,
+        /// Maximum number of symbols
+        #[clap(long, default_value = "5")]
+        limit: usize,
+        /// Time budget in seconds; nothing is printed when it is exceeded
+        #[clap(long, default_value = "6")]
+        budget: u64,
+    },
+    /// Agent session-start hook: print a short reminder that code search exists
+    Session {
+        /// Output format: plain or hermes (JSON)
+        #[clap(long, default_value = "plain")]
+        agent: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1466,6 +1499,24 @@ async fn main() -> Result<()> {
             }
             HookAction::Verify { quiet } => hook_cmd::execute_hook_verify(quiet)?,
             HookAction::ClaudeGuard => hook_cmd::execute_claude_guard()?,
+            HookAction::Context {
+                agent,
+                prompt,
+                max_chars,
+                limit,
+                budget,
+            } => commands::hook_context::run_context(
+                commands::hook_context::AgentFormat::parse(&agent),
+                &commands::hook_context::ContextOptions {
+                    prompt,
+                    max_chars,
+                    limit,
+                    budget: std::time::Duration::from_secs(budget),
+                },
+            ),
+            HookAction::Session { agent } => commands::hook_context::run_session(
+                commands::hook_context::AgentFormat::parse(&agent),
+            ),
         },
         Command::Auth { action } => {
             match action {
@@ -1567,7 +1618,13 @@ async fn main() -> Result<()> {
             yes,
             remove,
             validate,
+            no_instructions,
         } => {
+            let native = if list {
+                String::new()
+            } else {
+                commands::agents::run(agents.as_deref(), dry_run, force, no_instructions, remove)?
+            };
             let opts = commands::install::InstallOptions {
                 list,
                 agents,
@@ -1577,6 +1634,9 @@ async fn main() -> Result<()> {
                 remove,
                 validate,
             };
+            if !native.is_empty() {
+                println!("{native}");
+            }
             let output = commands::install::execute_install(&opts)?;
             println!("{output}");
             0

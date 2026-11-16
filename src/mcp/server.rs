@@ -321,6 +321,14 @@ fn handle_request(request: &JsonRpcRequest) -> JsonRpcResponse {
     }
 }
 
+/// Added to the model's system prompt by clients that read server instructions.
+const SERVER_INSTRUCTIONS: &str = "cora indexes this project's code so you can search it by meaning instead of guessing file names. \
+Use it before you read or change code: cora.brain_search to find where something is done (ask in words: \
+\"where do we retry a failed request\"), cora.search_symbols when you know the name, cora.find_callers and \
+cora.find_impact before changing a function (what breaks), cora.find_affected_tests to choose the tests to run, \
+cora.dead_code for unused code. If a tool says there is no index, run `cora index` in the project root. \
+For a review of a diff use cora.review_prepare and cora.review_finalize.";
+
 fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
     let result = InitializeResult {
         protocol_version: PROTOCOL_VERSION.to_string(),
@@ -331,6 +339,7 @@ fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
             name: SERVER_NAME.to_string(),
             version: SERVER_VERSION.to_string(),
         },
+        instructions: Some(SERVER_INSTRUCTIONS.to_string()),
     };
 
     JsonRpcResponse {
@@ -421,6 +430,12 @@ mod tests {
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
+        assert!(
+            result["instructions"]
+                .as_str()
+                .is_some_and(|i| i.contains("cora.brain_search") && i.contains("cora.find_impact")),
+            "the server explains how to use its tools"
+        );
         assert_eq!(result["serverInfo"]["name"], SERVER_NAME);
     }
 

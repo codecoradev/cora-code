@@ -96,6 +96,15 @@ impl Backend {
     }
 }
 
+/// Set by commands that must stay fast (agent hooks): the model is used if it
+/// is already on disk, never downloaded.
+static NO_DOWNLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Forbid downloading the model in this process.
+pub fn forbid_download() {
+    NO_DOWNLOAD.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Thread-local active backend — set once at index/brain-search time.
 static ACTIVE_BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
 
@@ -146,6 +155,7 @@ pub fn resolve_backend(config_embedding: &str) -> Backend {
 }
 
 fn resolve(config_embedding: &str, allow_download: bool) -> Backend {
+    let allow_download = allow_download && !NO_DOWNLOAD.load(std::sync::atomic::Ordering::Relaxed);
     // Already resolved? Return cached value.
     if let Some(&b) = ACTIVE_BACKEND.get() {
         return b;
