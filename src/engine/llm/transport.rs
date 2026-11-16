@@ -119,6 +119,12 @@ pub(crate) struct Usage {
 /// duplicate-field guard (>= 1.0.120), so we extract manually via `Value`
 /// and pick the first non-zero value in preference order.
 pub(super) fn parse_usage_value(val: &Value) -> Option<Usage> {
+    /// A counter above `u32::MAX` is clamped, not wrapped: `as u32` would turn
+    /// `u32::MAX + 1` into 0 and the usage would silently vanish.
+    fn saturate_u32(n: u64) -> u32 {
+        u32::try_from(n).unwrap_or(u32::MAX)
+    }
+
     let obj = val.as_object()?;
 
     let prompt_tokens = obj
@@ -126,20 +132,20 @@ pub(super) fn parse_usage_value(val: &Value) -> Option<Usage> {
         .and_then(|v| v.as_u64())
         .or_else(|| obj.get("promptTokens").and_then(|v| v.as_u64()))
         .or_else(|| obj.get("input_tokens").and_then(|v| v.as_u64()))
-        .unwrap_or(0) as u32;
+        .map_or(0, saturate_u32);
 
     let completion_tokens = obj
         .get("completion_tokens")
         .and_then(|v| v.as_u64())
         .or_else(|| obj.get("completionTokens").and_then(|v| v.as_u64()))
         .or_else(|| obj.get("output_tokens").and_then(|v| v.as_u64()))
-        .unwrap_or(0) as u32;
+        .map_or(0, saturate_u32);
 
     let total_tokens = obj
         .get("total_tokens")
         .and_then(|v| v.as_u64())
         .or_else(|| obj.get("totalTokens").and_then(|v| v.as_u64()))
-        .unwrap_or(0) as u32;
+        .map_or(0, saturate_u32);
 
     Some(Usage {
         prompt_tokens,
@@ -775,6 +781,34 @@ mod tests {
                 .get("temperature")
                 .is_some()
         );
+    }
+
+    /// A counter past `u32::MAX` saturates instead of wrapping to a small
+    /// number, for every field name a provider may use.
+    #[test]
+    fn usage_counters_above_u32_max_saturate() {
+        let over = u64::from(u32::MAX) + 1;
+        let json = serde_json::json!({
+            "prompt_tokens": over,
+            "completionTokens": over + 41,
+            "total_tokens": u64::MAX,
+        });
+        let u = parse_usage_value(&json).unwrap();
+        assert_eq!(u.prompt_tokens, u32::MAX);
+        assert_eq!(u.completion_tokens, u32::MAX);
+        assert_eq!(u.total_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn usage_counters_at_the_boundary_are_kept() {
+        let json = serde_json::json!({
+            "input_tokens": u32::MAX,
+            "output_tokens": u64::from(u32::MAX) - 1,
+        });
+        let u = parse_usage_value(&json).unwrap();
+        assert_eq!(u.prompt_tokens, u32::MAX);
+        assert_eq!(u.completion_tokens, u32::MAX - 1);
+        assert_eq!(u.total_tokens, 0);
     }
 
     #[test]
