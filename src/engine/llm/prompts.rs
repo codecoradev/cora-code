@@ -38,6 +38,7 @@ RESPONSE FORMAT:
 Return a JSON array of objects with these fields:
 - "file": string — the file path (MUST be from the diff)
 - "line": number or null — the approximate line number
+- "snippet": string or null — the exact source line the finding is about, copied verbatim (no line number, no +/- diff marker); used to verify "line"
 - "severity": "critical" | "major" | "minor" | "info"
 - "issue_type": string — category (security, performance, bugs, best_practice, style, suggestion)
 - "title": string — short description (max 100 chars)
@@ -112,6 +113,7 @@ RESPONSE FORMAT:
 Return a JSON array of objects with these fields:
 - "file": string — the file path (MUST be from the provided files)
 - "line": number or null — the approximate line number
+- "snippet": string or null — the exact source line the finding is about, copied verbatim (no line number); used to verify "line"
 - "severity": "critical" | "major" | "minor" | "info"
 - "issue_type": string — category (security, performance, bugs, best_practice, style, suggestion)
 - "title": string — short description (max 100 chars)
