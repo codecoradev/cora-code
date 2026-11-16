@@ -85,7 +85,7 @@ All projects share a **single global database**:
 ~/.codecora/cora-code/
 ├── cora.db               # SQLite — symbols, FTS5 index, call edges
 ├── vectors/              # one quantized vecq file per project: <project id>.<model>.vecq
-└── models/               # the code embedding model, downloaded once
+└── models/               # the code embedding model, unpacked from the release binary or downloaded once
 ```
 
 Index multiple repos and they all become searchable from any directory:
@@ -152,7 +152,7 @@ The `signals` field shows which search signals matched: `"fts"`, `"vector"`, `"g
 
 #### Embedding Engine
 
-Cora embeds every symbol (its name and signature) locally, with no API key and no GPU, using one model: `potion-code-16M-v2`, a static code model (256 dimensions, MIT). Tokens are looked up in a learned table and averaged. It is downloaded once (33.5 MB) and then used offline; it finds the right function from a description clearly more often than keyword search alone.
+Cora embeds every symbol (its name and signature) locally, with no API key and no GPU, using one model: `potion-code-16M-v2`, a static code model (256 dimensions, MIT). Tokens are looked up in a learned table and averaged. It is inside the release binaries (33.5 MB; a `cargo install` build downloads it once) and used offline; it finds the right function from a description clearly more often than keyword search alone.
 
 When the model is not available (offline before the first download, `CORA_EMBED_OFFLINE=1`, a blocked network) there is no substitute embedding: the vector signal is off and `cora brain` answers from keyword and call-graph signals, with a warning that says so. `brain.embedding: off` chooses that on purpose.
 

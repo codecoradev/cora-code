@@ -29,7 +29,7 @@
 - 📏 **Custom rule engine** — write your own regex rules in `.cora.yaml`
 - ✂️ **Auto-chunking** — splits large PRs into reviewable chunks automatically
 - 🔍 **Code Intelligence** — index symbols across 15 languages, call graph, trace, impact analysis
-- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33 MB model downloads once on first use, no API key, no GPU
+- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33.5 MB model is inside the release binaries (a `cargo install` build downloads it once on first use), no API key, no GPU
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
 - 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
@@ -234,7 +234,7 @@ Measured on the cora-code repository (1,996 symbols, 179 files, release build, w
 | Cold index (full rebuild) | **~0.6 s** | Walk + parse + embed every symbol + write the project's vector file |
 | Incremental (no changes) | **~0.13 s** | mtime:size fingerprint — skips unchanged files |
 | `cora brain` (one CLI run) | **~0.2 s** | Loads the 32 MB model, then FTS5 + vector scan + graph BFS → RRF fusion. A long-running `cora mcp` keeps the model loaded |
-| Binary size | **~36 MB** | Single binary; the embedding model (33.5 MB) is downloaded once on first use, not bundled |
+| Binary size | **~36 MB** (**~69 MB** release binary with the model, ~38.5 MB as `tar.gz`) | Single binary; release binaries carry the 33.5 MB embedding model, a `cargo install` build downloads it once on first use |
 
 > Measurements are indicative, not contractual. Your numbers will vary with codebase size, CPU cores, and disk I/O.
 
