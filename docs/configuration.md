@@ -106,7 +106,7 @@ analysis:
     - "resolve_*"
 
 brain:
-  embedding: auto           # auto | hashing | pretrained
+  embedding: auto           # auto | off
 
 profile: clean-code        # security-first | performance | clean-code | beginner-friendly | minimal | rust-strict | typescript-strict | go-pragmatic
 ```
@@ -536,23 +536,23 @@ Default `index_skip_files` patterns (bundled with cora):
 
 Glob patterns support: exact match (`main.rs`), wildcard suffix (`*.config.ts`), wildcard prefix (`vite.*`), and any-directory (`**/main.ts`).
 
-### Brain Embedding Backend
+### Brain Embedding
 
-Control which embedding backend Brain Mode uses for vector search. Selectable at runtime, no recompilation needed.
+Cora uses one embedding model for vector search, `potion-code-16M-v2` (256 dimensions, a 16M-parameter static code model, MIT), downloaded once (33.5 MB) on the first `cora index`, `cora brain` or `cora explore` and then used offline.
 
 ```yaml
 brain:
-  embedding: auto   # auto | potion | hashing | pretrained
+  embedding: auto   # auto | off
 ```
 
-| Value | Dimensions | Description |
-|-------|------------|-------------|
-| `auto` (default) | 256 | The `potion` code model; falls back to `pretrained` (if compiled in) and then `hashing` when the model cannot be downloaded |
-| `potion` | 256 | `potion-code-16M-v2`, a 16M-parameter static code embedding (MIT). Downloaded once (33.5 MB) on the first `cora index`, `cora brain` or `cora explore`, then used offline |
-| `hashing` | 256 | Zero-dependency bag-of-tokens hashing. Always available, no download. A weak signal: it counts for a quarter of a vote in `cora brain` |
-| `pretrained` | 768 | nomic-embed-code distilled vectors. Requires the `pretrained-embed` feature at build time |
+| Value | Description |
+|-------|-------------|
+| `auto` (default) | Use the code model. While it is not available (offline before the first download, `CORA_EMBED_OFFLINE=1`), the vector signal is off: search uses keywords and the call graph and says so |
+| `off` | Never use embeddings |
 
-**The model download.** The first command that needs embeddings downloads all three model files in one step into `<data dir>/models/potion-code-16M-v2/` (`~/.codecora/cora-code/models/...`). The revision is pinned and every file is checked against its SHA-256 before it is moved into place, so a download is verified byte for byte. Several concurrent runs wait for one download. If the download fails (offline, blocked network), cora warns, uses the fallback embedding and does not retry for an hour.
+`potion` still loads and means `auto`. `hashing` and `pretrained` were removed (#751): they load, mean `auto` and print one warning.
+
+**The model download.** The first command that needs embeddings downloads all three model files in one step into `<data dir>/models/potion-code-16M-v2/` (`~/.codecora/cora-code/models/...`). The revision is pinned and every file is checked against its SHA-256 before it is moved into place, so a download is verified byte for byte. Several concurrent runs wait for one download. If the download fails (offline, blocked network), cora warns, turns the vector signal off and does not retry for an hour.
 
 | Environment variable | Effect |
 |---|---|
@@ -561,8 +561,6 @@ brain:
 | `CORA_EMBED_OFFLINE=1` | Never touch the network; use the model only if it is already downloaded |
 
 > **One vector file per project and model.** Vectors live in `<data dir>/vectors/<project id>.<model>.vecq` and are rebuilt from the project's symbols after every index run that changed them. Changing `brain.embedding`, or the first run after the code model became available, re-embeds the project on the next `cora index` even when no file changed; the file of a model no longer used is removed. `brain.vector_store` and `brain.vector_bits` were removed: a config that still sets them loads and warns once.
-
-> **Note:** If you select `pretrained` but cora was built without the `pretrained-embed` feature, it falls back to `hashing` with a warning.
 
 ## Inline Suppression (`cora-ignore`)
 

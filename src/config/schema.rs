@@ -586,12 +586,12 @@ pub struct AnalysisConfig {
     pub entry_point_patterns: Vec<String>,
 }
 
-/// Brain Mode configuration — controls embedding backend for vector search.
+/// Brain Mode configuration — the code embedding model for vector search.
 ///
-/// By default (`auto`), cora selects the best available backend at runtime: the
-/// `potion-code-16M-v2` code model (downloaded once on first use) → pretrained
-/// 768d (if compiled with `pretrained-embed`) → hashing 256d fallback.
-/// Users can force a specific backend via `.cora.yaml`.
+/// By default (`auto`), cora uses the `potion-code-16M-v2` code model
+/// (downloaded once on first use). When the model is not available the vector
+/// signal is off and search uses keywords and the call graph; `off` chooses
+/// that on purpose.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct BrainConfig {
     /// Removed (#750): vectors are one vecq file per project. Still parsed so an
@@ -601,14 +601,14 @@ pub struct BrainConfig {
     /// Removed (#750), see [`Self::vector_store`].
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub vector_bits: String,
-    /// Embedding backend selection.
+    /// Embedding selection.
     ///
-    /// - `"auto"` (default) — best available: potion → pretrained → hashing
-    /// - `"potion"` — the potion-code-16M-v2 code model (downloaded once)
-    /// - `"hashing"` — force 256d hashing trick (zero dependency)
-    /// - `"pretrained"` — force nomic 768d (requires `--features pretrained-embed`)
+    /// - `"auto"` (default) — the potion-code-16M-v2 code model (downloaded
+    ///   once); the vector signal is off while it is not available
+    /// - `"off"` — never use embeddings
     ///
-    /// Invalid values fall back to `"auto"` with a warning.
+    /// `potion`, `hashing` and `pretrained` (removed, #751) still load, mean
+    /// `auto` and print one warning (`hashing`, `pretrained`).
     #[serde(default, skip_serializing_if = "is_default")]
     pub embedding: BrainEmbeddingMode,
 }
@@ -625,26 +625,44 @@ pub struct BrainSection {
     pub embedding: Option<BrainEmbeddingMode>,
 }
 
-/// Embedding backend mode for Brain Mode.
+/// Embedding mode for Brain Mode.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BrainEmbeddingMode {
-    /// Best available backend (potion, else pretrained if compiled, else hashing).
+    /// The code model, downloaded once on first use.
     #[default]
+    #[serde(alias = "potion")]
     Auto,
-    /// The potion-code-16M-v2 code model (downloaded once on first use).
-    Potion,
-    /// Force 256d hashing trick (zero dependency).
+    /// No embeddings: keyword and graph search only.
+    Off,
+    /// Removed (#751): behaves as `auto` and warns.
+    #[serde(skip_serializing)]
     Hashing,
-    /// Force nomic 768d pretrained (requires feature flag).
+    /// Removed (#751): behaves as `auto` and warns.
+    #[serde(skip_serializing)]
     Pretrained,
+}
+
+impl BrainEmbeddingMode {
+    /// The value handed to the embedding resolver (`auto` or `off`).
+    pub fn resolver_value(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            _ => "auto",
+        }
+    }
+
+    /// Whether this is a removed value.
+    pub fn is_removed(&self) -> bool {
+        matches!(self, Self::Hashing | Self::Pretrained)
+    }
 }
 
 impl std::fmt::Display for BrainEmbeddingMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
-            Self::Potion => write!(f, "potion"),
+            Self::Off => write!(f, "off"),
             Self::Hashing => write!(f, "hashing"),
             Self::Pretrained => write!(f, "pretrained"),
         }
@@ -656,12 +674,12 @@ impl std::str::FromStr for BrainEmbeddingMode {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "potion" => Ok(Self::Potion),
+            "auto" | "potion" => Ok(Self::Auto),
+            "off" => Ok(Self::Off),
             "hashing" => Ok(Self::Hashing),
             "pretrained" => Ok(Self::Pretrained),
             other => Err(format!(
-                "unknown brain.embedding value '{other}' — expected auto, potion, hashing, or pretrained"
+                "unknown brain.embedding value '{other}' — expected auto or off"
             )),
         }
     }

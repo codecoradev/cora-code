@@ -7,7 +7,8 @@
 //! from the project's symbols after every index run that changed them.
 
 use crate::embed::{
-    active_backend, active_dims, active_provider_name, embed_batch_dispatch, embed_code_dispatch,
+    Backend, active_backend, active_dims, active_provider_name, embed_batch_dispatch,
+    embed_code_dispatch,
 };
 use crate::index::symbols::SymbolQuery;
 use crate::index::vector::{self, Loaded, ProjectVectors};
@@ -45,6 +46,9 @@ pub enum VectorState {
     IndexEmpty,
     /// The index was built with other dimensions than the active embedding.
     DimsMismatch,
+    /// The code embedding model is not available (or `brain.embedding: off`):
+    /// the vector signal is off, keyword and graph signals answer alone.
+    Off,
 }
 
 /// How a brain search was answered: which signals found how much.
@@ -75,10 +79,10 @@ impl BrainDiagnostics {
                  vector signal skipped (run `cora index --rebuild`)"
                     .to_string(),
             ),
-            VectorState::Used if self.embedding_tier.as_deref() != Some("potion") => out.push(
-                "vector hits come from a weak fallback embedding and may be unrelated to the \
-                 question: the code embedding model is not in use (run `cora index` with network \
-                 access once to download it, or see CORA_EMBED_MODEL_DIR)"
+            VectorState::Off => out.push(
+                "vector signal is off (the code embedding model is not available): results come \
+                 from keyword and graph signals only. Run `cora index` with network access once \
+                 to download the model, or see CORA_EMBED_MODEL_DIR"
                     .to_string(),
             ),
             _ => {}
@@ -152,6 +156,13 @@ fn project_vector_path(project_id: i64) -> std::path::PathBuf {
 /// exists, and nothing is shared with other projects. Returns the number of
 /// symbols embedded.
 pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
+    if active_backend() == Backend::Off {
+        // No model, no vectors: drop what an earlier model left so nothing stale is read.
+        vector::forget(&project_vector_path(project_id));
+        vector::remove_project_files(project_id, None);
+        vector::remove_legacy_shared_index();
+        return Ok(0);
+    }
     let path = project_vector_path(project_id);
     let mut stmt =
         conn.prepare("SELECT id, name, signature FROM symbols WHERE project_id = ?1 ORDER BY id")?;
@@ -264,15 +275,6 @@ pub fn brain_search_report(
             |r| r.get(0),
         )
         .ok();
-    // Only the code embedding model earns a full vote. Measured on retrieval
-    // sets (docs/code-intelligence.md), the hashing and static-vocabulary
-    // embeddings were neutral to harmful when fused with keyword search at
-    // half weight, so they count for a quarter.
-    let vector_weight = match embedding_tier.as_deref() {
-        Some("potion") => 1.0,
-        _ => 0.25,
-    };
-
     // ── RRF Fusion ──────────────────────────────────────────────────────
     let mut fused: HashMap<i64, (f32, Vec<String>)> = HashMap::new();
 
@@ -284,7 +286,7 @@ pub fn brain_search_report(
     }
 
     for (rank, (id, _sim)) in vec_hits.iter().enumerate() {
-        let rrf = vector_weight / (RRF_K + (rank as f32 + 1.0));
+        let rrf = 1.0 / (RRF_K + (rank as f32 + 1.0));
         let entry = fused.entry(*id).or_insert((0.0, Vec::new()));
         entry.0 += rrf;
         entry.1.push("vector".into());
@@ -394,6 +396,9 @@ fn fts5_terms_search(
 /// source file changed since the last `cora index`, for example on the first run
 /// after the model changed.
 pub fn project_needs_embedding(project_id: i64) -> bool {
+    if active_backend() == Backend::Off {
+        return false;
+    }
     !matches!(
         vector::load_cached(&project_vector_path(project_id), active_dims()),
         Loaded::Ready(_)
@@ -438,6 +443,9 @@ fn vector_search_state(
     query: &str,
     limit: usize,
 ) -> (Vec<(i64, f32)>, VectorState) {
+    if active_backend() == Backend::Off {
+        return (Vec::new(), VectorState::Off);
+    }
     let dims = active_dims();
     let vectors = match vector::load_cached(&project_vector_path(project_id), dims) {
         Loaded::Ready(v) if v.len() > 0 => v,
@@ -767,45 +775,35 @@ pub fn tzif() {}
     }
 
     #[test]
-    fn static_embedding_and_vector_only_results_are_warned_about() {
+    fn vector_only_results_are_warned_about() {
         let diag = BrainDiagnostics {
             terms: vec![],
             fts_hits: 0,
             vector_hits: 4,
             graph_hits: 0,
             vector: VectorState::Used,
-            embedding_tier: Some("static".to_string()),
+            embedding_tier: Some("potion".to_string()),
         };
-        let w = diag.warnings();
-        assert!(w.iter().any(|m| m.contains("weak fallback embedding")));
         assert!(
-            w.iter()
+            diag.warnings()
+                .iter()
                 .any(|m| m.contains("every result comes from the vector"))
         );
     }
 
-    /// The code model's vectors are a full vote; every fallback embedding
-    /// counts for a quarter (measured: they hurt keyword search at more).
+    /// Without the model there is no vector signal, and the user is told why.
     #[test]
-    fn only_the_code_model_gets_a_full_vote_and_no_warning() {
-        let base = BrainDiagnostics {
+    fn a_missing_model_turns_the_vector_signal_off_with_a_clear_message() {
+        let diag = BrainDiagnostics {
             terms: vec![],
             fts_hits: 3,
-            vector_hits: 3,
+            vector_hits: 0,
             graph_hits: 0,
-            vector: VectorState::Used,
-            embedding_tier: Some("potion".to_string()),
+            vector: VectorState::Off,
+            embedding_tier: None,
         };
-        assert!(base.warnings().is_empty());
-        for tier in ["static", "pretrained"] {
-            let weak = BrainDiagnostics {
-                embedding_tier: Some(tier.to_string()),
-                ..base.clone()
-            };
-            assert!(
-                weak.warnings().iter().any(|w| w.contains("weak fallback")),
-                "{tier}"
-            );
-        }
+        let w = diag.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("vector signal is off") && w[0].contains("CORA_EMBED_MODEL_DIR"));
     }
 }

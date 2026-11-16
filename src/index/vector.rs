@@ -56,7 +56,11 @@ impl ProjectVectors {
     pub fn build(dims: usize, items: impl IntoIterator<Item = (i64, Vec<f32>)>) -> Self {
         let mut index = VecqIndex::with_residual(dims, SEED);
         for (id, v) in items {
-            index.add_keyed(id as u64, &v);
+            // A symbol made only of words the model does not know has a zero
+            // vector, which has no direction: vecq refuses it. Leave it out.
+            if usable(&v) {
+                index.add_keyed(id as u64, &v);
+            }
         }
         Self { index }
     }
@@ -75,7 +79,7 @@ impl ProjectVectors {
     /// The `k` nearest symbols of the project as `(symbol id, similarity)`,
     /// best first.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(i64, f32)> {
-        if self.index.is_empty() || query.len() != self.index.dim() {
+        if self.index.is_empty() || query.len() != self.index.dim() || !usable(query) {
             return Vec::new();
         }
         self.index
@@ -94,6 +98,11 @@ impl ProjectVectors {
     pub fn dim(&self) -> usize {
         self.index.dim()
     }
+}
+
+/// A vector with a direction: finite and not all zero.
+fn usable(v: &[f32]) -> bool {
+    v.iter().all(|x| x.is_finite()) && v.iter().any(|x| *x != 0.0)
 }
 
 /// True when every live slot carries a key. Files written by vecq-core 0.2.x
@@ -201,6 +210,23 @@ mod tests {
     fn unit(x: &[f32]) -> Vec<f32> {
         let n = x.iter().map(|v| v * v).sum::<f32>().sqrt();
         x.iter().map(|v| v / n).collect()
+    }
+
+    /// A word the model does not know embeds to the zero vector; it must not
+    /// panic vecq, neither as a stored symbol nor as a question.
+    #[test]
+    fn zero_vectors_are_skipped_and_a_zero_query_finds_nothing() {
+        let v = ProjectVectors::build(
+            2,
+            vec![
+                (1, vec![0.0, 0.0]),
+                (2, unit(&[1.0, 0.0])),
+                (3, vec![f32::NAN, 1.0]),
+            ],
+        );
+        assert_eq!(v.len(), 1);
+        assert!(v.search(&[0.0, 0.0], 3).is_empty());
+        assert_eq!(v.search(&unit(&[1.0, 0.0]), 3)[0].0, 2);
     }
 
     fn sample() -> ProjectVectors {
