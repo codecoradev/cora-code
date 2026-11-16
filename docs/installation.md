@@ -51,6 +51,8 @@ $ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cor
 $ mv cora ~/.local/bin/cora
 ```
 
+**The release archives contain the code embedding model** (`potion-code-16M-v2`, 33.5 MB, pinned and checksum-verified at build time), so `cora index` and `cora brain` work right away with no network. The binary is therefore about 70 MB uncompressed; the first use unpacks the model into `~/.codecora/cora-code/models/`. A binary built with `cargo install` has no model inside and downloads it once on first use.
+
 Asset naming convention: `cora-{target-triple}-{version}.tar.gz` (Linux/macOS) or `.zip` (Windows). Replace the target triple as needed:
 
 | Platform | Asset name |

@@ -8,6 +8,7 @@
 //! alone, with a message that says so (#751). A weak substitute measured
 //! neutral to harmful when fused with keyword search, so it is not offered.
 
+pub mod bundled;
 pub mod model_store;
 pub mod potion;
 
