@@ -572,6 +572,8 @@ pub fn extract_calls(content: &str, language: &str, file_path: &str) -> Vec<Call
                         callee: name,
                         file: file_path.to_string(),
                         line: line_no,
+                        qualifier: None,
+                        caller_type: None,
                     });
                 }
             }
@@ -709,6 +711,8 @@ pub fn detect_routes(
                 target,
                 file: file_path.to_string(),
                 line: line_no as u32,
+                qualifier: None,
+                caller_type: None,
             });
         }
     }
@@ -957,6 +961,8 @@ pub fn extract_all(content: &str, language: &str, file_path: &str) -> ExtractedA
                                 callee: name,
                                 file: file_path.to_string(),
                                 line: line_no,
+                                qualifier: None,
+                                caller_type: None,
                             });
                         }
                     }
@@ -985,6 +991,10 @@ pub struct CallSite {
     pub callee: String,
     pub file: String,
     pub line: u32,
+    /// Type or module the callee was reached through, when known (#714).
+    pub qualifier: Option<String>,
+    /// For call edges: the impl type of the calling method, when it is one.
+    pub caller_type: Option<String>,
 }
 
 fn def(cap: regex::Captures, kind: SymbolKind, line: u32, file: &str, raw: &str) -> ExtractedDef {

@@ -139,12 +139,17 @@ enum Command {
 
     /// Find all callers of a symbol (who calls this?)
     Callers {
-        /// Symbol name to search for
+        /// Symbol to search for: `name`, `Type::name` or a type name
         symbol: String,
 
         /// Maximum results
         #[clap(long, default_value = "50")]
         limit: usize,
+
+        /// Leave out ambiguous calls (receiver type unknown) for a
+        /// `Type::name` query
+        #[clap(long)]
+        strict: bool,
 
         /// Output as JSON
         #[clap(long)]
@@ -859,10 +864,12 @@ async fn main() -> Result<()> {
         Command::Callers {
             symbol,
             limit,
+            strict,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
-            let callers = index::graph::find_callers(&conn, project_id, &symbol, limit)?;
+            let callers =
+                index::graph::find_callers_opts(&conn, project_id, &symbol, limit, strict)?;
 
             // Cross-project fallback: if no callers in current project,
             // search across all indexed projects.
