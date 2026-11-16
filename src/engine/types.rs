@@ -26,6 +26,21 @@ impl Severity {
         }
     }
 
+    /// Map the severity word a model wrote, accepting the common synonyms.
+    /// `None` for a word that is not a severity at all (`"performance"`).
+    pub fn from_model_word(s: &str) -> Option<Self> {
+        let w = s.trim().to_ascii_lowercase();
+        Some(match w.as_str() {
+            "critical" | "blocker" | "fatal" | "severe" => Severity::Critical,
+            "major" | "high" | "error" | "serious" | "important" => Severity::Major,
+            "minor" | "medium" | "moderate" | "warning" | "warn" | "low" => Severity::Minor,
+            "info" | "informational" | "note" | "nit" | "nitpick" | "suggestion" | "trivial" => {
+                Severity::Info
+            }
+            _ => return None,
+        })
+    }
+
     /// Get the label text for this severity.
     pub fn label(self) -> &'static str {
         match self {
@@ -108,12 +123,28 @@ impl IssueType {
     }
 }
 
+/// Read a severity the way a model writes it. A synonym (`high`, `warning`)
+/// maps to its level; a word that is not a severity (`"performance"`, a
+/// category in the wrong field) must not make the whole batch fail to parse, so
+/// it becomes `minor` and is logged (#723).
+fn deserialize_model_severity<'de, D>(d: D) -> Result<Severity, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let word = String::deserialize(d)?;
+    Ok(Severity::from_model_word(&word).unwrap_or_else(|| {
+        tracing::warn!(severity = %word, "unknown severity from the model, using minor");
+        Severity::Minor
+    }))
+}
+
 /// A single review issue found in code
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewIssue {
     pub file: String,
     #[serde(default)]
     pub line: Option<u32>,
+    #[serde(deserialize_with = "deserialize_model_severity")]
     pub severity: Severity,
     /// Issue type/category — stored as string since LLM output varies.
     /// Common values: security, performance, bug, `best_practice`, style, suggestion

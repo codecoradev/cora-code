@@ -486,7 +486,7 @@ pub fn admit(
     valid_files: &[String],
     source: &Source<'_>,
 ) -> Vec<ReviewIssue> {
-    let mut admitted: Vec<ReviewIssue> = issues
+    let admitted: Vec<ReviewIssue> = issues
         .into_iter()
         .filter(|i| valid_files.is_empty() || valid_files.iter().any(|f| f == &i.file))
         .map(|mut i| {
@@ -521,6 +521,11 @@ pub fn admit(
             i
         })
         .collect();
+
+    // Recognisable false-positive classes are dropped or lowered here, before
+    // anything is stored (#723).
+    let admitted = crate::engine::reflect::apply(admitted);
+    let mut admitted = admitted;
 
     if admitted.len() > MAX_JUDGE_FINDINGS {
         // Keep the most severe, preserving the judge's order among them.
@@ -561,6 +566,18 @@ mod tests {
         ReviewIssue::new(file, line, severity, "title")
             .with_type("bug")
             .with_body("body")
+    }
+
+    /// #723: admission runs the reflection pass, so a security claim about a
+    /// markdown file never reaches storage.
+    #[test]
+    fn admission_drops_a_security_claim_about_docs() {
+        let mut doc = issue("docs/api.md", Some(1), Severity::Major);
+        doc.issue_type = Some("security".to_string());
+        let code = issue("src/api.rs", Some(1), Severity::Major);
+        let out = admit(vec![doc, code], &[], &Source::Diff(&[]));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].file, "src/api.rs");
     }
 
     fn admit_diff(issues: Vec<ReviewIssue>) -> Vec<ReviewIssue> {

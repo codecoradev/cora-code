@@ -518,6 +518,43 @@ mod tests {
         assert!(parse_scan_response("{{invalid", None).is_err());
     }
 
+    // ─── Severity words a model invents (#723) ───
+
+    /// A category in the severity field used to fail the strict parse and drop
+    /// the objects around it; it now becomes `minor` and the batch survives.
+    #[test]
+    fn a_category_in_the_severity_field_does_not_lose_the_batch() {
+        let input = r#"[
+            {"file":"a.rs","line":1,"severity":"performance","issue_type":"performance","title":"T1","body":"B1"},
+            {"file":"b.rs","line":2,"severity":"major","issue_type":"bugs","title":"T2","body":"B2"}
+        ]"#;
+        let result = parse_review_response(input, None).unwrap();
+        assert_eq!(result.0.len(), 2);
+        assert_eq!(result.0[0].severity, Severity::Minor);
+        assert_eq!(result.0[1].severity, Severity::Major);
+    }
+
+    #[test]
+    fn common_severity_synonyms_map_to_their_level() {
+        let input = r#"[
+            {"file":"a.rs","line":1,"severity":"High","title":"T","body":"B"},
+            {"file":"b.rs","line":2,"severity":"warning","title":"T","body":"B"},
+            {"file":"c.rs","line":3,"severity":"Suggestion","title":"T","body":"B"},
+            {"file":"d.rs","line":4,"severity":"blocker","title":"T","body":"B"}
+        ]"#;
+        let r = parse_review_response(input, None).unwrap();
+        let sev: Vec<Severity> = r.0.iter().map(|i| i.severity).collect();
+        assert_eq!(
+            sev,
+            [
+                Severity::Major,
+                Severity::Minor,
+                Severity::Info,
+                Severity::Critical
+            ]
+        );
+    }
+
     // ─── Various severity values ───
 
     #[test]
