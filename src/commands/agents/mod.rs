@@ -9,6 +9,7 @@
 
 pub mod claude;
 pub mod hermes;
+pub mod opencode;
 pub mod pi;
 
 use anyhow::{Context, Result};
@@ -167,6 +168,7 @@ pub fn all() -> Vec<Box<dyn Integration>> {
     vec![
         Box::new(claude::Claude),
         Box::new(hermes::Hermes),
+        Box::new(opencode::OpenCode),
         Box::new(pi::PI),
         Box::new(pi::OMP),
     ]
