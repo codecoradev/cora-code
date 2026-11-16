@@ -3,7 +3,9 @@
 //! directly, not hidden behind pi's `codemode`) and the `cora-code` skill.
 //! Both agents share the extension API shape, so one template serves both.
 
-use super::{CODE_SKILL, Ctx, Integration, Report, Step, remove_file_step, write_if_changed};
+use super::{
+    CODE_SKILL, Ctx, Integration, Report, Step, read_existing, remove_file_step, write_if_changed,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -97,14 +99,15 @@ impl PiFamily {
 
     fn install_extension(&self, ctx: &Ctx) -> Step {
         let path = self.extension(ctx);
-        if let Ok(existing) = std::fs::read_to_string(&path)
-            && !existing.starts_with(MARK)
-            && !ctx.force
-        {
-            return Step::Skipped(format!(
-                "{} exists and is not managed by cora (use --force to replace it)",
-                path.display()
-            ));
+        match read_existing(&path) {
+            Err(e) => return Step::Failed(e),
+            Ok(Some(existing)) if !existing.starts_with(MARK) && !ctx.force => {
+                return Step::Skipped(format!(
+                    "{} exists and is not managed by cora (use --force to replace it)",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
         }
         write_if_changed(&path, &extension_source(ctx), ctx)
     }
@@ -114,8 +117,9 @@ impl PiFamily {
             return Step::Skipped("not requested".into());
         }
         let path = self.mcp_file(ctx);
-        let mut doc: Value = match std::fs::read_to_string(&path) {
-            Ok(s) if !s.trim().is_empty() => match serde_json::from_str(&s) {
+        let mut doc: Value = match read_existing(&path) {
+            Err(e) => return Step::Failed(e),
+            Ok(Some(s)) if !s.trim().is_empty() => match serde_json::from_str(&s) {
                 Ok(v @ Value::Object(_)) => v,
                 _ => {
                     return Step::Failed(format!(
@@ -124,8 +128,14 @@ impl PiFamily {
                     ));
                 }
             },
-            _ => json!({}),
+            Ok(_) => json!({}),
         };
+        if doc.get("mcpServers").is_some_and(|m| !m.is_object()) {
+            return Step::Failed(format!(
+                "{}: `mcpServers` is not an object; left untouched",
+                path.display()
+            ));
+        }
         let wanted = (self.mcp)(ctx);
         let servers = &mut doc["mcpServers"];
         if !servers.is_object() {
@@ -150,14 +160,18 @@ impl PiFamily {
 
     fn remove_mcp(&self, ctx: &Ctx) -> Step {
         let path = self.mcp_file(ctx);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Step::Unchanged(format!("{} not present", path.display()));
+        let text = match read_existing(&path) {
+            Ok(Some(t)) => t,
+            Ok(None) => return Step::Unchanged(format!("{} not present", path.display())),
+            Err(e) => return Step::Failed(e),
         };
         let Ok(mut doc) = serde_json::from_str::<Value>(&text) else {
             return Step::Failed(format!("{} is not JSON; left untouched", path.display()));
         };
-        let removed = doc["mcpServers"]
-            .as_object_mut()
+        // `get_mut`, not indexing: indexing a missing key inserts `null`.
+        let removed = doc
+            .get_mut("mcpServers")
+            .and_then(Value::as_object_mut)
             .is_some_and(|m| m.remove("cora").is_some());
         if !removed {
             return Step::Unchanged("no `cora` server".into());
@@ -207,13 +221,13 @@ impl Integration for PiFamily {
     fn remove(&self, ctx: &Ctx) -> Report {
         let mut r = Report::new(self.name, self.detected(ctx));
         let path = self.extension(ctx);
-        if std::fs::read_to_string(&path).is_ok_and(|s| !s.starts_with(MARK)) && !ctx.force {
-            r.push(
+        match read_existing(&path) {
+            Err(e) => r.push("extension", Step::Failed(e)),
+            Ok(Some(s)) if !s.starts_with(MARK) && !ctx.force => r.push(
                 "extension",
                 Step::Skipped(format!("{} is not managed by cora, kept", path.display())),
-            );
-        } else {
-            r.push("extension", remove_file_step(&path, ctx));
+            ),
+            Ok(_) => r.push("extension", remove_file_step(&path, ctx)),
         }
         r.push("mcp", self.remove_mcp(ctx));
         r.push("skill", remove_file_step(&self.skill(ctx), ctx));
@@ -272,6 +286,38 @@ mod tests {
             assert_eq!(back, json!({"mcpServers":{"other":{"command":"x"}}}));
             assert!(!fam.extension(&c).exists() && !fam.skill(&c).exists());
         }
+    }
+
+    #[test]
+    fn unreadable_or_oddly_shaped_files_are_reported_and_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path());
+        let mcp = PI.mcp_file(&c);
+        let ext = PI.extension(&c);
+        std::fs::create_dir_all(mcp.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ext.parent().unwrap()).unwrap();
+        std::fs::write(&ext, [0xff, 0xfe]).unwrap(); // not UTF-8
+        std::fs::write(&mcp, r#"{"mcpServers":[]}"#).unwrap();
+
+        let r = PI.install(&c);
+        assert!(r.failed(), "{}", r.render());
+        assert_eq!(std::fs::read(&ext).unwrap(), vec![0xff, 0xfe]);
+        assert_eq!(
+            std::fs::read_to_string(&mcp).unwrap(),
+            r#"{"mcpServers":[]}"#
+        );
+
+        let r = PI.remove(&c);
+        assert!(
+            ext.exists(),
+            "an unreadable file is not removed: {}",
+            r.render()
+        );
+
+        // Removing from a file without `mcpServers` must not insert a null.
+        std::fs::write(&mcp, r#"{"theme":"x"}"#).unwrap();
+        PI.remove_mcp(&c);
+        assert_eq!(std::fs::read_to_string(&mcp).unwrap(), r#"{"theme":"x"}"#);
     }
 
     #[test]
