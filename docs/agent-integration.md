@@ -30,6 +30,10 @@ Everything is written under your home directory, never inside a project.
 - A file of yours is never replaced: cora marks the files it writes, keeps a one-time `.cora-backup` of a config it edits, refuses a config it cannot read or parse, and does not rewrite `opencode.jsonc` (comments) or a `hooks:` / `mcp_servers:` key you already have in Hermes (it prints the snippet instead).
 - `--remove` deletes only what cora wrote and restores your files.
 
+## Skills stay in step with cora
+
+The skills (`cora-code`, and `cora-review` for Claude Code) ship inside the binary and carry a marker with the cora version that wrote them. After an upgrade, `cora install` refreshes the copies cora wrote; a skill you edited is kept (use `--force` to replace it). The build fails if a skill names an MCP tool, command or flag that cora does not have.
+
 ## Things to know
 
 - **Hermes** asks once to approve the new hook (or set `HERMES_ACCEPT_HOOKS=1`). Its MCP support needs the `mcp` Python package.

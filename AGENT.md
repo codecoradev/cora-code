@@ -270,6 +270,22 @@ Missing any = release blocker.
 - [ ] `./target/release/cora mcp --help` — new subcommands work
 - [ ] `./target/release/cora review --staged` — no crash on clean tree
 
+### 1b. Skills (shipped inside the binary)
+
+`src/commands/cora_review_skill.md` and `src/commands/agents/cora_code_skill.md` are
+embedded in the binary and installed into users' agents by `cora install`. They name
+CLI commands and MCP tools, so they must move with the code.
+
+- [ ] `cargo test` passes the skill checks (`commands::agents::skills`): every MCP tool,
+      `cora <command>` and `--flag` a skill names exists
+- [ ] Reread both skill texts against this release's CHANGELOG (renamed or new tools,
+      commands, flags, install steps) and update them in the same release
+- [ ] A skill that must stay recognizable after a rewrite: the old text's SHA-256 is added to
+      `LEGACY_REVIEW_SKILLS` only if that text shipped without a marker (v0.19.0 and v0.20.0
+      are already there; newer releases carry the marker and need nothing)
+- [ ] `cora install --dry-run` on a machine with an older install reports the skills as
+      "updated" (cora-written copies) and "kept" (edited copies)
+
 ### 2. Documentation (Every File)
 
 Documentation drift is the #1 source of user confusion. Each file must reflect

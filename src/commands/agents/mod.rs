@@ -11,6 +11,7 @@ pub mod claude;
 pub mod hermes;
 pub mod opencode;
 pub mod pi;
+pub mod skills;
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -237,6 +238,40 @@ pub fn write_if_changed(path: &Path, content: &str, ctx: &Ctx) -> Step {
     match write_atomic(path, content) {
         Ok(()) => Step::Done(format!("wrote {}", path.display())),
         Err(e) => Step::Failed(format!("{}: {e:#}", path.display())),
+    }
+}
+
+/// Install the `cora-code` skill at `path` (see [`skills`]).
+pub fn skill_step(path: &Path, ctx: &Ctx) -> Step {
+    skills_outcome(
+        skills::install(path, CODE_SKILL, &[], ctx.dry_run, ctx.force),
+        path,
+    )
+}
+
+/// Remove the `cora-code` skill at `path` if cora wrote it.
+pub fn skill_remove_step(path: &Path, ctx: &Ctx) -> Step {
+    skills_outcome(
+        skills::remove(path, CODE_SKILL, &[], ctx.dry_run, ctx.force),
+        path,
+    )
+}
+
+fn skills_outcome(result: Result<skills::Outcome>, path: &Path) -> Step {
+    use skills::Outcome::*;
+    let shown = path.display();
+    match result {
+        Err(e) => Step::Failed(format!("{shown}: {e:#}")),
+        Ok(UpToDate) => Step::Unchanged(shown.to_string()),
+        Ok(NotPresent) => Step::Unchanged(format!("{shown} not present")),
+        Ok(KeptCustomized) => Step::Skipped(format!(
+            "{shown} was edited by you, kept (use --force to replace it)"
+        )),
+        Ok(Installed) => Step::Done(format!("wrote {shown}")),
+        Ok(Updated(Some(v))) => Step::Done(format!("updated {shown} (was written by cora {v})")),
+        Ok(Updated(None)) => Step::Done(format!("updated {shown}")),
+        Ok(Removed) => Step::Done(format!("removed {shown}")),
+        Ok(Would(inner)) => Step::Done(format!("would change {shown} ({inner:?})")),
     }
 }
 

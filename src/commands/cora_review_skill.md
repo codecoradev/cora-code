@@ -3,9 +3,11 @@ name: cora-review
 description: Review a git diff or scan a project with Cora's checks, with YOU as the reviewer. No LLM or API key needs to be configured in cora. Use when asked to review changes, a PR, staged changes, or to scan the project for issues with cora.
 ---
 
+{{CORA_SKILL_MARKER}}
+
 # Cora review (agent as reviewer)
 
-Cora runs its deterministic checks (rules, secrets, security, index scans) and gives you the review prompts. You do the judging with your own model, then cora validates and merges your findings. Requires the `cora` MCP server (`cora install` sets it up for most agents; for Claude Code run `claude mcp add cora -- cora mcp`). Some agents show the tool names with underscores (`cora_review_prepare`).
+Cora runs its deterministic checks (rules, secrets, security, index scans) and gives you the review prompts. You do the judging with your own model, then cora validates and merges your findings. Requires the `cora` MCP server (`cora install` sets it up for Claude Code, Hermes, pi, omp, opencode and most other agents). Some agents show the tool names with underscores (`cora_review_prepare`).
 
 ## Safety first
 
