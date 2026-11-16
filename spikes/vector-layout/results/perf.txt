@@ -1,0 +1,34 @@
+176 projects, 127400 vectors, 256 dims
+
+build (all vectors, 1 thread):
+  global usearch           33877 ms
+  global vecq               1786 ms
+  per-project usearch       9467 ms (sum of 176 indexes)
+  per-project vecq          1525 ms
+
+save + size:
+  global usearch             94 ms    149.4 MB
+  global vecq                38 ms     34.7 MB
+  per-project usearch       107 ms    149.3 MB total
+  per-project vecq           27 ms     34.7 MB total
+
+re-index one project of 689 functions (embeddings ready; rewrite its vectors and save):
+  global usearch (remove + add + save whole file)        306 ms
+  global vecq    (save whole file; add excluded)          45 ms
+  per-project usearch (build + save own file)             35 ms
+  per-project vecq    (build + save own file)              8 ms
+
+load (read file and rebuild in memory):
+  global usearch          194.7 ms
+  global vecq              42.1 ms
+  one project usearch       0.6 ms
+  one project vecq          0.1 ms
+
+query latency, 696 queries, 1 thread (microseconds, median / p95):
+  global usearch, cora over-fetch         205 /      376
+  global usearch, filtered search        5540 /    33462
+  global usearch, adaptive fetch         2909 /    24422
+  global vecq, cora over-fetch          13769 /    15872
+  per-project usearch                      32 /       67
+  per-project vecq                         63 /      159
+

@@ -1,0 +1,4 @@
+global-usearch     index memory +148.5 MB (rss 172 -> 320, 176 projects exist)
+global-vecq        index memory +24.1 MB (rss 171 -> 195, 176 projects exist)
+project-usearch    index memory +2.5 MB (rss 172 -> 174, 176 projects exist)
+project-vecq       index memory +0.0 MB (rss 171 -> 171, 176 projects exist)
