@@ -91,14 +91,34 @@ fn drop_hook(doc: &mut Value, event: &str, mark: &str) -> bool {
 
 fn read_settings(ctx: &Ctx) -> Result<Value, String> {
     let path = settings_path(ctx);
-    match read_existing(&path)? {
-        None => Ok(json!({})),
-        Some(s) if s.trim().is_empty() => Ok(json!({})),
+    let doc = match read_existing(&path)? {
+        None => return Ok(json!({})),
+        Some(s) if s.trim().is_empty() => return Ok(json!({})),
         Some(s) => serde_json::from_str::<Value>(&s)
             .ok()
             .filter(Value::is_object)
-            .ok_or_else(|| format!("{} is not a JSON object; left untouched", path.display())),
+            .ok_or_else(|| format!("{} is not a JSON object; left untouched", path.display()))?,
+    };
+    // The merge indexes into `hooks` and the two event lists: indexing a value
+    // of the wrong type panics, so refuse a settings file shaped otherwise.
+    let bad = |what: &str| {
+        format!(
+            "{}: `{what}` has an unexpected shape; left untouched",
+            path.display()
+        )
+    };
+    match doc.get("hooks") {
+        None => {}
+        Some(h) if h.is_object() => {
+            for event in [PROMPT_EVENT, SESSION_EVENT] {
+                if h.get(event).is_some_and(|l| !l.is_array()) {
+                    return Err(bad(&format!("hooks.{event}")));
+                }
+            }
+        }
+        Some(_) => return Err(bad("hooks")),
     }
+    Ok(doc)
 }
 
 fn write_settings(doc: &Value, ctx: &Ctx) -> Step {
@@ -391,6 +411,24 @@ mod tests {
         std::fs::write(settings_path(&c), [0xff, 0xfe]).unwrap(); // not UTF-8
         assert!(Claude.install(&c).failed());
         assert_eq!(std::fs::read(settings_path(&c)).unwrap(), vec![0xff, 0xfe]);
+    }
+
+    #[test]
+    fn a_hooks_value_of_the_wrong_type_is_reported_not_a_panic() {
+        for bad in [
+            r#"{"hooks":[]}"#,
+            r#"{"hooks":"x"}"#,
+            r#"{"hooks":{"UserPromptSubmit":"x"}}"#,
+            r#"{"hooks":{"SessionStart":{}}}"#,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let c = ctx(tmp.path());
+            std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+            std::fs::write(settings_path(&c), bad).unwrap();
+            assert!(Claude.install(&c).failed(), "{bad}");
+            assert!(Claude.remove(&c).failed(), "{bad}");
+            assert_eq!(std::fs::read_to_string(settings_path(&c)).unwrap(), bad);
+        }
     }
 
     #[test]
