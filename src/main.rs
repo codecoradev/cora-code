@@ -136,6 +136,10 @@ enum Command {
         #[clap(long)]
         docs: bool,
 
+        /// Do not add meaning-based matches to a multi-word query
+        #[clap(long)]
+        no_semantic: bool,
+
         /// Output as JSON
         #[clap(long)]
         json: bool,
@@ -827,6 +831,7 @@ async fn main() -> Result<()> {
             language,
             limit,
             docs,
+            no_semantic,
             json,
         } => {
             let (conn, project_id, _project_root) = open_index_strict_or_exit()?;
@@ -849,6 +854,11 @@ async fn main() -> Result<()> {
                 },
             };
 
+            let semantic_text = query.clone().filter(|t| t.split_whitespace().count() >= 2);
+            let semantic_kind = kind.clone();
+            let semantic_file = file.clone();
+            let semantic_wanted = !no_semantic && semantic_text.is_some() && language.is_none();
+
             let q = index::SymbolQuery {
                 text: query,
                 kind: sym_kind,
@@ -862,6 +872,29 @@ async fn main() -> Result<()> {
             let total = outcome.total;
             let results = outcome.results;
 
+            // A question rarely has every word in one symbol name. When the
+            // keyword search leaves room, complete it with matches by meaning
+            // (the same hybrid `cora brain` uses), listed separately.
+            let semantic: Vec<index::brain::BrainResult> = match (&semantic_text, semantic_wanted) {
+                (Some(text), true) if results.len() < limit => {
+                    index::session::configure_for_search(index::session::ConfigSource::Full(
+                        cli.global.config.as_deref(),
+                    ));
+                    let seen: std::collections::HashSet<i64> =
+                        results.iter().map(|r| r.symbol.id).collect();
+                    index::brain::semantic_matches(
+                        &conn,
+                        project_id,
+                        text,
+                        &seen,
+                        semantic_kind.as_deref(),
+                        semantic_file.as_deref(),
+                        limit - results.len(),
+                    )
+                }
+                _ => Vec::new(),
+            };
+
             if json {
                 let json_results: Vec<serde_json::Value> = results
                     .iter()
@@ -874,8 +907,20 @@ async fn main() -> Result<()> {
                             "signature": r.symbol.signature,
                             "language": r.symbol.language,
                             "score": r.score,
+                            "via": "keyword",
                         })
                     })
+                    .chain(semantic.iter().map(|r| {
+                        serde_json::json!({
+                            "name": r.name,
+                            "kind": r.kind,
+                            "file": r.file,
+                            "line": r.line,
+                            "signature": r.signature,
+                            "score": r.score,
+                            "via": "semantic",
+                        })
+                    }))
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json_results)?);
                 if total > results.len() {
@@ -884,28 +929,50 @@ async fn main() -> Result<()> {
                         commands::index_cmd::explore_header(results.len(), total).dimmed()
                     );
                 }
-            } else if results.is_empty() {
+            } else if results.is_empty() && semantic.is_empty() {
                 eprintln!("{}", "No symbols found.".yellow());
             } else {
-                println!(
-                    "{}",
-                    commands::index_cmd::explore_header(results.len(), total).cyan()
-                );
-                println!(
-                    "{}",
-                    "───────────────────────────────────────────────".dimmed()
-                );
-                for r in &results {
+                if !results.is_empty() {
                     println!(
-                        "  {} {} {}:{}",
-                        r.symbol.kind.as_str().blue(),
-                        r.symbol.name.white().bold(),
-                        r.symbol.file.dimmed(),
-                        r.symbol.line
+                        "{}",
+                        commands::index_cmd::explore_header(results.len(), total).cyan()
                     );
-                    if let Some(sig) = r.symbol.signature.lines().next().map(str::trim) {
-                        if !sig.is_empty() {
-                            println!("    {} {}", "→".dimmed(), sig.dimmed());
+                    println!(
+                        "{}",
+                        "───────────────────────────────────────────────".dimmed()
+                    );
+                    for r in &results {
+                        println!(
+                            "  {} {} {}:{}",
+                            r.symbol.kind.as_str().blue(),
+                            r.symbol.name.white().bold(),
+                            r.symbol.file.dimmed(),
+                            r.symbol.line
+                        );
+                        if let Some(sig) = r.symbol.signature.lines().next().map(str::trim) {
+                            if !sig.is_empty() {
+                                println!("    {} {}", "→".dimmed(), sig.dimmed());
+                            }
+                        }
+                    }
+                }
+                if !semantic.is_empty() {
+                    println!(
+                        "{}",
+                        format!("{} matches by meaning (not by name):", semantic.len()).cyan()
+                    );
+                    for r in &semantic {
+                        println!(
+                            "  {} {} {}:{}",
+                            r.kind.blue(),
+                            r.name.white().bold(),
+                            r.file.dimmed(),
+                            r.line
+                        );
+                        if let Some(sig) = r.signature.lines().next().map(str::trim) {
+                            if !sig.is_empty() {
+                                println!("    {} {}", "→".dimmed(), sig.dimmed());
+                            }
                         }
                     }
                 }

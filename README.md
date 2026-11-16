@@ -29,7 +29,7 @@
 - 📏 **Custom rule engine** — write your own regex rules in `.cora.yaml`
 - ✂️ **Auto-chunking** — splits large PRs into reviewable chunks automatically
 - 🔍 **Code Intelligence** — index symbols across 15 languages, call graph, trace, impact analysis
-- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + vector KNN + graph) with RRF fusion
+- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33 MB model downloads once on first use, no API key, no GPU
 - 🗄️ **Multi-project database** — one global index, search across all your repos at once
 - 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
 - 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)

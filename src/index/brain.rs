@@ -10,11 +10,12 @@
 //! A dimension mismatch between an existing on-disk index and the current
 //! compile-time backend triggers a warning and advises re-indexing.
 
-use crate::embed::{active_dims, active_provider_name, embed_code_dispatch};
+use crate::embed::{
+    active_backend, active_dims, active_provider_name, embed_batch_dispatch, embed_code_dispatch,
+};
 use crate::index::symbols::SymbolQuery;
 use crate::index::vector::{CodeVectorIndex, cosine_distance_to_similarity};
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use rusqlite::Connection;
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, RwLock};
@@ -91,9 +92,10 @@ impl BrainDiagnostics {
                  vector signal skipped (run `cora index --rebuild`)"
                     .to_string(),
             ),
-            VectorState::Used if self.embedding_tier.as_deref() == Some("static") => out.push(
-                "vector hits come from a static text embedding and may be unrelated to the \
-                 question; configure an embedding provider for semantic matches"
+            VectorState::Used if self.embedding_tier.as_deref() != Some("potion") => out.push(
+                "vector hits come from a weak fallback embedding and may be unrelated to the \
+                 question: the code embedding model is not in use (run `cora index` with network \
+                 access once to download it, or see CORA_EMBED_MODEL_DIR)"
                     .to_string(),
             ),
             _ => {}
@@ -157,7 +159,17 @@ pub fn question_terms(query: &str) -> Vec<String> {
 
 /// Path to the usearch vector index file.
 fn vector_index_path() -> std::path::PathBuf {
-    crate::data_dir::cora_data_dir().join("cora_index.usearch")
+    let dir = crate::data_dir::cora_data_dir();
+    // Hashing and pretrained vectors keep the historical file name (their
+    // dimensions differ, which the dimension check handles). The potion model
+    // has the same 256 dimensions as hashing but means something else, so it
+    // gets a file of its own: vectors of different models never mix.
+    match active_backend() {
+        crate::embed::Backend::Potion => {
+            dir.join(format!("cora_index.{}.usearch", active_backend().tag()))
+        }
+        _ => dir.join("cora_index.usearch"),
+    }
 }
 
 /// Check if an existing on-disk vector index has compatible dimensions.
@@ -313,6 +325,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     // Compute current fingerprints and filter to only changed symbols
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    let backend_tag = active_backend().tag();
 
     let changed: Vec<(i64, String)> = rows
         .iter()
@@ -323,6 +336,9 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
                 format!("{name} {signature}")
             };
             let mut hasher = DefaultHasher::new();
+            // The model is part of the fingerprint: switching it re-embeds
+            // every symbol instead of trusting vectors of another model.
+            backend_tag.hash(&mut hasher);
             text.hash(&mut hasher);
             let current_fp = format!("{:016x}", hasher.finish());
 
@@ -346,12 +362,12 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
     // ── Parallel embedding computation (Rayon) ─────────────────────────
     // embed_code_dispatch is pure + CPU-bound. usearch insert is serial.
     let t_compute = std::time::Instant::now();
+    let texts: Vec<String> = changed.iter().map(|(_, text)| text.clone()).collect();
+    let vectors = embed_batch_dispatch(&texts);
     let embedded: Vec<(i64, Vec<f32>)> = changed
-        .par_iter()
-        .map(|(sym_id, text)| {
-            let vec = embed_code_dispatch(text);
-            (*sym_id, vec)
-        })
+        .iter()
+        .map(|(sym_id, _)| *sym_id)
+        .zip(vectors)
         .collect();
     let compute_ms = t_compute.elapsed().as_millis();
 
@@ -401,11 +417,7 @@ pub fn embed_project(conn: &Connection, project_id: i64) -> Result<usize> {
 
     // Determine tier label
     let provider = active_provider_name();
-    let tier = if provider.contains("pretrained") {
-        "pretrained"
-    } else {
-        "static"
-    };
+    let tier = active_backend().tier();
     conn.execute(
         "UPDATE projects SET embedding_tier = ?3, embedding_dims = ?1, \
          embedding_provider = ?4, last_embedded_at = datetime('now') WHERE id = ?2",
@@ -470,11 +482,13 @@ pub fn brain_search_report(
             |r| r.get(0),
         )
         .ok();
-    // A static (text-only) embedding is a weak signal; count it for half.
-    let vector_weight = if embedding_tier.as_deref() == Some("static") {
-        0.5
-    } else {
-        1.0
+    // Only the code embedding model earns a full vote. Measured on retrieval
+    // sets (docs/code-intelligence.md), the hashing and static-vocabulary
+    // embeddings were neutral to harmful when fused with keyword search at
+    // half weight, so they count for a quarter.
+    let vector_weight = match embedding_tier.as_deref() {
+        Some("potion") => 1.0,
+        _ => 0.25,
     };
 
     // ── RRF Fusion ──────────────────────────────────────────────────────
@@ -605,6 +619,51 @@ pub fn vector_index_needs_rebuild() -> bool {
     }
     let path = vector_index_path().with_extension("vecq");
     path.exists() && crate::index::vector::vecq_file_needs_rebuild(&path, active_dims())
+}
+
+/// Meaning-based matches for a multi-word query, to complete a keyword search
+/// that found too little: the question is searched with the full hybrid
+/// ([`brain_search_report`] in natural-language mode) and symbols the keyword
+/// search already returned (`exclude`) are left out. Returns at most `room`
+/// results, optionally restricted to a symbol kind and a file path prefix.
+pub fn semantic_matches(
+    conn: &Connection,
+    project_id: i64,
+    text: &str,
+    exclude: &HashSet<i64>,
+    kind: Option<&str>,
+    file_prefix: Option<&str>,
+    room: usize,
+) -> Vec<BrainResult> {
+    if room == 0 || text.split_whitespace().count() < 2 {
+        return Vec::new();
+    }
+    let Ok(report) = brain_search_report(conn, project_id, text, 50, true) else {
+        return Vec::new();
+    };
+    report
+        .results
+        .into_iter()
+        .filter(|r| !exclude.contains(&r.symbol_id))
+        .filter(|r| kind.is_none_or(|k| r.kind == k))
+        .filter(|r| file_prefix.is_none_or(|p| r.file.starts_with(p)))
+        .take(room)
+        .collect()
+}
+
+/// True when the project was embedded by another model than the active one (or
+/// never): its vectors are in a different index and must be rebuilt, even if no
+/// file changed since the last `cora index`.
+pub fn embedding_provider_changed(conn: &Connection, project_id: i64) -> bool {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT embedding_provider FROM projects WHERE id = ?1",
+            [project_id],
+            |r| r.get(0),
+        )
+        .ok()
+        .flatten();
+    stored.as_deref() != Some(active_provider_name())
 }
 
 /// Return a read guard over the vector index cache, loading the on-disk
@@ -990,7 +1049,7 @@ pub fn tzif() {}
         let healthy = BrainDiagnostics {
             vector: VectorState::Used,
             vector_hits: 3,
-            embedding_tier: Some("provider".to_string()),
+            embedding_tier: Some("potion".to_string()),
             ..base
         };
         assert!(healthy.warnings().is_empty());
@@ -1016,10 +1075,35 @@ pub fn tzif() {}
             embedding_tier: Some("static".to_string()),
         };
         let w = diag.warnings();
-        assert!(w.iter().any(|m| m.contains("static text embedding")));
+        assert!(w.iter().any(|m| m.contains("weak fallback embedding")));
         assert!(
             w.iter()
                 .any(|m| m.contains("every result comes from the vector"))
         );
+    }
+
+    /// The code model's vectors are a full vote; every fallback embedding
+    /// counts for a quarter (measured: they hurt keyword search at more).
+    #[test]
+    fn only_the_code_model_gets_a_full_vote_and_no_warning() {
+        let base = BrainDiagnostics {
+            terms: vec![],
+            fts_hits: 3,
+            vector_hits: 3,
+            graph_hits: 0,
+            vector: VectorState::Used,
+            embedding_tier: Some("potion".to_string()),
+        };
+        assert!(base.warnings().is_empty());
+        for tier in ["static", "pretrained"] {
+            let weak = BrainDiagnostics {
+                embedding_tier: Some(tier.to_string()),
+                ..base.clone()
+            };
+            assert!(
+                weak.warnings().iter().any(|w| w.contains("weak fallback")),
+                "{tier}"
+            );
+        }
     }
 }

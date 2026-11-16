@@ -94,7 +94,7 @@ pub fn list_tools() -> Vec<Tool> {
         // ─── Code Intelligence ───
         Tool {
             name: "cora.search_symbols".to_string(),
-            description: "Search the symbol index for code intelligence. Returns matching symbols with file location, kind, and signature. Requires `cora index` to be run first.".to_string(),
+            description: "Search the symbol index by symbol name or keyword. Returns matching symbols with file location, kind, and signature. For a question in words (\"where do we retry a failed request\"), use cora.brain_search instead. Requires `cora index` to be run first.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -201,7 +201,7 @@ pub fn list_tools() -> Vec<Tool> {
         // Brain Mode (Phase 3)
         Tool {
             name: "cora.brain_search".to_string(),
-            description: "Hybrid code search: FTS5 + vector embeddings + graph proximity → RRF fusion. Better than plain text search for semantic code queries.".to_string(),
+            description: "Search code by meaning. Ask in words (\"how does the review store prune old findings\", \"parse the severity from the model reply\"): keyword search, a code embedding model and graph proximity are fused into one ranking. Use cora.search_symbols when you already know the symbol name.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

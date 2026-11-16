@@ -1,0 +1,4 @@
+{
+ "normalize": true,
+ "embedding_dtype": "float32"
+}

@@ -598,7 +598,13 @@ fn index_project_with_id(
     // (legacy pre-0.3.0 vecq file, vecq #542: if all files are unchanged this
     // would be the only chance to re-embed — without it the vector signal
     // stays dead until a file actually changes).
-    if stats.files_indexed > 0 || stats.files_pruned > 0 || brain::vector_index_needs_rebuild() {
+    // A change of embedding model (for example the first run after the code
+    // model became the default) also needs a re-embed, files unchanged or not.
+    if stats.files_indexed > 0
+        || stats.files_pruned > 0
+        || brain::vector_index_needs_rebuild()
+        || brain::embedding_provider_changed(conn, project_id)
+    {
         match brain::embed_project(conn, project_id) {
             Ok(n) => {
                 stats.embedded_symbols = Some(n);

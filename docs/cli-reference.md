@@ -119,7 +119,8 @@ See [Code Intelligence](./code-intelligence) for detailed usage.
 | `cora index --watch` | Auto-sync file watcher (2s poll interval) |
 | `cora index --stats` | Show index statistics (symbol count, languages, DB size) |
 | `cora index --prune` | Remove stale entries for deleted files |
-| `cora explore` `<query>` | Keyword search (FTS5) over symbol names |
+| `cora explore` `<query>` | Keyword search (FTS5) over symbol names; a multi-word query is completed with a separate block of matches by meaning |
+| `cora explore --no-semantic` | Keyword results only, even for a multi-word query |
 | `cora explore --kind` `function` | Filter by symbol kind |
 | `cora explore --file` `"src/"` | Filter by file path prefix |
 | `cora explore --language` `rust` | Filter by language |
