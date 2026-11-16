@@ -93,10 +93,64 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// Files cora leaves out of review, scan and the index unless told otherwise:
+/// dependencies, build output, minified and generated files, lockfiles. They
+/// are the main source of noise and of untrusted text in a prompt, so they
+/// are out of scope by default (`ignore.defaults: false` turns the list off;
+/// `ignore.files` adds to it). Patterns with a leading `**/` match at any depth.
+pub const BUILTIN_IGNORE: &[&str] = &[
+    // The original four, kept for configs and tests that name them.
+    "node_modules/**",
+    "dist/**",
+    "target/**",
+    ".git/**",
+    // Dependencies, at any depth (monorepos).
+    "**/node_modules/**",
+    "**/vendor/**",
+    "**/bower_components/**",
+    "**/__pycache__/**",
+    "**/site-packages/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/Pods/**",
+    // Build and test output.
+    "build/**",
+    "out/**",
+    "**/.next/**",
+    "**/.nuxt/**",
+    "**/coverage/**",
+    "**/.gradle/**",
+    // Minified, bundled and generated.
+    "**/*.min.js",
+    "**/*.min.css",
+    "**/*.map",
+    // Lockfiles.
+    "**/package-lock.json",
+    "**/yarn.lock",
+    "**/pnpm-lock.yaml",
+    "**/bun.lockb",
+    "**/Cargo.lock",
+    "**/poetry.lock",
+    "**/Pipfile.lock",
+    "**/Gemfile.lock",
+    "**/composer.lock",
+    "**/go.sum",
+    "**/flake.lock",
+];
+
 /// Ignore configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IgnoreConfig {
+    /// Files out of scope for review, scan and the index: the built-ins
+    /// ([`BUILTIN_IGNORE`], unless `defaults` is off) plus the user's patterns.
     pub files: Vec<String>,
+    /// Whether [`BUILTIN_IGNORE`] is part of `files` (`ignore.defaults`, default true).
+    #[serde(default = "default_true")]
+    pub defaults: bool,
     pub rules: Vec<String>,
     /// Rules silenced only for some paths (`ignore.rules` object entries, #680).
     #[serde(default)]
@@ -194,12 +248,8 @@ impl Default for Config {
             ],
             rules: vec![],
             ignore: IgnoreConfig {
-                files: vec![
-                    "node_modules/**".into(),
-                    "dist/**".into(),
-                    "target/**".into(),
-                    ".git/**".into(),
-                ],
+                files: BUILTIN_IGNORE.iter().map(|s| (*s).to_string()).collect(),
+                defaults: true,
                 rules: vec![],
                 scoped: vec![],
             },
@@ -506,6 +556,9 @@ where
 pub struct IgnoreSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
+    /// `false` turns the built-in ignores ([`BUILTIN_IGNORE`]) off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub defaults: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<IgnoreRuleEntry>>,
 }
@@ -829,6 +882,13 @@ impl CoraFile {
             config.rules.clone_from(v);
         }
         if let Some(ig) = &self.ignore {
+            if ig.defaults == Some(false) {
+                config.ignore.defaults = false;
+                config
+                    .ignore
+                    .files
+                    .retain(|f| !BUILTIN_IGNORE.contains(&f.as_str()));
+            }
             if let Some(v) = &ig.files {
                 // Merge user-specified ignore patterns with defaults.
                 // Previously this used clone_from, which OVERWROTE the default
@@ -1216,6 +1276,7 @@ provider: zai
         let mut cfg = Config::default();
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
+                defaults: None,
                 files: Some(vec!["vendor/**".to_string()]),
                 rules: Some(vec![IgnoreRuleEntry::Plain("skip-rule-1".to_string())]),
             }),
@@ -1254,6 +1315,7 @@ provider: zai
         let mut cfg = Config::default();
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
+                defaults: None,
                 files: Some(vec![
                     "node_modules/**".to_string(), // already a default
                     "my-vendor/**".to_string(),

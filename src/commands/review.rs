@@ -132,6 +132,28 @@ pub async fn execute_review(
 ) -> Result<ReviewResult> {
     // 1. Get the diff, minus the files `review.exclude` removes (#720)
     let diff = get_diff(opts, config)?;
+    // Dependencies, build output, minified files and lockfiles are out of scope
+    // by default (`ignore.defaults`): nothing about them reaches the scanners or
+    // the model. Say so once, so a missing file in the report is not a mystery.
+    let (diff, skipped_by_default) = crate::engine::review::drop_builtin_ignored(config, &diff);
+    if !skipped_by_default.is_empty() && !opts.quiet {
+        eprintln!(
+            "ℹ {} file(s) skipped by the built-in ignores (dependencies, build output, lockfiles; \
+             `ignore.defaults: false` turns them off): {}",
+            skipped_by_default.len(),
+            skipped_by_default
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+                + if skipped_by_default.len() > 5 {
+                    ", …"
+                } else {
+                    ""
+                }
+        );
+    }
     let matcher = PathMatcher::new(&config.review.exclude);
     let (diff, excluded) = if matcher.is_empty() {
         (diff, Vec::new())
