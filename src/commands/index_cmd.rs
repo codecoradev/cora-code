@@ -122,3 +122,31 @@ fn run_once(session: &IndexSession, verbose: bool) -> Result<()> {
     );
     Ok(())
 }
+
+/// Header line for `cora explore`: "Found N symbols" or, when the result was
+/// cut at `--limit`, "Showing N of M symbols (raise --limit to see more)".
+pub fn explore_header(shown: usize, total: usize) -> String {
+    if total > shown {
+        format!("Showing {shown} of {total} symbols (raise --limit to see more):")
+    } else {
+        format!("Found {shown} symbols:")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explore_header;
+
+    #[test]
+    fn header_plain_when_nothing_was_cut() {
+        assert_eq!(explore_header(12, 12), "Found 12 symbols:");
+    }
+
+    #[test]
+    fn header_reports_truncation() {
+        assert_eq!(
+            explore_header(50, 213),
+            "Showing 50 of 213 symbols (raise --limit to see more):"
+        );
+    }
+}
