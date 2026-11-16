@@ -3,8 +3,8 @@
 //! `cora-code` skill and a short block in `~/.claude/CLAUDE.md`.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
-    remove_instruction_block, upsert_instruction_block, write_if_changed,
+    Ctx, Integration, Report, Step, backup_once, read_existing, remove_instruction_block,
+    skill_remove_step, skill_step, upsert_instruction_block, write_if_changed,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -227,7 +227,7 @@ impl Integration for Claude {
         }
 
         register_mcp(ctx, &mut r);
-        r.push("skill", write_if_changed(&skill_path(ctx), CODE_SKILL, ctx));
+        r.push("skill", skill_step(&skill_path(ctx), ctx));
         r.todo.push(
             "headless runs (`claude -p`) ask before using MCP tools: allow the read-only ones with \
              permissions.allow [\"mcp__cora__cora_brain_search\", \"mcp__cora__cora_search_symbols\", \
@@ -281,7 +281,7 @@ impl Integration for Claude {
                 );
             }
         }
-        r.push("skill", remove_file_step(&skill_path(ctx), ctx));
+        r.push("skill", skill_remove_step(&skill_path(ctx), ctx));
         r.push(
             "instructions",
             remove_instruction_block(&claude_md(ctx), ctx),

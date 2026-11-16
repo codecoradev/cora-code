@@ -10,7 +10,7 @@
 //! of writing it.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
+    Ctx, Integration, Report, Step, backup_once, read_existing, skill_remove_step, skill_step,
     write_if_changed,
 };
 use std::path::PathBuf;
@@ -198,7 +198,7 @@ impl Integration for Hermes {
     fn install(&self, ctx: &Ctx) -> Report {
         let mut r = Report::new("hermes", self.detected(ctx));
         install_config(ctx, &mut r);
-        r.push("skill", write_if_changed(&skill(ctx), CODE_SKILL, ctx));
+        r.push("skill", skill_step(&skill(ctx), ctx));
         r.todo.push(
             "Hermes asks you once to approve the new hook (start `hermes chat`, or set \
              HERMES_ACCEPT_HOOKS=1 / hooks_auto_accept: true)"
@@ -210,7 +210,7 @@ impl Integration for Hermes {
     fn remove(&self, ctx: &Ctx) -> Report {
         let mut r = Report::new("hermes", self.detected(ctx));
         remove_config(ctx, &mut r);
-        r.push("skill", remove_file_step(&skill(ctx), ctx));
+        r.push("skill", skill_remove_step(&skill(ctx), ctx));
         r
     }
 }

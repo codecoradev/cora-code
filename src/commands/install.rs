@@ -268,82 +268,43 @@ fn install_claude_skill(opts: &InstallOptions) -> Option<Result<String>> {
 }
 
 fn install_skill_at(path: &std::path::Path, opts: &InstallOptions) -> Result<String> {
+    use crate::commands::agents::skills::{self, Outcome};
     let name = "claude-code skill /cora-review";
-    if opts.remove {
-        if !path.exists() {
-            return Ok(format!(
-                "{} {} — no skill found",
-                name.bold(),
-                "⏭ ".dimmed()
-            ));
-        }
-        // Never delete a customized copy: only remove ours (or with --force).
-        if !opts.force && std::fs::read_to_string(path).is_ok_and(|c| c != CLAUDE_SKILL) {
-            return Ok(format!(
-                "{} {} {} — customized, kept (use --force to remove)",
-                name.bold(),
-                "⏭ ".dimmed(),
-                path.display()
-            ));
-        }
-        if opts.dry_run {
-            return Ok(format!(
-                "{} {} {} — would remove",
-                name.bold(),
-                "🔍 ".cyan(),
-                path.display()
-            ));
-        }
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed to remove {}", path.display()))?;
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_dir(dir); // only if empty
-        }
-        return Ok(format!(
-            "{} {} {} — removed",
-            name.bold(),
-            "✓ ".green(),
-            path.display()
-        ));
-    }
-
-    if path.exists() && !opts.force {
-        let current = std::fs::read_to_string(path).unwrap_or_default();
-        if current == CLAUDE_SKILL {
-            return Ok(format!(
-                "{} {} {} — up to date",
-                name.bold(),
-                "⏭ ".dimmed(),
-                path.display()
-            ));
-        }
-        return Ok(format!(
-            "{} {} {} — exists and differs (use --force to overwrite)",
-            name.bold(),
-            "⏭ ".dimmed(),
-            path.display()
-        ));
-    }
-    if opts.dry_run {
-        return Ok(format!(
-            "{} {} {} — would write",
-            name.bold(),
-            "🔍 ".cyan(),
-            path.display()
-        ));
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-    }
-    std::fs::write(path, CLAUDE_SKILL)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(format!(
-        "{} {} {} — installed",
-        name.bold(),
-        "✓ ".green(),
-        path.display()
-    ))
+    let shown = path.display();
+    let line = |mark: String, what: &str| format!("{} {} {shown} — {what}", name.bold(), mark);
+    let legacy = skills::LEGACY_REVIEW_SKILLS;
+    let outcome = if opts.remove {
+        skills::remove(path, CLAUDE_SKILL, legacy, opts.dry_run, opts.force)?
+    } else {
+        skills::install(path, CLAUDE_SKILL, legacy, opts.dry_run, opts.force)?
+    };
+    Ok(match outcome {
+        Outcome::NotPresent => format!("{} {} — no skill found", name.bold(), "⏭ ".dimmed()),
+        Outcome::UpToDate => line("⏭ ".dimmed().to_string(), "up to date"),
+        Outcome::KeptCustomized if opts.remove => line(
+            "⏭ ".dimmed().to_string(),
+            "customized, kept (use --force to remove)",
+        ),
+        Outcome::KeptCustomized => line(
+            "⏭ ".dimmed().to_string(),
+            "exists and differs (you edited it; use --force to overwrite)",
+        ),
+        Outcome::Installed => line("✓ ".green().to_string(), "installed"),
+        Outcome::Updated(Some(v)) => line(
+            "✓ ".green().to_string(),
+            &format!("updated (was written by cora {v})"),
+        ),
+        Outcome::Updated(None) => line("✓ ".green().to_string(), "updated"),
+        Outcome::Removed => line("✓ ".green().to_string(), "removed"),
+        Outcome::Would(inner) => line(
+            "🔍 ".cyan().to_string(),
+            match *inner {
+                Outcome::Removed => "would remove",
+                Outcome::Updated(_) => "would update",
+                _ => "would write",
+            },
+        ),
+    })
 }
 
 /// Execute the `cora install` subcommand.
@@ -505,7 +466,10 @@ mod tests {
         let path = skill_path(dir.path());
         let msg = install_skill_at(&path, &opts()).unwrap();
         assert!(msg.contains("installed"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), CLAUDE_SKILL);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::commands::agents::skills::render(CLAUDE_SKILL)
+        );
         assert!(
             install_skill_at(&path, &opts())
                 .unwrap()
@@ -530,7 +494,10 @@ mod tests {
             ..opts()
         };
         install_skill_at(&path, &force).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), CLAUDE_SKILL);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::commands::agents::skills::render(CLAUDE_SKILL)
+        );
     }
 
     #[test]

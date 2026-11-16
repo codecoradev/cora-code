@@ -4,7 +4,8 @@
 //! Both agents share the extension API shape, so one template serves both.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, read_existing, remove_file_step, write_if_changed,
+    Ctx, Integration, Report, Step, read_existing, remove_file_step, skill_remove_step, skill_step,
+    write_if_changed,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -210,7 +211,7 @@ impl Integration for PiFamily {
         let mut r = Report::new(self.name, self.detected(ctx));
         r.push("extension", self.install_extension(ctx));
         r.push("mcp", self.install_mcp(ctx));
-        r.push("skill", write_if_changed(&self.skill(ctx), CODE_SKILL, ctx));
+        r.push("skill", skill_step(&self.skill(ctx), ctx));
         r.todo.push(format!(
             "restart {} (or reload extensions) to pick up the extension",
             self.name
@@ -230,7 +231,7 @@ impl Integration for PiFamily {
             Ok(_) => r.push("extension", remove_file_step(&path, ctx)),
         }
         r.push("mcp", self.remove_mcp(ctx));
-        r.push("skill", remove_file_step(&self.skill(ctx), ctx));
+        r.push("skill", skill_remove_step(&self.skill(ctx), ctx));
         r
     }
 }
