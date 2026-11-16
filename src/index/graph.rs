@@ -104,36 +104,98 @@ pub fn clear_edges_for_file(conn: &Connection, file: &str, project_id: i64) -> a
     Ok(())
 }
 
+/// A caller query: the callee name plus an optional type or module it must
+/// have been reached through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalleeQuery {
+    /// Final name segment (`from_env` for `WebSearchTool::from_env`).
+    pub name: String,
+    /// Type or module before the name, when the query gave one.
+    pub qualifier: Option<String>,
+}
+
+impl CalleeQuery {
+    /// Parse `name` or `Type::name` (any leading path is reduced to its last
+    /// type segment; `Type.name` is accepted too).
+    pub fn parse(raw: &str) -> Self {
+        let raw = raw.trim();
+        let mut parts = raw.rsplitn(2, "::");
+        let name = parts.next().unwrap_or(raw);
+        let qualifier = parts
+            .next()
+            .and_then(|q| q.rsplit("::").next())
+            .map(|q| q.split('<').next().unwrap_or(q).trim())
+            .filter(|q| !q.is_empty());
+        Self {
+            name: name.to_string(),
+            qualifier: qualifier.map(str::to_string),
+        }
+    }
+}
+
 /// Find all callers of a symbol (who calls this?), scoped to a project.
 ///
-/// Returns symbols that call the given name, grouped by file.
+/// `symbol_name` is a bare name (every call to that name, as before), a
+/// `Type::name` (only calls through `Type`, plus ambiguous calls whose
+/// receiver type is unknown) or a bare type name (every call through it, and
+/// calls to a tuple-struct constructor of that name).
 pub fn find_callers(
     conn: &Connection,
     project_id: i64,
     symbol_name: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<CallerResult>> {
-    let pattern = symbol_name;
+    find_callers_opts(conn, project_id, symbol_name, limit, false)
+}
 
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT cg.caller, cg.file, cg.line
-         FROM call_graph cg
-         WHERE cg.callee = ?1 AND cg.project_id = ?2
-         LIMIT ?3",
-    )?;
-
-    let rows = stmt.query_map(
-        rusqlite::params![pattern, project_id, limit as i64],
-        |row| {
-            Ok(CallerResult {
-                caller: row.get(0)?,
-                file: row.get(1)?,
-                line: row.get::<_, i64>(2)? as u32,
-            })
-        },
-    )?;
-
-    Ok(rows.filter_map(|r| r.ok()).collect())
+/// `find_callers` with `strict`: leave out ambiguous edges (no known
+/// qualifier) for a type-qualified query.
+pub fn find_callers_opts(
+    conn: &Connection,
+    project_id: i64,
+    symbol_name: &str,
+    limit: usize,
+    strict: bool,
+) -> anyhow::Result<Vec<CallerResult>> {
+    let q = CalleeQuery::parse(symbol_name);
+    let map = |row: &rusqlite::Row| -> rusqlite::Result<CallerResult> {
+        Ok(CallerResult {
+            caller: row.get(0)?,
+            file: row.get(1)?,
+            line: row.get::<_, i64>(2)? as u32,
+            qualifier: row.get(3)?,
+            caller_type: row.get(4)?,
+        })
+    };
+    let rows: Vec<CallerResult> = match &q.qualifier {
+        Some(qual) => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT cg.caller, cg.file, cg.line, cg.qualifier, cg.caller_type
+                 FROM call_graph cg
+                 WHERE cg.callee = ?1 AND cg.project_id = ?2
+                   AND (cg.qualifier = ?3 OR (cg.qualifier IS NULL AND ?4 = 0))
+                 LIMIT ?5",
+            )?;
+            stmt.query_map(
+                rusqlite::params![q.name, project_id, qual, strict as i64, limit as i64],
+                map,
+            )?
+            .filter_map(|r| r.ok())
+            .collect()
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT cg.caller, cg.file, cg.line, cg.qualifier, cg.caller_type
+                 FROM call_graph cg
+                 WHERE (cg.callee = ?1 OR cg.qualifier = ?1) AND cg.project_id = ?2
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(rusqlite::params![q.name, project_id, limit as i64], map)?
+                .filter_map(|r| r.ok())
+                .collect()
+        }
+    };
+    Ok(rows)
 }
 
 /// Find callers of a symbol across ALL projects (cross-project fallback).
@@ -210,20 +272,27 @@ pub fn impact_analysis(
     symbol_name: &str,
     depth: u32,
 ) -> anyhow::Result<Vec<ImpactNode>> {
+    // A node is a method name plus, when known, the impl type it belongs to,
+    // so two `from_env` of different types are followed separately (#714).
+    let seed = CalleeQuery::parse(symbol_name);
+    let key = |name: &str, ty: Option<&str>| match ty {
+        Some(t) => format!("{t}::{name}"),
+        None => name.to_string(),
+    };
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut result = Vec::new();
-    let mut current_level = vec![symbol_name.to_string()];
+    let mut current_level: Vec<(String, Option<String>)> = vec![(seed.name, seed.qualifier)];
     let mut current_depth = 0u32;
 
     while current_depth < depth && !current_level.is_empty() {
         let mut next_level = Vec::new();
 
-        for sym in &current_level {
-            if !visited.insert(sym.clone()) {
+        for (sym, ty) in &current_level {
+            if !visited.insert(key(sym, ty.as_deref())) {
                 continue;
             }
 
-            let callers = find_callers(conn, project_id, sym, 100)?;
+            let callers = find_callers(conn, project_id, &key(sym, ty.as_deref()), 100)?;
             for caller in callers {
                 let node = ImpactNode {
                     symbol: caller.caller.clone(),
@@ -232,8 +301,8 @@ pub fn impact_analysis(
                     depth: current_depth + 1,
                 };
 
-                if !visited.contains(&caller.caller) {
-                    next_level.push(caller.caller.clone());
+                if !visited.contains(&key(&caller.caller, caller.caller_type.as_deref())) {
+                    next_level.push((caller.caller.clone(), caller.caller_type.clone()));
                 }
 
                 result.push(node);
@@ -261,6 +330,13 @@ pub struct CallerResult {
     pub caller: String,
     pub file: String,
     pub line: u32,
+    /// Type or module the call went through; `None` means the receiver type
+    /// is unknown, so the edge is ambiguous for a type-qualified query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+    /// Impl type of the calling method, when it is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_type: Option<String>,
 }
 
 /// A cross-project caller result (includes which project the caller belongs to).
@@ -1416,6 +1492,79 @@ pub fn maintenance() -> usize {
 
     /// Regression: callers were matched with `LIKE '%name%'`, so removing
     /// `run` flagged callers of `rerun`, and `_`/`%` acted as wildcards.
+    fn typed_call(conn: &Connection, pid: i64, caller: &str, callee: &str, q: Option<&str>) {
+        conn.execute(
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, qualifier) \
+             VALUES (?1, ?2, 'a.rs', 1, ?3, ?4)",
+            rusqlite::params![caller, callee, pid, q],
+        )
+        .unwrap();
+    }
+
+    /// #714: `callers Type::method` lists only calls through that type, plus
+    /// ambiguous ones unless strict; a bare name still lists every call.
+    #[test]
+    fn test_find_callers_type_qualified() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        typed_call(&conn, pid, "roster_a", "from_env", Some("WebSearchTool"));
+        typed_call(&conn, pid, "roster_b", "from_env", Some("WebFetchTool"));
+        typed_call(&conn, pid, "untyped", "from_env", None);
+
+        let names = |v: Vec<CallerResult>| {
+            let mut n: Vec<String> = v.into_iter().map(|c| c.caller).collect();
+            n.sort();
+            n
+        };
+        assert_eq!(names(find_callers(&conn, pid, "from_env", 50).unwrap()).len(), 3);
+        assert_eq!(
+            names(find_callers(&conn, pid, "WebSearchTool::from_env", 50).unwrap()),
+            ["roster_a", "untyped"]
+        );
+        assert_eq!(
+            names(find_callers_opts(&conn, pid, "WebSearchTool::from_env", 50, true).unwrap()),
+            ["roster_a"]
+        );
+    }
+
+    /// #714: a bare type name finds the calls made through the type.
+    #[test]
+    fn test_find_callers_of_a_type_name() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        typed_call(&conn, pid, "roster", "from_env", Some("WebFetchTool"));
+        typed_call(&conn, pid, "roster", "default", Some("WebFetchTool"));
+        typed_call(&conn, pid, "elsewhere", "default", Some("Other"));
+
+        let callers = find_callers(&conn, pid, "WebFetchTool", 50).unwrap();
+        assert_eq!(callers.len(), 2);
+        assert!(callers.iter().all(|c| c.caller == "roster"));
+    }
+
+    /// #714: impact follows the typed node, so another type's same-named method
+    /// does not widen the result.
+    #[test]
+    fn test_impact_follows_typed_nodes() {
+        let conn = mem_conn();
+        let pid = test_project(&conn);
+        typed_call(&conn, pid, "a_user", "from_env", Some("A"));
+        typed_call(&conn, pid, "b_user", "from_env", Some("B"));
+        typed_call(&conn, pid, "top_a", "a_user", None);
+        typed_call(&conn, pid, "top_b", "b_user", None);
+
+        let nodes = impact_analysis(&conn, pid, "A::from_env", 3).unwrap();
+        let syms: Vec<&str> = nodes.iter().map(|n| n.symbol.as_str()).collect();
+        assert_eq!(syms, ["a_user", "top_a"]);
+    }
+
+    #[test]
+    fn test_callee_query_parse() {
+        let q = CalleeQuery::parse("crate::web::WebTool<T>::run");
+        assert_eq!((q.name.as_str(), q.qualifier.as_deref()), ("run", Some("WebTool")));
+        let q = CalleeQuery::parse("run");
+        assert_eq!((q.name.as_str(), q.qualifier), ("run", None));
+    }
+
     #[test]
     fn test_find_callers_exact_match_only() {
         let conn = mem_conn();

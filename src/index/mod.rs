@@ -235,7 +235,7 @@ fn index_file_in_tx(
     )?;
     if !extracted.calls.is_empty() {
         let mut stmt = tx.prepare(
-            "INSERT INTO call_graph (caller, callee, file, line, project_id) VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO call_graph (caller, callee, file, line, project_id, qualifier, caller_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
         )?;
         for site in &extracted.calls {
             stmt.execute(rusqlite::params![
@@ -244,6 +244,8 @@ fn index_file_in_tx(
                 site.file,
                 site.line as i64,
                 project_id,
+                site.qualifier,
+                site.caller_type,
             ])?;
         }
     }
