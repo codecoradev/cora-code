@@ -140,6 +140,62 @@ pub fn configure_for_search(source: ConfigSource<'_>) -> Configured {
     configure(load_config(source).as_ref())
 }
 
+/// What [`refresh_for_context`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextRefresh {
+    /// Symbols the project has in the index now.
+    pub symbols: usize,
+    /// Files parsed again in this run (0 when nothing changed).
+    pub files_updated: usize,
+    /// Whether the code embedding model is active (the vector signal is on).
+    pub model: bool,
+}
+
+impl ContextRefresh {
+    /// One line for a log: what the context is made of.
+    pub fn describe(&self) -> String {
+        let updated = if self.files_updated > 0 {
+            format!(", {} file(s) updated", self.files_updated)
+        } else {
+            String::new()
+        };
+        let model = if self.model {
+            "code model on"
+        } else {
+            "code model off: keyword and call-graph context only"
+        };
+        format!("Code index: {} symbols{updated}; {model}", self.symbols)
+    }
+}
+
+/// Bring the index (and the vectors) of the project containing `start` up to
+/// date before a review or scan reads it (`context_chain.auto_index`). `None`
+/// when disabled or when it could not be done; the caller then reads whatever
+/// index exists, as before.
+pub fn refresh_for_context(start: &Path, config: &Config) -> Option<ContextRefresh> {
+    if !(config.context_chain.use_brain && config.context_chain.auto_index) {
+        return None;
+    }
+    let run = || -> Result<ContextRefresh> {
+        let bridge = IndexBridge::open_or_create(start)?;
+        let session = IndexSession::from_bridge(bridge, Some(config))?;
+        let stats = session.index(false)?;
+        let summary = session.summary()?;
+        Ok(ContextRefresh {
+            symbols: summary.total_symbols,
+            files_updated: stats.files_indexed,
+            model: crate::embed::active_backend() == Backend::Potion,
+        })
+    };
+    match run() {
+        Ok(r) => Some(r),
+        Err(e) => {
+            tracing::warn!("could not refresh the code index: {e:#}");
+            None
+        }
+    }
+}
+
 /// An open, configured index for one project.
 pub struct IndexSession {
     conn: Connection,

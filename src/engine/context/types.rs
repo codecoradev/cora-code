@@ -50,6 +50,15 @@ pub struct ContextConfig {
     #[serde(default = "default_true")]
     pub use_brain: bool,
 
+    /// When `true` (default), bring the project's index and vectors up to date
+    /// before a review or scan builds its context (incremental: unchanged files
+    /// are skipped). Without it a review only sees code intelligence where
+    /// someone ran `cora index` first, so a fresh CI checkout would get none and
+    /// the code embedding model would go unused. Also applies to the agent
+    /// reviewer tools. Set to `false` to only read an existing index.
+    #[serde(default = "default_true")]
+    pub auto_index: bool,
+
     /// Depth for impact analysis blast-radius traversal.
     /// Depth 1 = direct callers only.
     /// Depth 2 = callers of callers (recommended).
@@ -91,6 +100,7 @@ impl Default for ContextConfig {
             include_tests: true,
             include_callers: true,
             use_brain: true,
+            auto_index: true,
             impact_depth: 2,
             prefer_index: true,
         }

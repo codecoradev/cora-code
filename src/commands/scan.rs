@@ -142,7 +142,15 @@ pub async fn execute_scan(
     // 2b. Run index-powered deterministic scans (unused imports, dead code)
     // These work even without LLM and add findings to the final report.
     let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
-    let index_bridge = crate::engine::index_bridge::IndexBridge::open(&root_abs);
+    // With a judge, bring the index up to date first: the judge's context below
+    // reads it, and on a fresh checkout it is empty (#765). Without one nothing
+    // reads that context, so the index is only read (a `--no-llm` run keeps its
+    // speed and its findings).
+    let index_bridge = if matches!(judge, JudgeChoice::Llm(_)) {
+        crate::engine::index_bridge::IndexBridge::open_refreshed(&root_abs, config, false)
+    } else {
+        crate::engine::index_bridge::IndexBridge::open(&root_abs)
+    };
     let index_findings = index_findings(config, &index_bridge, &files);
     if !index_findings.is_empty() {
         eprintln!(

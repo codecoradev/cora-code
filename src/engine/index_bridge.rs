@@ -61,6 +61,31 @@ impl IndexBridge {
         Self::open_tolerant_at(&crate::data_dir::graph_db_path(), start)
     }
 
+    /// [`Self::open`] after bringing the index up to date for a review or scan
+    /// (`context_chain.auto_index`, see
+    /// [`crate::index::session::refresh_for_context`]). With `quiet` nothing is
+    /// printed; otherwise one line says what the context is made of.
+    pub fn open_refreshed(
+        start: &Path,
+        config: &crate::config::schema::Config,
+        quiet: bool,
+    ) -> Self {
+        if let Some(r) = crate::index::session::refresh_for_context(start, config) {
+            if !quiet {
+                eprintln!("ℹ {}", r.describe());
+            }
+        }
+        Self::open(start)
+    }
+
+    /// [`Self::open_refreshed`] for the current working directory.
+    pub fn open_cwd_refreshed(config: &crate::config::schema::Config, quiet: bool) -> Self {
+        match std::env::current_dir() {
+            Ok(cwd) => Self::open_refreshed(&cwd, config, quiet),
+            Err(_) => Self::unavailable(),
+        }
+    }
+
     /// Tolerant open of the global index for the current working directory.
     pub fn open_cwd() -> Self {
         match std::env::current_dir() {

@@ -243,7 +243,9 @@ pub fn review_prepare(params: &Value) -> ToolResult {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to load config: {e}")),
     };
-    let bridge = IndexBridge::open_cwd();
+    // Same as `cora review`: the index is brought up to date first, so the
+    // agent's prompt carries code intelligence and the code model is used (#765).
+    let bridge = IndexBridge::open_cwd_refreshed(&config, true);
     let packet = review::prepare(&config, diff, None, &bridge);
     // Show what `review_finalize` will report: the same post-processing
     // (`ignore.rules`, inline `cora-ignore` markers, the findings cap) runs here,
@@ -572,16 +574,28 @@ pub fn scan_prepare(params: &Value) -> ToolResult {
         .collect();
     let total_chars: usize = batch_chars.iter().sum();
 
+    // Same context `cora scan` gives its judge: impact, tests and related code by
+    // meaning, from an index that is brought up to date first (#765).
+    let bridge = IndexBridge::open_refreshed(&root, &config, true);
+    let brain_ctx = if config.context_chain.use_brain {
+        let batch_files_only: Vec<_> = batch.to_vec();
+        review::build_scan_brain_context(
+            &batch_files_only,
+            config.context_chain.impact_depth,
+            &bridge,
+        )
+    } else {
+        None
+    };
     let prompts = llm::scan_prompts(
         &format_batch_for_prompt(batch),
         &config.focus,
         &config.rules,
         None,
-        None,
+        brain_ctx.as_deref(),
     );
 
     let deterministic: Vec<Value> = if batch_idx == 0 {
-        let bridge = IndexBridge::open(&root);
         let index = crate::commands::scan::index_findings(&config, &bridge, &files);
         crate::commands::scan::finalize_issues(&config, &files, index)
             .0
