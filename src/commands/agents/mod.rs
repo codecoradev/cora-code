@@ -202,6 +202,20 @@ pub fn run(
 
 // ── helpers shared by the integrations ──────────────────────────────────────
 
+/// The file's text, `None` when it does not exist. Any other failure
+/// (permissions, invalid UTF-8, I/O) is an error: a file that cannot be read
+/// must never be mistaken for an empty one and written over.
+pub fn read_existing(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "{}: cannot read it ({e}); left untouched",
+            path.display()
+        )),
+    }
+}
+
 /// Write `content` to `path` if it differs: create the directories, write to a
 /// temporary file and rename. In a dry run nothing is written.
 pub fn write_if_changed(path: &Path, content: &str, ctx: &Ctx) -> Step {
@@ -304,7 +318,10 @@ pub fn block_remove(existing: &str) -> String {
 
 /// Upsert the managed block into the instruction file at `path`.
 pub fn upsert_instruction_block(path: &Path, body: &str, ctx: &Ctx) -> Step {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let existing = match read_existing(path) {
+        Ok(text) => text.unwrap_or_default(),
+        Err(e) => return Step::Failed(e),
+    };
     let wanted = block_upsert(&existing, body);
     if wanted == existing {
         return Step::Unchanged(path.display().to_string());
@@ -317,8 +334,10 @@ pub fn upsert_instruction_block(path: &Path, body: &str, ctx: &Ctx) -> Step {
 
 /// Remove the managed block from the instruction file at `path`.
 pub fn remove_instruction_block(path: &Path, ctx: &Ctx) -> Step {
-    let Ok(existing) = std::fs::read_to_string(path) else {
-        return Step::Unchanged(format!("{} not present", path.display()));
+    let existing = match read_existing(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Step::Unchanged(format!("{} not present", path.display())),
+        Err(e) => return Step::Failed(e),
     };
     let wanted = block_remove(&existing);
     if wanted == existing {
@@ -417,6 +436,29 @@ mod tests {
         assert_eq!(c.cora_shell(), "\"/Users/Jane Doe/bin/cora\"");
         c.cora = "cora".into();
         assert_eq!(c.cora_shell(), "cora");
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_an_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_existing(&tmp.path().join("missing")), Ok(None));
+        let bad = tmp.path().join("bad.md");
+        std::fs::write(&bad, [0xff, 0xfe, 0xfd]).unwrap(); // not UTF-8
+        assert!(read_existing(&bad).is_err());
+        let c = ctx(tmp.path());
+        assert!(matches!(
+            upsert_instruction_block(&bad, "x", &c),
+            Step::Failed(_)
+        ));
+        assert!(matches!(
+            remove_instruction_block(&bad, &c),
+            Step::Failed(_)
+        ));
+        assert_eq!(
+            std::fs::read(&bad).unwrap(),
+            vec![0xff, 0xfe, 0xfd],
+            "left untouched"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! `cora-code` skill and a short block in `~/.claude/CLAUDE.md`.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, remove_file_step,
+    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
     remove_instruction_block, upsert_instruction_block, write_if_changed,
 };
 use serde_json::{Value, json};
@@ -91,10 +91,10 @@ fn drop_hook(doc: &mut Value, event: &str, mark: &str) -> bool {
 
 fn read_settings(ctx: &Ctx) -> Result<Value, String> {
     let path = settings_path(ctx);
-    match std::fs::read_to_string(&path) {
-        Err(_) => Ok(json!({})),
-        Ok(s) if s.trim().is_empty() => Ok(json!({})),
-        Ok(s) => serde_json::from_str::<Value>(&s)
+    match read_existing(&path)? {
+        None => Ok(json!({})),
+        Some(s) if s.trim().is_empty() => Ok(json!({})),
+        Some(s) => serde_json::from_str::<Value>(&s)
             .ok()
             .filter(Value::is_object)
             .ok_or_else(|| format!("{} is not a JSON object; left untouched", path.display())),
@@ -381,6 +381,16 @@ mod tests {
             doc["hooks"][PROMPT_EVENT][0]["hooks"][0]["command"],
             "new hook context --agent claude"
         );
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_is_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c = ctx(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(settings_path(&c), [0xff, 0xfe]).unwrap(); // not UTF-8
+        assert!(Claude.install(&c).failed());
+        assert_eq!(std::fs::read(settings_path(&c)).unwrap(), vec![0xff, 0xfe]);
     }
 
     #[test]
