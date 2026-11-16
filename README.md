@@ -225,14 +225,14 @@ See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for al
 
 ## Performance
 
-Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64, single-thread baseline → Rayon parallel).
+Measured on the cora-code repository (1,996 symbols, 179 files, release build, with the real `potion-code-16M-v2` model).
 
 | Operation | Time | Notes |
 |-----------|------|-------|
-| Cold index (full rebuild) | **~936ms** | Walk + parse + embed + HNSW insert (Rayon parallel) |
-| Incremental (no changes) | **~6ms** | mtime:size fingerprint — skips unchanged files |
-| Brain search (hybrid) | **~5ms** | FTS5 + vector KNN + graph BFS → RRF fusion |
-| Binary size | **10.4 MB** | Single static binary, zero runtime dependencies |
+| Cold index (full rebuild) | **~0.6 s** | Walk + parse + embed every symbol + write the project's vector file |
+| Incremental (no changes) | **~0.13 s** | mtime:size fingerprint — skips unchanged files |
+| `cora brain` (one CLI run) | **~0.2 s** | Loads the 32 MB model, then FTS5 + vector scan + graph BFS → RRF fusion. A long-running `cora mcp` keeps the model loaded |
+| Binary size | **~36 MB** | Single binary; the embedding model (33.5 MB) is downloaded once on first use, not bundled |
 
 > Measurements are indicative, not contractual. Your numbers will vary with codebase size, CPU cores, and disk I/O.
 
