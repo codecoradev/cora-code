@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-16
+
 ### Removed
 
 - **The hashing and pretrained embeddings are gone (#751).** The code model is the only embedding. Without it (offline before the first download, `CORA_EMBED_OFFLINE=1`, `brain.embedding: off`) the vector signal is off and `cora brain` answers from keyword and call-graph signals with a warning that says so, instead of mixing in a weak substitute that measured neutral to harmful. `brain.embedding` is now `auto` or `off`; `potion` still loads, `hashing` and `pretrained` load with one warning. The `pretrained-embed` build feature, the 31 MB vendored token table and its extraction script are deleted, and the vector weights table with them.
@@ -1136,7 +1138,9 @@ Benchmarked on the cora-code repository (1,864 symbols, 115 Rust files, x86_64):
 - **Cross-platform** — Linux (x86_64, ARM64), macOS (Apple Silicon), Windows (x86_64)
 - **MIT License** — fully open source
 
-[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.19.0...develop
+[Unreleased]: https://github.com/codecoradev/cora-code/compare/v0.21.0...develop
+[0.21.0]: https://github.com/codecoradev/cora-code/compare/v0.20.0...v0.21.0
+[0.20.0]: https://github.com/codecoradev/cora-code/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/codecoradev/cora-code/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/codecoradev/cora-code/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/codecoradev/cora-code/compare/v0.17.1...v0.17.2
