@@ -9,6 +9,7 @@
 
 pub mod claude;
 pub mod hermes;
+pub mod pi;
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -163,7 +164,12 @@ pub trait Integration {
 
 /// Every native integration.
 pub fn all() -> Vec<Box<dyn Integration>> {
-    vec![Box::new(claude::Claude), Box::new(hermes::Hermes)]
+    vec![
+        Box::new(claude::Claude),
+        Box::new(hermes::Hermes),
+        Box::new(pi::PI),
+        Box::new(pi::OMP),
+    ]
 }
 
 /// Install (or remove) the native integrations for the detected agents, or for
