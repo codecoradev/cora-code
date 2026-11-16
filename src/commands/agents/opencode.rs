@@ -8,8 +8,8 @@
 //! online docs were not found in that release, so they are not generated.
 
 use super::{
-    CODE_SKILL, Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
-    write_if_changed,
+    Ctx, Integration, Report, Step, backup_once, read_existing, remove_file_step,
+    skill_remove_step, skill_step, write_if_changed,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -186,7 +186,7 @@ impl Integration for OpenCode {
         };
         r.push("plugin", step);
         r.push("mcp", install_mcp(ctx));
-        r.push("skill", write_if_changed(&skill(ctx), CODE_SKILL, ctx));
+        r.push("skill", skill_step(&skill(ctx), ctx));
         r.todo
             .push("restart opencode to load the plugin".to_string());
         r
@@ -204,7 +204,7 @@ impl Integration for OpenCode {
             Ok(_) => r.push("plugin", remove_file_step(&path, ctx)),
         }
         r.push("mcp", remove_mcp(ctx));
-        r.push("skill", remove_file_step(&skill(ctx), ctx));
+        r.push("skill", skill_remove_step(&skill(ctx), ctx));
         r
     }
 }

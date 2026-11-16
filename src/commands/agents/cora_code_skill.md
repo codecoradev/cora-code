@@ -3,6 +3,8 @@ name: cora-code
 description: Search this project's code by meaning, find who calls a function and what a change affects, and pick the tests to run, using cora's local code index. Use before reading, changing or explaining code you do not know, when asked where something is implemented, how a feature works, or what a change would break.
 ---
 
+{{CORA_SKILL_MARKER}}
+
 # Code search with cora
 
 cora keeps a local index of the project (symbols, call graph, a code embedding model). Use it instead of guessing file names or grepping for words. It answers in milliseconds and costs no model tokens.
