@@ -152,21 +152,17 @@ The `signals` field shows which search signals matched: `"fts"`, `"vector"`, `"g
 
 #### Embedding Engine
 
-Cora embeds every symbol (its name and signature) locally, with no API key and no GPU. The backend is selectable via `brain.embedding` in `.cora.yaml`.
+Cora embeds every symbol (its name and signature) locally, with no API key and no GPU, using one model: `potion-code-16M-v2`, a static code model (256 dimensions, MIT). Tokens are looked up in a learned table and averaged. It is downloaded once (33.5 MB) and then used offline; it finds the right function from a description clearly more often than keyword search alone.
 
-| Backend | Dimensions | Method | When to use |
-|---------|------------|--------|-------------|
-| `potion` (default via `auto`) | 256 | `potion-code-16M-v2`, a static code model: tokens are looked up in a learned table and averaged. Downloaded once (33.5 MB) | Almost always: it finds the right function from a description clearly more often than keyword search alone |
-| `hashing` | 256 | Bag-of-tokens hashing | Offline fallback, near-duplicate detection. A weak signal for search |
-| `pretrained` | 768 | nomic-embed-code distilled (needs the `pretrained-embed` build feature) | Legacy |
+When the model is not available (offline before the first download, `CORA_EMBED_OFFLINE=1`, a blocked network) there is no substitute embedding: the vector signal is off and `cora brain` answers from keyword and call-graph signals, with a warning that says so. `brain.embedding: off` chooses that on purpose.
 
 ```yaml
 # .cora.yaml
 brain:
-  embedding: auto   # auto | potion | hashing | pretrained
+  embedding: auto   # auto | off
 ```
 
-**Why this model.** It was chosen by measurement, on 1,639 queries (hand-written questions and doc comments of this repository, of 8 other Rust crates and of the Python standard library) with the documents cora indexes (name and signature). Alone it beat keyword search by +0.07 to +0.12 in MRR@10, with intervals that exclude zero on every set, and fused with keyword search at full weight it is better by +0.04 to +0.09. The previous embeddings were neutral on this repository and harmful elsewhere (down to -0.09), which is why `hashing` and `pretrained` now count for a quarter of a vote. On `cora brain` itself, on this repository, MRR@10 rose from 0.22 to 0.32 (hand-written questions) and from 0.39 to 0.52 (doc comments).
+**Why this model.** It was chosen by measurement, on 1,639 queries (hand-written questions and doc comments of this repository, of 8 other Rust crates and of the Python standard library) with the documents cora indexes (name and signature). Alone it beat keyword search by +0.07 to +0.12 in MRR@10, with intervals that exclude zero on every set, and fused with keyword search at full weight it is better by +0.04 to +0.09. The embeddings it replaced (a hashing trick and a distilled 768-dimension table) were neutral on this repository and harmful elsewhere (down to -0.09), so they were removed (#751) instead of being kept as a fallback. On `cora brain` itself, on this repository, MRR@10 rose from 0.22 to 0.32 (hand-written questions) and from 0.39 to 0.52 (doc comments).
 
 Embedding is cheap: tens of thousands of symbols per second on a few CPU cores, about 80 MB of memory for the model, and 256-dimensional vectors (about 1 KB per symbol).
 

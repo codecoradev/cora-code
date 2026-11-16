@@ -96,25 +96,23 @@ fn the_code_model_gets_its_own_index_and_answers_a_semantic_question() {
 }
 
 #[test]
-fn switching_the_model_re_embeds_without_any_file_change() {
+fn without_the_model_there_are_no_vectors_and_the_model_arriving_builds_them() {
     let (_g, proj, home) = sandbox();
 
-    // 1. Offline: the hashing fallback fills the project's own file.
+    // 1. Offline, no model: no vector file, keyword search still answers.
     stdout(
         cora(&proj, &home)
             .arg("index")
             .env("CORA_EMBED_OFFLINE", "1"),
     );
-    assert!(
-        vector_files(&home)
-            .iter()
-            .any(|f| f.ends_with(".hashing.vecq"))
+    assert!(vector_files(&home).is_empty(), "{:?}", vector_files(&home));
+    let out = stdout(
+        cora(&proj, &home)
+            .args(["brain", "decode_json_text", "--json"])
+            .env("CORA_EMBED_OFFLINE", "1"),
     );
-    assert!(
-        !vector_files(&home)
-            .iter()
-            .any(|f| f.ends_with(".potion-code-v2.vecq"))
-    );
+    let results: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(results[0]["name"], "decode_json_text", "{out}");
 
     // 2. The model becomes available; no source file changed.
     stdout(
@@ -125,11 +123,7 @@ fn switching_the_model_re_embeds_without_any_file_change() {
     let files = vector_files(&home);
     assert!(
         files.iter().any(|f| f.ends_with(".potion-code-v2.vecq")),
-        "a new model must re-embed even when no file changed: {files:?}"
-    );
-    assert!(
-        !files.iter().any(|f| f.ends_with(".hashing.vecq")),
-        "the file of the model no longer used is removed: {files:?}"
+        "the model arriving must build vectors even when no file changed: {files:?}"
     );
 
     let out = stdout(
@@ -142,7 +136,7 @@ fn switching_the_model_re_embeds_without_any_file_change() {
 }
 
 #[test]
-fn a_missing_model_degrades_to_hashing_without_failing() {
+fn a_missing_model_turns_the_vector_signal_off_without_failing() {
     let (_g, proj, home) = sandbox();
     let empty = home.join("no-model");
     std::fs::create_dir_all(&empty).unwrap();
@@ -157,10 +151,38 @@ fn a_missing_model_degrades_to_hashing_without_failing() {
         .clone();
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("not available"), "{err}");
+    assert!(err.contains("vector signal is off"), "{err}");
+    assert!(vector_files(&home).is_empty());
+}
+
+#[test]
+fn off_disables_embeddings_and_removed_values_warn() {
+    let (_g, proj, home) = sandbox();
+    let model = fixture_model();
+
+    std::fs::write(proj.join(".cora.yaml"), "brain:\n  embedding: off\n").unwrap();
+    stdout(
+        cora(&proj, &home)
+            .arg("index")
+            .env("CORA_EMBED_MODEL_DIR", &model),
+    );
+    assert!(vector_files(&home).is_empty(), "off must build no vectors");
+
+    // A removed value still loads: it means auto, with one warning.
+    std::fs::write(proj.join(".cora.yaml"), "brain:\n  embedding: hashing\n").unwrap();
+    let out = cora(&proj, &home)
+        .arg("index")
+        .env("CORA_EMBED_MODEL_DIR", &model)
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("was removed"), "{err}");
     assert!(
         vector_files(&home)
             .iter()
-            .any(|f| f.ends_with(".hashing.vecq"))
+            .any(|f| f.ends_with(".potion-code-v2.vecq"))
     );
 }
 

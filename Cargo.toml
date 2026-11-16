@@ -10,7 +10,6 @@ keywords = ["cli", "code-review", "ai", "git", "pre-commit"]
 categories = ["command-line-utilities", "development-tools"]
 rust-version = "1.89"
 exclude = [
-    "vendored/",
     "docs/",
     ".github/",
     "tests/",
@@ -99,7 +98,6 @@ tempfile = "3"
 
 [features]
 default = ["tree-sitter"]
-pretrained-embed = []
 tree-sitter = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",

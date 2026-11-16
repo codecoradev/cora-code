@@ -29,12 +29,16 @@ fn sandbox(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     .unwrap();
     std::fs::write(
         proj.join("lib.rs"),
-        "pub fn alpha_widget() {}\npub fn beta_gadget() {}\n",
+        "pub fn load_settings_file(path: &str) {}\npub fn send_request_to_server(url: &str) {}\n",
     )
     .unwrap();
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     (guard, proj, home)
+}
+
+fn fixture_model() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-model")
 }
 
 fn run(cora: &mut Command) -> String {
@@ -46,12 +50,12 @@ fn run(cora: &mut Command) -> String {
 fn brain_fresh_process_emits_vector_signal() {
     let (_guard, proj, home) = sandbox("usearch");
 
-    // 1. Index in one process (default usearch backend).
+    // 1. Index in one process (the code model, here the tiny fixture).
     run(cora_cmd()
         .args(["index"])
         .current_dir(&proj)
         .env("CODECORA_HOME", &home)
-        .env("CORA_EMBED_OFFLINE", "1"));
+        .env("CORA_EMBED_MODEL_DIR", fixture_model()));
 
     let vectors = home.join("cora-code").join("vectors");
     let files: Vec<String> = std::fs::read_dir(&vectors)
@@ -60,16 +64,16 @@ fn brain_fresh_process_emits_vector_signal() {
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
     assert!(
-        files.iter().any(|f| f.ends_with(".hashing.vecq")),
+        files.iter().any(|f| f.ends_with(".potion-code-v2.vecq")),
         "one vecq file per project after `cora index`, got {files:?}"
     );
 
     // 2. Search in a FRESH process — vector signal must fire.
     let out = run(cora_cmd()
-        .args(["brain", "alpha"])
+        .args(["brain", "open a folder on disk"])
         .current_dir(&proj)
         .env("CODECORA_HOME", &home)
-        .env("CORA_EMBED_OFFLINE", "1"));
+        .env("CORA_EMBED_MODEL_DIR", fixture_model()));
 
     assert!(
         out.contains("vector"),
@@ -93,7 +97,7 @@ fn removed_vector_options_warn_and_do_not_break_indexing() {
         .args(["index"])
         .current_dir(&proj)
         .env("CODECORA_HOME", &home)
-        .env("CORA_EMBED_OFFLINE", "1")
+        .env("CORA_EMBED_MODEL_DIR", fixture_model())
         .assert()
         .success()
         .get_output()

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The hashing and pretrained embeddings are gone (#751).** The code model is the only embedding. Without it (offline before the first download, `CORA_EMBED_OFFLINE=1`, `brain.embedding: off`) the vector signal is off and `cora brain` answers from keyword and call-graph signals with a warning that says so, instead of mixing in a weak substitute that measured neutral to harmful. `brain.embedding` is now `auto` or `off`; `potion` still loads, `hashing` and `pretrained` load with one warning. The `pretrained-embed` build feature, the 31 MB vendored token table and its extraction script are deleted, and the vector weights table with them.
+
 ### Added
 
 - **`cora explore` completes a question with matches by meaning (#746).** A multi-word query that keyword search cannot fill gets a separate block of symbols found by the same hybrid `cora brain` uses; `--no-semantic` turns it off and `--json` marks each result `via: keyword` or `via: semantic`. The MCP tool descriptions of `cora.brain_search` and `cora.search_symbols` now say which one to use for a question and which for a known name.
@@ -32,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A question made only of words the model does not know no longer crashes the vector search.** Such a question embeds to the zero vector, which vecq refuses; it now finds nothing from vectors, and a symbol with a zero vector is left out of the file.
 - **`cora brain` finds symbols for a question and shows what answered (#717).** A sentence such as "how does web_search pick its backend" needed every word in one symbol name, found nothing by keyword, and left only the noisy vector hits. The question is now reduced to its content words (stop words dropped, `snake_case` split) and a symbol ranks by how many it matches. Results are returned in rank order (they came back in table order), a static text embedding counts for half in the fusion, and `cora brain` prints how many hits each signal found plus a warning when the vector index is empty, mismatched or text-only. The MCP `cora.brain_search` tool uses the same question handling.
 - **`cora trace` follows `Type::method` too (#743).** `trace Type::method` follows only calls made through that type in both directions, and every hop continues from the type of the node it reached, so same-named methods of other types are no longer merged. Nodes report the type they were reached as, and `--strict` drops calls whose type is unknown once a node has one. Bare-name traces are unchanged.
 - **Huge token counts from a custom endpoint no longer wrap (#713).** A usage counter above `u32::MAX` was cast with `as u32`, so a value just past the limit became a tiny number and the usage was lost; it is now clamped to `u32::MAX`.

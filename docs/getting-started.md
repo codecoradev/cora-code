@@ -123,7 +123,7 @@ Key configuration options:
 | `ignore` | File patterns and rules to skip |
 | `hook` | Pre-commit hook settings: mode, severity threshold, max diff size |
 | `llm` | LLM parameters: temperature, max_tokens, timeout |
-| `brain.embedding` | Embedding backend: `auto`, `hashing` (256d), or `pretrained` (768d) |
+| `brain.embedding` | Embeddings: `auto` (the code model) or `off` |
 
 ## Next Steps
 
