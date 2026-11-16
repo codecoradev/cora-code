@@ -108,3 +108,60 @@ jobs:
           cora-api-key: ${{ env.ACCESS_TOKEN || secrets.CORA_API_KEY }}
           cora-base-url: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL }}
           cora-model: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL }}
+
+      # The review action only prints how many findings blocked the job; the
+      # findings themselves go to Code Scanning. Print them here, also when the
+      # action failed, so the log, the annotations and the job summary show what
+      # to fix. Output only: no token use and no PR comment, because the SARIF
+      # text derives from untrusted PR code (this job runs on pull_request_target).
+      - name: Show Cora findings
+        if: always()
+        run: |
+          # -I: isolated mode, so nothing in the PR checkout can be imported.
+          python3 -I - <<'PY'
+          import json, os, sys
+
+          MAX = 30
+
+
+          def cmd_data(s: str) -> str:
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def cmd_prop(s: str) -> str:
+              return cmd_data(s).replace(":", "%3A").replace(",", "%2C")
+
+
+          def cell(s: str) -> str:
+              return " ".join(s.split()).replace("|", "\\|")[:500]
+
+
+          try:
+              data = json.load(open("cora-results.sarif"))
+              results = data.get("runs", [{}])[0].get("results", [])
+          except Exception:
+              sys.exit(0)
+
+          rows = []
+          for r in results[:MAX]:
+              loc = (r.get("locations") or [{}])[0].get("physicalLocation", {})
+              path = loc.get("artifactLocation", {}).get("uri", "")
+              line = loc.get("region", {}).get("startLine", 1)
+              rule = r.get("ruleId", "")
+              msg = r.get("message", {}).get("text", "")
+              level = "error" if r.get("level") == "error" else "warning"
+              first = msg.strip().splitlines()[0] if msg.strip() else rule
+              where = f"file={cmd_prop(path)},line={line}," if path else ""
+              print(f"::{level} {where}title={cmd_prop('Cora: ' + rule)}::" + cmd_data(first[:300]))
+              rows.append((level, path, line, rule, msg))
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary and results:
+              with open(summary, "a") as f:
+                  f.write(f"### Cora findings ({len(results)})\n\n")
+                  f.write("| Level | Location | Rule | Message |\n|---|---|---|---|\n")
+                  for level, path, line, rule, msg in rows:
+                      f.write(f"| {level} | `{cell(path)}:{line}` | {cell(rule)} | {cell(msg)} |\n")
+                  if len(results) > MAX:
+                      f.write(f"\n{len(results) - MAX} more not shown.\n")
+          PY
