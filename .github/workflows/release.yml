@@ -247,12 +247,13 @@ jobs:
             printf '| Linux (ARM64) | `cora-aarch64-unknown-linux-gnu-%s.tar.gz` |\n' "${{ steps.version.outputs.TAG }}"
             printf '| macOS (Apple Silicon) | `cora-aarch64-apple-darwin-%s.tar.gz` |\n' "${{ steps.version.outputs.TAG }}"
             printf '| Windows (x86_64) | `cora-x86_64-pc-windows-msvc-%s.zip` |\n\n' "${{ steps.version.outputs.TAG }}"
+            printf 'The archives above contain the code embedding model, so semantic search works right after the download, offline included.\n\n'
             printf '### 🚀 Quick Start\n\n'
             printf '```bash\n'
             printf '# Quick install (Linux / macOS)\n'
             printf 'curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh\n\n'
-            printf '# Or via cargo\n'
-            printf 'cargo install cora\n\n'
+            printf '# Or via cargo (builds from source; downloads the 33.5 MB code model on first use)\n'
+            printf 'cargo install cora-code\n\n'
             printf '# Init project\n'
             printf 'cora init\n\n'
             printf '# Review staged changes\n'
