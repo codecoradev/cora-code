@@ -602,8 +602,7 @@ fn index_project_with_id(
     // model became the default) also needs a re-embed, files unchanged or not.
     if stats.files_indexed > 0
         || stats.files_pruned > 0
-        || brain::vector_index_needs_rebuild()
-        || brain::embedding_provider_changed(conn, project_id)
+        || brain::project_needs_embedding(project_id)
     {
         match brain::embed_project(conn, project_id) {
             Ok(n) => {

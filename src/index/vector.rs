@@ -1,963 +1,325 @@
-//! Persistent vector index using usearch (HNSW) for symbol embeddings.
+//! Vector files: one quantized (vecq) file per project and embedding model.
 //!
-//! Pattern copied from uteke-core/src/memory/vector.rs, simplified for cora-code:
-//! - Keys are symbol database IDs (i64) instead of UUID strings
-//! - Single purpose: code symbol semantic search
-
-// Public API reserved for Phase 4+ (remove, dims, etc.).
-#![allow(dead_code)]
+//! A project's vectors live in `<data dir>/vectors/<project id>.<model tag>.vecq`,
+//! keyed by symbol id. The file is rebuilt from the project's symbols after every
+//! index run that changed them and replaced atomically (write to a temporary
+//! file, then rename), so it never holds a vector of a symbol that is gone and
+//! a reader never sees half a file. A search loads only the current project's
+//! file and scans it: no other project's vectors are read, filtered or
+//! returned, and nothing is shared between projects or processes except the
+//! rename.
+//!
+//! Measured against one shared HNSW index on 176 projects (127,400 vectors),
+//! this layout keeps retrieval at the exact ceiling, uses 4.3x less disk, loads
+//! in 0.1 ms and needs no resident memory for an idle project (#750).
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use std::collections::HashMap;
-use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use usearch::{Index, IndexOptions, MetricKind, ScalarKind};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
+use vecq_core::VecqIndex;
 
-const USEARCH_EXT: &str = "usearch";
-const VECQ_EXT: &str = "vecq";
-const VECQ_SEED: u64 = 42;
+/// Seed of the quantizer (fixed so a rebuild of the same data is identical).
+const SEED: u64 = 42;
+const EXT: &str = "vecq";
 
-/// Which physical vector store backs `CodeVectorIndex` (#542).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VectorStoreKind {
-    /// HNSW graph over f32 vectors (the historical default).
-    #[default]
-    Usearch,
-    /// vecq quantized scan — pure Rust, deterministic, ~5x smaller.
-    Vecq,
+/// Directory holding every project's vector file.
+pub fn vectors_dir() -> PathBuf {
+    crate::data_dir::cora_data_dir().join("vectors")
 }
 
-impl VectorStoreKind {
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
-            "vecq" => Self::Vecq,
-            _ => Self::Usearch, // "usearch", "" and anything unknown
+/// Vector file of `project_id` for the model named `tag`.
+pub fn project_file(project_id: i64, tag: &str) -> PathBuf {
+    vectors_dir().join(format!("{project_id}.{tag}.{EXT}"))
+}
+
+/// One project's vectors.
+pub struct ProjectVectors {
+    index: VecqIndex,
+}
+
+/// What reading a project's vector file found.
+pub enum Loaded {
+    /// The file is there and usable.
+    Ready(Arc<ProjectVectors>),
+    /// No file: the project was never embedded with this model.
+    Missing,
+    /// The file was built with other dimensions than the active model.
+    DimsMismatch { file: usize, wanted: usize },
+    /// The file cannot be read (corrupt, or a format from an older vecq).
+    Unreadable(String),
+}
+
+impl ProjectVectors {
+    /// Build a project's vectors from `(symbol id, vector)` pairs.
+    pub fn build(dims: usize, items: impl IntoIterator<Item = (i64, Vec<f32>)>) -> Self {
+        let mut index = VecqIndex::with_residual(dims, SEED);
+        for (id, v) in items {
+            index.add_keyed(id as u64, &v);
         }
-    }
-}
-
-/// vecq quantization width (`brain.vector_bits` in `.cora.yaml`).
-///
-/// Default is 4-bit + residual rescore: on cora's default hashing-trick
-/// embeddings it measured the best recall@10 at 4-bit scan speed across
-/// 1k/5k/13k-symbol indexes (recall study, 2026-08) — plain 5-bit, the
-/// vecq-core default, trailed by ~4-7 points at every scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VectorBits {
-    /// 4-bit base codes + second-pass residual rescoring (format v1.4).
-    #[default]
-    Residual,
-    /// Plain 4-bit Lloyd-Max (max compression, lowest recall).
-    B4,
-    /// Plain 5-bit Lloyd-Max (vecq-core's out-of-the-box default).
-    B5,
-    /// Plain 6-bit Lloyd-Max (highest plain recall, slowest scan).
-    B6,
-}
-
-impl VectorBits {
-    /// Lenient like [`VectorStoreKind::parse`]: empty/unknown → Residual.
-    pub fn parse(s: &str) -> Self {
-        match s.trim().to_lowercase().as_str() {
-            "4" => Self::B4,
-            "5" => Self::B5,
-            "6" => Self::B6,
-            _ => Self::Residual, // "residual", "" and anything unknown
-        }
+        Self { index }
     }
 
-    fn create(&self, dims: usize) -> vecq_core::VecqIndex {
-        match self {
-            Self::Residual => vecq_core::VecqIndex::with_residual(dims, VECQ_SEED),
-            Self::B4 => Self::create_plain(dims, 4),
-            Self::B5 => Self::create_plain(dims, 5),
-            Self::B6 => Self::create_plain(dims, 6),
-        }
-    }
-
-    fn create_plain(dims: usize, bits: u8) -> vecq_core::VecqIndex {
-        let mut index = vecq_core::VecqIndex::new(dims, VECQ_SEED);
-        index.set_bits(bits);
-        index
-    }
-
-    /// Whether an on-disk index was built at this width. A mismatch triggers
-    /// one rebuild so a config change actually takes effect instead of
-    /// silently serving the old width forever.
-    fn matches(&self, index: &vecq_core::VecqIndex) -> bool {
-        match self {
-            Self::Residual => index.is_residual(),
-            Self::B4 => !index.is_residual() && index.bits() == 4,
-            Self::B5 => !index.is_residual() && index.bits() == 5,
-            Self::B6 => !index.is_residual() && index.bits() == 6,
-        }
-    }
-}
-
-static VECTOR_STORE: LazyLock<std::sync::RwLock<VectorStoreKind>> =
-    LazyLock::new(|| std::sync::RwLock::new(VectorStoreKind::Usearch));
-
-static VECTOR_BITS: LazyLock<std::sync::RwLock<VectorBits>> =
-    LazyLock::new(|| std::sync::RwLock::new(VectorBits::default()));
-
-/// Select the physical vector store used by NEW indexes (process-wide).
-/// Existing on-disk indexes keep their own format via file extension.
-pub fn set_vector_store(kind: VectorStoreKind) {
-    *VECTOR_STORE.write().unwrap() = kind;
-}
-
-pub fn current_vector_store() -> VectorStoreKind {
-    *VECTOR_STORE.read().unwrap()
-}
-
-/// Select the vecq quantization width used by NEW indexes (process-wide).
-pub fn set_vector_bits(bits: VectorBits) {
-    *VECTOR_BITS.write().unwrap() = bits;
-}
-
-pub fn current_vector_bits() -> VectorBits {
-    *VECTOR_BITS.read().unwrap()
-}
-
-/// Apply `brain.vector_store` + `brain.vector_bits` from a loaded config (any
-/// process entry that touches Brain search/embedding must call this before
-/// opening the index, or `.vecq`/`.usearch` files silently diverge between
-/// runs).
-pub fn apply_config_store(config: Option<&crate::config::schema::Config>) {
-    let (kind, bits) = config
-        .map(|c| {
-            (
-                VectorStoreKind::parse(&c.brain.vector_store),
-                VectorBits::parse(&c.brain.vector_bits),
-            )
-        })
-        .unwrap_or_default();
-    set_vector_store(kind);
-    set_vector_bits(bits);
-}
-
-/// Hashing-trick embedding dimensions (zero-dependency fallback).
-pub const FALLBACK_DIMS: usize = 256;
-
-/// Default embedding dimensions for the vector index.
-///
-/// When compiled with `pretrained-embed`, uses nomic-embed-code 768-dim vectors.
-/// Otherwise falls back to the hashing-trick 256-dim vectors.
-#[cfg(feature = "pretrained-embed")]
-pub const DEFAULT_DIMS: usize = 768;
-
-#[cfg(not(feature = "pretrained-embed"))]
-pub const DEFAULT_DIMS: usize = FALLBACK_DIMS;
-
-/// Persistent HNSW vector index for code symbol embeddings.
-///
-/// - Keys are symbol database IDs (i64)
-/// - Cosine distance metric
-/// - Disk persistence via buffer-based serialization (same as uteke)
-/// - Cross-process safety via exclusive file lock
-pub struct CodeVectorIndex {
-    inner: Inner,
-    path: Option<PathBuf>,
-    dirty: bool,
-    _lock_file: Option<File>,
-}
-
-enum Inner {
-    Usearch {
-        index: Index,
-        /// Maps usearch integer key → symbol database ID.
-        key_to_symbol: HashMap<u64, i64>,
-        /// Maps symbol database ID → usearch integer key.
-        symbol_to_key: HashMap<i64, u64>,
-        next_key: u64,
-    },
-    /// vecq keys are u64 natively (tombstone removal + compact), so symbol
-    /// IDs map directly — no sidecar needed.
-    Vecq(Box<vecq_core::VecqIndex>),
-}
-
-impl CodeVectorIndex {
-    /// Create a new empty in-memory index (backend selected by
-    /// [`current_vector_store`]).
-    pub fn new(dims: usize) -> Result<Self> {
-        Ok(Self {
-            inner: match current_vector_store() {
-                VectorStoreKind::Usearch => Inner::Usearch {
-                    index: create_usearch_index(dims)?,
-                    key_to_symbol: HashMap::new(),
-                    symbol_to_key: HashMap::new(),
-                    next_key: 0,
-                },
-                VectorStoreKind::Vecq => Inner::Vecq(Box::new(current_vector_bits().create(dims))),
-            },
-            path: None,
-            dirty: false,
-            _lock_file: None,
-        })
-    }
-
-    /// Load from disk, or create empty if not exists.
-    /// Acquires exclusive file lock for cross-process safety.
-    ///
-    /// Each backend owns its own file extension (`.usearch` vs `.vecq`), so
-    /// switching `brain.vector_store` never misreads the other's format.
-    pub fn load_or_create(path: &Path, dims: usize) -> Result<Self> {
-        match current_vector_store() {
-            VectorStoreKind::Vecq => {
-                Self::load_or_create_vecq(&path.with_extension(VECQ_EXT), dims)
-            }
-            VectorStoreKind::Usearch => Self::load_or_create_usearch(path, dims),
-        }
-    }
-
-    fn load_or_create_usearch(path: &Path, dims: usize) -> Result<Self> {
-        if !path.exists() {
-            std::fs::write(path, []).context("create usearch file")?;
-        }
-
-        let mut lock_file = acquire_file_lock(path)?;
-
-        let mut idx = if lock_file.metadata().context("read file metadata")?.len() == 0 {
-            Self::new(dims)?
-        } else {
-            Self::load_from_file(&mut lock_file, path)?
-        };
-        idx.path = Some(path.to_path_buf());
-        idx._lock_file = Some(lock_file);
-        Ok(idx)
-    }
-
-    fn load_or_create_vecq(path: &Path, dims: usize) -> Result<Self> {
-        if !path.exists() {
-            std::fs::write(path, []).context("create vecq file")?;
-        }
-        let mut lock_file = acquire_file_lock(path)?;
-
-        let mut buffer = Vec::new();
-        if lock_file.metadata().context("read vecq metadata")?.len() > 0 {
-            use std::io::{Read, Seek, SeekFrom};
-            lock_file
-                .seek(SeekFrom::Start(0))
-                .context("seek vecq file")?;
-            lock_file
-                .read_to_end(&mut buffer)
-                .context("read vecq file")?;
-        }
-
-        let bits = current_vector_bits();
-        let mut index = bits.create(dims);
-        let mut dirty = false;
-        if !buffer.is_empty() {
-            match vecq_core::VecqIndex::from_bytes(&buffer) {
-                Ok(loaded)
-                    if loaded.dim() == dims && bits.matches(&loaded) && vecq_has_keys(&loaded) =>
-                {
-                    index = loaded;
-                }
-                // Dim mismatch (e.g. rebuilt with/without pretrained-embed):
-                // keeping the loaded dims would panic on the next insert.
-                Ok(loaded) if loaded.dim() != dims => {
-                    tracing::warn!(
-                        "vecq index dims {} != current {dims} — recreating; \
-                         `cora index` will re-embed all symbols",
-                        loaded.dim()
-                    );
-                    dirty = true;
-                }
-                Ok(loaded) if !bits.matches(&loaded) => {
-                    tracing::warn!(
-                        "vecq index width ({}) != configured brain.vector_bits ({bits:?}) — \
-                         recreating; `cora index` will re-embed all symbols",
-                        if loaded.is_residual() {
-                            "residual".to_string()
-                        } else {
-                            format!("{}-bit", loaded.bits())
-                        }
-                    );
-                    dirty = true;
-                }
-                // Legacy vecq-core 0.2.x file (vecq#32): parses fine but
-                // carries no keyed-slot table, and cora's symbol ids live in
-                // the key map — searching it would silently return nothing.
-                Ok(_) => {
-                    tracing::warn!(
-                        "vecq file predates keyed persistence (vecq#32) — \
-                         recreating index; `cora index` will re-embed all symbols"
-                    );
-                    dirty = true;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "vecq index unreadable ({e}) — recreating; \
-                         `cora index` will re-embed all symbols"
-                    );
-                    dirty = true;
-                }
-            }
-        }
-
-        Ok(Self {
-            inner: Inner::Vecq(Box::new(index)),
-            path: Some(path.to_path_buf()),
-            dirty,
-            _lock_file: Some(lock_file),
-        })
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn load_from_file(file: &mut File, path: &Path) -> Result<Self> {
-        use std::io::{Read, Seek, SeekFrom};
-
-        file.seek(SeekFrom::Start(0)).context("seek usearch file")?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer).context("read usearch file")?;
-
-        let index =
-            Index::restore_from_buffer(&buffer).context("load usearch index from buffer")?;
-
-        // Rebuild key mappings from sidecar
-        let mut key_to_symbol = HashMap::new();
-        let mut symbol_to_key = HashMap::new();
-        let mut next_key = 0u64;
-
-        let mapping_path = path.with_extension("keys");
-        if mapping_path.exists() {
-            let data = std::fs::read_to_string(&mapping_path).context("read key mapping file")?;
-            for line in data.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some((key_str, sym_id)) = line.split_once('\t') {
-                    if let (Ok(key), Ok(sym)) = (key_str.parse::<u64>(), sym_id.parse::<i64>()) {
-                        key_to_symbol.insert(key, sym);
-                        symbol_to_key.insert(sym, key);
-                        next_key = next_key.max(key + 1);
-                    }
-                }
-            }
-        }
-
-        Ok(Self {
-            inner: Inner::Usearch {
-                index,
-                key_to_symbol,
-                symbol_to_key,
-                next_key,
-            },
-            path: None,
-            dirty: false,
-            _lock_file: None,
-        })
-    }
-
-    /// Save index and key mappings to disk.
-    pub fn save(&mut self) -> Result<()> {
-        if let Inner::Vecq(index) = &mut self.inner {
-            let path = self
-                .path
-                .as_ref()
-                .context("vecq index has no path")?
-                .with_extension(VECQ_EXT);
-            let buffer = index.to_bytes();
-            let tmp_path = path.with_extension(format!("{VECQ_EXT}.tmp"));
-            std::fs::write(&tmp_path, &buffer).context("write temp vecq index")?;
-            std::fs::rename(&tmp_path, path).context("rename temp vecq")?;
-            self.dirty = false;
-            return Ok(());
-        }
-        if let Some(ref path) = self.path {
-            let Inner::Usearch {
-                index,
-                key_to_symbol,
-                ..
-            } = &self.inner
-            else {
-                unreachable!("vecq path returned earlier");
-            };
-            let buf_len = index.serialized_length();
-            let mut buffer = vec![0u8; buf_len];
-            index
-                .save_to_buffer(&mut buffer)
-                .context("save usearch to buffer")?;
-
-            let tmp_path = path.with_extension(format!("{USEARCH_EXT}.tmp"));
-            std::fs::write(&tmp_path, &buffer).context("write temp usearch index")?;
-            std::fs::rename(&tmp_path, path).context("rename temp usearch")?;
-
-            // Save key mapping sidecar
-            let mapping_path = path.with_extension("keys");
-            let mut lines = Vec::new();
-            for (&key, &sym_id) in key_to_symbol {
-                lines.push(format!("{key}\t{sym_id}"));
-            }
-            atomic_write(&mapping_path, lines.join("\n").as_bytes())?;
-
-            self.dirty = false;
-        }
+    /// Write the file atomically: a temporary file in the same directory, then a rename.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let dir = path.parent().context("vector file has no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let tmp = path.with_extension(format!("{EXT}.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, self.index.to_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
         Ok(())
     }
 
-    /// Insert a symbol embedding. If symbol ID exists, replaces it.
-    pub fn insert(&mut self, symbol_id: i64, embedding: &[f32]) -> Result<()> {
-        if let Inner::Vecq(index) = &mut self.inner {
-            let key = symbol_id as u64;
-            if index.contains_key(key) {
-                index.remove_keyed(key);
-            }
-            index.add_keyed(key, embedding);
-            self.dirty = true;
-            return Ok(());
-        }
-        let Inner::Usearch {
-            index,
-            key_to_symbol,
-            symbol_to_key,
-            next_key,
-        } = &mut self.inner
-        else {
-            unreachable!("usearch insert path guarded above");
-        };
-
-        // Remove old entry if exists
-        if let Some(&old_key) = symbol_to_key.get(&symbol_id) {
-            key_to_symbol.remove(&old_key);
-            index.remove(old_key).context("remove old usearch entry")?;
-        }
-
-        let key = *next_key;
-        *next_key += 1;
-        key_to_symbol.insert(key, symbol_id);
-        symbol_to_key.insert(symbol_id, key);
-
-        // Auto-reserve if at capacity
-        if index.size() >= index.capacity() {
-            let new_cap = (index.capacity() + 1024).max(1024);
-            index.reserve(new_cap).context("reserve usearch capacity")?;
-        }
-
-        index.add(key, embedding).context("insert into usearch")?;
-
-        self.dirty = true;
-        Ok(())
-    }
-
-    /// Remove a symbol by database ID. Incremental, no rebuild.
-    pub fn remove(&mut self, symbol_id: i64) -> bool {
-        if let Inner::Vecq(index) = &mut self.inner {
-            let removed = index.remove_keyed(symbol_id as u64);
-            self.dirty |= removed;
-            return removed;
-        }
-        let Inner::Usearch {
-            index,
-            key_to_symbol,
-            symbol_to_key,
-            next_key: _,
-        } = &mut self.inner
-        else {
-            return false;
-        };
-        if let Some(&key) = symbol_to_key.get(&symbol_id) {
-            key_to_symbol.remove(&key);
-            symbol_to_key.remove(&symbol_id);
-            if let Err(e) = index.remove(key) {
-                tracing::error!("Failed to remove from usearch: {e}");
-            }
-            self.dirty = true;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Search for k nearest neighbors. Returns (symbol_id, cosine_distance) pairs.
+    /// The `k` nearest symbols of the project as `(symbol id, similarity)`,
+    /// best first.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(i64, f32)> {
-        if let Inner::Vecq(index) = &self.inner {
-            if index.is_empty() {
-                return Vec::new();
-            }
-            let count = k.max(1);
-            return index
-                .search_keyed(query, count)
-                .into_iter()
-                .map(|(key, sim)| (key as i64, 1.0 - sim))
-                .collect();
-        }
-        if self.index_size() == 0 {
+        if self.index.is_empty() || query.len() != self.index.dim() {
             return Vec::new();
         }
-        let count = k.max(1);
-        let Inner::Usearch {
-            index,
-            key_to_symbol,
-            ..
-        } = &self.inner
-        else {
-            unreachable!("vecq path returned earlier");
-        };
-        let results = match index.search(query, count) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("usearch search failed: {e}");
-                return Vec::new();
-            }
-        };
-
-        results
-            .keys
-            .iter()
-            .zip(results.distances.iter())
-            .filter_map(|(key, dist)| key_to_symbol.get(key).map(|&id| (id, *dist)))
+        self.index
+            .search_keyed(query, k.max(1))
+            .into_iter()
+            .map(|(key, sim)| (key as i64, sim))
             .collect()
     }
 
-    /// Number of vectors in the index.
+    /// Number of vectors.
     pub fn len(&self) -> usize {
-        match &self.inner {
-            Inner::Usearch { index, .. } => index.size(),
-            Inner::Vecq(index) => index.len(),
-        }
+        self.index.len()
     }
 
-    /// Embedding dimensionality.
-    pub fn dims(&self) -> usize {
-        match &self.inner {
-            Inner::Usearch { index, .. } => index.dimensions(),
-            Inner::Vecq(index) => index.dim(),
-        }
-    }
-
-    /// Whether the index has unsaved changes.
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
-    }
-
-    /// Whether the index is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[allow(dead_code)]
-    fn index_size(&self) -> usize {
-        self.len()
+    /// Number of dimensions.
+    pub fn dim(&self) -> usize {
+        self.index.dim()
     }
 }
 
-fn create_usearch_index(dims: usize) -> Result<Index> {
-    let options = IndexOptions {
-        dimensions: dims,
-        metric: MetricKind::Cos,
-        quantization: ScalarKind::F32,
-        ..Default::default()
-    };
-    Index::new(&options).context("create usearch index")
-}
-
-/// cora only inserts via `add_keyed`, so every live slot of a healthy index
-/// carries a key. Files written by vecq-core 0.2.x (before format v1.3)
-/// load with vectors but no key table — searching them would silently
-/// return nothing (vecq#32).
-fn vecq_has_keys(index: &vecq_core::VecqIndex) -> bool {
+/// True when every live slot carries a key. Files written by vecq-core 0.2.x
+/// parse but have no key table, so a search would return nothing.
+fn has_keys(index: &VecqIndex) -> bool {
     index.is_empty() || (0..index.slots()).any(|s| index.key_of(s).is_some())
 }
 
-/// True when the `.vecq` file exists but cannot serve keyed search after
-/// reload — legacy vecq#32 file, unreadable, built with different dims, or
-/// at a different width than the configured `brain.vector_bits`. Mirrors
-/// exactly what [`CodeVectorIndex::load_or_create`] will decide, so
-/// `cora index` can force a re-embed when the index is about to be rebuilt.
-pub fn vecq_file_needs_rebuild(path: &Path, dims: usize) -> bool {
+/// Read a vector file without caching.
+fn read_file(path: &Path, dims: usize) -> Loaded {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
-        Err(_) => return false, // no file / unreadable — nothing to rebuild
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Loaded::Missing,
+        Err(e) => return Loaded::Unreadable(e.to_string()),
     };
-    if bytes.is_empty() {
-        return false;
-    }
-    match vecq_core::VecqIndex::from_bytes(&bytes) {
-        Ok(loaded) => {
-            loaded.dim() != dims
-                || !current_vector_bits().matches(&loaded)
-                || !vecq_has_keys(&loaded)
+    match VecqIndex::from_bytes(&bytes) {
+        Ok(index) if index.dim() != dims => Loaded::DimsMismatch {
+            file: index.dim(),
+            wanted: dims,
+        },
+        Ok(index) if !has_keys(&index) => {
+            Loaded::Unreadable("a vector file from before keyed storage".to_string())
         }
-        Err(_) => true,
+        Ok(index) => Loaded::Ready(Arc::new(ProjectVectors { index })),
+        Err(e) => Loaded::Unreadable(e.to_string()),
     }
 }
 
-/// Convert cosine distance (0..2) to cosine similarity (0..1).
-pub fn cosine_distance_to_similarity(distance: f32) -> f32 {
-    (1.0 - distance).clamp(0.0, 1.0)
-}
+type Entry = (SystemTime, u64, Arc<ProjectVectors>);
 
-/// How long [`acquire_file_lock`] waits for another process to release the
-/// index lock before giving up. The lock is held for the lifetime of any
-/// `cora` process that loaded the index, so an unbounded wait would hang
-/// forever behind a long-running scan (#587).
-const FILE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Files loaded by this process, reloaded when the file changes. A long-lived
+/// process (the MCP server, `cora watch`) therefore sees a re-index.
+static CACHE: LazyLock<Mutex<HashMap<PathBuf, Entry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Poll interval while waiting for a busy lock.
-const FILE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-
-fn acquire_file_lock(path: &Path) -> Result<File> {
-    acquire_file_lock_within(path, FILE_LOCK_TIMEOUT)
-}
-
-/// Take the exclusive lock on `path`, polling until `timeout` elapses.
-/// Returns a descriptive error instead of blocking indefinitely.
-fn acquire_file_lock_within(path: &Path, timeout: std::time::Duration) -> Result<File> {
-    let file = File::options()
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("open usearch file for locking: {}", path.display()))?;
-
-    let start = std::time::Instant::now();
-    loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => {
-                tracing::debug!("usearch file lock acquired: {}", path.display());
-                return Ok(file);
-            }
-            Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
-                if start.elapsed() >= timeout {
-                    anyhow::bail!(
-                        "timed out after {}s waiting for the vector index lock at {}; \
-                         another cora process may be holding it",
-                        timeout.as_secs_f32(),
-                        path.display()
-                    );
-                }
-                std::thread::sleep(FILE_LOCK_POLL);
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("acquire exclusive file lock on {}", path.display()));
+/// Load a project's vector file, from this process's cache when it has not changed.
+pub fn load_cached(path: &Path, dims: usize) -> Loaded {
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
+    if let Some((mtime, len)) = stamp {
+        if let Some((m, l, v)) = CACHE.lock().unwrap().get(path) {
+            if *m == mtime && *l == len && v.dim() == dims {
+                return Loaded::Ready(Arc::clone(v));
             }
         }
     }
+    let loaded = read_file(path, dims);
+    if let (Loaded::Ready(v), Some((mtime, len))) = (&loaded, stamp) {
+        CACHE
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), (mtime, len, Arc::clone(v)));
+    }
+    loaded
 }
 
-fn atomic_write(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    let tmp_path = path.with_extension("keys.tmp");
-    std::fs::write(&tmp_path, data).context("write temp key mapping")?;
-    std::fs::rename(&tmp_path, path).context("rename temp to final key mapping")?;
-    Ok(())
+/// Forget a cached file (after it was rewritten or deleted).
+pub fn forget(path: &Path) {
+    CACHE.lock().unwrap().remove(path);
+}
+
+/// Delete the vector files of a project: every model's, or all but `keep`.
+/// Used when a project is removed or rebuilt from scratch, and to drop the file
+/// of a model the project no longer uses.
+pub fn remove_project_files(project_id: i64, keep: Option<&str>) {
+    let Ok(rd) = std::fs::read_dir(vectors_dir()) else {
+        return;
+    };
+    let prefix = format!("{project_id}.");
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(tag) = rest.strip_suffix(&format!(".{EXT}")) else {
+            continue;
+        };
+        if keep.is_none_or(|k| k != tag) {
+            forget(&entry.path());
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Delete the files of the former shared index (`cora_index.*`). Nothing reads
+/// them any more; every project is rebuilt into its own file on its next index run.
+pub fn remove_legacy_shared_index() {
+    let dir = crate::data_dir::cora_data_dir();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("cora_index.") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_unit_vec(dims: usize, idx: usize) -> Vec<f32> {
-        let mut v = vec![0.0f32; dims];
-        if idx < dims {
-            v[idx] = 1.0;
-        }
-        v
+    fn unit(x: &[f32]) -> Vec<f32> {
+        let n = x.iter().map(|v| v * v).sum::<f32>().sqrt();
+        x.iter().map(|v| v / n).collect()
     }
 
-    /// The global store selector is process-wide — serialize every test that
-    /// constructs an index so backend flips never race parallel tests.
-    static STORE_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
-
-    fn with_store_lock() -> std::sync::MutexGuard<'static, ()> {
-        STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn sample() -> ProjectVectors {
+        ProjectVectors::build(
+            4,
+            vec![
+                (10, unit(&[1.0, 0.0, 0.0, 0.0])),
+                (11, unit(&[0.0, 1.0, 0.0, 0.0])),
+                (12, unit(&[0.9, 0.1, 0.0, 0.0])),
+                (13, unit(&[0.0, 0.0, 1.0, 0.0])),
+            ],
+        )
     }
 
     #[test]
-    fn locked_index_errors_instead_of_blocking() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("held.usearch");
-        std::fs::write(&path, []).unwrap();
-        let holder = acquire_file_lock_within(&path, std::time::Duration::from_secs(1)).unwrap();
+    fn the_nearest_symbols_come_back_best_first_with_their_ids() {
+        let v = sample();
+        let hits = v.search(&unit(&[1.0, 0.05, 0.0, 0.0]), 2);
+        let ids: Vec<i64> = hits.iter().map(|h| h.0).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&10) && ids.contains(&12), "{ids:?}");
+        assert!(hits[0].1 >= hits[1].1);
+    }
 
-        let started = std::time::Instant::now();
-        let err = acquire_file_lock_within(&path, std::time::Duration::from_millis(200))
-            .expect_err("second lock must time out while the first is held");
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        let msg = format!("{err:#}");
+    #[test]
+    fn a_saved_file_loads_with_the_same_ids_and_a_rebuild_replaces_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vectors").join("7.test.vecq");
+        sample().save(&path).unwrap();
+        assert!(path.exists());
+        // no temporary file is left behind
+        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, ["7.test.vecq"]);
+
+        let Loaded::Ready(v) = read_file(&path, 4) else {
+            panic!("expected a usable file");
+        };
+        assert_eq!(v.len(), 4);
+        let ids: Vec<i64> = v
+            .search(&unit(&[0.0, 0.0, 1.0, 0.0]), 1)
+            .iter()
+            .map(|h| h.0)
+            .collect();
+        assert_eq!(ids, [13]);
+
+        // rebuilding with different symbols leaves no trace of the old ones
+        ProjectVectors::build(4, vec![(99, unit(&[0.0, 0.0, 1.0, 0.0]))])
+            .save(&path)
+            .unwrap();
+        let Loaded::Ready(v) = read_file(&path, 4) else {
+            panic!("expected a usable file");
+        };
+        assert_eq!(v.len(), 1);
+        assert_eq!(v.search(&unit(&[0.0, 0.0, 1.0, 0.0]), 5)[0].0, 99);
+    }
+
+    #[test]
+    fn a_missing_wrong_sized_or_corrupt_file_is_reported_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("1.m.vecq");
+        assert!(matches!(read_file(&path, 4), Loaded::Missing));
+        sample().save(&path).unwrap();
+        assert!(matches!(
+            read_file(&path, 8),
+            Loaded::DimsMismatch { file: 4, wanted: 8 }
+        ));
+        std::fs::write(&path, b"not a vecq file").unwrap();
+        assert!(matches!(read_file(&path, 4), Loaded::Unreadable(_)));
+    }
+
+    #[test]
+    fn the_cache_sees_a_rewritten_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("2.m.vecq");
+        sample().save(&path).unwrap();
+        let Loaded::Ready(first) = load_cached(&path, 4) else {
+            panic!("ready");
+        };
+        assert_eq!(first.len(), 4);
+        // a re-index rewrites the file with another size: the next load sees it
+        ProjectVectors::build(4, vec![(1, unit(&[1.0, 0.0, 0.0, 0.0]))])
+            .save(&path)
+            .unwrap();
+        let Loaded::Ready(second) = load_cached(&path, 4) else {
+            panic!("ready");
+        };
+        assert_eq!(second.len(), 1);
+    }
+
+    #[test]
+    fn query_of_the_wrong_size_returns_nothing_instead_of_panicking() {
+        assert!(sample().search(&[1.0, 0.0], 3).is_empty());
+    }
+
+    /// Unit tests get an isolated data directory (`data_dir::codecora_home`).
+    #[test]
+    fn removing_project_files_matches_the_project_id_exactly_and_can_keep_a_model() {
+        let dir = vectors_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["9001.a.vecq", "9001.b.vecq", "90010.a.vecq", "9002.a.vecq"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        remove_project_files(9001, Some("a"));
+        assert!(dir.join("9001.a.vecq").exists(), "the kept model stays");
         assert!(
-            msg.contains("another cora process may be holding it"),
-            "{msg}"
+            !dir.join("9001.b.vecq").exists(),
+            "another model is removed"
         );
-        assert!(msg.contains("held.usearch"), "{msg}");
-
-        drop(holder);
-        acquire_file_lock_within(&path, std::time::Duration::from_secs(1))
-            .expect("lock is acquirable once released");
-    }
-
-    #[test]
-    fn test_empty_search() {
-        let _g = with_store_lock();
-        let idx = CodeVectorIndex::new(768).unwrap();
-        assert!(idx.is_empty());
-        let results = idx.search(&[0.0f32; 768], 5);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn test_insert_and_search() {
-        let _g = with_store_lock();
-        let mut idx = CodeVectorIndex::new(768).unwrap();
-
-        let v1 = make_unit_vec(768, 0); // unit vector along dim 0
-        let v2 = make_unit_vec(768, 1); // unit vector along dim 1
-        let mut v3 = vec![0.0f32; 768];
-        v3[0] = 0.9;
-        v3[1] = 0.1;
-        let norm = v3.iter().map(|x| x * x).sum::<f32>().sqrt();
-        v3.iter_mut().for_each(|x| *x /= norm);
-
-        idx.insert(100, &v1).unwrap();
-        idx.insert(200, &v2).unwrap();
-        idx.insert(300, &v3).unwrap();
-        assert_eq!(idx.len(), 3);
-
-        // Query with v1 — should return v3 closest (similar direction), then v1 (exact)
-        let results = idx.search(&v1, 3);
-        assert_eq!(results.len(), 3);
-        // First result should be symbol 100 (exact match, dist ~0)
-        assert_eq!(results[0].0, 100);
-        // v3 is closer to v1 than v2 is
-        let d_v3 = results.iter().find(|(id, _)| *id == 300).map(|(_, d)| *d);
-        let d_v2 = results.iter().find(|(id, _)| *id == 200).map(|(_, d)| *d);
-        assert!(d_v3.unwrap() < d_v2.unwrap());
-    }
-
-    #[test]
-    fn test_replace_on_duplicate_insert() {
-        let _g = with_store_lock();
-        let mut idx = CodeVectorIndex::new(64).unwrap();
-
-        let v1 = make_unit_vec(64, 0);
-        let v2 = make_unit_vec(64, 1);
-
-        idx.insert(42, &v1).unwrap();
-        assert_eq!(idx.len(), 1);
-
-        // Insert same symbol ID with different vector — should replace
-        idx.insert(42, &v2).unwrap();
-        assert_eq!(idx.len(), 1); // still 1, not 2
-
-        let results = idx.search(&v2, 1);
-        assert_eq!(results[0].0, 42);
-    }
-
-    #[test]
-    fn test_remove() {
-        let _g = with_store_lock();
-        let mut idx = CodeVectorIndex::new(64).unwrap();
-
-        idx.insert(1, &make_unit_vec(64, 0)).unwrap();
-        idx.insert(2, &make_unit_vec(64, 1)).unwrap();
-        assert_eq!(idx.len(), 2);
-
-        assert!(idx.remove(1));
-        assert_eq!(idx.len(), 1);
-
-        let results = idx.search(&make_unit_vec(64, 0), 5);
-        assert!(results.iter().all(|(id, _)| *id != 1));
-    }
-
-    #[test]
-    fn test_save_and_load() {
-        let _g = with_store_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch");
-
-        {
-            let mut idx = CodeVectorIndex::new(64).unwrap();
-            idx.insert(10, &make_unit_vec(64, 0)).unwrap();
-            idx.insert(20, &make_unit_vec(64, 1)).unwrap();
-            idx.path = Some(path.clone());
-            idx.save().unwrap();
-        }
-
-        let idx2 = CodeVectorIndex::load_or_create(&path, DEFAULT_DIMS).unwrap();
-        assert_eq!(idx2.len(), 2);
-
-        let results = idx2.search(&make_unit_vec(64, 0), 1);
-        assert_eq!(results[0].0, 10);
-    }
-
-    #[test]
-    fn test_vecq_backend_roundtrip_all_widths() {
-        for bits in [
-            VectorBits::Residual,
-            VectorBits::B4,
-            VectorBits::B5,
-            VectorBits::B6,
-        ] {
-            let _g = with_store_lock();
-            set_vector_store(VectorStoreKind::Vecq);
-            set_vector_bits(bits);
-            let mut idx = CodeVectorIndex::new(64).unwrap();
-
-            idx.insert(1, &make_unit_vec(64, 0)).unwrap();
-            idx.insert(2, &make_unit_vec(64, 1)).unwrap();
-            assert_eq!(idx.len(), 2);
-
-            // Replace semantics
-            idx.insert(1, &make_unit_vec(64, 2)).unwrap();
-            assert_eq!(idx.len(), 2);
-
-            // Removal
-            assert!(idx.remove(2));
-            assert!(!idx.remove(2));
-            assert_eq!(idx.len(), 1);
-
-            let results = idx.search(&make_unit_vec(64, 2), 5);
-            assert_eq!(results.len(), 1);
-            assert_eq!(results[0].0, 1);
-            // distance conversion: similarity ~1.0 -> distance ~0.0
-            assert!(results[0].1 < 0.05, "dist={:?}", results[0].1);
-
-            set_vector_bits(VectorBits::default());
-            set_vector_store(VectorStoreKind::Usearch);
-        }
-    }
-
-    #[test]
-    fn test_vecq_save_and_load_restores_keys() {
-        let _g = with_store_lock();
-        set_vector_store(VectorStoreKind::Vecq);
-        set_vector_bits(VectorBits::default()); // residual
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch"); // caller names it; backend picks .vecq
-
-        {
-            let mut idx = CodeVectorIndex::new(64).unwrap();
-            idx.insert(10, &make_unit_vec(64, 0)).unwrap();
-            idx.insert(20, &make_unit_vec(64, 1)).unwrap();
-            idx.path = Some(path.clone());
-            idx.save().unwrap();
-        }
-
-        assert!(dir.path().join("test.vecq").exists());
-        // vecq-core 0.3.0 keyed persistence (vecq#32 closed): symbol-id keys
-        // survive reload, so a fresh process serves the index as-is.
-        let idx2 = CodeVectorIndex::load_or_create(&path, 64).unwrap();
-        assert_eq!(idx2.len(), 2, "keyed map must survive reload");
-        assert!(!idx2.is_dirty(), "healthy keyed file loads clean");
-
-        let results = idx2.search(&make_unit_vec(64, 0), 1);
-        assert_eq!(results[0].0, 10);
-        set_vector_store(VectorStoreKind::Usearch);
-    }
-
-    #[test]
-    fn test_vecq_legacy_keyless_file_rebuilds() {
-        let _g = with_store_lock();
-        set_vector_store(VectorStoreKind::Vecq);
-        // The simulated legacy file is plain 5-bit; match that width so the
-        // load hits the keyless arm rather than the width-mismatch arm.
-        set_vector_bits(VectorBits::B5);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch");
-        let vecq_path = dir.path().join("test.vecq");
-
-        // Simulate a vecq-core 0.2.x file (vecq#32): vectors serialized
-        // without a keyed-slot table, which is what unkeyed `add()` produces.
-        let mut legacy = vecq_core::VecqIndex::new(64, VECQ_SEED);
-        legacy.add(&make_unit_vec(64, 0));
-        std::fs::write(&vecq_path, legacy.to_bytes()).unwrap();
-
-        let idx = CodeVectorIndex::load_or_create(&path, 64).unwrap();
-        assert!(idx.is_empty(), "keyless file must not be served");
-        assert!(idx.is_dirty(), "keyless file must trigger a rebuild");
-        set_vector_bits(VectorBits::default());
-        set_vector_store(VectorStoreKind::Usearch);
-    }
-
-    #[test]
-    fn test_vecq_width_switch_rebuilds() {
-        let _g = with_store_lock();
-        set_vector_store(VectorStoreKind::Vecq);
-        set_vector_bits(VectorBits::default()); // residual
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch");
-
-        {
-            let mut idx = CodeVectorIndex::new(64).unwrap();
-            idx.insert(10, &make_unit_vec(64, 0)).unwrap();
-            idx.path = Some(path.clone());
-            idx.save().unwrap();
-        }
-
-        // A healthy keyed index must NOT be kept when the configured width
-        // changed — the rebuild makes brain.vector_bits actually take effect.
-        set_vector_bits(VectorBits::B5);
-        let idx = CodeVectorIndex::load_or_create(&path, 64).unwrap();
-        assert!(idx.is_empty(), "width-mismatched file must not be served");
-        assert!(idx.is_dirty(), "width change must trigger a rebuild");
-        set_vector_bits(VectorBits::default());
-        set_vector_store(VectorStoreKind::Usearch);
-    }
-
-    #[test]
-    fn test_vecq_corrupt_file_rebuilds() {
-        let _g = with_store_lock();
-        set_vector_store(VectorStoreKind::Vecq);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch");
-        std::fs::write(dir.path().join("test.vecq"), vec![0u8; 64]).unwrap();
-
-        let idx = CodeVectorIndex::load_or_create(&path, 64).unwrap();
-        assert!(idx.is_empty());
-        assert!(idx.is_dirty());
-        set_vector_store(VectorStoreKind::Usearch);
-    }
-
-    #[test]
-    fn test_vecq_dim_mismatch_rebuilds() {
-        let _g = with_store_lock();
-        set_vector_store(VectorStoreKind::Vecq);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.usearch");
-
-        {
-            let mut idx = CodeVectorIndex::new(64).unwrap();
-            idx.insert(10, &make_unit_vec(64, 0)).unwrap();
-            idx.path = Some(path.clone());
-            idx.save().unwrap();
-        }
-
-        let idx = CodeVectorIndex::load_or_create(&path, 128).unwrap();
-        assert!(idx.is_empty());
-        assert!(idx.is_dirty());
-        assert_eq!(idx.dims(), 128);
-        set_vector_store(VectorStoreKind::Usearch);
-    }
-
-    #[test]
-    fn vector_store_parse_is_lenient() {
-        assert_eq!(VectorStoreKind::parse("vecq"), VectorStoreKind::Vecq);
-        assert_eq!(VectorStoreKind::parse("VECQ "), VectorStoreKind::Vecq);
-        assert_eq!(VectorStoreKind::parse("usearch"), VectorStoreKind::Usearch);
-        assert_eq!(VectorStoreKind::parse(""), VectorStoreKind::Usearch);
-        assert_eq!(VectorStoreKind::parse("bogus"), VectorStoreKind::Usearch);
-    }
-
-    #[test]
-    fn vector_bits_parse_is_lenient() {
-        assert_eq!(VectorBits::parse("residual"), VectorBits::Residual);
-        assert_eq!(VectorBits::parse(" RESIDUAL "), VectorBits::Residual);
-        assert_eq!(VectorBits::parse("4"), VectorBits::B4);
-        assert_eq!(VectorBits::parse("5"), VectorBits::B5);
-        assert_eq!(VectorBits::parse("6"), VectorBits::B6);
-        assert_eq!(VectorBits::parse(""), VectorBits::Residual);
-        assert_eq!(VectorBits::parse("bogus"), VectorBits::Residual);
-    }
-
-    #[test]
-    fn test_cosine_distance_to_similarity() {
-        assert!((cosine_distance_to_similarity(0.0) - 1.0).abs() < f32::EPSILON);
-        assert!((cosine_distance_to_similarity(1.0) - 0.0).abs() < f32::EPSILON);
-        assert!((cosine_distance_to_similarity(2.0) - 0.0).abs() < f32::EPSILON);
-        assert!((cosine_distance_to_similarity(0.5) - 0.5).abs() < f32::EPSILON);
+        assert!(
+            dir.join("90010.a.vecq").exists(),
+            "project 90010 is not project 9001"
+        );
+        assert!(dir.join("9002.a.vecq").exists());
+        remove_project_files(9001, None);
+        assert!(!dir.join("9001.a.vecq").exists());
+        assert!(dir.join("90010.a.vecq").exists());
     }
 }

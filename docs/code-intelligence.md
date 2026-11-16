@@ -35,7 +35,7 @@ Scans your project, extracts symbol definitions (functions, structs, enums, trai
 |-----------|-----------|---------|
 | Symbol table (regex) | Regex extractors (18 languages) | SQLite FTS5 |
 | Symbol table (AST) | Tree-sitter grammars (12+ languages, enabled by default) | SQLite FTS5 |
-| Vector embeddings | Static hashing (256d) or pretrained nomic (768d), runtime-selectable | usearch HNSW index |
+| Vector embeddings | Code embedding model `potion-code-16M-v2` (256d) | One quantized vecq file per project |
 | Call graph | Regex scope tracking + tree-sitter AST edges | SQLite `edges` table |
 
 ```bash
@@ -84,7 +84,8 @@ All projects share a **single global database**:
 ```
 ~/.codecora/cora-code/
 ├── cora.db               # SQLite — symbols, FTS5 index, call edges
-└── cora_index.usearch   # usearch HNSW — 256d vector embeddings
+├── vectors/              # one quantized vecq file per project: <project id>.<model>.vecq
+└── models/               # the code embedding model, downloaded once
 ```
 
 Index multiple repos and they all become searchable from any directory:
@@ -122,7 +123,7 @@ Combines three search signals into ranked results via **Reciprocal Rank Fusion (
 | Signal | Engine | What it finds |
 --------|--------|--------------|
 | FTS5 | SQLite keyword match | Exact name/signature matches |
-| Vector KNN | usearch HNSW (cosine) | Semantically similar code |
+| Vector KNN | vecq scan of the project's own vector file (cosine) | Semantically similar code |
 | Graph BFS | Call graph traversal | Related symbols (callers/callees) |
 
 ```bash
@@ -175,10 +176,12 @@ Embedding is cheap: tens of thousands of symbols per second on a few CPU cores, 
 |---|---|
 | Symbols, edges, call graph, review history, per-project embedding metadata (model, dimensions, time) | SQLite database `cora.db` in the data directory (`~/.codecora/cora-code/`) |
 | Keyword index | An FTS5 virtual table in the same database |
-| Vectors | One file per model next to the database, keyed by the symbol's database id: `cora_index.potion-code-v2.usearch` (HNSW graph over f32 vectors, via usearch) or, with `brain.vector_store: vecq`, a `.vecq` file (quantized brute-force scan, about 5x smaller). The file is shared by all projects and a lock serializes writers |
+| Vectors | One quantized (vecq) file per project and model in `vectors/`: `<project id>.potion-code-v2.vecq`, keyed by the symbol's database id. Rebuilt from the project's symbols and replaced atomically after every index run that changed them, so it never holds a vector of a symbol that is gone, and deleted with the project |
 | The model | `models/potion-code-16M-v2/` in the data directory |
 
-A search embeds the question, asks the vector file for the nearest symbols, keeps those of the current project, and fuses them with the keyword and graph results by reciprocal rank fusion. A symbol is re-embedded only when its name, signature or the model changed.
+A search embeds the question, scans the current project's vector file for the nearest symbols (no other project's vectors are read), and fuses them with the keyword and graph results by reciprocal rank fusion.
+
+**Why one file per project.** A single shared index let other projects crowd the current one out of the candidates (on 176 projects the vector signal lost 11 to 29% of its MRR and up to a quarter of the queries found no candidate), never freed the vectors of deleted symbols, and had to be read into memory by every process (+148 MB at 127,000 vectors). One vecq file per project matches the exact ceiling at every size measured, is 4.3 times smaller, loads in 0.1 ms and re-indexes in a few milliseconds. A query scans the file: about 0.06 ms for a typical project, 2 ms at 20,000 symbols and 13 ms at 127,000.
 
 #### Where it is used
 
@@ -329,8 +332,9 @@ All code intelligence features are available as MCP tools for AI coding agents:
 │   ├── edges            # Call relationships (caller_id → callee_id)
 │   ├── reviews          # Review history for tech debt tracking
 │   └── findings         # Review findings + finding_events
-└── cora_index.usearch   # usearch HNSW vector index
-    └── cora_index.keys           # Key-to-symbol-id mapping (lock is held on the .usearch file itself, fs2)
+├── vectors/                  # one vecq file per project and model
+│   └── 3.potion-code-v2.vecq
+└── models/                   # downloaded embedding model
 ```
 
 To reset everything:
