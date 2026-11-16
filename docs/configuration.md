@@ -552,7 +552,9 @@ brain:
 
 `potion` still loads and means `auto`. `hashing` and `pretrained` were removed (#751): they load, mean `auto` and print one warning.
 
-**The model download.** The first command that needs embeddings downloads all three model files in one step into `<data dir>/models/potion-code-16M-v2/` (`~/.codecora/cora-code/models/...`). The revision is pinned and every file is checked against its SHA-256 before it is moved into place, so a download is verified byte for byte. Several concurrent runs wait for one download. If the download fails (offline, blocked network), cora warns, turns the vector signal off and does not retry for an hour.
+**Release binaries carry the model.** The archives published on GitHub Releases are built with the `bundled-model` feature: the first command that needs embeddings unpacks the model from the binary into `<data dir>/models/potion-code-16M-v2/` (size and SHA-256 checked, atomic, no network, `CORA_EMBED_OFFLINE=1` works). Only a binary without it (`cargo install`, a source build) downloads, as below. To build your own bundled binary: `scripts/fetch-model.sh <dir>`, then `CORA_BUNDLED_MODEL_DIR=<dir> cargo build --release --features tree-sitter,bundled-model`.
+
+**The model download.** Without a bundled model, the first command that needs embeddings downloads all three model files in one step into `<data dir>/models/potion-code-16M-v2/` (`~/.codecora/cora-code/models/...`). The revision is pinned and every file is checked against its SHA-256 before it is moved into place, so a download is verified byte for byte. Several concurrent runs wait for one download. If the download fails (offline, blocked network), cora warns, turns the vector signal off and does not retry for an hour.
 
 | Environment variable | Effect |
 |---|---|
