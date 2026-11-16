@@ -989,6 +989,7 @@ impl CoraFile {
                 config.debt.history_dir.clone_from(&debt.history_dir);
             }
             config.debt.retention_days = debt.retention_days;
+            config.debt.max_stored_findings = debt.max_stored_findings;
         }
         // Resolve profile — load built-in or custom, merge into config
         if let Some(profile_ref) = &self.profile {

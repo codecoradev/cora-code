@@ -320,6 +320,7 @@ pub fn review_finalize(params: &Value) -> ToolResult {
     let gate_recorded =
         crate::engine::commit_gate::record_for_diff(diff, "agent", should_block, total_found);
     finalize::save_history(
+        &config,
         &HistoryEntry {
             command: "review (agent)",
             summary: &response.summary,
@@ -745,6 +746,7 @@ pub fn scan_finalize(params: &Value) -> ToolResult {
         ),
     };
     finalize::save_history(
+        &config,
         &HistoryEntry {
             command: "scan (agent)",
             summary: &summary,

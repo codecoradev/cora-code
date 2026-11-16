@@ -335,6 +335,7 @@ pub async fn execute_review(
         output.push_str(&quality_gate::format_gate_output(gate));
     }
     finalize::save_history(
+        config,
         &HistoryEntry {
             command: review_command(opts),
             summary: &filtered_response.summary,
@@ -721,6 +722,7 @@ async fn execute_chunked_review(
         output.push_str(&quality_gate::format_gate_output(gate));
     }
     finalize::save_history(
+        config,
         &HistoryEntry {
             command: review_command(opts),
             summary: &filtered_response.summary,

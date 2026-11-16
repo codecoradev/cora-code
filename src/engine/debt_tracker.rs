@@ -17,6 +17,7 @@ use std::collections::HashMap;
 // ─── Default config values ───
 
 const DEFAULT_RETENTION_DAYS: u64 = 90;
+const DEFAULT_MAX_STORED_FINDINGS: usize = 500;
 
 // ─── Category mapping ───
 
@@ -413,6 +414,12 @@ pub struct DebtConfig {
     /// Auto-cleanup snapshots older than N days (default: 90).
     #[serde(default = "default_retention_days")]
     pub retention_days: u64,
+
+    /// Store at most this many findings per review or scan run, the most severe
+    /// first (default: 500; `0` = no limit). One full-repository scan used to
+    /// store thousands of findings and bury the actionable ones (#725).
+    #[serde(default = "default_max_stored_findings")]
+    pub max_stored_findings: usize,
 }
 
 fn default_true() -> bool {
@@ -425,8 +432,13 @@ impl Default for DebtConfig {
             enabled: true,
             history_dir: None,
             retention_days: DEFAULT_RETENTION_DAYS,
+            max_stored_findings: DEFAULT_MAX_STORED_FINDINGS,
         }
     }
+}
+
+fn default_max_stored_findings() -> usize {
+    DEFAULT_MAX_STORED_FINDINGS
 }
 
 fn default_retention_days() -> u64 {
@@ -638,6 +650,7 @@ mod tests {
                 should_block: true,
                 tokens: None,
                 issues: &issues,
+                max_stored_findings: 0,
             })
             .unwrap();
 

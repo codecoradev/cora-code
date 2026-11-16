@@ -113,6 +113,7 @@ pub async fn execute_commit(
 
         // Review history in cora.db (best-effort)
         finalize::save_history(
+            config,
             &HistoryEntry {
                 command: "commit",
                 summary: &filtered.summary,
