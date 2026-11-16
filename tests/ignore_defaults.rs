@@ -173,3 +173,68 @@ fn ignore_keep_turns_single_built_ins_off() {
     );
     assert!(!scan.contains("dist/bundle.js"), "still ignored: {scan}");
 }
+
+/// The commit gate looks a verdict up by the hash of the whole staged diff, so a
+/// review that skipped ignored files must still record it for the whole diff
+/// (otherwise every commit that touches a lockfile is reviewed twice).
+fn staged_gate(stage: &[(&str, &str)]) -> i32 {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(p)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "."]);
+    std::fs::create_dir_all(p.join("src")).unwrap();
+    std::fs::write(p.join("src/lib.rs"), "pub fn real() {}\n").unwrap();
+    std::fs::write(p.join("package-lock.json"), "{}\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+    for (path, content) in stage {
+        std::fs::write(p.join(path), content).unwrap();
+    }
+    git(&["add", "-A"]);
+
+    let home = tempfile::tempdir().unwrap();
+    let review = cora(p, home.path())
+        .args(["review", "--staged", "--no-llm"])
+        .output()
+        .unwrap();
+    assert!(review.status.success(), "{review:?}");
+    cora(p, home.path())
+        .args(["hook", "verify", "--quiet"])
+        .status()
+        .unwrap()
+        .code()
+        .unwrap()
+}
+
+#[test]
+fn a_verdict_is_recorded_for_the_whole_staged_diff_when_a_lockfile_is_part_of_it() {
+    let code = staged_gate(&[
+        ("src/lib.rs", "pub fn real() { let _x = 1; }\n"),
+        ("package-lock.json", "{\"a\": 1}\n"),
+    ]);
+    assert_eq!(
+        code, 0,
+        "the commit gate must accept the reviewed staged diff"
+    );
+}
+
+#[test]
+fn a_staged_diff_of_ignored_files_only_passes_the_gate_too() {
+    let code = staged_gate(&[("package-lock.json", "{\"a\": 1}\n")]);
+    assert_eq!(
+        code, 0,
+        "nothing reviewable must not leave the commit unvalidated"
+    );
+}
