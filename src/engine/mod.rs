@@ -21,6 +21,7 @@ pub mod path_match;
 pub mod postprocess;
 pub mod profiles;
 pub mod quality_gate;
+pub mod reflect;
 pub mod review;
 pub mod review_store;
 pub mod rules;
