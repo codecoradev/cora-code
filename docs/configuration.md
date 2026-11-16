@@ -79,6 +79,7 @@ hook:
 
 ignore:
   defaults: true               # built-in ignores: node_modules, vendor, dist, lockfiles, *.min.js ... (see Ignore Files)
+  keep: []                     # built-ins to turn off one by one, e.g. ["**/vendor/**"]
   files:
     - "src/generated/**"       # added to the built-ins
     - "*.generated.ts"
@@ -653,23 +654,25 @@ Files and directories that are out of scope for cora. Ignoring is the first thin
 
 ### Built-in ignores
 
-Cora ignores these by default, **at any depth** (a monorepo's `packages/app/node_modules` too), in `cora review` (the diff), `cora scan` and `cora index`:
+Cora ignores these by default in `cora review` (the diff), `cora scan` and `cora index`. Only names that are almost always third-party or generated are on the list; names that are often a project's own code are **not**:
 
 | Kind | Patterns |
 |---|---|
-| Dependencies | `node_modules`, `vendor`, `bower_components`, `__pycache__`, `site-packages`, `.venv`, `venv`, `Pods` |
-| Build and test output | `dist`, `build`, `out`, `target` (at the project root), `.next`, `.nuxt`, `coverage`, `.gradle` (any depth), `.git` |
-| Minified and generated | `*.min.js`, `*.min.css`, `*.map` |
+| Dependencies | `node_modules`, `vendor`, `bower_components`, `__pycache__`, `site-packages`, `.venv`, `Pods` (at any depth, so a monorepo's `packages/app/node_modules` too) |
+| Output | `dist`, `target` and `.git` at the project root; `.next`, `.nuxt`, `.gradle` at any depth |
+| Minified files and source maps | `*.min.js`, `*.min.css`, `*.js.map`, `*.css.map` |
 | Lockfiles | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.sum`, `flake.lock` |
 
-`cora review` says how many files of the diff the built-ins skipped. See the effective list with `cora config show`. If one of them holds your own code (a `vendor/` directory you maintain, a `build/` of scripts), turn the built-ins off and list what you want ignored yourself:
+**Not ignored on purpose:** `build`, `out`, `coverage`, `venv`, `docs/_build` and similar. They are often real source or scripts (coveragepy's `coverage/` package is its whole source; a Go `build/` holds scripts). Build and coverage output is normally in `.gitignore`, which `cora scan` and `cora index` follow; list the rest yourself in `ignore.files`. The list was checked against real repositories (Django, Rails, React, Flask, Express, coveragepy, ripgrep, cobra): it hid only vendored libraries, minified files, source maps and lockfiles.
+
+`cora review` says how many files of the diff the built-ins skipped, and which. See the effective list with `cora config show`. Turn built-ins off when one of them is wrong for your project:
 
 ```yaml
 ignore:
-  defaults: false     # the built-ins above no longer apply
-  files:
-    - "node_modules/**"
-    - "**/dist/**"
+  keep:                # turn single built-ins off (written exactly as above)
+    - "**/vendor/**"   # a vendor/ directory that is your own code
+    - "**/Cargo.lock"  # review lockfile changes
+  # defaults: false    # or turn the whole list off
 ```
 
 ### Your own patterns
@@ -700,7 +703,7 @@ Files that `.gitignore` already excludes are skipped by the walk of `cora scan` 
 
 | Setting | Effect |
 |---|---|
-| `ignore.defaults` | `false` turns the built-in list off. |
+| `ignore.defaults` | `false` turns the built-in list off. `ignore.keep` turns single entries off. |
 | `ignore.files` | Out of scope for scan, index and review-time context. Adds to the built-ins. |
 | `review.exclude` | Removed from the reviewed **diff** (never sent to the model, never produces a finding), whatever `ignore.files` says. |
 | `rules_engine.index_skip_files` | Left out of the **index scanners** only (dead code, unused imports); the files are still indexed. |

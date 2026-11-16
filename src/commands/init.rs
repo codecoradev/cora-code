@@ -27,10 +27,9 @@ rules: []
 #   - "Ensure all public functions have error handling"
 
 # Ignore patterns
-# Dependencies (node_modules, vendor, ...), build output (dist, build, target, ...),
-# minified files and lockfiles are ignored by default, at any depth.
-# Add your own generated or vendored paths here; `defaults: false` turns the
-# built-ins off.
+# Dependencies (node_modules, vendor, ...), dist/target, minified files, source maps
+# and lockfiles are ignored by default. Add your own generated or vendored paths
+# here; `keep: [...]` turns single built-ins off and `defaults: false` all of them.
 ignore:
   files: []
 #   files:

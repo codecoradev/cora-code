@@ -6,7 +6,7 @@ Review, scan and the code index read what is in the project. Dependencies, build
 
 ## What cora already ignores
 
-At any depth, in review (the diff), scan and the index: `node_modules`, `vendor`, `bower_components`, `__pycache__`, `site-packages`, `.venv`, `venv`, `Pods`, `dist`, `build`, `out`, `target`, `.next`, `.nuxt`, `coverage`, `.gradle`, `.git`, `*.min.js`, `*.min.css`, `*.map` and the common lockfiles. Files in `.gitignore` are skipped by scan and index as well. See the effective list with `cora config show`.
+In review (the diff), scan and the index: `node_modules`, `vendor`, `bower_components`, `__pycache__`, `site-packages`, `.venv`, `Pods` (at any depth), `dist`, `target`, `.git` (project root), `.next`, `.nuxt`, `.gradle`, `*.min.js`, `*.min.css`, `*.js.map`, `*.css.map` and the common lockfiles. Files in `.gitignore` are skipped by scan and index as well. `build`, `out`, `coverage` and `venv` are **not** on the list on purpose: they are often real source or scripts. See the effective list with `cora config show`.
 
 ## What to add
 
@@ -14,8 +14,8 @@ Look at the project for what the defaults do not cover, and ask the user before 
 
 - generated code (`*.pb.go`, `*_generated.*`, `src/generated/**`, API clients, schema output);
 - vendored or copied third-party sources under a name the defaults do not know;
-- build or report output in other places (`site/`, `docs/_build/`, `reports/`), snapshots, recorded fixtures, large data files;
-- a directory that holds your own code under a default name (a maintained `vendor/`, a `build/` of scripts): set `ignore.defaults: false` and list what you want ignored yourself.
+- build or report output (`build/`, `out/`, `site/`, `docs/_build/`, `reports/`) that is not in `.gitignore`, snapshots, recorded fixtures, large data files;
+- a directory that holds your own code under a default name (a maintained `vendor/`): turn that built-in off with `ignore.keep: ["**/vendor/**"]` (`ignore.defaults: false` turns all of them off).
 
 ## How (in `.cora.yaml`)
 

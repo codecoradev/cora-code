@@ -98,36 +98,39 @@ fn default_true() -> bool {
 }
 
 /// Files cora leaves out of review, scan and the index unless told otherwise:
-/// dependencies, build output, minified and generated files, lockfiles. They
-/// are the main source of noise and of untrusted text in a prompt, so they
-/// are out of scope by default (`ignore.defaults: false` turns the list off;
-/// `ignore.files` adds to it). Patterns with a leading `**/` match at any depth.
+/// dependencies, generated output, minified files, lockfiles. They are the main
+/// source of noise and of untrusted text in a prompt.
+///
+/// Only names that are almost always third-party or generated are in it.
+/// Names that are often a project's own code (`coverage`, `venv`, `build`, `out`,
+/// `docs/_build`) are left out on purpose, even at the project root: a pattern
+/// that hides real code is worse than one that lets noise through (checked
+/// against real repositories: coveragepy's `coverage/` is its whole source).
+/// Those directories are normally in `.gitignore`, which scan and index follow. `ignore.defaults: false` turns the list off, `ignore.keep`
+/// turns single entries off, `ignore.files` adds to it.
 pub const BUILTIN_IGNORE: &[&str] = &[
     // The original four, kept for configs and tests that name them.
     "node_modules/**",
     "dist/**",
     "target/**",
     ".git/**",
-    // Dependencies, at any depth (monorepos).
+    // Dependencies, at any depth (monorepos, vendored front-end libraries).
     "**/node_modules/**",
     "**/vendor/**",
     "**/bower_components/**",
     "**/__pycache__/**",
     "**/site-packages/**",
     "**/.venv/**",
-    "**/venv/**",
     "**/Pods/**",
-    // Build and test output.
-    "build/**",
-    "out/**",
+    // Framework caches.
     "**/.next/**",
     "**/.nuxt/**",
-    "**/coverage/**",
     "**/.gradle/**",
-    // Minified, bundled and generated.
+    // Minified files and source maps.
     "**/*.min.js",
     "**/*.min.css",
-    "**/*.map",
+    "**/*.js.map",
+    "**/*.css.map",
     // Lockfiles.
     "**/package-lock.json",
     "**/yarn.lock",
@@ -559,6 +562,10 @@ pub struct IgnoreSection {
     /// `false` turns the built-in ignores ([`BUILTIN_IGNORE`]) off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defaults: Option<bool>,
+    /// Built-in patterns to turn off one by one (written exactly as in
+    /// [`BUILTIN_IGNORE`]), for example `"**/Cargo.lock"` to review lockfiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<IgnoreRuleEntry>>,
 }
@@ -888,6 +895,9 @@ impl CoraFile {
                     .ignore
                     .files
                     .retain(|f| !BUILTIN_IGNORE.contains(&f.as_str()));
+            }
+            if let Some(keep) = &ig.keep {
+                config.ignore.files.retain(|f| !keep.contains(f));
             }
             if let Some(v) = &ig.files {
                 // Merge user-specified ignore patterns with defaults.
@@ -1277,6 +1287,7 @@ provider: zai
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
                 defaults: None,
+                keep: None,
                 files: Some(vec!["vendor/**".to_string()]),
                 rules: Some(vec![IgnoreRuleEntry::Plain("skip-rule-1".to_string())]),
             }),
@@ -1309,6 +1320,60 @@ provider: zai
         assert_eq!(cfg.ignore.rules, vec!["skip-rule-1"]);
     }
 
+    /// Names that are often a project's own code must never be built-in ignores:
+    /// a pattern that hides real code is worse than noise (coveragepy's
+    /// `coverage/` package, a Go `build/` of scripts, a Python `venv` module).
+    #[test]
+    fn built_in_ignores_never_name_directories_that_often_hold_real_code() {
+        for pattern in BUILTIN_IGNORE {
+            for risky in [
+                "coverage", "venv", "build", "out", "src", "lib", "test", "docs", "bin", "scripts",
+            ] {
+                assert!(
+                    !pattern.split('/').any(|segment| segment == risky),
+                    "built-in ignore `{pattern}` names `{risky}`, which is often real source"
+                );
+            }
+            assert!(
+                pattern.ends_with("/**") || pattern.starts_with("**/"),
+                "`{pattern}` is neither a directory nor an any-depth file pattern"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_keep_removes_single_built_ins_and_defaults_false_removes_all() {
+        let mut config = Config::default();
+        assert!(config.ignore.files.contains(&"**/Cargo.lock".to_string()));
+        let cora = CoraFile {
+            ignore: Some(IgnoreSection {
+                files: Some(vec!["mine/**".into()]),
+                defaults: None,
+                keep: Some(vec!["**/Cargo.lock".into()]),
+                rules: None,
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut config).unwrap();
+        assert!(!config.ignore.files.contains(&"**/Cargo.lock".to_string()));
+        assert!(config.ignore.files.contains(&"**/yarn.lock".to_string()));
+        assert!(config.ignore.files.contains(&"mine/**".to_string()));
+
+        let mut config = Config::default();
+        let cora = CoraFile {
+            ignore: Some(IgnoreSection {
+                files: Some(vec!["only/**".into()]),
+                defaults: Some(false),
+                keep: None,
+                rules: None,
+            }),
+            ..Default::default()
+        };
+        cora.merge_into(&mut config).unwrap();
+        assert_eq!(config.ignore.files, vec!["only/**".to_string()]);
+        assert!(!config.ignore.defaults);
+    }
+
     #[test]
     fn merge_ignore_files_dedup() {
         // User lists a pattern that's already a default — should not duplicate.
@@ -1316,6 +1381,7 @@ provider: zai
         let cora = CoraFile {
             ignore: Some(IgnoreSection {
                 defaults: None,
+                keep: None,
                 files: Some(vec![
                     "node_modules/**".to_string(), // already a default
                     "my-vendor/**".to_string(),

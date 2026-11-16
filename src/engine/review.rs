@@ -183,9 +183,13 @@ pub fn drop_builtin_ignored(config: &Config, diff: &str) -> (String, Vec<String>
     if !config.ignore.defaults {
         return (diff.to_string(), Vec::new());
     }
-    let patterns: Vec<String> = crate::config::schema::BUILTIN_IGNORE
+    // The built-ins still in force: `ignore.keep` removed some from the list.
+    let patterns: Vec<String> = config
+        .ignore
+        .files
         .iter()
-        .map(|s| (*s).to_string())
+        .filter(|f| crate::config::schema::BUILTIN_IGNORE.contains(&f.as_str()))
+        .cloned()
         .collect();
     let out = crate::engine::chunker::exclude_paths(
         diff,
