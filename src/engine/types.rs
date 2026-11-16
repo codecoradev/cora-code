@@ -490,6 +490,12 @@ pub struct ReviewResponse {
     /// unchanged; the CLI reports it on stderr.
     #[serde(skip)]
     pub dropped_findings: usize,
+    /// Why the model judge did not run, when the response holds deterministic
+    /// findings only (API error, unparseable reply). `None` when the judge ran
+    /// or was not requested (`--no-llm`). Never serialized (#720): callers use
+    /// it to tell a partial review from a complete one.
+    #[serde(skip)]
+    pub judge_failure: Option<String>,
 }
 
 /// Response from a full project scan

@@ -257,6 +257,7 @@ impl Judge for AgentJudge {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         })
     }
 }
@@ -291,6 +292,7 @@ impl Judge for NoJudge {
             tokens_used: None,
             should_block: false,
             dropped_findings: 0,
+            judge_failure: None,
         })
     }
 }

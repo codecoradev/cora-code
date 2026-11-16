@@ -280,6 +280,7 @@ mod tests {
             tokens_used: None,
             should_block: true, // stale value from the judge
             dropped_findings: 0,
+            judge_failure: None,
         };
         shape(&mut resp, &config("warn", false), &opts(Severity::Major));
         assert!(resp.issues.is_empty());
