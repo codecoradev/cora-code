@@ -175,7 +175,32 @@ struct Analysis {
     deterministic: crate::engine::deterministic::DeterministicReport,
 }
 
+/// The diff without the files the built-in ignores cover (dependencies, build
+/// output, minified files, lockfiles; `ignore.defaults`), and the paths removed.
+/// Nothing about them reaches the scanners or the judge. Applying it twice is
+/// harmless.
+pub fn drop_builtin_ignored(config: &Config, diff: &str) -> (String, Vec<String>) {
+    if !config.ignore.defaults {
+        return (diff.to_string(), Vec::new());
+    }
+    // The built-ins still in force: `ignore.keep` removed some from the list.
+    let patterns: Vec<String> = config
+        .ignore
+        .files
+        .iter()
+        .filter(|f| crate::config::schema::BUILTIN_IGNORE.contains(&f.as_str()))
+        .cloned()
+        .collect();
+    let out = crate::engine::chunker::exclude_paths(
+        diff,
+        &crate::engine::path_match::PathMatcher::new(&patterns),
+    );
+    (out.diff, out.excluded)
+}
+
 fn analyze(config: &Config, diff: &str, index_bridge: &IndexBridge) -> Analysis {
+    let (filtered, _) = drop_builtin_ignored(config, diff);
+    let diff = filtered.as_str();
     let valid_files = llm::extract_file_paths_from_diff(diff);
     let chunks = crate::engine::diff_parser::parse_diff(diff);
 
@@ -229,6 +254,8 @@ pub fn prepare(
     memory_context: Option<&str>,
     index_bridge: &IndexBridge,
 ) -> Packet {
+    let (filtered, _) = drop_builtin_ignored(config, diff);
+    let diff = filtered.as_str();
     let Analysis {
         valid_files,
         chunks: diff_chunks,

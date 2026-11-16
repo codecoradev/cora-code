@@ -159,6 +159,122 @@ pub fn remove(
     }
 }
 
+/// One file of a skill: its path inside the skill directory and its text.
+pub struct SkillFile {
+    pub path: &'static str,
+    pub text: &'static str,
+}
+
+/// A skill shipped in the binary: `SKILL.md` and the files it loads on demand
+/// (`references/`), the layout the Agent Skills format asks for.
+pub struct Skill {
+    pub name: &'static str,
+    pub files: &'static [SkillFile],
+}
+
+/// `cora-code`: search, callers, impact, tests, and the habits around a PR.
+pub static CODE: Skill = Skill {
+    name: "cora-code",
+    files: &[
+        SkillFile {
+            path: "SKILL.md",
+            text: include_str!("skills/cora-code/SKILL.md"),
+        },
+        SkillFile {
+            path: "references/tools.md",
+            text: include_str!("skills/cora-code/references/tools.md"),
+        },
+        SkillFile {
+            path: "references/ignore.md",
+            text: include_str!("skills/cora-code/references/ignore.md"),
+        },
+    ],
+};
+
+/// `cora-review`: the agent as the reviewer of a diff or a project.
+pub static REVIEW: Skill = Skill {
+    name: "cora-review",
+    files: &[
+        SkillFile {
+            path: "SKILL.md",
+            text: include_str!("skills/cora-review/SKILL.md"),
+        },
+        SkillFile {
+            path: "references/ignore.md",
+            text: include_str!("skills/cora-review/references/ignore.md"),
+        },
+        SkillFile {
+            path: "references/scan.md",
+            text: include_str!("skills/cora-review/references/scan.md"),
+        },
+        SkillFile {
+            path: "references/ci.md",
+            text: include_str!("skills/cora-review/references/ci.md"),
+        },
+    ],
+};
+
+/// Every skill cora ships (the standards and drift checks walk this list).
+#[cfg(test)]
+pub fn all() -> [&'static Skill; 2] {
+    [&CODE, &REVIEW]
+}
+
+/// Texts cora wrote before skills carried a marker, per file.
+fn legacy_for(skill: &Skill, file: &SkillFile) -> &'static [&'static str] {
+    if skill.name == "cora-review" && file.path == "SKILL.md" {
+        LEGACY_REVIEW_SKILLS
+    } else {
+        &[]
+    }
+}
+
+/// Install every file of `skill` under `dir` (see [`install`] for what happens
+/// to each file). One result per file.
+pub fn install_dir(
+    dir: &Path,
+    skill: &Skill,
+    dry_run: bool,
+    force: bool,
+) -> Vec<(std::path::PathBuf, Result<Outcome>)> {
+    skill
+        .files
+        .iter()
+        .map(|f| {
+            let path = dir.join(f.path);
+            let result = install(&path, f.text, legacy_for(skill, f), dry_run, force);
+            (path, result)
+        })
+        .collect()
+}
+
+/// Remove the files of `skill` under `dir` that cora wrote (see [`remove`]);
+/// `references/` first and `SKILL.md` last, so empty directories go with them.
+pub fn remove_dir(
+    dir: &Path,
+    skill: &Skill,
+    dry_run: bool,
+    force: bool,
+) -> Vec<(std::path::PathBuf, Result<Outcome>)> {
+    let results = skill
+        .files
+        .iter()
+        .rev()
+        .map(|f| {
+            let path = dir.join(f.path);
+            let result = remove(&path, f.text, legacy_for(skill, f), dry_run, force);
+            (path, result)
+        })
+        .collect();
+    if !dry_run {
+        // Directories left empty (a file you deleted yourself) go too; a
+        // directory that still holds anything is never touched.
+        let _ = std::fs::remove_dir(dir.join("references"));
+        let _ = std::fs::remove_dir(dir);
+    }
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,12 +395,12 @@ mod tests {
 
     // ── the skills must not drift from the code they describe ──────────────
 
-    /// Every skill cora ships: (name, embedded text).
-    fn shipped() -> Vec<(&'static str, &'static str)> {
-        vec![
-            ("cora-code", super::super::CODE_SKILL),
-            ("cora-review", include_str!("../cora_review_skill.md")),
-        ]
+    /// Every file of every skill cora ships: (skill, path, text).
+    fn shipped() -> Vec<(&'static str, &'static str, &'static str)> {
+        all()
+            .iter()
+            .flat_map(|s| s.files.iter().map(move |f| (s.name, f.path, f.text)))
+            .collect()
     }
 
     /// `cora.tool_name` or `cora_tool_name` tokens in `text`.
@@ -293,7 +409,8 @@ mod tests {
         let mut out = Vec::new();
         let mut i = 0;
         while i + 5 < chars.len() {
-            let word_start = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+            let word_start = i == 0
+                || !(chars[i - 1].is_alphanumeric() || matches!(chars[i - 1], '_' | '.' | '/'));
             if word_start
                 && chars[i..].starts_with(&['c', 'o', 'r', 'a'])
                 && matches!(chars[i + 4], '.' | '_')
@@ -321,28 +438,26 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect();
-        for (skill, text) in shipped() {
-            let mentions = tool_mentions(text);
-            assert!(
-                !mentions.is_empty(),
-                "{skill} names no MCP tool: the check is blind"
-            );
-            for m in mentions {
+        let mut seen = 0;
+        for (skill, path, text) in shipped() {
+            for m in tool_mentions(text) {
+                seen += 1;
                 assert!(
                     known.contains(&m),
-                    "skill `{skill}` names the MCP tool `{m}`, which cora does not have; \
+                    "{skill}/{path} names the MCP tool `{m}`, which cora does not have; \
                      update the skill (known tools: {known:?})"
                 );
             }
         }
+        assert!(seen > 10, "the check is blind: {seen} tool mentions");
     }
 
     #[test]
     fn every_cora_command_and_flag_a_skill_shows_exists() {
         use clap::CommandFactory;
         let cli = crate::Cli::command();
-        for (skill, text) in shipped() {
-            let mut checked = 0;
+        let mut checked = 0;
+        for (skill, path, text) in shipped() {
             for span in text.split('`').skip(1).step_by(2) {
                 let Some(rest) = span.strip_prefix("cora ") else {
                     continue;
@@ -353,7 +468,9 @@ mod tests {
                     continue;
                 }
                 let sub = cli.find_subcommand(first).unwrap_or_else(|| {
-                    panic!("skill `{skill}` shows `cora {first}`, which is not a cora subcommand: `{span}`")
+                    panic!(
+                        "{skill}/{path} shows `cora {first}`, which is not a cora subcommand: `{span}`"
+                    )
                 });
                 checked += 1;
                 for w in words.filter(|w| w.starts_with("--")) {
@@ -365,31 +482,211 @@ mod tests {
                             || cli.get_arguments().any(|a| a.get_long() == Some(flag));
                         assert!(
                             known,
-                            "skill `{skill}` shows `--{flag}` for `cora {first}`, which has no such flag: `{span}`"
+                            "{skill}/{path} shows `--{flag}` for `cora {first}`, which has no such flag: `{span}`"
                         );
                     }
                 }
             }
+        }
+        assert!(checked > 10, "the check is blind: {checked} commands");
+    }
+
+    /// Flags written in a list after a command, such as
+    /// `cora brain "<q>" (`--limit`, `--json`)`, are checked too.
+    #[test]
+    fn flags_listed_beside_a_command_exist() {
+        use clap::CommandFactory;
+        let cli = crate::Cli::command();
+        for (skill, path, text) in shipped() {
+            for line in text.lines() {
+                // A table row such as: | need | `cora callers <name>` (`--limit`, `--json`) | tool |
+                let Some(start) = line.find("`cora ") else {
+                    continue;
+                };
+                let after = &line[start + 6..];
+                let Some(end) = after.find('`') else { continue };
+                let command = after[..end].split_whitespace().next().unwrap_or("");
+                let Some(sub) = cli.find_subcommand(command) else {
+                    continue;
+                };
+                let rest = &after[end + 1..];
+                let Some(open) = rest.find('(') else { continue };
+                let Some(close) = rest[open..].find(')') else {
+                    continue;
+                };
+                for span in rest[open..open + close].split('`').skip(1).step_by(2) {
+                    for flag in span.split_whitespace().filter(|w| w.starts_with("--")) {
+                        let name = flag.trim_start_matches("--");
+                        assert!(
+                            sub.get_arguments().any(|a| a.get_long() == Some(name))
+                                || cli.get_arguments().any(|a| a.get_long() == Some(name)),
+                            "{skill}/{path}: `cora {command}` has no flag `{flag}`"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── the Agent Skills standard ────────────────────────────────────────
+
+    #[test]
+    fn skills_follow_the_agent_skills_layout() {
+        for skill in all() {
+            let main = skill
+                .files
+                .iter()
+                .find(|f| f.path == "SKILL.md")
+                .expect("SKILL.md");
+            let text = main.text;
+            // Frontmatter: only `name` and `description`, in that order.
+            let body = text.strip_prefix("---\n").expect("frontmatter");
+            let (front, _) = body.split_once("\n---\n").expect("frontmatter end");
+            let keys: Vec<&str> = front
+                .lines()
+                .filter_map(|l| l.split_once(": ").map(|(k, _)| k))
+                .collect();
+            assert_eq!(keys, ["name", "description"], "{}", skill.name);
+            let name = front
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("name: ")
+                .unwrap();
+            assert_eq!(name, skill.name);
+            // name: 1-64 chars, lowercase letters, digits and single hyphens.
             assert!(
-                checked > 0,
-                "{skill} shows no `cora <command>`: the check is blind"
+                (1..=64).contains(&name.len())
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    && !name.starts_with('-')
+                    && !name.ends_with('-')
+                    && !name.contains("--"),
+                "{name}"
+            );
+            let description = front
+                .lines()
+                .nth(1)
+                .unwrap()
+                .strip_prefix("description: ")
+                .unwrap();
+            assert!(
+                (50..=1024).contains(&description.len()),
+                "{}: description is {} chars",
+                skill.name,
+                description.len()
+            );
+            assert!(
+                description.contains("Use when") || description.contains("Use before"),
+                "{}: the description must say when to use the skill",
+                skill.name
+            );
+            // The body stays short: details live in references/.
+            assert!(
+                text.lines().count() <= 120,
+                "{}: SKILL.md is {} lines; move detail into references/",
+                skill.name,
+                text.lines().count()
             );
         }
     }
 
     #[test]
-    fn every_skill_carries_the_marker_and_valid_frontmatter() {
-        for (skill, text) in shipped() {
-            assert!(
-                text.starts_with(&format!("---\nname: {skill}\ndescription: ")),
-                "{skill}"
-            );
+    fn every_reference_is_linked_from_skill_md_and_none_is_orphaned_or_deep() {
+        for skill in all() {
+            let main = skill
+                .files
+                .iter()
+                .find(|f| f.path == "SKILL.md")
+                .unwrap()
+                .text;
+            for f in skill.files.iter().filter(|f| f.path != "SKILL.md") {
+                assert!(
+                    f.path.starts_with("references/") && f.path.matches('/').count() == 1,
+                    "{}: {} must sit directly in references/",
+                    skill.name,
+                    f.path
+                );
+                assert!(
+                    main.contains(&format!("`{}`", f.path)),
+                    "{}: SKILL.md does not point to {}",
+                    skill.name,
+                    f.path
+                );
+                // One level deep: a reference does not send the reader to another one.
+                assert!(
+                    !f.text.contains("references/"),
+                    "{}: {} points to another reference",
+                    skill.name,
+                    f.path
+                );
+                // Nothing in a reference is an unfilled placeholder.
+                assert!(!f.text.contains("TODO"), "{}/{}", skill.name, f.path);
+            }
+            // Every file path SKILL.md names exists.
+            for word in main.split('`').skip(1).step_by(2) {
+                if word.starts_with("references/") {
+                    assert!(
+                        skill.files.iter().any(|f| f.path == word),
+                        "{}: SKILL.md points to a missing file {word}",
+                        skill.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_file_carries_exactly_one_marker() {
+        for (skill, path, text) in shipped() {
             assert_eq!(
                 text.matches(PLACEHOLDER).count(),
                 1,
-                "{skill} needs exactly one marker line"
+                "{skill}/{path} needs exactly one marker line"
             );
             assert!(render(text).contains(env!("CARGO_PKG_VERSION")));
         }
+    }
+
+    #[test]
+    fn a_whole_skill_installs_refreshes_and_removes_with_its_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("skills").join("cora-review");
+        let all_ok = |r: Vec<(std::path::PathBuf, Result<Outcome>)>| -> Vec<Outcome> {
+            r.into_iter().map(|(_, o)| o.unwrap()).collect()
+        };
+        let first = all_ok(install_dir(&dir, &REVIEW, false, false));
+        assert!(first.iter().all(|o| *o == Outcome::Installed), "{first:?}");
+        assert!(dir.join("references").join("ci.md").is_file());
+        let again = all_ok(install_dir(&dir, &REVIEW, false, false));
+        assert!(again.iter().all(|o| *o == Outcome::UpToDate), "{again:?}");
+
+        // An edited reference is kept; SKILL.md, written by an older cora, is refreshed.
+        std::fs::write(dir.join("references").join("ci.md"), "my ci notes\n").unwrap();
+        let older = std::fs::read_to_string(dir.join("SKILL.md"))
+            .unwrap()
+            .replace(env!("CARGO_PKG_VERSION"), "0.0.1");
+        std::fs::write(dir.join("SKILL.md"), older).unwrap();
+        let outcomes = all_ok(install_dir(&dir, &REVIEW, false, false));
+        assert!(outcomes.contains(&Outcome::KeptCustomized), "{outcomes:?}");
+        assert!(
+            outcomes.contains(&Outcome::Updated(Some("0.0.1".into()))),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("references").join("ci.md")).unwrap(),
+            "my ci notes\n"
+        );
+
+        // Remove takes cora's files, keeps the edited one, and its directory.
+        let removed = all_ok(remove_dir(&dir, &REVIEW, false, false));
+        assert!(removed.contains(&Outcome::KeptCustomized), "{removed:?}");
+        assert!(dir.join("references").join("ci.md").exists());
+        assert!(!dir.join("SKILL.md").exists());
+        // With the edited file gone the whole skill directory goes.
+        std::fs::remove_file(dir.join("references").join("ci.md")).unwrap();
+        let _ = all_ok(remove_dir(&dir, &REVIEW, false, false));
+        assert!(!dir.exists());
     }
 }

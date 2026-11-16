@@ -272,8 +272,10 @@ Missing any = release blocker.
 
 ### 1b. Skills (shipped inside the binary)
 
-`src/commands/cora_review_skill.md` and `src/commands/agents/cora_code_skill.md` are
-embedded in the binary and installed into users' agents by `cora install`. They name
+`src/commands/agents/skills/<name>/SKILL.md` and its `references/` files (`cora-code`,
+`cora-review`) are embedded in the binary and installed into users' agents by
+`cora install`. They follow the Agent Skills layout (short `SKILL.md`, detail in
+`references/`); `cargo test` checks the layout. They name
 CLI commands and MCP tools, so they must move with the code.
 
 - [ ] `cargo test` passes the skill checks (`commands::agents::skills`): every MCP tool,

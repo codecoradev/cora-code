@@ -143,6 +143,17 @@ jobs:
           cora-model: ${{ secrets.CORA_MODEL }}
 ```
 
+### Take `.cora.yaml` from the base branch
+
+The job checks out the pull request head, and cora reads `.cora.yaml` from that checkout. A pull request can therefore change its own review: `ignore.files` or `review.exclude` to hide files, prompts and rules, or `provider.base_url` to receive the API key (cora ignores a base URL from an untrusted project config; pin `cora-base-url` and `cora-model` as above anyway). Put this step between the checkout and the review action so the config comes from the base branch, and read a change to `.cora.yaml` by hand:
+
+```yaml
+      - name: Use the base branch's .cora.yaml
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git show "$BASE_SHA:.cora.yaml" > .cora.yaml 2>/dev/null || rm -f .cora.yaml
+```
+
 ### Anthropic with workload identity federation (no stored API key)
 
 Instead of a long-lived `CORA_API_KEY`, the job can exchange its GitHub OIDC token for a short-lived Anthropic access token. Create a federation rule in the Anthropic Console (issuer `https://token.actions.githubusercontent.com`, audience `https://api.anthropic.com`, a **subject prefix** that matches your repository), then provide `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID`, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID` (and optionally `ANTHROPIC_MODEL`) as organization or repository secrets or variables.

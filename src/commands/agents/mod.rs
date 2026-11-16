@@ -16,9 +16,6 @@ pub mod skills;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// The `cora-code` skill, shared by every agent.
-pub const CODE_SKILL: &str = include_str!("cora_code_skill.md");
-
 /// What an installer needs to know about this run.
 #[derive(Debug, Clone)]
 pub struct Ctx {
@@ -241,37 +238,69 @@ pub fn write_if_changed(path: &Path, content: &str, ctx: &Ctx) -> Step {
     }
 }
 
-/// Install the `cora-code` skill at `path` (see [`skills`]).
-pub fn skill_step(path: &Path, ctx: &Ctx) -> Step {
-    skills_outcome(
-        skills::install(path, CODE_SKILL, &[], ctx.dry_run, ctx.force),
-        path,
+/// Install the `cora-code` skill (`SKILL.md` and `references/`) in the directory
+/// of `skill_md` (see [`skills`]).
+pub fn skill_step(skill_md: &Path, ctx: &Ctx) -> Step {
+    let Some(dir) = skill_md.parent() else {
+        return Step::Failed(format!("{} has no directory", skill_md.display()));
+    };
+    skills_steps(
+        dir,
+        skills::install_dir(dir, &skills::CODE, ctx.dry_run, ctx.force),
     )
 }
 
-/// Remove the `cora-code` skill at `path` if cora wrote it.
-pub fn skill_remove_step(path: &Path, ctx: &Ctx) -> Step {
-    skills_outcome(
-        skills::remove(path, CODE_SKILL, &[], ctx.dry_run, ctx.force),
-        path,
+/// Remove the `cora-code` skill files cora wrote from the directory of `skill_md`.
+pub fn skill_remove_step(skill_md: &Path, ctx: &Ctx) -> Step {
+    let Some(dir) = skill_md.parent() else {
+        return Step::Failed(format!("{} has no directory", skill_md.display()));
+    };
+    skills_steps(
+        dir,
+        skills::remove_dir(dir, &skills::CODE, ctx.dry_run, ctx.force),
     )
 }
 
-fn skills_outcome(result: Result<skills::Outcome>, path: &Path) -> Step {
-    use skills::Outcome::*;
-    let shown = path.display();
-    match result {
-        Err(e) => Step::Failed(format!("{shown}: {e:#}")),
-        Ok(UpToDate) => Step::Unchanged(shown.to_string()),
-        Ok(NotPresent) => Step::Unchanged(format!("{shown} not present")),
-        Ok(KeptCustomized) => Step::Skipped(format!(
-            "{shown} was edited by you, kept (use --force to replace it)"
-        )),
-        Ok(Installed) => Step::Done(format!("wrote {shown}")),
-        Ok(Updated(Some(v))) => Step::Done(format!("updated {shown} (was written by cora {v})")),
-        Ok(Updated(None)) => Step::Done(format!("updated {shown}")),
-        Ok(Removed) => Step::Done(format!("removed {shown}")),
-        Ok(Would(inner)) => Step::Done(format!("would change {shown} ({inner:?})")),
+/// One step for a whole skill: a failure wins, then files kept because you edited
+/// them, then what changed, else nothing to do.
+fn skills_steps(dir: &Path, results: Vec<(PathBuf, Result<skills::Outcome>)>) -> Step {
+    use skills::Outcome::{
+        Installed, KeptCustomized, NotPresent, Removed, UpToDate, Updated, Would,
+    };
+    let shown = dir.display();
+    let (mut written, mut changed, mut kept, mut same, mut would) = (0, 0, 0, 0, 0);
+    for (path, result) in results {
+        match result {
+            Err(e) => return Step::Failed(format!("{}: {e:#}", path.display())),
+            Ok(Installed) => written += 1,
+            Ok(Updated(_) | Removed) => changed += 1,
+            Ok(KeptCustomized) => kept += 1,
+            Ok(UpToDate | NotPresent) => same += 1,
+            Ok(Would(_)) => would += 1,
+        }
+    }
+    if would > 0 {
+        return Step::Done(format!("would change {would} file(s) in {shown}"));
+    }
+    let kept_note = if kept > 0 {
+        format!(" ({kept} file(s) you edited kept; --force replaces them)")
+    } else {
+        String::new()
+    };
+    if written + changed > 0 {
+        let verb = if changed == 0 { "wrote" } else { "updated" };
+        Step::Done(format!(
+            "{verb} {} file(s) in {shown}{kept_note}",
+            written + changed
+        ))
+    } else if kept > 0 {
+        Step::Skipped(format!(
+            "{shown}: {kept} file(s) edited by you kept (use --force to replace them)"
+        ))
+    } else if same > 0 {
+        Step::Unchanged(shown.to_string())
+    } else {
+        Step::Unchanged(format!("{shown} not present"))
     }
 }
 
@@ -503,11 +532,5 @@ mod tests {
             vec![0xff, 0xfe, 0xfd],
             "left untouched"
         );
-    }
-
-    #[test]
-    fn the_code_skill_has_the_frontmatter_agents_require() {
-        assert!(CODE_SKILL.starts_with("---\nname: cora-code\ndescription: "));
-        assert!(CODE_SKILL.contains("cora_brain_search"));
     }
 }

@@ -78,8 +78,10 @@ hook:
   on_violation: warn           # warn | disallow (blocks commit if violations found)
 
 ignore:
+  defaults: true               # built-in ignores: node_modules, vendor, dist, lockfiles, *.min.js ... (see Ignore Files)
+  keep: []                     # built-ins to turn off one by one, e.g. ["**/vendor/**"]
   files:
-    - "vendor/**"
+    - "src/generated/**"       # added to the built-ins
     - "*.generated.ts"
   rules: []                    # rule IDs to skip (e.g. ["no-unwrap", "sql-injection"])
 
@@ -648,16 +650,42 @@ ignore:
 
 ## Ignore Files
 
-Exclude files or directories from **all** cora operations — review, scan, and indexing. This is the broadest exclusion mechanism.
+Files and directories that are out of scope for cora. Ignoring is the first thing to set up in a project: dependencies, build output and generated code are noise for the reviewer, cost tokens, put untrusted third-party text in the prompt, and fill the code index with symbols that are not yours (so "related code" would point into `node_modules`).
+
+### Built-in ignores
+
+Cora ignores these by default in `cora review` (the diff), `cora scan` and `cora index`. Only names that are almost always third-party or generated are on the list; names that are often a project's own code are **not**:
+
+| Kind | Patterns |
+|---|---|
+| Dependencies | `node_modules`, `vendor`, `bower_components`, `__pycache__`, `site-packages`, `.venv`, `Pods` (at any depth, so a monorepo's `packages/app/node_modules` too) |
+| Output | `dist`, `target` and `.git` at the project root; `.next`, `.nuxt`, `.gradle` at any depth |
+| Minified files and source maps | `*.min.js`, `*.min.css`, `*.js.map`, `*.css.map` |
+| Lockfiles | `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `composer.lock`, `go.sum`, `flake.lock` |
+
+**Not ignored on purpose:** `build`, `out`, `coverage`, `venv`, `docs/_build` and similar. They are often real source or scripts (coveragepy's `coverage/` package is its whole source; a Go `build/` holds scripts). Build and coverage output is normally in `.gitignore`, which `cora scan` and `cora index` follow; list the rest yourself in `ignore.files`. The list was checked against real repositories (Django, Rails, React, Flask, Express, coveragepy, ripgrep, cobra): it hid only vendored libraries, minified files, source maps and lockfiles.
+
+`cora review` says how many files of the diff the built-ins skipped, and which. See the effective list with `cora config show`. Turn built-ins off when one of them is wrong for your project:
+
+```yaml
+ignore:
+  keep:                # turn single built-ins off (written exactly as above)
+    - "**/vendor/**"   # a vendor/ directory that is your own code
+    - "**/Cargo.lock"  # review lockfile changes
+  # defaults: false    # or turn the whole list off
+```
+
+### Your own patterns
 
 ```yaml
 ignore:
   files:
-    - "vendor/**"
-    - "*.min.js"
-    - "**/generated/**"
-    - "*.lock"
+    - "src/generated/**"
+    - "**/*.pb.go"
+    - "*.generated.ts"
 ```
+
+`ignore.files` **adds** to the built-ins. It excludes files from review-time context, `cora scan` and `cora index`.
 
 | Pattern | Matches |
 |---------|---------|
@@ -669,9 +697,20 @@ ignore:
 | `src/engine/**` | Prefix-dir — everything under `src/engine/` |
 | `**/*.test.ts` | Double wildcard ext — any `.test.ts` file anywhere |
 
-**Auto-skipped by default** (gitignore-aware): `node_modules/`, `target/`, `.git/`, `dist/`, `build/`.
+Files that `.gitignore` already excludes are skipped by the walk of `cora scan` and `cora index` as well.
 
-> **`ignore.files` vs `rules_engine.index_skip_files`:** `ignore.files` excludes files from **everything** (review, scan, index). `rules_engine.index_skip_files` excludes files from **index scanners only** (dead code, unused imports) — they're still reviewed by the LLM.
+### Which mechanism for what
+
+| Setting | Effect |
+|---|---|
+| `ignore.defaults` | `false` turns the built-in list off. `ignore.keep` turns single entries off. |
+| `ignore.files` | Out of scope for scan, index and review-time context. Adds to the built-ins. |
+| `review.exclude` | Removed from the reviewed **diff** (never sent to the model, never produces a finding), whatever `ignore.files` says. |
+| `rules_engine.index_skip_files` | Left out of the **index scanners** only (dead code, unused imports); the files are still indexed. |
+| `ignore.rules` | Silences a rule (everywhere, or only under some paths); the files are still reviewed. Give a reason. |
+| `cora-ignore:` comment | Silences one finding at one place. |
+
+Prefer ignoring files over silencing rules, and a narrow `ignore.rules` over a broad one: a silenced rule hides the same mistake in your own code too. Do not ignore your tests or your source to make a report shorter.
 
 ## Static Analysis
 
