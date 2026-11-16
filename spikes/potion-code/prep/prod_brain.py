@@ -20,10 +20,15 @@ queries = [json.loads(l) for l in open(prefix + ".queries.jsonl")]
 for q in queries:
     want = {corpus[i] for i in q["rel"] if i in corpus}
     out = subprocess.run([cora, "brain", q["q"], "--limit", "10", "--json"], cwd=root, capture_output=True, text=True)
+    # A failed run is not "no result": it would silently lower the score.
+    if out.returncode != 0:
+        sys.exit(f"cora brain failed (exit {out.returncode}) on {q['q']!r}: {out.stderr.strip()[:300]}")
     try:
         results = json.loads(out.stdout)
-    except Exception:
-        results = []
+    except json.JSONDecodeError as e:
+        sys.exit(f"cora brain printed invalid JSON on {q['q']!r}: {e}")
+    if not isinstance(results, list):
+        sys.exit(f"cora brain printed an unexpected shape on {q['q']!r}: {type(results).__name__}")
     rank = None
     for pos, r in enumerate(results, 1):
         if (r["name"], r["file"]) in want:

@@ -116,6 +116,12 @@ and 0.388 on `cora_doc`, against 0.231 and 0.415 for the `bm25` baseline here.
 The harness is therefore close to, and slightly generous towards, the keyword
 part of production.
 
+Note: those two production figures were produced by a version of `prod_brain.py`
+that scored a failed or unparsable `cora brain` run as "no result". The script now
+stops on the first failure, so a rerun cannot be deflated silently. The hashing
+backend those figures measured has since been removed (#751), so they cannot be
+reproduced on the current code; read them as indicative.
+
 ## Limits, stated plainly
 
 - Doc-comment and hand-written questions are a proxy for real agent questions.
