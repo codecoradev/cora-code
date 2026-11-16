@@ -522,6 +522,10 @@ pub struct LLMConfig {
     /// JSON parameter name for max tokens (resolved from config).
     pub max_tokens_param: String,
     pub timeout: u64,
+    /// `reasoning_effort` sent with every request (`none`, `minimal`, `low`,
+    /// ...), so a reasoning model does not spend the output budget on thinking
+    /// (#718). `None` leaves the provider default.
+    pub reasoning_effort: Option<String>,
 }
 
 impl Default for LLMConfig {
@@ -535,6 +539,7 @@ impl Default for LLMConfig {
             max_tokens: 4096,
             max_tokens_param: "max_tokens".to_string(),
             timeout: 600,
+            reasoning_effort: None,
         }
     }
 }

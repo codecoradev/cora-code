@@ -50,6 +50,7 @@ llm:
   temperature: 0
   max_tokens: 4096
   max_tokens_param: auto       # auto | max_tokens | max_output_tokens | max_completion_tokens
+  reasoning_effort: low        # optional: none | minimal | low | medium | high (sent as `reasoning_effort`)
   timeout: 120
   cache_ttl: 1440
 
@@ -595,6 +596,23 @@ or the model call fails and only the deterministic findings remain, the
 output says which files were not reviewed and the exit code is 1 instead of 0
 (a blocking code, 2, is never lowered). Set `review.fail_on_incomplete: false`
 to keep the old warn-and-pass behaviour.
+
+### When the model cannot answer a whole request
+
+A reasoning model can spend its entire output budget on thinking and return an
+empty reply with `finish_reason=length`, however large `max_tokens` is. Cora
+first raises `max_tokens` (up to a ceiling). If the reply is still empty, or the
+model call fails, it reviews the diff again in two halves, and halves a failing
+chunk again, down to a quarter of the original; a single hunk cannot be cut
+further. `llm.reasoning_effort` (for example `low`, or `none` where the model
+allows it) is sent with every request and keeps the model from over-thinking in
+the first place. Leave it unset to use the provider default. A provider that
+rejects the field answers HTTP 400, so set it only for models that take it.
+
+A reply whose findings array is followed by more JSON (a duplicate or truncated
+copy) is never shown as a summary: the findings in the array are kept and the
+extra text is dropped, and with an empty array the reply is retried instead of
+reported as "No issues found".
 
 ## Path-scoped ignore rules
 

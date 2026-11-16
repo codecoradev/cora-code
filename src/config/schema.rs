@@ -37,6 +37,10 @@ pub struct Config {
     pub max_tokens: u32,
     /// JSON parameter name for max tokens (e.g. "max_tokens" or "max_output_tokens").
     pub max_tokens_param: String,
+    /// `reasoning_effort` request field (`none`, `minimal`, `low`, `medium`,
+    /// `high`, ...). Unset = provider default (#718).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// HTTP timeout in seconds for LLM requests.
     pub timeout: u64,
     /// Cache TTL in minutes for review caching.
@@ -219,6 +223,7 @@ impl Default for Config {
             temperature: 0.0,
             max_tokens: 8192, // #536: reasoning models need headroom above chain-of-thought
             max_tokens_param: "auto".to_string(),
+            reasoning_effort: None,
             timeout: 600,
             cache_ttl: 1440, // 24h in minutes
             static_analysis: StaticAnalysisConfig::default(),
@@ -295,6 +300,14 @@ impl Config {
         }
         if let Err(e) = check_base_url(&self.provider.base_url) {
             errs.push(format!("provider.base_url: {e}"));
+        }
+
+        if let Some(e) = &self.reasoning_effort {
+            if e.is_empty() || e.chars().any(char::is_whitespace) {
+                errs.push(format!(
+                    "llm.reasoning_effort must be one word such as none, minimal, low, medium or high, got: {e:?}"
+                ));
+            }
         }
 
         // ── review ──
@@ -706,6 +719,11 @@ pub struct LlmSection {
     /// `"max_output_tokens"`, `"max_completion_tokens"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens_param: Option<String>,
+    /// `reasoning_effort` to send with each request (`none`, `minimal`,
+    /// `low`, `medium`, `high`, ...). Lowering it keeps a reasoning model from
+    /// spending the output budget on thinking (#718).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -921,6 +939,9 @@ impl CoraFile {
             }
             if let Some(ref v) = llm.max_tokens_param {
                 config.max_tokens_param = v.clone();
+            }
+            if let Some(ref v) = llm.reasoning_effort {
+                config.reasoning_effort = Some(v.trim().to_string());
             }
         }
         if let Some(re) = &self.rules_engine {
@@ -1709,6 +1730,7 @@ llm:
                 max_tokens_param: None,
                 timeout: None,
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1730,6 +1752,7 @@ llm:
                 max_tokens_param: None,
                 timeout: None,
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1747,6 +1770,7 @@ llm:
                 max_tokens_param: None,
                 timeout: Some(300),
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1764,6 +1788,7 @@ llm:
                 max_tokens_param: None,
                 timeout: Some(240),
                 cache_ttl: Some(2880),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1809,6 +1834,7 @@ provider:
                 max_tokens_param: None,
                 timeout: Some(60),
                 cache_ttl: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1996,6 +2022,7 @@ bundling:
             max_tokens_param: Some("max_output_tokens".to_string()),
             timeout: Some(300),
             cache_ttl: Some(60),
+            ..Default::default()
         };
         let yaml = serde_yaml_ng::to_string(&section).unwrap();
         let back: LlmSection = serde_yaml_ng::from_str(&yaml).unwrap();
@@ -2178,5 +2205,20 @@ ignore:
         cfg.review.max_chunk_chars = 10;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("review.max_chunk_chars"), "err: {err}");
+    }
+
+    // ─── #718: llm.reasoning_effort ───
+
+    #[test]
+    fn reasoning_effort_merges_and_validates() {
+        let cora: CoraFile = serde_yaml_ng::from_str("llm:\n  reasoning_effort: low\n").unwrap();
+        let mut cfg = Config::default();
+        assert!(cfg.reasoning_effort.is_none());
+        cora.merge_into(&mut cfg).unwrap();
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
+        assert!(cfg.validate().is_ok());
+        cfg.reasoning_effort = Some("very low".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("llm.reasoning_effort"), "err: {err}");
     }
 }

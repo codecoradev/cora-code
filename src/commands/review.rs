@@ -215,7 +215,7 @@ pub async fn execute_review(
     let llm_start = std::time::Instant::now();
 
     // 5. Call the LLM engine
-    let response = match crate::engine::review::review_diff_with_judge(
+    let first_try = crate::engine::review::review_diff_with_judge(
         config,
         judge,
         &diff,
@@ -224,8 +224,39 @@ pub async fn execute_review(
         opts.quiet,
         memory_context,
     )
-    .await
-    {
+    .await;
+
+    // The model could not review the whole diff in one request (empty reply at
+    // finish_reason=length, gateway timeout, unparseable reply): do not just
+    // fail, review it in smaller pieces instead (#718).
+    let judge_failed = match &first_try {
+        Err(_) => true,
+        Ok(resp) => resp.judge_failure.is_some(),
+    };
+    if judge_failed && opts.auto_chunk && retry_budget(&diff).is_some() {
+        if !opts.quiet {
+            eprintln!(
+                "{}",
+                "↻ The model could not review the diff in one request; retrying in smaller chunks…"
+                    .yellow()
+            );
+        }
+        let budget = retry_budget(&diff).unwrap_or(budget);
+        return execute_chunked_review(
+            config,
+            judge,
+            opts,
+            format,
+            progress,
+            &diff,
+            budget,
+            &excluded,
+            memory_context,
+        )
+        .await;
+    }
+
+    let response = match first_try {
         Ok(resp) => {
             if progress.is_enabled() {
                 // SAFETY: elapsed ms fits u64 for any reasonable review duration
@@ -475,7 +506,10 @@ async fn execute_chunked_review(
     let mut should_block = false;
     let mut dropped_findings = 0usize;
 
-    for chunk in &chunks {
+    let mut queue: std::collections::VecDeque<(chunker::DiffChunk, u8)> =
+        chunks.iter().cloned().map(|c| (c, 0)).collect();
+    while let Some((chunk, depth)) = queue.pop_front() {
+        let chunk = &chunk;
         if !opts.quiet {
             eprintln!(
                 "{}",
@@ -526,6 +560,21 @@ async fn execute_chunked_review(
                     total_tokens.estimated_cost_usd += usage.estimated_cost_usd;
                 }
 
+                // The judge fell back to deterministic findings. Try the chunk
+                // again in two halves before giving up on it (#718); the pieces
+                // re-run the deterministic checks, so this attempt is dropped.
+                if resp.judge_failure.is_some() && depth < MAX_RETRY_DEPTH {
+                    if let Some(parts) = split_for_retry(chunk) {
+                        retry_note(opts, chunk, parts.len());
+                        for part in parts.into_iter().rev() {
+                            queue.push_front((part, depth + 1));
+                        }
+                        continue;
+                    }
+                }
+                // Only a chunk that is kept speaks in the merged summary; the
+                // "LLM review failed" text of a chunk that was split and
+                // retried must not survive into a run that then succeeded.
                 if !resp.summary.is_empty() {
                     summaries.push(format!(
                         "[Chunk {}/{} — {}] {}",
@@ -535,7 +584,6 @@ async fn execute_chunked_review(
                         resp.summary
                     ));
                 }
-
                 dropped_findings += resp.dropped_findings;
                 // The judge fell back to deterministic findings: keep them, but
                 // the chunk was not reviewed by the model (#720).
@@ -557,6 +605,15 @@ async fn execute_chunked_review(
             Err(e) => {
                 if progress.is_enabled() {
                     progress.error(&e.to_string(), "chunked_review");
+                }
+                if depth < MAX_RETRY_DEPTH {
+                    if let Some(parts) = split_for_retry(chunk) {
+                        retry_note(opts, chunk, parts.len());
+                        for part in parts.into_iter().rev() {
+                            queue.push_front((part, depth + 1));
+                        }
+                        continue;
+                    }
                 }
                 any_error = true;
                 failures.push(ChunkFailure {
@@ -706,6 +763,46 @@ async fn execute_chunked_review(
         output,
         &filtered_response,
     ))
+}
+
+/// A chunk is split again after a model failure only down to this size.
+const MIN_RETRY_SPLIT_CHARS: usize = 4_000;
+
+/// How many times a failing chunk may be halved (so at most 1/4 of its size).
+const MAX_RETRY_DEPTH: u8 = 2;
+
+/// Split a chunk the model failed on into smaller ones, or `None` when it is
+/// already small or is a single hunk that cannot be cut (#718).
+fn split_for_retry(chunk: &chunker::DiffChunk) -> Option<Vec<chunker::DiffChunk>> {
+    if chunk.diff.len() < MIN_RETRY_SPLIT_CHARS {
+        return None;
+    }
+    let parts = chunker::chunk_diff(&chunk.diff, chunk.diff.len() / 2);
+    (parts.len() > 1).then_some(parts)
+}
+
+/// Budget for re-reviewing a whole diff in smaller chunks after a failed
+/// single request: half its size, or `None` when it cannot be split (#718).
+fn retry_budget(diff: &str) -> Option<usize> {
+    if diff.len() < MIN_RETRY_SPLIT_CHARS {
+        return None;
+    }
+    let half = diff.len() / 2;
+    (chunker::chunk_diff(diff, half).len() > 1).then_some(half)
+}
+
+fn retry_note(opts: &ReviewOptions, chunk: &chunker::DiffChunk, pieces: usize) {
+    if !opts.quiet {
+        eprintln!(
+            "  {}",
+            format!(
+                "↻ Chunk {}/{} failed; retrying as {pieces} smaller pieces…",
+                chunk.index + 1,
+                chunk.total
+            )
+            .yellow()
+        );
+    }
 }
 
 /// A chunk the model could not review.
@@ -908,5 +1005,49 @@ mod tests {
             true,
         );
         assert!(pretty.contains("Excluded by review.exclude (1): x.md"));
+    }
+
+    // ─── #718: smaller pieces after a model failure ───
+
+    fn hunky(n: usize) -> String {
+        let mut d =
+            String::from("diff --git a/src/x.rs b/src/x.rs\n--- a/src/x.rs\n+++ b/src/x.rs\n");
+        for i in 0..n {
+            d.push_str(&format!(
+                "@@ -{0},1 +{0},2 @@\n-old line number {i} padding padding padding\n+new line number {i} padding padding padding\n+extra\n",
+                i * 10 + 1
+            ));
+        }
+        d
+    }
+
+    #[test]
+    fn a_failed_big_chunk_is_split_into_smaller_pieces() {
+        let diff = hunky(200);
+        assert!(diff.len() > MIN_RETRY_SPLIT_CHARS);
+        let chunk = chunker::chunk_diff(&diff, usize::MAX).remove(0);
+        let parts = split_for_retry(&chunk).expect("splittable");
+        assert!(parts.len() >= 2);
+        let hunks: usize = parts.iter().map(|p| p.diff.matches("\n@@ ").count()).sum();
+        assert_eq!(hunks, 200, "no hunk lost or duplicated");
+    }
+
+    #[test]
+    fn small_or_indivisible_chunks_are_not_retried() {
+        let small = chunker::chunk_diff(&hunky(2), usize::MAX).remove(0);
+        assert!(split_for_retry(&small).is_none());
+        assert!(retry_budget(&hunky(2)).is_none());
+        // One huge hunk cannot be cut below its own size.
+        let one = format!(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,1 +1,1 @@\n+{}\n",
+            "x".repeat(10_000)
+        );
+        assert!(retry_budget(&one).is_none());
+    }
+
+    #[test]
+    fn retry_budget_is_half_the_diff() {
+        let diff = hunky(200);
+        assert_eq!(retry_budget(&diff), Some(diff.len() / 2));
     }
 }

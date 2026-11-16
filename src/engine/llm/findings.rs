@@ -22,8 +22,8 @@ use tracing::debug;
 use super::LlmEvents;
 use super::prompts::strict_retry_prompt;
 use super::repair::{
-    extract_json_and_summary, extract_partial_json_objects, repair_json_string,
-    repair_truncated_json, strip_code_fences,
+    extract_json_and_summary_marked, extract_partial_json_objects, is_stray_json,
+    repair_json_string, repair_truncated_json, strip_code_fences,
 };
 use super::transport::{Completion, Transport, Turn, Usage, preview_raw};
 use crate::engine::types::ReviewIssue;
@@ -142,8 +142,8 @@ pub(crate) async fn complete_with_recovery<T: Transport>(
         }
         return Err(CoraError::LlmParse(format!(
             "provider returned an EMPTY response (finish_reason={finish_reason:?}) \
-             after raising max_tokens to {budget}. Raise `max_tokens` in config or disable \
-             reasoning on the model."
+             after raising max_tokens to {budget}. Raise `max_tokens`, or lower \
+             `llm.reasoning_effort` (for example `low`) in config."
         )));
     }
 }
@@ -213,7 +213,7 @@ pub(crate) fn parse_findings(raw: &str) -> Result<Findings, CoraError> {
     if raw.trim().is_empty() {
         return Err(CoraError::LlmParse(format!(
             "provider returned an EMPTY response (no message content). Common cause: \
-             reasoning consumed the output budget — raise `max_tokens` in config. {}",
+             reasoning consumed the output budget — raise `max_tokens` or lower `llm.reasoning_effort` in config. {}",
             non_json_error_message(raw)
         )));
     }
@@ -221,14 +221,33 @@ pub(crate) fn parse_findings(raw: &str) -> Result<Findings, CoraError> {
         return Err(CoraError::LlmParse(non_json_error_message(raw)));
     }
 
-    let (json_str, summary) = extract_json_and_summary(raw);
+    let (json_str, summary, marked) = extract_json_and_summary_marked(raw);
+    // Text after the array that is not marked as a summary and is not prose is
+    // a second (often truncated) JSON blob. Never show it as a summary, and
+    // never let it turn into a clean "No issues found" (#718).
+    let stray = !marked && is_stray_json(&summary);
+    let summary = if stray { String::new() } else { summary };
     let json_str = strip_code_fences(&json_str);
     // Repair common LLM JSON mistakes (invalid escapes) before strict parse.
     let json_str = repair_json_string(&json_str);
     let summary = (!summary.is_empty()).then_some(summary);
+    let check_stray = |found: usize| -> Result<(), CoraError> {
+        if stray && found == 0 {
+            return Err(CoraError::LlmParse(format!(
+                "model reply held more JSON outside the findings array and none inside it; \
+                 the findings may have been cut off. Raw response prefix: {}",
+                preview_raw(raw)
+            )));
+        }
+        if stray {
+            tracing::warn!("dropped JSON after the findings array (not a summary)");
+        }
+        Ok(())
+    };
 
     let strict_err = match serde_json::from_str::<Vec<ReviewIssue>>(&json_str) {
         Ok(issues) => {
+            check_stray(issues.len())?;
             return Ok(Findings {
                 issues,
                 summary,
@@ -243,6 +262,7 @@ pub(crate) fn parse_findings(raw: &str) -> Result<Findings, CoraError> {
     let repair_err = match serde_json::from_str::<Vec<ReviewIssue>>(&repaired) {
         Ok(issues) => {
             debug!("truncated JSON repair succeeded — some data may be partial");
+            check_stray(issues.len())?;
             return Ok(Findings {
                 issues,
                 summary,
@@ -262,6 +282,7 @@ pub(crate) fn parse_findings(raw: &str) -> Result<Findings, CoraError> {
         .filter_map(|o| serde_json::from_str::<ReviewIssue>(o).ok())
         .collect();
     if !issues.is_empty() {
+        check_stray(issues.len())?;
         let recovery = Recovery::PartialObjects {
             recovered: issues.len(),
             skipped: total - issues.len(),
@@ -997,5 +1018,41 @@ mod tests {
             f.recovery,
             Recovery::PartialObjects { recovered: 2, .. }
         ));
+    }
+
+    // ─── #718: text after the findings array is never a summary ───
+
+    const TRUNCATED_BLOB: &str = r#"[]
+{"file":"src/a.rs","line":3,"severity":"minor","title":"Unused vari"#;
+
+    #[test]
+    fn stray_json_after_an_empty_array_is_not_a_clean_pass() {
+        // Before the fix: no issues + summary = the raw blob, printed under
+        // "No issues found!".
+        let err = parse_findings(TRUNCATED_BLOB).unwrap_err().to_string();
+        assert!(err.contains("outside the findings array"), "{err}");
+    }
+
+    #[test]
+    fn stray_json_after_findings_keeps_them_and_drops_the_blob() {
+        let raw = format!("{SINGLE_ISSUE_JSON}\n```json\n[{{\"file\":\"a.rs\",\"line\":9,\"seve");
+        let f = parse_findings(&raw).unwrap();
+        assert_eq!(f.issues.len(), 1);
+        assert!(f.summary.is_none(), "summary was {:?}", f.summary);
+    }
+
+    #[test]
+    fn prose_after_the_array_is_still_a_summary() {
+        let f = parse_findings("[] Looks good overall.").unwrap();
+        assert_eq!(f.summary.as_deref(), Some("Looks good overall."));
+        let g = parse_findings("[]|||All clear.").unwrap();
+        assert_eq!(g.summary.as_deref(), Some("All clear."));
+    }
+
+    #[test]
+    fn explicit_separator_summary_may_start_with_a_bracket() {
+        // After `|||` the model meant a summary; only unmarked text is vetted.
+        let f = parse_findings("[]|||[note] nothing to flag").unwrap();
+        assert_eq!(f.summary.as_deref(), Some("[note] nothing to flag"));
     }
 }

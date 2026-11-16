@@ -13,13 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`review.exclude` (#720).** Globs of files removed from the reviewed diff (`CHANGELOG.md`, `docs/**`, lockfiles). Unlike `ignore.files`, they are never sent to the model and never produce a finding; the output names them.
 - **`review.fail_on_incomplete` (#720, default `true`).** A review that did not cover the whole diff (a chunk failed, or the model call failed and only the deterministic findings remain) names the files it skipped and exits 1. Set it to `false` for the old warn-and-pass behaviour.
 
+- **`llm.reasoning_effort` (#718).** Optional value sent as `reasoning_effort` with every request, so a reasoning model does not spend the output budget on thinking.
+- **A review the model cannot answer is retried in smaller pieces (#718).** When the reply stays empty at `finish_reason=length`, or the model call fails, the diff is reviewed again in halves (a failing chunk is halved again, down to a quarter) instead of failing the whole run. Before, the run ended with "Review could not complete" at any `max_tokens`.
+
 ### Changed
 
 - A failed model call in `cora review --format sarif` still returns a valid SARIF with a warning, but now exits 1 instead of 0 unless `review.fail_on_incomplete` is `false` (#720).
 
 ### Fixed
 
-- **`scan` and `scan_prepare` walk the project in a stable order.** The directory walk followed the filesystem's `readdir` order, so `order: path` and the `files_fingerprint` built from it could differ between machines, and the test `finalize_agrees_with_prepare_only_for_the_same_filters` failed in CI whenever the walk happened to match the default `source-first` order. Entries are now sorted by name inside each directory.
+
 - **Chunked review lost files (#720).** Splitting a diff cut file headers and glued the blocks of a multi-file chunk together without a newline, so only the last file of each chunk was parsed back. Splitting now follows `diff --git` boundaries and is lossless.
 
 ## [0.20.0] - 2026-10-27
