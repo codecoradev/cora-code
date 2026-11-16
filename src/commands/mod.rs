@@ -1,4 +1,5 @@
 pub mod agent_config;
+pub mod agents;
 pub mod auth;
 pub mod commit_cmd;
 pub mod completion;
@@ -6,6 +7,7 @@ pub mod config_cmd;
 pub mod debt;
 pub mod findings;
 pub mod hook_cmd;
+pub mod hook_context;
 pub mod index_cmd;
 pub mod init;
 pub mod install;

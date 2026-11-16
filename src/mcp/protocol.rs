@@ -113,6 +113,10 @@ pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: ServerInfo,
+    /// How to use the server's tools. Clients that read it (omp, opencode,
+    /// Claude Code) add it to the model's system prompt.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub instructions: Option<String>,
 }
 
 #[cfg(test)]

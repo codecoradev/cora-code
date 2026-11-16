@@ -11,6 +11,8 @@
 pub mod model_store;
 pub mod potion;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Dimensions of the code model's vectors.
 pub const EMBEDDING_DIM: usize = 256;
 
@@ -61,8 +63,19 @@ impl Backend {
 /// Process-wide backend, set once at index/brain-search time.
 static ACTIVE_BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
 
+/// When set, the model is never downloaded in this process (agent hooks must
+/// not hang on the network).
+static NO_DOWNLOAD: AtomicBool = AtomicBool::new(false);
+
+/// Forbid downloading the model in this process; an already downloaded model
+/// is still used.
+pub fn forbid_download() {
+    NO_DOWNLOAD.store(true, Ordering::Relaxed);
+}
+
 /// Try to make the model available and load it.
 fn try_potion(allow_download: bool) -> Option<Backend> {
+    let allow_download = allow_download && !NO_DOWNLOAD.load(Ordering::Relaxed);
     match model_store::ensure(allow_download).and_then(|dir| potion::install(&dir).map(|_| ())) {
         Ok(()) => Some(Backend::Potion),
         Err(e) => {
