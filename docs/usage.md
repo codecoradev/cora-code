@@ -169,8 +169,8 @@ The `.cora.yaml` file provides persistent configuration. Place it in your projec
 
 | File | Purpose |
 |------|---------|
-| `~/.cora/auth.toml` | API key (secret, chmod 600) |
-| `~/.cora/config.yaml` | Global defaults (provider, model, etc.) |
+| `~/.codecora/cora-code/auth.toml` | API key (secret, chmod 600) |
+| `~/.codecora/cora-code/config.yaml` | Global defaults (provider, model, etc.) |
 | `.cora.yaml` | Per-project overrides |
 
 ```yaml
