@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ruby: methods in modules and classes nested in modules are indexed (#791).** Two gaps in the Tree-sitter extractor: a second `"module"` arm that also extracts the methods was unreachable, and only the direct children of a file were visited, so the usual `module Outer; class Inner; def run` layout indexed nothing inside `Outer`. The superclass edge of a Ruby class also carried the `<` of `< Base` in its target, so it never matched the symbol `Base`. On Sinatra (147 Ruby files) the index grows from 184 to 853 symbols, the methods from 79 to 622, and `cora explore halt` finds `Sinatra::Base#halt`. Projects with Ruby code need one `cora index` to benefit.
+
 - **`index-breaking-change` no longer reports a removal whose callers are deleted in the same change (#794).** The index predates the diff, so a helper removed together with its only caller was reported as "breaks 1 caller" and blocked the review; callers whose call site is one of the removed lines (or in a deleted file) are now ignored, and the finding stays for callers that remain.
 
 - **Documentation corrected against the code (#782).** The README's quick install now uses `install.sh`, which verifies the SHA-256 checksum and the Sigstore signature (the script it named before did neither, and the `CORA_VERSION` pin in the examples never reached the installer); the License section says Apache-2.0; the global config directory is `~/.codecora/cora-code/` everywhere (it said `~/.cora/`); Tree-sitter is no longer called opt-in; language, rule and pattern counts, the Rust badge, the Homebrew claim, the download URL and the release flow in CONTRIBUTING were wrong or stale.

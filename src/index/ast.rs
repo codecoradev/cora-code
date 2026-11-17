@@ -2189,6 +2189,28 @@ fn extract_ruby(
     let mut edges = Vec::new();
     let mut cursor = root.walk();
 
+    /// Visit the classes and modules nested in a class or module body (the usual
+    /// `module Outer; class Inner; def run` layout, #791). Only `class` and `module`
+    /// children are walked: their methods are already taken by
+    /// `extract_methods_from_ruby_node`, and walking a `method` again would index it twice.
+    fn walk_ruby_nested(
+        node: &tree_sitter::Node,
+        source: &str,
+        file_path: &str,
+        nodes: &mut Vec<AstNode>,
+        edges: &mut Vec<AstEdge>,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "class" | "module" => walk_ruby(&child, source, file_path, nodes, edges),
+                // tree-sitter-ruby wraps the body of a class or module in body_statement.
+                "body_statement" => walk_ruby_nested(&child, source, file_path, nodes, edges),
+                _ => {}
+            }
+        }
+    }
+
     fn walk_ruby(
         node: &tree_sitter::Node,
         source: &str,
@@ -2197,23 +2219,6 @@ fn extract_ruby(
         edges: &mut Vec<AstEdge>,
     ) {
         match node.kind() {
-            "module" => {
-                let name = if let Some(n) = node.child_by_field_name("name") {
-                    node_text(&n, source)
-                } else {
-                    String::new()
-                };
-                if !name.is_empty() {
-                    nodes.push(AstNode {
-                        name,
-                        kind: SymbolKind::Module,
-                        file: file_path.to_string(),
-                        line: (node.start_position().row + 1) as u32,
-                        signature: signature_for_node(node, source),
-                        parent: None,
-                    });
-                }
-            }
             "class" => {
                 let name = if let Some(n) = node.child_by_field_name("name") {
                     node_text(&n, source)
@@ -2224,7 +2229,12 @@ fn extract_ruby(
                     let line = (node.start_position().row + 1) as u32;
                     // Parent class
                     if let Some(superclass) = node.child_by_field_name("superclass") {
-                        let parent = node_text(&superclass, source);
+                        // The superclass node's text is `< Base`; keep the name only, or the
+                        // edge never matches the symbol `Base`.
+                        let parent = node_text(&superclass, source)
+                            .trim_start_matches('<')
+                            .trim()
+                            .to_string();
                         if !parent.is_empty() {
                             edges.push(AstEdge {
                                 source: name.clone(),
@@ -2247,11 +2257,9 @@ fn extract_ruby(
                     });
                     // Methods inside class (tree-sitter-ruby wraps them in body_statement)
                     extract_methods_from_ruby_node(node, source, file_path, &name, nodes);
+                    walk_ruby_nested(node, source, file_path, nodes, edges);
                 }
             }
-            // Unreachable today: the "module" arm above shadows this one, so methods inside a
-            // Ruby module are not indexed (#791). That fix removes the arm above and this allow.
-            #[allow(unreachable_patterns)]
             "module" => {
                 let name = if let Some(n) = node.child_by_field_name("name") {
                     node_text(&n, source)
@@ -2269,6 +2277,7 @@ fn extract_ruby(
                     });
                     // Methods inside module (same body_statement wrapping)
                     extract_methods_from_ruby_node(node, source, file_path, &name, nodes);
+                    walk_ruby_nested(node, source, file_path, nodes, edges);
                 }
             }
             "method" => {
@@ -2693,6 +2702,91 @@ func (s *Server) Start() error {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"NewServer"));
         assert!(names.contains(&"Start"));
+    }
+
+    #[test]
+    fn test_extract_ruby_module_methods() {
+        // #791: the methods of a Ruby module were never indexed because the
+        // first `"module"` arm shadowed the one that extracts them.
+        let code =
+            "module Greeter\n  def hello\n    puts 'hi'\n  end\n\n  def goodbye\n  end\nend\n";
+        let (nodes, _edges) = extract(code, "rb", "greeter.rb");
+        let modules: Vec<&str> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, SymbolKind::Module))
+            .map(|n| n.name.as_str())
+            .collect();
+        let methods: Vec<(&str, Option<&str>)> = nodes
+            .iter()
+            .filter(|n| matches!(n.kind, SymbolKind::Method))
+            .map(|n| (n.name.as_str(), n.parent.as_deref()))
+            .collect();
+        assert_eq!(
+            modules,
+            vec!["Greeter"],
+            "the module itself is indexed once"
+        );
+        assert!(
+            methods.contains(&("hello", Some("Greeter"))),
+            "got {methods:?}"
+        );
+        assert!(
+            methods.contains(&("goodbye", Some("Greeter"))),
+            "got {methods:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ruby_nested_classes_and_modules() {
+        // #791: `module Outer; class Inner; def run` is the usual Ruby layout, but only the
+        // direct children of the file were visited, so nothing inside Outer was indexed.
+        let code = "module Outer\n  VERSION = 1\n\n  module Deep\n    class Leaf\n      def leaf_method\n      end\n    end\n  end\n\n  class Inner < Base\n    def run\n      helper\n    end\n  end\nend\n";
+        let (nodes, edges) = extract(code, "rb", "outer.rb");
+        let kinds = |k: SymbolKind| -> Vec<&str> {
+            nodes
+                .iter()
+                .filter(|n| n.kind == k)
+                .map(|n| n.name.as_str())
+                .collect()
+        };
+        let modules = kinds(SymbolKind::Module);
+        let classes = kinds(SymbolKind::Class);
+        let methods = kinds(SymbolKind::Method);
+        assert!(
+            modules.contains(&"Outer") && modules.contains(&"Deep"),
+            "{modules:?}"
+        );
+        assert!(
+            classes.contains(&"Inner") && classes.contains(&"Leaf"),
+            "{classes:?}"
+        );
+        assert!(
+            methods.contains(&"run") && methods.contains(&"leaf_method"),
+            "{methods:?}"
+        );
+        assert_eq!(
+            nodes.iter().filter(|n| n.name == "Outer").count(),
+            1,
+            "a nested class or module must not be indexed twice: {nodes:?}"
+        );
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.kind == EdgeKind::Inherits && e.target == "Base"),
+            "the superclass edge of a nested class is kept: {edges:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_ruby_class_methods() {
+        let code = "class Account\n  def balance\n    0\n  end\nend\n";
+        let (nodes, _edges) = extract(code, "rb", "account.rb");
+        assert!(
+            nodes
+                .iter()
+                .any(|n| n.name == "balance" && matches!(n.kind, SymbolKind::Method)),
+            "class methods must keep being indexed: {nodes:?}"
+        );
     }
 
     #[test]
