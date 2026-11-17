@@ -29,7 +29,7 @@ Complete command reference for the cora CLI.
 | `cora init --force` | Overwrite existing config file |
 | `cora init --no-hook` | Skip pre-commit hook installation |
 | `cora config show` | Show resolved configuration |
-| `cora config show --global` | Show global config (`~/.cora/config.yaml`) |
+| `cora config show --global` | Show global config (`~/.codecora/cora-code/config.yaml`) |
 | `cora config show --project` | Show project config (`.cora.yaml`) |
 | `cora config set` `<key>` `<value>` | Set a config value |
 | `cora config set` `<key>` `<value>` `--global` | Write to global config instead of project |

@@ -13,7 +13,7 @@ This document helps you decide *whether* and *how* to contribute in a way that's
 - Cora has one active maintainer ([@ajianaz](https://github.com/ajianaz)).
 - Review bandwidth is limited.
 - Not every contribution can be accepted, even if it's technically correct. Alignment with project direction matters as much as code quality.
-- For scope and direction, check open issues and [ROADMAP.md](ROADMAP.md) if available. Read them before opening anything non-trivial.
+- For scope and direction, check open issues and [the roadmap](docs/roadmap.md). Read them before opening anything non-trivial.
 
 This is normal for a solo project. A "no" on a PR is not personal.
 
@@ -94,7 +94,7 @@ If your change touches behavior in any of these load-bearing paths, the PR must 
 
 - **Index engine (src/index/)**: SQLite writes, schema migrations, FTS5, symbol extraction
 - **Code graph (src/index/graph.rs)**: call graph construction, dead-code detection
-- **Embedding (src/embed/)**: ONNX inference, tokenizer, dimension handling
+- **Embedding (src/embed/)**: the code embedding model (Model2Vec), its pinned download and SHA-256 check, the bundled-model install, the vector signal when the model is unavailable
 - **Schema migration (src/index/schema.rs)**: version upgrades, data migration
 - **Config (src/config/)**: YAML resolution chain, merge logic
 - **MCP tools (src/mcp/)**: tool registration, parameter handling
@@ -206,7 +206,7 @@ src/
 │   ├── review.rs           # LLM review pipeline
 │   ├── scanner.rs          # File scanning
 │   ├── types.rs            # Issue, Severity, etc.
-│   ├── llm.rs              # LLM API abstraction
+│   ├── llm/                # LLM API abstraction (transport, prompts, repair)
 │   ├── context/            # Context building for review
 │   └── rules/              # Rule definitions
 ├── index/                   # Code intelligence
@@ -214,8 +214,10 @@ src/
 │   ├── symbols.rs          # Symbol extraction + FTS5
 │   ├── graph.rs            # Call graph + dead-code detection
 │   └── mod.rs              # Index orchestration
-├── embed/                   # Embedding engine
-│   └── onnx.rs             # ONNX runtime wrapper
+├── embed/                   # Code embedding model (Model2Vec)
+│   ├── potion.rs           # Model loading and encoding
+│   ├── model_store.rs      # Pinned download + SHA-256 verification
+│   └── bundled.rs          # Model bundled into release binaries
 ├── config/                  # Configuration
 │   ├── schema.rs           # YAML structs + merge
 │   ├── loader.rs           # Resolution chain
@@ -233,21 +235,22 @@ src/
 - **SQLite-first indexing** — Symbol data, FTS5, and code graph all live in a single `cora.db` per project
 - **Tree-sitter for parsing** — Language-agnostic AST extraction for symbol indexing
 - **Local code embedding model** — `potion-code-16M-v2` is downloaded once (pinned, SHA-256-verified) and runs locally; no embedding API. Without it the vector signal is off and search uses keywords and the call graph
-- **Schema versioning** — Integer counter; auto-migration on upgrade (current: v6)
+- **Schema versioning** — Integer counter (`SCHEMA_VERSION` in `src/index/schema.rs`); auto-migration on upgrade
 - **Config merge chain** — Global → project `.cora.yaml` → CLI flags, with profile overlay
 - **Pre-commit hook** — Cora runs as a git pre-commit hook reviewing staged diff via LLM
 
 ## Release flow
 
-Cora follows a simplified GitFlow:
+Releases are made by the maintainer. Cora follows a simplified GitFlow:
 
 ```
-develop (default) → PR → main → tag vX.Y.Z → release workflow
+develop (default) → release/vX.Y.Z → PR → main (merge commit) → tag vX.Y.Z → release workflow
 ```
 
-- Tags must be on `main`, not `develop`.
-- The release workflow verifies tag ancestry to `origin/main` before building.
-- Version bumps happen on `develop` before syncing to `main`.
+- The release branch carries the version bump (`Cargo.toml`, `Cargo.lock`), the CHANGELOG entry (`[Unreleased]` becomes `[X.Y.Z]`) and the version pins in the docs.
+- Tags must be on `main`, not `develop`; the release workflow verifies the tag is reachable from `origin/main` before building.
+- After the release, the bump and changelog are synced back into `develop` with a PR.
+- The detailed checklist is in `AGENT.md` (Pre-Release Checklist and Release Workflow).
 
 ## Reporting Issues
 

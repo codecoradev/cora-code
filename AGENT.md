@@ -156,12 +156,12 @@ Three GitHub Actions workflows in `.github/workflows/`:
 1. **CLI flags** (`--provider`, `--model`, etc.)
 2. **Environment variables** (`CORA_PROVIDER`, `CORA_MODEL`, etc.)
 3. **Project config** (`.cora.yaml` in repo root)
-4. **Global config** (`~/.cora/config.yaml`)
+4. **Global config** (`~/.codecora/cora-code/config.yaml`)
 5. **Built-in defaults** (defined in `config/schema.rs`)
 
 ### Auth Separation
 
-API keys live in a separate `auth.toml` file (`~/.cora/auth.toml`), not in
+API keys live in a separate `auth.toml` file (`~/.codecora/cora-code/auth.toml`), not in
 `.cora.yaml`. This prevents accidental key leakage via committed config files.
 
 ## Design Decisions
@@ -297,7 +297,7 @@ reality BEFORE version bump.
 |------|---------------|
 | `README.md` | "Why Cora" bullets match all features. Commands table includes all subcommands. Config example shows latest features. All links point to `codecora.dev` |
 | `CHANGELOG.md` | New version entry with ALL changes (Added, Changed, Fixed, Removed). Link references at bottom include new version |
-| `docs/changelog.md` | Mirrors `CHANGELOG.md` exactly — same content, same links |
+| `docs/changelog.md` | Generated from `CHANGELOG.md` by the docs build (`predocs:build`) and git-ignored; never edit or commit it |
 | `docs/roadmap.md` | Completed items marked ✓ Done (not ◎ Planned). Future items accurate |
 | `docs/getting-started.md` | Quick start still works. Next steps links valid. New major features mentioned |
 | `docs/configuration.md` | All config keys documented with examples. New sections (quality gate, security scanner, MCP, profiles, custom rules, language analyzers) present |

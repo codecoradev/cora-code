@@ -12,7 +12,7 @@ Get up and running with cora in three simple steps.
    `curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh`
 
 2. **Authenticate** (optional) — Run `cora auth login` to pick your provider and enter your API key. Without a key, `cora review` / `cora scan` still run the deterministic checks, and an AI coding agent can review through the `cora` MCP server (see [Usage](./usage#review-with-your-agent-no-llm-setup)).
-   Cora stores the API key in `~/.cora/auth.toml` (never committed to git) and provider settings in `~/.cora/config.yaml`.
+   Cora stores the API key in `~/.codecora/cora-code/auth.toml` (never committed to git) and provider settings in `~/.codecora/cora-code/config.yaml`.
 
 3. **Review** — Analyze your staged changes:
    `cora review`
@@ -44,7 +44,7 @@ $ cora auth login
   Model [glm-5.1]:          ← press Enter to accept default
   Base URL [https://api.z.ai/api/coding/paas/v4]:  ← press Enter to accept default
 
-✅ API key saved to ~/.cora/auth.toml
+✅ API key saved to ~/.codecora/cora-code/auth.toml
    Provider: zai | Model: glm-5.1 | Base: https://api.z.ai/api/coding/paas/v4
 ```
 
@@ -52,15 +52,15 @@ $ cora auth login
 |------|-------------|
 | Known providers | Provider env vars auto-detected (e.g. `ZAI_API_KEY`) |
 | Custom provider | Enter your own base URL, model name, and API key |
-| API key | Saved to `~/.cora/auth.toml` (secret) |
-| Provider settings | Saved to `~/.cora/config.yaml` |
+| API key | Saved to `~/.codecora/cora-code/auth.toml` (secret) |
+| Provider settings | Saved to `~/.codecora/cora-code/config.yaml` |
 
 Check your auth status anytime:
 
 ```bash
 $ cora auth status
 ✅ API key is configured.
-   Source: ~/.cora/auth.toml
+   Source: ~/.codecora/cora-code/auth.toml
 
    Provider: openai
    Model: gpt-4o-mini
