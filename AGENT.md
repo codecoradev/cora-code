@@ -112,6 +112,18 @@ src/
     └── template.rs      # Hook script templates
 ```
 
+### Dependency rules
+
+```
+config/ → engine/ → formatters/
+main.rs → commands/ → output
+commands/, mcp/ → engine/*   (rules, scanners, profiles, diff_parser, index_bridge)
+git/, hook/ are leaf helpers
+```
+
+Engine modules must not depend on `commands/` or on `config/loader` directly; `mcp/tools`
+reaches the engine through `crate::engine::*`.
+
 ## Key Files
 
 | File | Purpose |
@@ -142,12 +154,24 @@ The pre-commit hook runs the installed `cora` binary on the staged diff. Never s
 
 ## CI/CD
 
-Three GitHub Actions workflows in `.github/workflows/`:
+The workflows in `.github/workflows/`:
 
-1. **ci.yml** — PR checks: build, test, clippy, fmt on push to `develop` and PRs
-2. **release.yml** — Triggered by `v*` tags; builds for 4 platforms (Linux x86_64,
-   macOS x86_64, macOS ARM64, Windows x86_64), publishes to crates.io
-3. **deploy-website.yml** — Deploys project website/docs
+1. **ci.yml** — Check, Format, Clippy, Test, Build, Security Audit (CVE), Website Build,
+   NPM Audit and Cargo Outdated on every PR and on pushes to `develop` and `main`. The
+   push to `develop` exists to fill the Rust build cache that PRs restore (a cache
+   written inside a PR is visible to that PR only); docs-only pushes are skipped.
+2. **cora-review.yml** — Cora Review on every PR (`pull_request_target`; the config comes
+   from the base branch, never from the PR).
+3. **pr-checks.yml** — Branch Naming, Conventional Commits and PR Description.
+4. **release.yml** — Triggered by `v*` tags; builds the 4 platform binaries with the code
+   model bundled, publishes to crates.io, signs the checksums and creates the GitHub Release.
+5. **deploy-website.yml** — Deploys the project website and docs.
+6. **project-sync.yml** — Moves linked issues to Done on the roadmap board.
+7. **anthropic-wif-smoke.yml** — Smoke test of the Anthropic workload identity federation.
+
+Required checks on a PR (13): Check, Format, Clippy, Test, Build, Security Audit (CVE),
+Website Build, NPM Audit, Cargo Outdated, Cora Review, Branch Naming, Conventional
+Commits, PR Description.
 
 ## Config System
 
@@ -166,6 +190,11 @@ API keys live in a separate `auth.toml` file (`~/.codecora/cora-code/auth.toml`)
 
 ## Design Decisions
 
+- **Exit codes:** 0 success, 1 error, 2 quality gate failed.
+- **`CORA_API_KEY`** is for CI; local use keeps the key in `~/.codecora/cora-code/auth.toml`.
+- **The Marketplace action** lives in its own repository, `codecoradev/cora-review-action`,
+  not in this tree.
+- **`merge_into()`** returns `Result<(), CoraError>`: an invalid profile config fails fast.
 - **Severity comparison uses `<=` not `>=`**: Severity filtering uses `<=` because
   the ordinal maps info=1, warning=2, error=3 — so `--severity warning` means
   "include warning and below (info)", not "warning and above (error)". This is
@@ -308,7 +337,6 @@ reality BEFORE version bump.
 | `docs/code-intelligence.md` | Index, brain, trace, arch, multi-project DB, data directory |
 | `docs/installation.md` | Version pin example uses latest. Platforms list accurate |
 | `AGENT.md` | Code structure tree current. Test count current. Key files table current |
-| `.agent.md` | Pre-release checklist current. CI checks count current. Module dependencies current |
 
 ### 3. Cross-Check
 
@@ -320,7 +348,7 @@ reality BEFORE version bump.
 
 ### 4. CI & Scanning
 
-- [ ] CI: 10/10 checks green on develop branch
+- [ ] CI: 13/13 checks green on the release PR
 - [ ] Code Scanning: 0 open alerts (fix or dismiss each with reason)
 - [ ] No open PRs blocking the release
 
@@ -360,7 +388,7 @@ Generate a comprehensive pre-release report covering:
 ✅ TESTS:        N pass (unit + CLI + config)
 ✅ CLIPPY:       Clean
 ✅ FORMAT:       Clean
-✅ CI:           10/10 green
+✅ CI:           13/13 green
 ✅ CODE SCANNING: 0 open
 ✅ OPEN PRs:      0
 ✅ OPEN ISSUES:   N (all post-release scope)
@@ -475,9 +503,9 @@ When submitting cora to directories, aggregators, or showcases (Trendshift, etc.
 
 ### Key Metrics to Mention
 
-- Test count (708+)
-- Lines of Rust code (26,400+)
-- CI checks (10)
+- Test count (1,500+)
+- Lines of Rust code (67,000+)
+- CI checks (13)
 - GitHub Marketplace action published
 - MCP server with 22 tools
 - Apache-2.0 license
