@@ -22,8 +22,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PROJECT_BOARD_TOKEN }}
           PROJECT_NODE_ID: ${{ secrets.PROJECT_NODE_ID }}
-          STATUS_FIELD_ID: PVTSSF_lADOEUV_vs4BahYpzhVYcGc
-          DONE_OPTION_ID: 98236657
         run: |
           set -e
 
@@ -133,10 +131,47 @@ jobs:
           }
 
           # ------------------------------------------------------------------
+          # Helper: find the Status field and its "Done" option by name, so
+          # editing or recreating the option on the board cannot break the job.
+          # Prints "<field id> <option id>"; fails when either is missing.
+          # ------------------------------------------------------------------
+          resolve_status_ids() {
+            local resp
+            resp=$(gh api graphql \
+              -f query="
+                query {
+                  node(id: \"$PROJECT_NODE_ID\") {
+                    ... on ProjectV2 {
+                      field(name: \"Status\") {
+                        ... on ProjectV2SingleSelectField { id options { id name } }
+                      }
+                    }
+                  }
+                }") || { echo "::error::Could not read the project Status field." >&2; return 1; }
+            local ids
+            ids=$(printf '%s' "$resp" | jq -r '
+              .data.node.field as $f
+              | ($f.options // [])[]
+              | select((.name | ascii_downcase | gsub("^\\s+|\\s+$"; "")) == "done")
+              | "\($f.id) \(.id)"' | head -n 1)
+            if [ -z "$ids" ]; then
+              echo "::error::The project has no Status field with a Done option." >&2
+              return 1
+            fi
+            echo "$ids"
+          }
+
+          # ------------------------------------------------------------------
           # Helper: set Status field to Done for a project item.
           # ------------------------------------------------------------------
           set_done() {
             local item_id="$1"
+            if [ -z "${STATUS_FIELD_ID:-}" ] || [ -z "${DONE_OPTION_ID:-}" ]; then
+              local ids
+              ids=$(resolve_status_ids) || return 1
+              STATUS_FIELD_ID="${ids%% *}"
+              DONE_OPTION_ID="${ids##* }"
+            fi
             echo "Setting item $item_id → Done"
             gh api graphql \
               -f query="
