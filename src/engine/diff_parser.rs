@@ -299,33 +299,6 @@ pub fn detect_language(path: &str) -> &'static str {
     }
 }
 
-/// Extract all added lines from parsed file chunks.
-///
-/// Returns `(file_path, line_number, content)` triples.
-#[allow(dead_code)] // for the bundling engine, not wired yet (#792)
-pub fn extract_added_lines(chunks: &[FileChunk]) -> Vec<(String, u32, String)> {
-    let mut result = Vec::new();
-
-    for file in chunks {
-        let path = file
-            .new_path
-            .as_deref()
-            .or(file.old_path.as_deref())
-            .unwrap_or("unknown");
-        for hunk in &file.chunks {
-            for line in &hunk.lines {
-                if line.line_type == DiffLineType::Add {
-                    if let Some(ln) = line.new_line_no {
-                        result.push((path.to_string(), ln, line.content.clone()));
-                    }
-                }
-            }
-        }
-    }
-
-    result
-}
-
 // ─── Internal builder for assembling FileChunk ───
 
 struct FileChunkBuilder {
@@ -584,24 +557,6 @@ diff --git a/src/foo.rs b/src/foo.rs
         // Second added line at new=7
         let add2 = &hunk.lines[3];
         assert_eq!(add2.new_line_no, Some(7));
-    }
-
-    #[test]
-    fn extract_added_lines_works() {
-        let diff = r#"diff --git a/app.js b/app.js
---- a/app.js
-+++ b/app.js
-@@ -1,1 +1,3 @@
- console.log('a');
-+console.log('b');
-+console.log('c');
-"#;
-        let files = parse_diff(diff);
-        let added = extract_added_lines(&files);
-        assert_eq!(added.len(), 2);
-        assert_eq!(added[0].0, "app.js");
-        assert_eq!(added[0].1, 2);
-        assert_eq!(added[1].1, 3);
     }
 
     #[test]

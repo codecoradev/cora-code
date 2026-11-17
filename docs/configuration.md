@@ -730,7 +730,7 @@ review:
 
 ## Bundling
 
-> **Deprecation notice:** as of the current release, `cora scan` does **not** read this section — batch sizing is governed by `--batch-files` (default 20) and an internal ~60,000-character batch budget. These keys are parsed but have no effect on `cora scan`. They are kept for backward compatibility; do not rely on them.
+> **Deprecated, no effect:** the file grouping engine these keys configured was never called by `cora review` or `cora scan` and has been removed (#792). The keys are still accepted so an existing `.cora.yaml` keeps loading. Large diffs are split by a character budget (`review.max_chunk_chars`, see [Large Diffs](#large-diffs)); `cora scan` batches by `--batch-files` (default 20) and an internal ~60,000-character budget.
 
 ```yaml
 bundling:

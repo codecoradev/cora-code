@@ -24,7 +24,7 @@ pub struct AstNode {
     /// Full signature text.
     pub signature: String,
     /// Parent scope name (struct/class for methods).
-    #[allow(dead_code)] // computed at every site, never read (#792)
+    #[allow(dead_code)] // computed at every site, never read; stored or removed in #807
     pub parent: Option<String>,
 }
 
