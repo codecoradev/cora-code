@@ -99,6 +99,23 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # SECURITY: cora reads .cora.yaml from the checkout, which here is the PR
+      # head. Take the config from the base branch instead, so a PR cannot change
+      # its own review (ignore rules, custom rules, prompts, thresholds). The base
+      # URL and model are pinned through the action inputs below. Without a
+      # .cora.yaml on the base branch, the review runs with the defaults.
+      - name: Use the base branch config
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git cat-file -e "$BASE_SHA:.cora.yaml" 2>/dev/null; then
+            git show "$BASE_SHA:.cora.yaml" > .cora.yaml
+            echo "Using .cora.yaml from the base branch."
+          else
+            rm -f .cora.yaml
+            echo "No .cora.yaml on the base branch; using the defaults."
+          fi
+
       - name: Run Cora AI Code Review
         uses: codecoradev/cora-review-action@v1
         with:
