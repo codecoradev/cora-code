@@ -73,56 +73,6 @@ impl fmt::Display for Severity {
     }
 }
 
-/// Issue type categories.
-///
-/// Kept for API completeness — used for deserialization and future typed
-/// issue-type matching. Currently the LLM returns `issue_type` as a string,
-/// but this enum provides a structured alternative.
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IssueType {
-    Security,
-    Performance,
-    Bug,
-    BestPractice,
-    Style,
-    Suggestion,
-}
-
-#[allow(dead_code)]
-impl fmt::Display for IssueType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IssueType::Security => write!(f, "security"),
-            IssueType::Performance => write!(f, "performance"),
-            IssueType::Bug => write!(f, "bug"),
-            IssueType::BestPractice => write!(f, "best_practice"),
-            IssueType::Style => write!(f, "style"),
-            IssueType::Suggestion => write!(f, "suggestion"),
-        }
-    }
-}
-
-#[allow(dead_code)]
-impl IssueType {
-    /// Parse from string with lenient matching (accepts plural forms, etc.)
-    pub fn from_str_lossy(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "security" | "sec" => IssueType::Security,
-            "performance" | "perf" => IssueType::Performance,
-            "bug" | "bugs" => IssueType::Bug,
-            "best_practice" | "best-practice" | "bestpractice" | "best practice" => {
-                IssueType::BestPractice
-            }
-            "style" | "formatting" => IssueType::Style,
-            // suggestion/info merged into wildcard — all three arms returned
-            // identical IssueType::Suggestion, verified by clippy match_same_arms
-            _ => IssueType::Suggestion,
-        }
-    }
-}
-
 /// Read a severity the way a model writes it. A synonym (`high`, `warning`)
 /// maps to its level; a word that is not a severity (`"performance"`, a
 /// category in the wrong field) must not make the whole batch fail to parse, so
@@ -297,102 +247,6 @@ mod tests {
         assert!(!Severity::Major.icon().is_empty());
         assert!(!Severity::Minor.icon().is_empty());
         assert!(!Severity::Info.icon().is_empty());
-    }
-
-    // ─── IssueType::from_str_lossy ───
-
-    #[test]
-    fn issue_type_security() {
-        assert_eq!(IssueType::from_str_lossy("security"), IssueType::Security);
-    }
-
-    #[test]
-    fn issue_type_sec_alias() {
-        assert_eq!(IssueType::from_str_lossy("sec"), IssueType::Security);
-    }
-
-    #[test]
-    fn issue_type_performance() {
-        assert_eq!(
-            IssueType::from_str_lossy("performance"),
-            IssueType::Performance
-        );
-    }
-
-    #[test]
-    fn issue_type_perf_alias() {
-        assert_eq!(IssueType::from_str_lossy("perf"), IssueType::Performance);
-    }
-
-    #[test]
-    fn issue_type_bug() {
-        assert_eq!(IssueType::from_str_lossy("bug"), IssueType::Bug);
-    }
-
-    #[test]
-    fn issue_type_bugs_alias() {
-        assert_eq!(IssueType::from_str_lossy("bugs"), IssueType::Bug);
-    }
-
-    #[test]
-    fn issue_type_best_practice_variants() {
-        assert_eq!(
-            IssueType::from_str_lossy("best_practice"),
-            IssueType::BestPractice
-        );
-        assert_eq!(
-            IssueType::from_str_lossy("best-practice"),
-            IssueType::BestPractice
-        );
-        assert_eq!(
-            IssueType::from_str_lossy("bestpractice"),
-            IssueType::BestPractice
-        );
-        assert_eq!(
-            IssueType::from_str_lossy("best practice"),
-            IssueType::BestPractice
-        );
-    }
-
-    #[test]
-    fn issue_type_style() {
-        assert_eq!(IssueType::from_str_lossy("style"), IssueType::Style);
-    }
-
-    #[test]
-    fn issue_type_formatting_alias() {
-        assert_eq!(IssueType::from_str_lossy("formatting"), IssueType::Style);
-    }
-
-    #[test]
-    fn issue_type_suggestion() {
-        assert_eq!(
-            IssueType::from_str_lossy("suggestion"),
-            IssueType::Suggestion
-        );
-    }
-
-    #[test]
-    fn issue_type_info_alias() {
-        assert_eq!(IssueType::from_str_lossy("info"), IssueType::Suggestion);
-    }
-
-    #[test]
-    fn issue_type_unknown_falls_back() {
-        assert_eq!(IssueType::from_str_lossy("xyz"), IssueType::Suggestion);
-        assert_eq!(IssueType::from_str_lossy(""), IssueType::Suggestion);
-    }
-
-    // ─── IssueType display ───
-
-    #[test]
-    fn issue_type_display() {
-        assert_eq!(format!("{}", IssueType::Security), "security");
-        assert_eq!(format!("{}", IssueType::Performance), "performance");
-        assert_eq!(format!("{}", IssueType::Bug), "bug");
-        assert_eq!(format!("{}", IssueType::BestPractice), "best_practice");
-        assert_eq!(format!("{}", IssueType::Style), "style");
-        assert_eq!(format!("{}", IssueType::Suggestion), "suggestion");
     }
 
     // ─── LLMConfig::default ───
@@ -582,29 +436,26 @@ impl Default for LLMConfig {
 }
 
 /// CLI exit codes.
-#[allow(dead_code)]
 pub const EXIT_OK: i32 = 0;
-#[allow(dead_code)]
 pub const EXIT_ERROR: i32 = 1;
-#[allow(dead_code)]
 pub const EXIT_BLOCKED: i32 = 2;
-#[allow(dead_code)]
+#[cfg(test)]
 pub const EXIT_AUTH_ERROR: i32 = 3;
 
 /// Maximum diff size in bytes (50KB by default).
 ///
 /// Kept for API completeness — future commands may enforce this limit.
-#[allow(dead_code)]
+#[cfg(test)]
 pub const MAX_DIFF_SIZE: usize = 50 * 1024;
 
 /// Maximum files per scan batch.
 ///
 /// Kept for API completeness — scanner uses matching values inline.
-#[allow(dead_code)]
+#[cfg(test)]
 pub const MAX_SCAN_BATCH_FILES: usize = 20;
 
 /// Maximum characters per scan batch.
 ///
 /// Kept for API completeness — scanner uses matching values inline.
-#[allow(dead_code)]
+#[cfg(test)]
 pub const MAX_SCAN_BATCH_CHARS: usize = 80_000;

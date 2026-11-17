@@ -6,7 +6,6 @@ use thiserror::Error;
 /// continues to use `anyhow::Result` and converts via `?` (automatic
 /// `From<CoraError> for anyhow::Error` provided by `thiserror` + anyhow interop).
 #[derive(Debug, Error)]
-#[allow(dead_code)]
 pub enum CoraError {
     /// HTTP request to LLM API failed (network, DNS, timeout, etc.)
     #[error("LLM API request failed: {0}")]
@@ -24,10 +23,6 @@ pub enum CoraError {
     #[error("streaming error: {0}")]
     LlmStream(String),
 
-    /// JSON repair still failed after fix attempt.
-    #[error("JSON repair failed: {0}")]
-    LlmJsonRepair(String),
-
     /// YAML config parse error.
     #[error("config parse error: {0}")]
     ConfigParse(String),
@@ -39,10 +34,6 @@ pub enum CoraError {
     /// No API key configured.
     #[error("no API key found")]
     NoApiKey,
-
-    /// Diff exceeds maximum allowed size.
-    #[error("diff too large ({actual} chars, max {max})")]
-    DiffTooLarge { actual: usize, max: usize },
 
     /// Invalid git ref (shell metacharacters or path traversal).
     #[error("invalid ref: {0}")]
@@ -68,20 +59,8 @@ pub enum CoraError {
     #[error("cache serialize error: {0}")]
     CacheSerialize(String),
 
-    /// File scanner error.
-    #[error("scanner error: {0}")]
-    ScannerError(String),
-
     /// Auth file read/write error.
     #[error("auth error: {0}")]
     AuthError(String),
-
-    /// Hook install/uninstall error.
-    #[error("hook error: {0}")]
-    HookError(String),
-
-    /// LLM request timed out.
-    #[error("LLM request timed out: {0}")]
-    Timeout(String),
 }
 // test comment for cora review

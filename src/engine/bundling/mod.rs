@@ -1,4 +1,3 @@
-#[allow(dead_code, unused)]
 /// File bundling engine — groups files into cohesive units for LLM review.
 ///
 /// Instead of arbitrary batching by character count alone, the bundling engine
@@ -26,8 +25,10 @@
 ///     // send content to LLM
 /// }
 /// ```
+// The grouping engine is not called by review yet (#792).
+#[allow(dead_code)]
 pub mod grouping;
+#[allow(dead_code)]
 pub mod types;
 
-#[allow(dead_code, unused)]
 pub use types::GroupingStrategy;

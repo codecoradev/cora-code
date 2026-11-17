@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 /// Grouping strategies for bundling files into LLM-friendly groups.
 use std::collections::HashMap;
 

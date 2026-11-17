@@ -302,7 +302,7 @@ pub fn detect_language(path: &str) -> &'static str {
 /// Extract all added lines from parsed file chunks.
 ///
 /// Returns `(file_path, line_number, content)` triples.
-#[allow(dead_code)] // used by bundling in v0.5
+#[allow(dead_code)] // for the bundling engine, not wired yet (#792)
 pub fn extract_added_lines(chunks: &[FileChunk]) -> Vec<(String, u32, String)> {
     let mut result = Vec::new();
 

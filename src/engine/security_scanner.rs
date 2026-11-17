@@ -9,10 +9,13 @@ use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::engine::Severity;
+#[cfg(test)]
 use crate::engine::diff_parser::FileChunk;
 use crate::engine::rules::builtin::post_match_filter_for_path;
 use crate::engine::rules::types::RuleFinding;
-use crate::engine::scan_input::{self, ScanFile};
+#[cfg(test)]
+use crate::engine::scan_input;
+use crate::engine::scan_input::ScanFile;
 
 // ─── Security patterns ───
 
@@ -169,7 +172,7 @@ static COMPILED_PATTERNS: LazyLock<Vec<(String, String, Regex, Severity)>> = Laz
 ///
 /// Only scans added lines (not removed/context) to reduce false positives.
 /// Returns findings sorted by severity (worst first).
-#[cfg_attr(not(test), allow(dead_code))] // callers use scan_security_in; kept for tests/API
+#[cfg(test)]
 pub fn scan_security(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFinding> {
     scan_security_in(&scan_input::from_chunks(chunks), max_findings)
 }

@@ -194,7 +194,7 @@ pub fn parse_profile_yaml(yaml: &str) -> Result<Profile, String> {
 }
 
 /// Load all built-in profiles.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn load_all_builtins() -> Vec<Profile> {
     BUILTIN_PROFILES
         .iter()
@@ -297,7 +297,7 @@ pub fn resolve_profile_with_root(
 
 /// Auto-detect a profile based on project language.
 /// Returns the best-matching built-in profile name.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn auto_detect_profile(language: &str) -> &'static str {
     match language {
         "rs" => "rust-strict",

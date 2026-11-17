@@ -27,8 +27,6 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 
-#[allow(unused_imports)]
-pub use graph::{CallEdge, CalleeResult, CallerResult, ImpactNode};
 pub use symbols::{SearchOutcome, SearchResult, SymbolKind, SymbolQuery};
 
 /// Open or create the **global** symbol index database.

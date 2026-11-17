@@ -129,23 +129,6 @@ fn find_git_hooks_dir() -> Result<std::path::PathBuf> {
     Ok(hooks_dir)
 }
 
-/// Check whether the cora pre-commit hook is installed.
-///
-/// Kept for API completeness — useful for future `cora hook status` and
-/// guard logic in pre-commit hook template.
-#[allow(dead_code)]
-pub fn is_hook_installed() -> Result<bool> {
-    let hooks_dir = find_git_hooks_dir()?;
-    let hook_path = hooks_dir.join("pre-commit");
-
-    if !hook_path.is_file() {
-        return Ok(false);
-    }
-
-    let content = std::fs::read_to_string(&hook_path).unwrap_or_default();
-    Ok(content.contains("cora"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::is_cora_managed;

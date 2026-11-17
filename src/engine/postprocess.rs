@@ -64,7 +64,7 @@ pub struct PostprocessReport {
 /// Run the shared post-processing pipeline over `issues`. See the module docs
 /// for the per-source filter table. Drops the truncation count; use
 /// [`postprocess_report`] when the caller should surface it.
-#[cfg_attr(not(test), allow(dead_code))] // callers use postprocess_report; kept for tests/API
+#[cfg(test)]
 pub fn postprocess(
     issues: Vec<ReviewIssue>,
     source: &Source<'_>,

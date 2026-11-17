@@ -1089,7 +1089,6 @@ fn handle_install(params: &serde_json::Value) -> ToolResult {
         agents,
         dry_run,
         force: false,
-        yes: true, // MCP is non-interactive; guarded by `confirm` above
         remove: false,
         validate: false,
     };

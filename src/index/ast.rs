@@ -3,8 +3,6 @@
 // ! Provides proper AST-based symbol and edge extraction using tree-sitter.
 // ! Only compiled when the `tree-sitter` feature is enabled.
 
-#![allow(dead_code, unused)]
-
 use crate::index::extract::CallSite;
 use crate::index::extract::ExtractedDef;
 use crate::index::symbols::SymbolKind;
@@ -23,6 +21,7 @@ pub struct AstNode {
     /// Full signature text.
     pub signature: String,
     /// Parent scope name (struct/class for methods).
+    #[allow(dead_code)] // computed at every site, never read (#792)
     pub parent: Option<String>,
 }
 
@@ -51,7 +50,6 @@ pub enum EdgeKind {
     Imports,
     Implements,
     Inherits,
-    ChildOf,
     Route,
 }
 
@@ -62,7 +60,6 @@ impl EdgeKind {
             Self::Imports => "IMPORTS",
             Self::Implements => "IMPLEMENTS",
             Self::Inherits => "INHERITS",
-            Self::ChildOf => "CHILD_OF",
             Self::Route => "ROUTE",
         }
     }
@@ -1720,23 +1717,6 @@ fn extract_c(
                     }
                 }
             }
-            "declaration" => {
-                // Top-level const/typedef etc
-                if let Some(decl) = child.child_by_field_name("declarator") {
-                    // Only capture if it looks like a function pointer or named constant
-                    let mut dc = child.walk();
-                    if dc.goto_first_child() {
-                        loop {
-                            if dc.node().kind() == "type_qualifier" {
-                                // const — skip for now (too noisy)
-                            }
-                            if !dc.goto_next_sibling() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1984,11 +1964,6 @@ fn extract_csharp(
                             loop {
                                 let base = node_text(&bc.node(), source);
                                 if !base.is_empty() {
-                                    let edge_kind = if kind == SymbolKind::Interface {
-                                        EdgeKind::Inherits
-                                    } else {
-                                        EdgeKind::Implements
-                                    };
                                     // Heuristic: base type starting with 'I' is likely an interface
                                     let ek = if base.starts_with('I')
                                         && base
@@ -2218,7 +2193,7 @@ fn extract_ruby(
         node: &tree_sitter::Node,
         source: &str,
         file_path: &str,
-        mut nodes: &mut Vec<AstNode>,
+        nodes: &mut Vec<AstNode>,
         edges: &mut Vec<AstEdge>,
     ) {
         match node.kind() {
@@ -2274,6 +2249,9 @@ fn extract_ruby(
                     extract_methods_from_ruby_node(node, source, file_path, &name, nodes);
                 }
             }
+            // Unreachable today: the "module" arm above shadows this one, so methods inside a
+            // Ruby module are not indexed (#791). That fix removes the arm above and this allow.
+            #[allow(unreachable_patterns)]
             "module" => {
                 let name = if let Some(n) = node.child_by_field_name("name") {
                     node_text(&n, source)

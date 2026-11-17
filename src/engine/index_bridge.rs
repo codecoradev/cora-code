@@ -189,8 +189,8 @@ impl IndexBridge {
     }
 
     /// The resolved project id (if available).
-    #[allow(dead_code)]
     #[inline]
+    #[cfg(test)]
     pub fn project_id(&self) -> Option<i64> {
         self.project_id
     }
@@ -264,7 +264,7 @@ impl IndexBridge {
     ///
     /// Returns up to `limit` [`crate::index::brain::BrainResult`] entries.
     /// Returns an empty vec if the bridge is unavailable.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn brain_search(&self, query: &str, limit: usize) -> Vec<crate::index::brain::BrainResult> {
         let conn = match self.conn.as_ref() {
             Some(c) => c,
@@ -278,34 +278,12 @@ impl IndexBridge {
         crate::index::brain::brain_search(conn, pid, query, limit).unwrap_or_default()
     }
 
-    /// Run an impact analysis (blast radius) for the given symbol.
-    ///
-    /// Returns [`crate::index::graph::ImpactNode`] entries up to `depth`.
-    /// Returns an empty vec if the bridge is unavailable.
-    #[allow(dead_code)]
-    pub fn impact_analysis(
-        &self,
-        symbol_name: &str,
-        depth: u32,
-    ) -> Vec<crate::index::graph::ImpactNode> {
-        let conn = match self.conn.as_ref() {
-            Some(c) => c,
-            None => return Vec::new(),
-        };
-        let pid = match self.project_id {
-            Some(id) => id,
-            None => return Vec::new(),
-        };
-
-        crate::index::graph::impact_analysis(conn, pid, symbol_name, depth).unwrap_or_default()
-    }
-
     /// Direct access to the underlying connection (if available).
     ///
     /// Used by callers that need raw SQL beyond the typed helpers above.
     /// Returns `None` if the bridge is unavailable.
-    #[allow(dead_code)]
     #[inline]
+    #[cfg(test)]
     pub fn connection(&self) -> Option<&Connection> {
         self.conn.as_ref()
     }

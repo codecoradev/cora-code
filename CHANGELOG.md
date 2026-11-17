@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Dead code removed (#790).** About 500 lines that nothing used are gone, among them the YAML agent-config path, an unused `IssueType` enum, unused graph helpers and five error variants that were never created, and the 60 `#[allow(dead_code)]` attributes that hid them. The compiler now reports unused code again; the few items that are written but not wired in yet carry a narrow, commented allow that points to #792. `cora install --yes` is still accepted but has no effect (`install` never asks questions), and its help says so.
 - **A README and docs that are easier to read.** The README opens with a diagram of how cora works and a three-command quick start, groups the features (review, code intelligence, agents and CI), tucks upgrade and Gatekeeper details into a collapsed section and shows the timings as a chart next to the table. `docs/usage.md` shows how a review runs and `docs/agent-integration.md` how an agent uses cora, each with a diagram. The four SVG diagrams (`docs/public/diagrams/`) carry their own light and dark colors, a title and a description, and are checked by `tests/docs_drift.rs` (accessible, self-contained, used somewhere, and the chart matches the README table).
 
 ### Fixed

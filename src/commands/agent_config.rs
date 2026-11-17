@@ -16,8 +16,6 @@ use std::path::Path;
 pub enum ConfigFormat {
     Json,
     Jsonc,
-    #[allow(dead_code)]
-    Yaml,
 }
 
 /// The Cora MCP server entry injected into agent configs.
@@ -205,7 +203,6 @@ pub fn json_add_cora(config: &mut serde_json::Value) -> Result<()> {
 }
 
 /// Remove the `mcpServers.cora` entry. Returns `true` if it was present.
-#[allow(dead_code)]
 pub fn json_remove_cora(config: &mut serde_json::Value) -> bool {
     if let Some(servers) = config.get_mut("mcpServers").and_then(|m| m.as_object_mut()) {
         servers.remove("cora").is_some()
@@ -216,21 +213,8 @@ pub fn json_remove_cora(config: &mut serde_json::Value) -> bool {
 
 // ─── Public API: YAML ────────────────────────────────────────────────
 
-/// Read a YAML config file into a `serde_yaml_ng::Value`.
-pub fn read_yaml_config(path: &Path) -> Result<serde_yaml_ng::Value> {
-    let raw = fs_read(path)?;
-    let no_bom = strip_bom(&raw);
-    serde_yaml_ng::from_str(no_bom)
-        .with_context(|| format!("Failed to parse YAML in {}", path.display()))
-}
-
-/// Write a YAML config.
-pub fn write_yaml_config(path: &Path, config: &serde_yaml_ng::Value) -> Result<()> {
-    let output = serde_yaml_ng::to_string(config)?;
-    fs_write(path, &output)
-}
-
 /// Check whether a YAML config already contains a `mcpServers.cora` entry.
+#[cfg(test)]
 pub fn yaml_has_cora(config: &serde_yaml_ng::Value) -> bool {
     config
         .get("mcpServers")
@@ -239,6 +223,7 @@ pub fn yaml_has_cora(config: &serde_yaml_ng::Value) -> bool {
 }
 
 /// Insert or overwrite the `mcpServers.cora` entry in a YAML config.
+#[cfg(test)]
 pub fn yaml_add_cora(config: &mut serde_yaml_ng::Value) -> Result<()> {
     let mapping = config
         .as_mapping_mut()
@@ -267,7 +252,7 @@ pub fn yaml_add_cora(config: &mut serde_yaml_ng::Value) -> Result<()> {
 }
 
 /// Remove the `mcpServers.cora` entry from YAML. Returns `true` if present.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn yaml_remove_cora(config: &mut serde_yaml_ng::Value) -> bool {
     if let Some(mapping) = config
         .get_mut("mcpServers")
@@ -281,33 +266,6 @@ pub fn yaml_remove_cora(config: &mut serde_yaml_ng::Value) -> bool {
 }
 
 // ─── Format-agnostic helpers ─────────────────────────────────────────
-
-/// Read a config file, dispatching on the detected format.
-#[allow(dead_code)]
-pub fn read_config(path: &Path, format: ConfigFormat) -> Result<serde_json::Value> {
-    match format {
-        ConfigFormat::Json | ConfigFormat::Jsonc => read_json_config(path),
-        ConfigFormat::Yaml => {
-            let yaml = read_yaml_config(path)?;
-            // Convert YAML → JSON for a unified return type
-            let json_str = serde_yaml_ng::to_string(&yaml)?;
-            Ok(serde_json::from_str(&json_str)?)
-        }
-    }
-}
-
-/// Write a config file in the specified format.
-#[allow(dead_code)]
-pub fn write_config(path: &Path, format: ConfigFormat, config: &serde_json::Value) -> Result<()> {
-    match format {
-        ConfigFormat::Json | ConfigFormat::Jsonc => write_json_config(path, config),
-        ConfigFormat::Yaml => {
-            let yaml_str = serde_json::to_string(config)?;
-            let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml_str)?;
-            write_yaml_config(path, &yaml)
-        }
-    }
-}
 
 // ─── File I/O wrappers with context ──────────────────────────────────
 

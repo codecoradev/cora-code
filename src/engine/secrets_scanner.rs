@@ -5,9 +5,12 @@ use std::sync::LazyLock;
 use tracing::debug;
 
 use crate::engine::Severity;
+#[cfg(test)]
 use crate::engine::diff_parser::FileChunk;
 use crate::engine::rules::types::RuleFinding;
-use crate::engine::scan_input::{self, ScanFile};
+#[cfg(test)]
+use crate::engine::scan_input;
+use crate::engine::scan_input::ScanFile;
 
 // ─── Built-in secret patterns ───
 
@@ -113,7 +116,7 @@ static TEST_FIXTURE_RE: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// Returns findings capped at `max_findings`. Secret values are masked in the
 /// message body.
-#[cfg_attr(not(test), allow(dead_code))] // callers use scan_secrets_in; kept for tests/API
+#[cfg(test)]
 pub fn scan_secrets(chunks: &[FileChunk], max_findings: usize) -> Vec<RuleFinding> {
     scan_secrets_in(&scan_input::from_chunks(chunks), max_findings)
 }

@@ -124,7 +124,6 @@ pub struct SymbolQuery {
 
 impl SymbolQuery {
     /// Create a text search query.
-    #[allow(dead_code)]
     pub fn text(text: &str) -> Self {
         Self {
             text: Some(text.to_string()),
@@ -136,7 +135,7 @@ impl SymbolQuery {
     }
 
     /// Create a kind-filtered query.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn kind(kind: SymbolKind) -> Self {
         Self {
             kind: Some(kind),

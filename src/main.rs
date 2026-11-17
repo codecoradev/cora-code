@@ -562,7 +562,7 @@ enum Command {
         /// Overwrite existing cora entry
         #[clap(long)]
         force: bool,
-        /// Install ALL detected agents (non-interactive)
+        /// Accepted for compatibility: `cora install` never asks questions
         #[clap(long, short)]
         yes: bool,
         /// Remove cora MCP entry from detected agents (uninstall)
@@ -1615,7 +1615,7 @@ async fn main() -> Result<()> {
             agents,
             dry_run,
             force,
-            yes,
+            yes: _,
             remove,
             validate,
             no_instructions,
@@ -1630,7 +1630,6 @@ async fn main() -> Result<()> {
                 agents,
                 dry_run,
                 force,
-                yes,
                 remove,
                 validate,
             };
