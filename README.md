@@ -129,31 +129,13 @@ provider: zai
 model: glm-5.1
 focus: [security, bugs]
 
-# Quality gate — enforce code quality in CI
-quality_gate:
+quality_gate:        # enforce code quality in CI
   enabled: true
   thresholds:
-    max_critical: 0     # 0 critical = gate FAIL
-    max_security: 0     # 0 security findings = gate FAIL
-  categories:
-    performance:
-      action: warn      # warn only, don't fail CI
-      max_findings: 5
+    max_critical: 0  # any critical finding fails the gate
 ```
 
-```bash
-cora config show           # effective merged config
-cora config show --global  # ~/.codecora/cora-code/config.yaml
-cora config show --project # .cora.yaml
-```
-
-| File | Purpose |
-|------|---------|
-| `~/.codecora/cora-code/auth.toml` | API key (secret, chmod 600) |
-| `~/.codecora/cora-code/config.yaml` | Global defaults (provider, model, etc.) |
-| `.cora.yaml` | Per-project overrides |
-
-See **[Configuration →](https://codecora.dev/cora/docs/configuration)** for full reference.
+`cora config show` prints the merged result. API keys live in `~/.codecora/cora-code/auth.toml` (chmod 600), never in `.cora.yaml`. Everything else (quality profiles, custom rules, ignore files, brain and agent settings, environment variables): **[Configuration →](https://codecora.dev/cora/docs/configuration)**
 
 ## CI/CD
 
@@ -182,54 +164,19 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 
 ## Commands
 
-### Code Review
-
 | Command | Description |
 |---------|-------------|
-| `cora review` | Review code changes (diff, branch, commit, file) |
+| `cora review` | Review code changes (staged, branch, commit, file) |
 | `cora scan` | Scan files for issues |
 | `cora commit` | Review + generate commit message + commit |
-| `cora debt` | Show tech debt report from review history |
-| `cora findings` | Track, dismiss, and reopen review/scan findings |
-
-### Code Intelligence
-
-| Command | Description |
-|---------|-------------|
-| `cora index` | Index project symbols, vectors, and call graph |
-| `cora explore` | Search symbols by keyword (FTS5) |
-| `cora brain` | Hybrid semantic search (FTS5 + vectors + graph → RRF) |
-| `cora trace` | Trace call chains through the codebase |
-| `cora arch` | Architecture overview (modules, edges, hotspots) |
-| `cora callers` | Find all callers of a symbol |
-| `cora impact` | Analyze blast radius of changing a symbol |
-| `cora affected` | Find tests impacted by changed files |
-| `cora dead-code` | Detect dead code — functions with zero callers |
-| `cora query` | Query the code graph (e.g. `"main -> *"`) |
-| `cora routes` | List detected HTTP routes (Axum, Actix, Express, FastAPI, Flask, Go) |
-
-### Config & Setup
-
-| Command | Description |
-|---------|-------------|
-| `cora init` | Create project config + hook |
-| `cora auth login` | Save API key |
-| `cora config show` | Show resolved config |
-| `cora config validate` | Validate configuration |
-| `cora providers` | List available LLM providers |
-| `cora profile list` | List quality profiles (strict, balanced, lax) |
-| `cora mcp` | Start MCP server (22 tools) for AI coding agents |
-| `cora serve` | Start MCP server + auto-reindex on startup |
-| `cora install` | Auto-detect and configure AI coding agents (hooks, MCP, skill) |
-| `cora hook context` | Agent prompt hook: code-search results for a prompt |
-| `cora hook session` | Agent session-start hook: reminder that code search exists |
-| `cora hook install` | Install pre-commit hook |
+| `cora index` | Index project symbols, vectors and call graph |
+| `cora brain` | Hybrid semantic search (FTS5 + vectors + graph) |
+| `cora callers` / `impact` / `trace` | Who calls a symbol, what a change breaks, call chains |
+| `cora install` | Configure AI coding agents (hooks, MCP, skill) |
+| `cora mcp` | Start the MCP server (22 tools) for AI coding agents |
 | `cora upgrade` | Self-upgrade from GitHub Releases (checksum-verified) |
-| `cora completion` | Generate shell completion scripts |
-| `cora watch` | Watch files and re-index on change |
-| `cora upload-sarif` | Upload a SARIF file to GitHub Code Scanning |
 
-See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for all flags and examples.
+Also: `explore`, `arch`, `affected`, `dead-code`, `query`, `routes`, `debt`, `findings`, `init`, `auth`, `config`, `providers`, `profile`, `serve`, `watch`, `hook`, `completion`, `upload-sarif`. See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for every command and flag.
 
 ## Performance
 
@@ -246,16 +193,7 @@ Measured on the cora-code repository (1,996 symbols, 179 files, release build, w
 
 ## Environment Variables
 
-| Variable | Description |
-|----------|-------------|
-| `CORA_API_KEY` | API key (CI use) |
-| `CORA_PROVIDER` | Override provider |
-| `CORA_MODEL` | Override model |
-| `CORA_BASE_URL` | Override API base URL |
-| `CORA_EMBED_OFFLINE` | `1` = never download the code model (release binaries already contain it) |
-| `CODECORA_HOME` | Override the data directory (default `~/.codecora/cora-code/`) |
-
-Provider-specific keys are auto-detected: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `ZAI_API_KEY`
+`CORA_API_KEY`, `CORA_PROVIDER`, `CORA_MODEL` and `CORA_BASE_URL` override the config (handy in CI). Provider keys such as `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY` and `ZAI_API_KEY` are detected automatically. `CORA_EMBED_OFFLINE=1` never downloads the code model (release binaries already contain it); `CODECORA_HOME` moves the data directory. Full list: [Configuration](https://codecora.dev/cora/docs/configuration).
 
 ## Documentation
 

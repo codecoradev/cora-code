@@ -34,10 +34,10 @@ features:
     details: Upload findings to GitHub Code Scanning. Native SARIF support for CI integration.
   - icon: 🛡️
     title: Deterministic Scanners
-    details: 12 built-in rules + 13 security patterns + 15 secret detection patterns — run without LLM, zero cost.
+    details: Built-in rules, security patterns and secret detection — run without an LLM, zero cost.
   - icon: 🧠
     title: Code Intelligence
-    details: Index symbols across 15 languages. Call graph, trace, impact analysis. FTS5 + vector KNN + graph hybrid search.
+    details: Index symbols across 18 languages. Call graph, trace, impact analysis. FTS5 + vector KNN + graph hybrid search.
   - icon: 🌳
     title: Tree-sitter
     details: "AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, Svelte."

@@ -129,16 +129,16 @@ src/
 ## Testing
 
 ```bash
-cargo test               # 934 tests (default) / 934 (tree-sitter)
-                         #   637 unit tests
-                         #    16 CLI integration tests
-                         #     6 config tests
-                         #    49 tree-sitter tests (opt-in)
-cargo test --no-verify   # Skip pre-commit hooks (avoids timeout in hooks)
+cargo build
+cargo test --features tree-sitter          # the suite CI runs (1500+ tests: unit, CLI, MCP stdio, docs drift)
+cargo fmt --all -- --check                 # CI gate
+cargo clippy --all-targets --features tree-sitter -- -D warnings   # CI gate
 ```
 
-Use `--no-verify` when running tests through pre-commit hooks to prevent nested
-hook execution and timeouts.
+`tests/docs_drift.rs` keeps the README and docs true to the code (license, config path, version pins, tool and language counts, links). When a test there fails, fix the document, not the test.
+
+The pre-commit hook runs the installed `cora` binary on the staged diff. Never skip it with
+`--no-verify`: fix the finding, or suppress a proven false positive with a reason.
 
 ## CI/CD
 
@@ -295,7 +295,7 @@ reality BEFORE version bump.
 
 | File | What to check |
 |------|---------------|
-| `README.md` | "Why Cora" bullets match all features. Commands table includes all subcommands. Config example shows latest features. All links point to `codecora.dev` |
+| `README.md` | "Why Cora" bullets match all features. Commands table lists the everyday commands and the line below it names the rest; `docs/cli-reference.md` documents all of them. Config example shows latest features. All links point to `codecora.dev` |
 | `CHANGELOG.md` | New version entry with ALL changes (Added, Changed, Fixed, Removed). Link references at bottom include new version |
 | `docs/changelog.md` | Generated from `CHANGELOG.md` by the docs build (`predocs:build`) and git-ignored; never edit or commit it |
 | `docs/roadmap.md` | Completed items marked ✓ Done (not ◎ Planned). Future items accurate |
