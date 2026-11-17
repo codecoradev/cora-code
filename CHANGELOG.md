@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cora index` re-extracts every file once after an extractor change (#803).** A file was skipped when its `mtime:size` matched, so an upgrade that improved an extractor (the Ruby nesting of #791, for example) never reached the files that had not changed, until someone ran `cora index --rebuild`. The fingerprint now carries an extractor version, so the first `cora index` after such an upgrade re-extracts all files once; later runs skip unchanged files as before.
+
 - **Ruby: methods in modules and classes nested in modules are indexed (#791).** Two gaps in the Tree-sitter extractor: a second `"module"` arm that also extracts the methods was unreachable, and only the direct children of a file were visited, so the usual `module Outer; class Inner; def run` layout indexed nothing inside `Outer`. The superclass edge of a Ruby class also carried the `<` of `< Base` in its target, so it never matched the symbol `Base`. On Sinatra (147 Ruby files) the index grows from 184 to 853 symbols, the methods from 79 to 622, and `cora explore halt` finds `Sinatra::Base#halt`. Projects with Ruby code need one `cora index` to benefit.
 
 - **`index-breaking-change` no longer reports a removal whose callers are deleted in the same change (#794).** The index predates the diff, so a helper removed together with its only caller was reported as "breaks 1 caller" and blocked the review; callers whose call site is one of the removed lines (or in a deleted file) are now ignored, and the finding stays for callers that remain.
