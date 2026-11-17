@@ -21,7 +21,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 Pin a specific version:
 
 ```bash
-$ CORA_VERSION=v0.21.0 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
+$ CORA_VERSION=v0.21.1 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
 ```
 
 ## Install via Cargo
@@ -47,7 +47,7 @@ Supported platforms:
 
 ```bash
 # Download and extract (Linux x86_64 example)
-$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-x86_64-unknown-linux-gnu-v0.21.0.tar.gz | tar xz
+$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-x86_64-unknown-linux-gnu-v0.21.1.tar.gz | tar xz
 $ mv cora ~/.local/bin/cora
 ```
 
@@ -57,10 +57,10 @@ Asset naming convention: `cora-{target-triple}-{version}.tar.gz` (Linux/macOS) o
 
 | Platform | Asset name |
 |----------|------------|
-| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-v0.21.0.tar.gz` |
-| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-v0.21.0.tar.gz` |
-| macOS ARM64 | `cora-aarch64-apple-darwin-v0.21.0.tar.gz` |
-| Windows x86_64 | `cora-x86_64-pc-windows-msvc-v0.21.0.zip` |
+| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-v0.21.1.tar.gz` |
+| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-v0.21.1.tar.gz` |
+| macOS ARM64 | `cora-aarch64-apple-darwin-v0.21.1.tar.gz` |
+| Windows x86_64 | `cora-x86_64-pc-windows-msvc-v0.21.1.zip` |
 
 ## Build from Source
 
