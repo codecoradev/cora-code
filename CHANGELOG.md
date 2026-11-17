@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`index-breaking-change` no longer reports a removal whose callers are deleted in the same change (#794).** The index predates the diff, so a helper removed together with its only caller was reported as "breaks 1 caller" and blocked the review; callers whose call site is one of the removed lines (or in a deleted file) are now ignored, and the finding stays for callers that remain.
+
 ### Changed
 
 - **A README and docs that are easier to read.** The README opens with a diagram of how cora works and a three-command quick start, groups the features (review, code intelligence, agents and CI), tucks upgrade and Gatekeeper details into a collapsed section and shows the timings as a chart next to the table. `docs/usage.md` shows how a review runs and `docs/agent-integration.md` how an agent uses cora, each with a diagram. The four SVG diagrams (`docs/public/diagrams/`) carry their own light and dark colors, a title and a description, and are checked by `tests/docs_drift.rs` (accessible, self-contained, used somewhere, and the chart matches the README table).
