@@ -396,6 +396,13 @@ fn relative_links_and_anchors_resolve() {
                 }
             };
             let resolved = resolved.unwrap();
+            // docs/changelog.md is generated from CHANGELOG.md by the docs build and
+            // not committed, so check the source it is copied from.
+            let resolved = if resolved == Path::new("docs/changelog.md") {
+                PathBuf::from("CHANGELOG.md")
+            } else {
+                resolved
+            };
             if !root().join(&resolved).exists() {
                 problems.push(format!(
                     "{file}: {target} -> {} is missing",
