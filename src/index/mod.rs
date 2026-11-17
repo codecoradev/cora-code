@@ -745,7 +745,10 @@ fn file_fingerprint(content: &str) -> String {
 /// so bumping it makes the next `cora index` re-extract every file once, including
 /// files that did not change (#803). Bump it whenever an extractor starts to
 /// record symbols or edges it did not record before, or stops recording wrong ones.
-const EXTRACTOR_VERSION: u32 = 1;
+///
+/// History: 2 records function values passed as arguments and the functions named in
+/// serde attributes as calls (#802).
+const EXTRACTOR_VERSION: u32 = 2;
 
 /// Statistics from an index build run.
 #[derive(Debug, Clone, Default)]
