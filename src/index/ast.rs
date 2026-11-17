@@ -6,6 +6,9 @@
 use crate::index::extract::CallSite;
 use crate::index::extract::ExtractedDef;
 use crate::index::symbols::SymbolKind;
+use regex::Regex;
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
 /// A node in the code graph — a definition extracted from source.
 #[derive(Debug, Clone)]
@@ -322,6 +325,7 @@ fn extract_rust(
             "struct_item" => {
                 let name = node_name(&child, source);
                 if !name.is_empty() {
+                    serde_attribute_calls(&child, source, file_path, &name, &mut edges);
                     nodes.push(AstNode {
                         name,
                         kind: SymbolKind::Struct,
@@ -335,6 +339,7 @@ fn extract_rust(
             "enum_item" => {
                 let name = node_name(&child, source);
                 if !name.is_empty() {
+                    serde_attribute_calls(&child, source, file_path, &name, &mut edges);
                     nodes.push(AstNode {
                         name,
                         kind: SymbolKind::Enum,
@@ -563,6 +568,7 @@ fn extract_calls_in_impl(
         file_path: &str,
         caller: &str,
         self_type: Option<&str>,
+        locals: &HashSet<String>,
         edges: &mut Vec<AstEdge>,
     ) {
         if node.kind() == "call_expression" {
@@ -582,6 +588,11 @@ fn extract_calls_in_impl(
                 }
             }
         }
+        // `.map(helper)`, `.map(Type::make)`: a function passed as a value is called
+        // by the function that passes it, although there is no `call_expression`.
+        if node.kind() == "arguments" {
+            function_references(node, source, file_path, caller, self_type, locals, edges);
+        }
         // The arguments of a macro are a raw `token_tree`, not parsed
         // expressions, so a call inside `json!(..)`, `vec![..]`, `format!(..)`,
         // `assert!(..)` has no `call_expression` node (#715).
@@ -591,14 +602,136 @@ fn extract_calls_in_impl(
         let mut cursor = node.walk();
         if cursor.goto_first_child() {
             loop {
-                walk_calls(&cursor.node(), source, file_path, caller, self_type, edges);
+                walk_calls(
+                    &cursor.node(),
+                    source,
+                    file_path,
+                    caller,
+                    self_type,
+                    locals,
+                    edges,
+                );
                 if !cursor.goto_next_sibling() {
                     break;
                 }
             }
         }
     }
-    walk_calls(node, source, file_path, caller, self_type, edges);
+    let locals = local_bindings(&node_text(node, source));
+    walk_calls(node, source, file_path, caller, self_type, &locals, edges);
+}
+
+/// Names a function body binds itself (parameters, `let`, `for`, closure
+/// parameters). A bare identifier with one of these names that is passed as an
+/// argument is a variable, not a function used as a value.
+fn local_bindings(body: &str) -> HashSet<String> {
+    // Every lowercase word of a pattern is a binding or a harmless keyword.
+    static WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[a-z_]\w*").unwrap());
+    // `let (a, b) =`, `let mut x =`, `if let Some(v) =`, `for (i, x) in`
+    static AFTER_KEYWORD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?s)\b(?:let|for)\b([^=;{]*?)(?:=|\bin\b)").unwrap());
+    // `Some(v) =>`, `Ok(value) if cond =>`
+    static ARM: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b[A-Z]\w*\s*\(([^()]*)\)\s*(?:if\b[^=\n]*)?=>").unwrap());
+    // `Command::Callers { symbol, limit } =>`, `if let Cfg { name, .. } =`
+    static STRUCT_PATTERN: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b[A-Z][\w:]*\s*\{([^{}]*)\}\s*(?:=>|=)").unwrap());
+    // `name: Type` (parameters, closure parameters with a type)
+    static TYPED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([a-z_]\w*)\s*:").unwrap());
+    // `|a, b|`
+    static CLOSURE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\|([^|]*)\|").unwrap());
+    let mut names = HashSet::new();
+    for re in [&*AFTER_KEYWORD, &*ARM, &*STRUCT_PATTERN, &*CLOSURE] {
+        for cap in re.captures_iter(body) {
+            names.extend(WORD.find_iter(&cap[1]).map(|m| m.as_str().to_string()));
+        }
+    }
+    names.extend(TYPED.captures_iter(body).map(|c| c[1].to_string()));
+    names
+}
+
+/// Function paths passed as arguments: a bare snake_case identifier that the
+/// function does not bind itself, or a `Type::f` / `module::f` path. Constants,
+/// enum variants and types start uppercase and are skipped.
+fn function_references(
+    args: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    caller: &str,
+    self_type: Option<&str>,
+    locals: &HashSet<String>,
+    edges: &mut Vec<AstEdge>,
+) {
+    let mut cursor = args.walk();
+    for arg in args.children(&mut cursor) {
+        if !matches!(arg.kind(), "identifier" | "scoped_identifier") {
+            continue;
+        }
+        let name = normalize_callee_name(&node_text(&arg, source)).to_string();
+        if !name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
+            continue;
+        }
+        if arg.kind() == "identifier" && locals.contains(&name) {
+            continue;
+        }
+        edges.push(AstEdge {
+            source: caller.to_string(),
+            kind: EdgeKind::Calls,
+            target: name,
+            file: file_path.to_string(),
+            line: (arg.start_position().row + 1) as u32,
+            qualifier: callee_qualifier(&arg, source, self_type),
+            caller_type: self_type.map(str::to_string),
+        });
+    }
+}
+
+/// Functions named in the `serde` attributes of a struct or enum and of its
+/// fields (`default = "f"`, `deserialize_with = "path::f"`, ...): serde calls
+/// them, so the item is their caller.
+fn serde_attribute_calls(
+    item: &tree_sitter::Node,
+    source: &str,
+    file_path: &str,
+    owner: &str,
+    edges: &mut Vec<AstEdge>,
+) {
+    static SERDE_FN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"\b(?:default|deserialize_with|serialize_with|skip_serializing_if|with)\s*=\s*"([A-Za-z_][\w:]*)""#,
+        )
+        .unwrap()
+    });
+    if item.kind() == "attribute_item" {
+        let text = node_text(item, source);
+        if text.contains("serde") {
+            for cap in SERDE_FN.captures_iter(&text) {
+                let path = &cap[1];
+                let name = path.rsplit("::").next().unwrap_or(path);
+                if name.is_empty() {
+                    continue;
+                }
+                let qualifier = path.rsplit_once("::").and_then(|(prefix, _)| {
+                    path_qualifier(prefix)
+                        .filter(|q| !matches!(q.as_str(), "crate" | "super" | "self"))
+                });
+                edges.push(AstEdge {
+                    source: owner.to_string(),
+                    kind: EdgeKind::Calls,
+                    target: name.to_string(),
+                    file: file_path.to_string(),
+                    line: (item.start_position().row + 1) as u32,
+                    qualifier,
+                    caller_type: None,
+                });
+            }
+        }
+        return;
+    }
+    let mut cursor = item.walk();
+    for child in item.children(&mut cursor) {
+        serde_attribute_calls(&child, source, file_path, owner, edges);
+    }
 }
 
 /// Items that a token tree can declare; an identifier after one of these
@@ -2702,6 +2835,106 @@ func (s *Server) Start() error {
         let names: Vec<&str> = nodes.iter().map(|n| n.name.as_str()).collect();
         assert!(names.contains(&"NewServer"));
         assert!(names.contains(&"Start"));
+    }
+
+    fn call_targets(edges: &[AstEdge], caller: &str) -> Vec<String> {
+        let mut t: Vec<String> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Calls && e.source == caller)
+            .map(|e| e.target.clone())
+            .collect();
+        t.sort();
+        t
+    }
+
+    #[test]
+    fn test_rust_function_passed_as_argument_is_a_call() {
+        // A function used as a value is called by the function that passes it:
+        // `cora callers`, `impact` and `dead-code` must see it (no parentheses, so
+        // no `call_expression`).
+        let code = r#"
+fn helper(x: u32) -> u32 { x }
+struct S;
+impl S { fn make(v: u32) -> S { S } }
+fn run(items: Vec<u32>) {
+    let _a: Vec<u32> = items.iter().copied().map(helper).collect();
+    let _b: Vec<S> = items.into_iter().map(S::make).collect();
+    let _c = other(0, MAX_LEN, None, Mode::Fast, "text", 7, &items);
+    let (conn, project_id) = setup();
+    use_both(conn, project_id);
+    if let Some(inner) = lookup() {
+        take(inner);
+    }
+    match find() {
+        Ok(value) => keep(value),
+        Err(_) => {}
+    }
+    for (index, entry) in items.iter().enumerate() {
+        visit(index, entry);
+    }
+    match command {
+        Command::Callers { symbol, limit } => callers(symbol, limit),
+        _ => {}
+    }
+}
+"#;
+        let (_nodes, edges) = extract(code, "rs", "run.rs");
+        let targets = call_targets(&edges, "run");
+        assert!(targets.contains(&"helper".to_string()), "{targets:?}");
+        assert!(targets.contains(&"make".to_string()), "{targets:?}");
+        let make = edges.iter().find(|e| e.target == "make").unwrap();
+        assert_eq!(make.qualifier.as_deref(), Some("S"));
+        for noise in [
+            "MAX_LEN",
+            "None",
+            "Fast",
+            "Mode",
+            "text",
+            "items",
+            "conn",
+            "project_id",
+            "inner",
+            "value",
+            "index",
+            "entry",
+            "symbol",
+            "limit",
+        ] {
+            assert!(
+                !targets.contains(&noise.to_string()),
+                "{noise} is not a function: {targets:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_serde_attribute_functions_are_calls_of_the_struct() {
+        let code = r#"
+#[derive(Deserialize)]
+struct Cfg {
+    #[serde(default = "default_true")]
+    on: bool,
+    #[serde(skip_serializing_if = "is_default", deserialize_with = "crate::de::lenient")]
+    n: u32,
+    /// default = "not_an_attribute"
+    note: String,
+}
+fn default_true() -> bool { true }
+"#;
+        let (_nodes, edges) = extract(code, "rs", "cfg.rs");
+        let targets = call_targets(&edges, "Cfg");
+        for want in ["default_true", "is_default", "lenient"] {
+            assert!(
+                targets.contains(&want.to_string()),
+                "missing {want}: {targets:?}"
+            );
+        }
+        assert!(
+            !targets.contains(&"not_an_attribute".to_string()),
+            "{targets:?}"
+        );
+        let lenient = edges.iter().find(|e| e.target == "lenient").unwrap();
+        assert_eq!(lenient.qualifier.as_deref(), Some("de"));
     }
 
     #[test]
