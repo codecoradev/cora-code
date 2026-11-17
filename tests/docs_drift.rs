@@ -26,17 +26,11 @@ fn read(rel: &str) -> String {
 /// `docs/changelog.md` is generated from CHANGELOG.md by the docs build, and the
 /// design notes and standards keep history, so they are not checked.
 fn doc_files() -> Vec<String> {
-    let mut files: Vec<String> = [
-        "README.md",
-        "CONTRIBUTING.md",
-        "AGENT.md",
-        ".agent.md",
-        "SECURITY.md",
-    ]
-    .iter()
-    .filter(|f| root().join(f).exists())
-    .map(|f| f.to_string())
-    .collect();
+    let mut files: Vec<String> = ["README.md", "CONTRIBUTING.md", "AGENT.md", "SECURITY.md"]
+        .iter()
+        .filter(|f| root().join(f).exists())
+        .map(|f| f.to_string())
+        .collect();
     let mut pages: Vec<String> = fs::read_dir(root().join("docs"))
         .expect("docs/")
         .filter_map(|e| e.ok())
@@ -538,4 +532,23 @@ fn the_performance_chart_shows_the_numbers_of_the_readme_table() {
         );
     }
     assert_eq!(seen, 3, "the performance chart should label three bars");
+}
+
+#[test]
+fn agent_md_names_every_workflow() {
+    // The CI/CD section of AGENT.md lists the workflows; a new or renamed one must show up there.
+    let agent = read("AGENT.md");
+    let dir = root().join(".github/workflows");
+    let mut seen = 0;
+    for entry in fs::read_dir(&dir).expect(".github/workflows") {
+        let name = entry.unwrap().file_name().to_string_lossy().to_string();
+        if name.ends_with(".yml") || name.ends_with(".yaml") {
+            seen += 1;
+            assert!(
+                agent.contains(&name),
+                "AGENT.md does not mention the workflow {name}"
+            );
+        }
+    }
+    assert!(seen >= 5, "found only {seen} workflows");
 }
