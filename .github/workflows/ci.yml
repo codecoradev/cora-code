@@ -4,7 +4,16 @@ on:
   pull_request:
     branches: [develop, main]
   push:
-    branches: [main]
+    # A push to develop mostly exists to fill the build cache: a cache written
+    # inside a pull request is visible to that pull request only, so without a
+    # run on the base branch no PR could ever restore one. Skip it when only
+    # documents changed (nothing to cache). Never put paths-ignore under
+    # pull_request: the required checks must run on every PR.
+    branches: [develop, main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'assets/**'
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +35,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Pull requests restore the cache of develop, they do not write their own.
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo check --all-targets --features tree-sitter
       # The release build compiles the model in; keep that code path building.
       - name: Check the bundled-model build
@@ -50,6 +62,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Pull requests restore the cache of develop, they do not write their own.
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo clippy --all-targets --features tree-sitter -- -D warnings
 
   audit:
@@ -68,6 +83,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Pull requests restore the cache of develop, they do not write their own.
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo test --features tree-sitter
 
   build:
@@ -77,6 +95,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Pull requests restore the cache of develop, they do not write their own.
+          save-if: ${{ github.event_name == 'push' }}
       - run: cargo build --release --features tree-sitter
 
   # ── Docs (VitePress) ──
@@ -122,6 +143,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Compiling cargo-outdated took about four minutes on every run and decided
+      # the wall time of the whole PR. Keep the binary in the cache (refreshed
+      # weekly) and install it only on a miss; pushes write the cache.
+      - name: Week of the year
+        id: week
+        run: echo "week=$(date +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore cargo-outdated
+        id: tool
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cargo/bin/cargo-outdated
+          key: cargo-outdated-${{ runner.os }}-${{ steps.week.outputs.week }}
       - name: Install cargo-outdated
-        run: cargo install cargo-outdated --locked 2>/dev/null || true
+        if: steps.tool.outputs.cache-hit != 'true'
+        run: cargo install cargo-outdated --locked
+      - name: Save cargo-outdated
+        if: github.event_name == 'push' && steps.tool.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cargo/bin/cargo-outdated
+          key: cargo-outdated-${{ runner.os }}-${{ steps.week.outputs.week }}
       - run: cargo outdated || true
