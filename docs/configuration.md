@@ -10,8 +10,8 @@ cora uses a layered config system with clear separation of concerns. Later sourc
 
 | File | Contents | Used by |
 |------|----------|--------|
-| `~/.cora/auth.toml` | API key only (secret, chmod 600) | Local dev |
-| `~/.cora/config.yaml` | Provider, model, base_url, focus, hook, output, etc. | Global default |
+| `~/.codecora/cora-code/auth.toml` | API key only (secret, chmod 600) | Local dev |
+| `~/.codecora/cora-code/config.yaml` | Provider, model, base_url, focus, hook, output, etc. | Global default |
 | `.cora.yaml` | Per-project config overrides | Project + CI |
 | `CORA_API_KEY` env var | API key for CI/one-shot | CI only |
 
@@ -22,7 +22,7 @@ Settings are resolved in this order (highest priority first):
 1. **CLI flags** — `--provider`, `--model`, `--base-url`, etc.
 2. **Environment variables** — `CORA_PROVIDER`, `CORA_MODEL`, `CORA_BASE_URL`
 3. **.cora.yaml** — Project root config file
-4. **~/.cora/config.yaml** — Global config
+4. **~/.codecora/cora-code/config.yaml** — Global config
 5. **Auto-detect** — Provider-specific env vars (`OPENAI_API_KEY`, `ZAI_API_KEY`, etc.)
 6. **Built-in defaults** — Sensible defaults for all settings
 
@@ -32,7 +32,7 @@ After all sources are merged, **config values are validated at load time**: out-
 
 1. `--api-key` flag (one-shot)
 2. `CORA_API_KEY` env var (CI)
-3. `~/.cora/auth.toml` (local dev)
+3. `~/.codecora/cora-code/auth.toml` (local dev)
 4. Provider-specific env vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
 
 ## .cora.yaml Example

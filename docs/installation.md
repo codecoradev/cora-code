@@ -21,7 +21,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 Pin a specific version:
 
 ```bash
-$ CORA_VERSION=v0.21.1 curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
+$ curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | CORA_VERSION=v0.21.1 sh
 ```
 
 ## Install via Cargo
@@ -46,8 +46,9 @@ Supported platforms:
 - Windows x86_64
 
 ```bash
-# Download and extract (Linux x86_64 example)
-$ curl -sL https://github.com/codecoradev/cora-code/releases/latest/download/cora-x86_64-unknown-linux-gnu-v0.21.1.tar.gz | tar xz
+# Download and extract (Linux x86_64 example); pick the version from the Releases page
+$ VERSION=v0.21.1
+$ curl -sL "https://github.com/codecoradev/cora-code/releases/download/$VERSION/cora-x86_64-unknown-linux-gnu-$VERSION.tar.gz" | tar xz
 $ mv cora ~/.local/bin/cora
 ```
 
@@ -57,10 +58,10 @@ Asset naming convention: `cora-{target-triple}-{version}.tar.gz` (Linux/macOS) o
 
 | Platform | Asset name |
 |----------|------------|
-| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-v0.21.1.tar.gz` |
-| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-v0.21.1.tar.gz` |
-| macOS ARM64 | `cora-aarch64-apple-darwin-v0.21.1.tar.gz` |
-| Windows x86_64 | `cora-x86_64-pc-windows-msvc-v0.21.1.zip` |
+| Linux x86_64 | `cora-x86_64-unknown-linux-gnu-<version>.tar.gz` |
+| Linux ARM64 | `cora-aarch64-unknown-linux-gnu-<version>.tar.gz` |
+| macOS ARM64 | `cora-aarch64-apple-darwin-<version>.tar.gz` |
+| Windows x86_64 | `cora-x86_64-pc-windows-msvc-<version>.zip` |
 
 ## Build from Source
 
@@ -79,12 +80,12 @@ cora provides shell completions for bash, zsh, and fish:
 
 ```bash
 # Bash
-$ cora completion bash > ~/.cora/completion.bash
-$ echo 'source ~/.cora/completion.bash' >> ~/.bashrc
+$ cora completion bash > ~/.codecora/cora-code/completion.bash
+$ echo 'source ~/.codecora/cora-code/completion.bash' >> ~/.bashrc
 
 # Zsh
-$ cora completion zsh > ~/.cora/completion.zsh
-$ echo 'source ~/.cora/completion.zsh' >> ~/.zshrc
+$ cora completion zsh > ~/.codecora/cora-code/completion.zsh
+$ echo 'source ~/.codecora/cora-code/completion.zsh' >> ~/.zshrc
 
 # Fish
 $ cora completion fish > ~/.config/fish/completions/cora.fish
@@ -179,7 +180,7 @@ $ xattr -dr com.apple.quarantine /path/to/cora
 $ xattr -dr com.apple.provenance /path/to/cora
 ```
 
-Or install via `cargo` / Homebrew to sidestep Gatekeeper entirely.
+A binary built on your own machine with `cargo install cora-code` is not quarantined.
 
 ## Updating
 

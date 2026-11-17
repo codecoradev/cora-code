@@ -55,5 +55,5 @@ features:
     details: Configurable pass/fail thresholds for CI enforcement. Max critical, max security findings, per-category actions.
   - icon: 🔧
     title: Configurable
-    details: Per-project .cora.yaml, global ~/.cora/config.yaml, or env vars. Custom regex rules in config.
+    details: Per-project .cora.yaml, global ~/.codecora/cora-code/config.yaml, or env vars. Custom regex rules in config.
 ---

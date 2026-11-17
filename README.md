@@ -8,7 +8,7 @@
 [![CI](https://github.com/codecoradev/cora-code/actions/workflows/ci.yml/badge.svg)](https://github.com/codecoradev/cora-code/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/cora-code.svg)](https://crates.io/crates/cora-code)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.89+-orange.svg)](https://www.rust-lang.org/)
 
 </div>
 
@@ -22,20 +22,20 @@
 - ⚡ **Native Rust** — fast binary, no runtime dependencies, cross-platform
 - 🪝 **Pre-commit hooks** — catch issues before they reach CI
 - 📋 **SARIF output** — upload to GitHub Code Scanning
-- 🛡️ **Deterministic scanners** — 12 built-in rules + 13 security patterns + 15 secret detection patterns that run without LLM
+- 🛡️ **Deterministic scanners** — built-in rules, security patterns and secret detection that run without an LLM
 - 🧠 **Language-specific analysis** — tailored review guidance for Dart/Flutter, Svelte, TypeScript, Go, Rust, Python
 - 🚧 **Quality gate** — configurable pass/fail thresholds for CI enforcement
 - 📐 **Quality profiles** — strict, balanced, or lax presets for different project needs
 - 📏 **Custom rule engine** — write your own regex rules in `.cora.yaml`
 - ✂️ **Auto-chunking** — splits large PRs into reviewable chunks automatically
-- 🔍 **Code Intelligence** — index symbols across 15 languages, call graph, trace, impact analysis
+- 🔍 **Code Intelligence** — index symbols across 18 languages, call graph, trace, impact analysis
 - 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33.5 MB model is inside the release binaries (a `cargo install` build downloads it once on first use), no API key, no GPU
-- 🗄️ **Multi-project database** — one global index, search across all your repos at once
-- 🌳 **Tree-sitter** (opt-in) — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
+- 🗄️ **Multi-project database** — one global symbol index, search across all your repos at once (vectors are one file per project)
+- 🌳 **Tree-sitter** — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
 - 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
 - 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
 - 💾 **Diff-hash caching** — skip repeat reviews automatically
-- 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.cora/config.yaml`, or env vars
+- 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.codecora/cora-code/config.yaml`, or env vars
 
 ## Quick Start
 
@@ -46,18 +46,20 @@ Pick **one** install method — mixing channels can leave stale binaries on your
 | Method | When to use |
 |---|---|
 | **`curl … install.sh`** (recommended) | Quick standalone install; fetches the latest GitHub release binary |
-| **`cargo install --git …`** | You already have a Rust toolchain; builds from source |
+| **`cargo install cora-code`** | You already have a Rust toolchain; builds from source (no bundled model) |
 | **Pre-built binaries** | Manual download from [Releases](https://github.com/codecoradev/cora-code/releases) |
 
 ```bash
 # Install with the quick installer
-curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install-bundle.sh | sh
+curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
 
 # Or build from source with cargo
-cargo install --git https://github.com/codecoradev/cora-code
+cargo install cora-code
 ```
 
-> Pin a version: `CORA_VERSION=v0.21.1 curl -fsSL ... | sh`
+> Pin a version: `curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | CORA_VERSION=v0.21.1 sh`. The installer verifies the SHA-256 checksum (and the Sigstore signature when `cosign` is installed).
+>
+> **AI agents and CI:** install the release binary, do not build it from source: only the release binary contains the model and works offline.
 
 **The code model.** Release binaries (the installer, `cora upgrade`, the archives on the Releases page) already contain the 33.5 MB `potion-code-16M-v2` model, so semantic search works right after the download, offline included; the first use unpacks it into the data directory. A `cargo install` build does not carry it (the crates.io size limit is 10 MB) and downloads it once on first use.
 
@@ -87,7 +89,7 @@ xattr -dr com.apple.quarantine /path/to/cora
 xattr -dr com.apple.provenance /path/to/cora
 ```
 
-Or install via `cargo` / Homebrew to sidestep Gatekeeper entirely.
+A binary built on your own machine with `cargo install cora-code` is not quarantined.
 
 </details>
 
@@ -119,7 +121,7 @@ cora init  # creates .cora.yaml + installs pre-commit hook
 
 ## Configuration
 
-**Priority:** CLI flags → env vars → `.cora.yaml` (project) → `~/.cora/config.yaml` (global) → defaults
+**Priority:** CLI flags → env vars → `.cora.yaml` (project) → `~/.codecora/cora-code/config.yaml` (global) → defaults
 
 ```yaml
 # .cora.yaml
@@ -141,14 +143,14 @@ quality_gate:
 
 ```bash
 cora config show           # effective merged config
-cora config show --global  # ~/.cora/config.yaml
+cora config show --global  # ~/.codecora/cora-code/config.yaml
 cora config show --project # .cora.yaml
 ```
 
 | File | Purpose |
 |------|---------|
-| `~/.cora/auth.toml` | API key (secret, chmod 600) |
-| `~/.cora/config.yaml` | Global defaults (provider, model, etc.) |
+| `~/.codecora/cora-code/auth.toml` | API key (secret, chmod 600) |
+| `~/.codecora/cora-code/config.yaml` | Global defaults (provider, model, etc.) |
 | `.cora.yaml` | Per-project overrides |
 
 See **[Configuration →](https://codecora.dev/cora/docs/configuration)** for full reference.
@@ -220,8 +222,12 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 | `cora serve` | Start MCP server + auto-reindex on startup |
 | `cora install` | Auto-detect and configure AI coding agents (hooks, MCP, skill) |
 | `cora hook context` | Agent prompt hook: code-search results for a prompt |
+| `cora hook session` | Agent session-start hook: reminder that code search exists |
 | `cora hook install` | Install pre-commit hook |
 | `cora upgrade` | Self-upgrade from GitHub Releases (checksum-verified) |
+| `cora completion` | Generate shell completion scripts |
+| `cora watch` | Watch files and re-index on change |
+| `cora upload-sarif` | Upload a SARIF file to GitHub Code Scanning |
 
 See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for all flags and examples.
 
@@ -246,6 +252,8 @@ Measured on the cora-code repository (1,996 symbols, 179 files, release build, w
 | `CORA_PROVIDER` | Override provider |
 | `CORA_MODEL` | Override model |
 | `CORA_BASE_URL` | Override API base URL |
+| `CORA_EMBED_OFFLINE` | `1` = never download the code model (release binaries already contain it) |
+| `CODECORA_HOME` | Override the data directory (default `~/.codecora/cora-code/`) |
 
 Provider-specific keys are auto-detected: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GROQ_API_KEY`, `ZAI_API_KEY`
 
@@ -254,6 +262,10 @@ Provider-specific keys are auto-detected: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
 | Page | Description |
 |------|-------------|
 | [Getting Started](https://codecora.dev/cora/docs/getting-started) | Install, auth, first review |
+| [Installation](https://codecora.dev/cora/docs/installation) | Installer, archives, upgrade, verification |
+| [Usage](https://codecora.dev/cora/docs/usage) | Reviewing, scanning, review with your agent |
+| [Code Intelligence](https://codecora.dev/cora/docs/code-intelligence) | Index, brain search, trace, impact |
+| [AI Agent Integration](https://codecora.dev/cora/docs/agent-integration) | Hooks, MCP and skills for Claude Code, Hermes, pi, omp, opencode |
 | [Configuration](https://codecora.dev/cora/docs/configuration) | Config files, env vars, priority |
 | [CLI Reference](https://codecora.dev/cora/docs/cli-reference) | All commands and flags |
 | [Providers](https://codecora.dev/cora/docs/providers) | Supported LLM providers |
@@ -277,4 +289,4 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** for guidelines. PRs welcome!
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE)

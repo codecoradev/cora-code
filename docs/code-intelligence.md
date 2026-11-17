@@ -34,7 +34,7 @@ Scans your project, extracts symbol definitions (functions, structs, enums, trai
 | Component | Technology | Storage |
 |-----------|-----------|---------|
 | Symbol table (regex) | Regex extractors (18 languages) | SQLite FTS5 |
-| Symbol table (AST) | Tree-sitter grammars (12+ languages, enabled by default) | SQLite FTS5 |
+| Symbol table (AST) | Tree-sitter grammars (13 languages: 12 grammars plus Svelte through TypeScript, enabled by default) | SQLite FTS5 |
 | Vector embeddings | Code embedding model `potion-code-16M-v2` (256d) | One quantized vecq file per project |
 | Call graph | Regex scope tracking + tree-sitter AST edges | SQLite `edges` table |
 
