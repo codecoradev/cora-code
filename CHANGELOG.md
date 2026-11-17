@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The skills tell agents to install cora from the release binary and to review before a pull request.** Both skills (`cora-code`, `cora-review`) get a `references/install.md`: install with `install.sh` or the release archive and verify the checksum, never build from source to use cora (a source build lacks the bundled model and turns the meaning-based search off offline), then run `cora install` and `cora index`. Reviewing the branch with cora before opening a pull request is now worded as required, not recommended. `cora install` refreshes the cora-written copies.
+
 ## [0.21.0] - 2026-11-16
 
 ### Removed

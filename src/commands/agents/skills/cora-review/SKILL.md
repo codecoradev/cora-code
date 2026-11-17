@@ -7,7 +7,7 @@ description: Reviews a git diff or scans a project with cora's checks, with the 
 
 # Cora review (agent as reviewer)
 
-Cora runs its deterministic checks (rules, secrets, security, index scans) and gives you the review prompts, with code intelligence from its index (who calls the changed code, the tests that exercise it, related code found by meaning). You judge with your own model, then cora validates and merges your findings. Requires the `cora` MCP server (`cora install` sets it up for Claude Code, Hermes, pi, omp, opencode and most other agents). Some agents show the tool names with underscores (`cora_review_prepare`).
+Cora runs its deterministic checks (rules, secrets, security, index scans) and gives you the review prompts, with code intelligence from its index (who calls the changed code, the tests that exercise it, related code found by meaning). You judge with your own model, then cora validates and merges your findings. Requires the `cora` MCP server and a cora installed from the GitHub release binary, not built from source (`references/install.md`; `cora install` sets up the server for Claude Code, Hermes, pi, omp, opencode and most other agents). Some agents show the tool names with underscores (`cora_review_prepare`).
 
 ## Safety first
 
@@ -19,7 +19,7 @@ Dependencies, build output and generated code poison a review: noise, cost and u
 
 ## Before you open a pull request
 
-Review the whole branch, not only each commit: take `git diff <base>...HEAD` (the base is the branch the PR targets), run the review below, fix what is real, then open the PR. If the project has no `cora review` in its CI, suggest adding it: `references/ci.md`.
+This step is required, not optional. Review the whole branch, not only each commit: take `git diff <base>...HEAD` (the base is the branch the PR targets), run the review below, fix what is real, then open the PR. If the project has no `cora review` in its CI, suggest adding it: `references/ci.md`.
 
 ## Before every commit
 
@@ -49,3 +49,4 @@ Scanning judges the whole project in batches (`cora.scan_prepare`, then `cora.sc
 - `references/ignore.md`: what to ignore first, and how.
 - `references/scan.md`: scanning a whole project.
 - `references/ci.md`: running `cora review` in CI.
+- `references/install.md`: install cora from the release binary, not a build.
