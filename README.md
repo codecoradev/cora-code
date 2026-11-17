@@ -14,54 +14,42 @@
 
 ---
 
-**Cora** is a fast, native CLI for AI-powered code review and code intelligence — in your terminal, CI/CD, git hooks, or directly inside AI coding agents. Bring your own key, pick any model, index your codebase, and search semantically. All local, zero cloud.
+**Cora** is a fast, native CLI for AI-powered code review and code intelligence — in your terminal, CI/CD, git hooks, or directly inside AI coding agents. Bring your own key, pick any model, index your codebase, and search it by meaning. All local, zero cloud.
 
-## Why Cora?
+<p align="center">
+  <img src="docs/public/diagrams/how-cora-works.svg" alt="Terminal, git hooks, CI and AI coding agents call cora, which runs a local code index, deterministic checks and a judge (your model or your agent) and returns review findings, a CI verdict and code search." width="860">
+</p>
 
-- 🤖 **Multi-LLM** — OpenAI, Anthropic, Groq, Ollama, Z.AI, or any OpenAI-compatible API
-- ⚡ **Native Rust** — fast binary, no runtime dependencies, cross-platform
-- 🪝 **Pre-commit hooks** — catch issues before they reach CI
-- 📋 **SARIF output** — upload to GitHub Code Scanning
-- 🛡️ **Deterministic scanners** — built-in rules, security patterns and secret detection that run without an LLM
-- 🧠 **Language-specific analysis** — tailored review guidance for Dart/Flutter, Svelte, TypeScript, Go, Rust, Python
-- 🚧 **Quality gate** — configurable pass/fail thresholds for CI enforcement
-- 📐 **Quality profiles** — strict, balanced, or lax presets for different project needs
-- 📏 **Custom rule engine** — write your own regex rules in `.cora.yaml`
-- ✂️ **Auto-chunking** — splits large PRs into reviewable chunks automatically
-- 🔍 **Code Intelligence** — index symbols across 18 languages, call graph, trace, impact analysis
-- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33.5 MB model is inside the release binaries (a `cargo install` build downloads it once on first use), no API key, no GPU
-- 🗄️ **Multi-project database** — one global symbol index, search across all your repos at once (vectors are one file per project)
-- 🌳 **Tree-sitter** — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
-- 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
-- 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
-- 💾 **Diff-hash caching** — skip repeat reviews automatically
-- 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.codecora/cora-code/config.yaml`, or env vars
+[Quick start](#quick-start) · [What you get](#what-you-get) · [CI/CD](#cicd) · [Commands](#commands) · [Performance](#performance) · [Documentation](#documentation)
 
 ## Quick Start
 
-### Install
+From nothing to a first review in three commands:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh   # 1. install
+cora auth login                                                                           # 2. add your key (or skip it, see below)
+cora review                                                                               # 3. review your staged changes
+```
+
+### 1. Install
 
 Pick **one** install method — mixing channels can leave stale binaries on your `PATH`.
 
 | Method | When to use |
 |---|---|
-| **`curl … install.sh`** (recommended) | Quick standalone install; fetches the latest GitHub release binary |
+| **`curl … install.sh`** (recommended) | Standalone install; fetches the latest GitHub release binary and verifies it |
 | **`cargo install cora-code`** | You already have a Rust toolchain; builds from source (no bundled model) |
 | **Pre-built binaries** | Manual download from [Releases](https://github.com/codecoradev/cora-code/releases) |
-
-```bash
-# Install with the quick installer
-curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | sh
-
-# Or build from source with cargo
-cargo install cora-code
-```
 
 > Pin a version: `curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install.sh | CORA_VERSION=v0.21.1 sh`. The installer verifies the SHA-256 checksum (and the Sigstore signature when `cosign` is installed).
 >
 > **AI agents and CI:** install the release binary, do not build it from source: only the release binary contains the model and works offline.
 
 **The code model.** Release binaries (the installer, `cora upgrade`, the archives on the Releases page) already contain the 33.5 MB `potion-code-16M-v2` model, so semantic search works right after the download, offline included; the first use unpacks it into the data directory. A `cargo install` build does not carry it (the crates.io size limit is 10 MB) and downloads it once on first use.
+
+<details>
+<summary><b>Upgrade, check which <code>cora</code> you run, macOS Gatekeeper</b></summary>
 
 **Upgrading:** run `cora upgrade` (downloads the latest release, verifies its SHA-256 checksum and, when `cosign` is installed, its Sigstore signature, replaces the binary) or `cora upgrade --check` to just see if one is available. If you installed via `cargo install --path .`, re-run that instead.
 
@@ -74,15 +62,7 @@ cora --version           # should match the latest release
 
 If `which -a cora` shows more than one path (e.g. `~/.local/bin/cora` and `~/.cargo/bin/cora`), remove the one you don't want or reorder your `PATH`. See [Issue #314](https://github.com/codecoradev/cora-code/issues/314) for background.
 
-<details>
-<summary><b>macOS note — binary killed on launch (<code>Killed: 9</code>)?</b></summary>
-
-The prebuilt `aarch64-apple-darwin` binary is not Apple-notarized. On macOS, downloaded
-binaries may be tagged with `com.apple.quarantine` / `com.apple.provenance` and killed by
-Gatekeeper with **no error message**.
-
-The `install.sh` installer strips these attributes automatically. If you downloaded the
-binary manually (e.g. `gh release download`), strip them yourself:
+**macOS: binary killed on launch (`Killed: 9`)?** The prebuilt `aarch64-apple-darwin` binary is not Apple-notarized, and Gatekeeper may kill a downloaded binary with no error message. The `install.sh` installer strips the quarantine attributes. If you downloaded the binary manually, strip them yourself:
 
 ```bash
 xattr -dr com.apple.quarantine /path/to/cora
@@ -93,7 +73,7 @@ A binary built on your own machine with `cargo install cora-code` is not quarant
 
 </details>
 
-### Authenticate
+### 2. Authenticate
 
 ```bash
 cora auth login
@@ -103,7 +83,7 @@ Pick a provider, enter your API key. Done. Provider env vars (`ZAI_API_KEY`, `OP
 
 > **No key? Still useful.** `cora review` and `cora scan` run the deterministic checks (rules, secrets, security) with no LLM configured, and your AI coding agent can do the AI review itself: see [Review with your agent](docs/usage.md#review-with-your-agent-no-llm-setup).
 
-### Review
+### 3. Review
 
 ```bash
 cora review              # staged changes
@@ -113,11 +93,47 @@ cora commit              # review + generate commit msg + commit
 cora commit --yolo       # auto-commit, no prompts
 ```
 
-### Project Config
+### 4. Use it from your AI agent
 
 ```bash
-cora init  # creates .cora.yaml + installs pre-commit hook
+cora index     # index the project (seconds)
+cora install   # hooks + MCP + skill for Claude Code, Hermes, pi, omp and opencode
 ```
+
+Your agent now gets matching code in front of the model on every prompt. How it works and what is written where: [AI Agent Integration](https://codecora.dev/cora/docs/agent-integration).
+
+### 5. Project config
+
+```bash
+cora init  # creates .cora.yaml + installs the pre-commit hook
+```
+
+## What you get
+
+**Review**
+
+- 🤖 **Any model** — OpenAI, Anthropic, Groq, Ollama, Z.AI or any OpenAI-compatible API (bring your own key), or no key at all: your coding agent does the judging
+- 🛡️ **Deterministic scanners** — built-in rules, security patterns and secret detection that run without an LLM
+- 🚧 **Quality gate and profiles** — pass/fail thresholds for CI, strict/balanced/lax presets, your own regex rules in `.cora.yaml`
+- ✂️ **Large pull requests** — split into reviewable chunks automatically; a repeat review of the same diff is cached
+- 🧠 **Language-aware** — tailored guidance for Dart/Flutter, Svelte, TypeScript, Go, Rust, Python
+- 📋 **SARIF output** — upload to GitHub Code Scanning
+
+**Code intelligence**
+
+- 🔍 **Index** symbols across 18 languages with a call graph; trace, impact analysis, dead code, affected tests
+- 🧠 **Brain Mode** — hybrid semantic search (FTS5 + a local code embedding model + graph) with RRF fusion; the 33.5 MB model is inside the release binaries (a `cargo install` build downloads it once on first use), no API key, no GPU
+- 🌳 **Tree-sitter** — AST-based symbol extraction for 13 languages: Rust, Go, Python, TypeScript/TSX, Java, C, C++, C#, Ruby, PHP, Scala, JavaScript, **Svelte** (via TypeScript delegation, zero extra dependency)
+- 🗄️ **Multi-project database** — one global symbol index, search across all your repos at once (vectors are one file per project)
+
+**Agents and CI**
+
+- 🤖 **Agent hooks** — `cora install` makes Claude Code, Hermes, pi, omp and opencode put matching code in front of the model on every prompt (hook + MCP + skill), with `--dry-run` and `--remove`
+- 🔌 **MCP server** — 22 tools for AI coding agents (review, search, brain, debt, trace, dead code, graph query, agent-as-reviewer, ...)
+- 🪝 **Pre-commit hooks** — catch issues before they reach CI
+- 🔧 **Configurable** — per-project `.cora.yaml`, global `~/.codecora/cora-code/config.yaml`, or env vars
+
+**Built to run anywhere** — a single native Rust binary with no runtime dependencies for Linux, macOS and Windows.
 
 ## Configuration
 
@@ -179,6 +195,10 @@ Works on **all CI platforms** — [Gitea, GitLab, Bitbucket →](https://codecor
 Also: `explore`, `arch`, `affected`, `dead-code`, `query`, `routes`, `debt`, `findings`, `init`, `auth`, `config`, `providers`, `profile`, `serve`, `watch`, `hook`, `completion`, `upload-sarif`. See **[CLI Reference →](https://codecora.dev/cora/docs/cli-reference)** for every command and flag.
 
 ## Performance
+
+<p align="center">
+  <img src="docs/public/diagrams/performance.svg" alt="Bar chart: cold index about 0.6 seconds, incremental index about 0.13 seconds, one cora brain run about 0.2 seconds." width="720">
+</p>
 
 Measured on the cora-code repository (1,996 symbols, 179 files, release build, with the real `potion-code-16M-v2` model).
 

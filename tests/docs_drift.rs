@@ -382,7 +382,13 @@ fn relative_links_and_anchors_resolve() {
                 Some(PathBuf::from(&file))
             } else {
                 let base = if let Some(abs) = path.strip_prefix('/') {
-                    PathBuf::from("docs").join(abs)
+                    // A site-absolute path is a page or a file of docs/public.
+                    let public = PathBuf::from("docs/public").join(abs);
+                    if root().join(&public).exists() {
+                        public
+                    } else {
+                        PathBuf::from("docs").join(abs)
+                    }
                 } else {
                     dir.join(path)
                 };
@@ -447,4 +453,89 @@ fn the_readme_lists_every_page_of_the_docs_site() {
         );
     }
     assert!(pages >= 8, "found only {pages} pages in the docs nav");
+}
+
+fn diagram_files() -> Vec<PathBuf> {
+    let dir = root().join("docs/public/diagrams");
+    let mut files: Vec<PathBuf> = fs::read_dir(&dir)
+        .expect("docs/public/diagrams")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "svg"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn diagrams_are_accessible_and_self_contained() {
+    let files = diagram_files();
+    assert!(
+        files.len() >= 4,
+        "expected the four diagrams, found {}",
+        files.len()
+    );
+    for file in files {
+        let name = file.file_name().unwrap().to_string_lossy().to_string();
+        let svg = fs::read_to_string(&file).unwrap();
+        assert!(
+            svg.contains("<title"),
+            "{name}: no <title> for screen readers"
+        );
+        assert!(svg.contains("<desc"), "{name}: no <desc>");
+        assert!(
+            svg.contains("prefers-color-scheme:dark") || svg.contains("prefers-color-scheme: dark"),
+            "{name}: no dark mode styles"
+        );
+        for banned in ["<script", "<image", "<foreignObject", "href=\"http"] {
+            assert!(!svg.contains(banned), "{name}: contains {banned}");
+        }
+    }
+}
+
+#[test]
+fn every_image_has_alt_text_and_every_diagram_is_used() {
+    let md_image = Regex::new(r"!\[([^\]]*)\]\(([^)\s]+)\)").unwrap();
+    let html_image = Regex::new(r#"<img\b[^>]*>"#).unwrap();
+    let html_alt = Regex::new(r#"alt="[^"]+""#).unwrap();
+    let mut used = String::new();
+    for file in doc_files() {
+        let text = read(&file);
+        for cap in md_image.captures_iter(&text) {
+            assert!(
+                !cap[1].trim().is_empty(),
+                "{file}: image {} has no alt text",
+                &cap[2]
+            );
+            used.push_str(&cap[2]);
+            used.push('\n');
+        }
+        for tag in html_image.find_iter(&text) {
+            let tag = tag.as_str();
+            assert!(html_alt.is_match(tag), "{file}: {tag} has no alt text");
+            used.push_str(tag);
+            used.push('\n');
+        }
+    }
+    for file in diagram_files() {
+        let name = file.file_name().unwrap().to_string_lossy().to_string();
+        assert!(used.contains(&name), "{name} is not shown in any document");
+    }
+}
+
+#[test]
+fn the_performance_chart_shows_the_numbers_of_the_readme_table() {
+    let svg = read("docs/public/diagrams/performance.svg");
+    let readme = read("README.md");
+    let values = Regex::new(r#"class="val"[^>]*>([\d.]+) s<"#).unwrap();
+    let mut seen = 0;
+    for cap in values.captures_iter(&svg) {
+        seen += 1;
+        assert!(
+            readme.contains(&format!("**~{} s**", &cap[1])),
+            "the performance chart shows {} s, the README table does not",
+            &cap[1]
+        );
+    }
+    assert_eq!(seen, 3, "the performance chart should label three bars");
 }

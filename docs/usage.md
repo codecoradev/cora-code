@@ -4,6 +4,12 @@ title: Usage
 
 # Usage
 
+## How a review runs
+
+![A diff is filtered by the built-in ignores, checked by deterministic rules and given code context from the index, judged by your model or your coding agent, validated and merged, and turned into a verdict with quality gate, SARIF and PR comments.](/diagrams/review-pipeline.svg)
+
+Steps 1 to 3 run locally and need no LLM; `cora review --no-llm` runs the deterministic checks only.
+
 ## Review Modes
 
 cora supports multiple review modes, each suited to a different workflow:

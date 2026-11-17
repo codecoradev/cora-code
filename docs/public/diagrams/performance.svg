@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 250" role="img" aria-labelledby="t d">
+<title id="t">cora timings</title>
+<desc id="d">Horizontal bars: cold index about 0.6 seconds, incremental index about 0.13 seconds, one cora brain run about 0.2 seconds. Lower is better.</desc>
+<style>
+.bg{fill:#fcfcfb}
+.box{fill:#f1f0ec;stroke:#d6d4ce;stroke-width:1.5}
+.core{fill:#e9f1fc;stroke:#2a78d6;stroke-width:2}
+.inner{fill:#fcfcfb;stroke:#b9c9e3;stroke-width:1.2}
+.t1{font:600 15px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#0b0b0b}
+.t2{font:400 12.5px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#52514e}
+.tc{font:700 17px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#1d5fb4}
+.lbl{font:600 11px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:.08em;fill:#52514e}
+.val{font:700 13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#0b0b0b}
+.arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+.dash{stroke:#52514e;stroke-width:1.4;fill:none;stroke-dasharray:5 4}
+.head{fill:#52514e}
+.grid{stroke:#e2e1dc;stroke-width:1}
+.axis{stroke:#52514e;stroke-width:1.2}
+.bar{fill:#2a78d6}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19}
+.box{fill:#252523;stroke:#3a3a37}
+.core{fill:#17263a;stroke:#3987e5}
+.inner{fill:#1a1a19;stroke:#2f4666}
+.t1{fill:#f0efec}
+.t2{fill:#c3c2b7}
+.tc{fill:#7db2f0}
+.lbl{fill:#c3c2b7}
+.val{fill:#f0efec}
+.arrow{stroke:#c3c2b7}
+.dash{stroke:#c3c2b7}
+.head{fill:#c3c2b7}
+.grid{stroke:#33332f}
+.axis{stroke:#c3c2b7}
+.bar{fill:#3987e5}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="head"/></marker></defs>
+<rect width="720" height="250" rx="14" class="bg"/>
+<line x1="358.6" y1="30" x2="358.6" y2="186" class="grid"/>
+<text x="358.6" y="206" class="t2" text-anchor="middle">0.2 s</text>
+<line x1="467.1" y1="30" x2="467.1" y2="186" class="grid"/>
+<text x="467.1" y="206" class="t2" text-anchor="middle">0.4 s</text>
+<line x1="575.7" y1="30" x2="575.7" y2="186" class="grid"/>
+<text x="575.7" y="206" class="t2" text-anchor="middle">0.6 s</text>
+<text x="24" y="62" class="t2" text-anchor="start">Cold index (full rebuild)</text>
+<path d="M250 44H571.7a4 4 0 0 1 4 4V66a4 4 0 0 1 -4 4H250z" class="bar"/>
+<text x="585.7" y="62" class="val" text-anchor="start">0.6 s</text>
+<text x="24" y="112" class="t2" text-anchor="start">Incremental index (no changes)</text>
+<path d="M250 94H316.6a4 4 0 0 1 4 4V116a4 4 0 0 1 -4 4H250z" class="bar"/>
+<text x="330.6" y="112" class="val" text-anchor="start">0.13 s</text>
+<text x="24" y="162" class="t2" text-anchor="start">cora brain (one CLI run)</text>
+<path d="M250 144H354.6a4 4 0 0 1 4 4V166a4 4 0 0 1 -4 4H250z" class="bar"/>
+<text x="368.6" y="162" class="val" text-anchor="start">0.2 s</text>
+<line x1="250" y1="30" x2="250" y2="186" class="axis"/>
+<text x="360" y="238" class="t2" text-anchor="middle">Lower is better · cora-code repository, release build, real model</text>
+</svg>
