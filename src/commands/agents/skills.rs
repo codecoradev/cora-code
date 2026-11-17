@@ -188,6 +188,10 @@ pub static CODE: Skill = Skill {
             path: "references/ignore.md",
             text: include_str!("skills/cora-code/references/ignore.md"),
         },
+        SkillFile {
+            path: "references/install.md",
+            text: include_str!("skills/cora-code/references/install.md"),
+        },
     ],
 };
 
@@ -202,6 +206,10 @@ pub static REVIEW: Skill = Skill {
         SkillFile {
             path: "references/ignore.md",
             text: include_str!("skills/cora-review/references/ignore.md"),
+        },
+        SkillFile {
+            path: "references/install.md",
+            text: include_str!("skills/cora-review/references/install.md"),
         },
         SkillFile {
             path: "references/scan.md",
@@ -635,6 +643,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An agent that reads a skill must learn, from the skill alone, to get cora
+    /// from the release binary (the bundled model) and to review before a PR.
+    #[test]
+    fn skills_tell_agents_to_install_the_release_binary_and_review_before_a_pr() {
+        for skill in all() {
+            let file = |path: &str| {
+                skill
+                    .files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .unwrap_or_else(|| panic!("{}: missing {path}", skill.name))
+                    .text
+            };
+            let install = file("references/install.md");
+            assert!(
+                install.contains("install.sh"),
+                "{}: no installer",
+                skill.name
+            );
+            assert!(
+                install.contains("checksums-sha256.txt"),
+                "{}: no checksum step",
+                skill.name
+            );
+            assert!(
+                install.contains("does not contain the model"),
+                "{}: does not say a source build lacks the model",
+                skill.name
+            );
+            let body = file("SKILL.md");
+            assert!(
+                body.contains("references/install.md") && body.contains("release binary"),
+                "{}: SKILL.md does not point to the release-binary install",
+                skill.name
+            );
+        }
+        let review = REVIEW.files[0].text;
+        assert!(
+            review.contains("required, not optional"),
+            "review before a PR must be required"
+        );
+        let code = CODE.files[0].text;
+        assert!(
+            code.contains("You must review"),
+            "cora-code must require the review"
+        );
     }
 
     #[test]
