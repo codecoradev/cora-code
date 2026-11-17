@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/codecoradev/cora-code/main/install-
 cargo install --git https://github.com/codecoradev/cora-code
 ```
 
-> Pin a version: `CORA_VERSION=v0.21.0 curl -fsSL ... | sh`
+> Pin a version: `CORA_VERSION=v0.21.1 curl -fsSL ... | sh`
 
 **The code model.** Release binaries (the installer, `cora upgrade`, the archives on the Releases page) already contain the 33.5 MB `potion-code-16M-v2` model, so semantic search works right after the download, offline included; the first use unpacks it into the data directory. A `cargo install` build does not carry it (the crates.io size limit is 10 MB) and downloads it once on first use.
 
