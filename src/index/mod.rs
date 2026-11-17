@@ -463,7 +463,7 @@ fn index_project_with_id(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let size = metadata.len();
-        let cheap_fp = format!("{mtime}:{size}");
+        let cheap_fp = format!("v{EXTRACTOR_VERSION}:{mtime}:{size}");
 
         // O(1) hashmap lookup — skip file entirely if unchanged
         if let Some(stored) = stored_fingerprints.get(&rel_str) {
@@ -740,6 +740,12 @@ fn file_fingerprint(content: &str) -> String {
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
 }
+
+/// Version of what the extractors record. It is part of every file fingerprint,
+/// so bumping it makes the next `cora index` re-extract every file once, including
+/// files that did not change (#803). Bump it whenever an extractor starts to
+/// record symbols or edges it did not record before, or stops recording wrong ones.
+const EXTRACTOR_VERSION: u32 = 1;
 
 /// Statistics from an index build run.
 #[derive(Debug, Clone, Default)]
@@ -1037,6 +1043,48 @@ pub struct AuthService {
             Some(repo.as_path()),
             ".git must stop the upward walk"
         );
+    }
+
+    /// #803: the stored fingerprint names the extractor version, so an extractor
+    /// that records more (or different) edges is applied to files that did not change.
+    #[test]
+    fn test_fingerprint_carries_the_extractor_version() {
+        let conn = mem_conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        index_project(&conn, &root, false).unwrap();
+        let stored: String = conn
+            .query_row("SELECT fingerprint FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            stored.starts_with(&format!("v{EXTRACTOR_VERSION}:")),
+            "fingerprint {stored:?} must start with the extractor version"
+        );
+    }
+
+    #[test]
+    fn test_index_from_an_older_extractor_is_re_extracted_once() {
+        let conn = mem_conn();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        index_project(&conn, &root, false).unwrap();
+        // An index written before the version existed (or by an older extractor).
+        conn.execute(
+            "UPDATE files SET fingerprint = substr(fingerprint, instr(fingerprint, ':') + 1)",
+            [],
+        )
+        .unwrap();
+        let again = index_project(&conn, &root, false).unwrap();
+        assert_eq!(
+            again.files_indexed, 1,
+            "an old-format fingerprint must be re-extracted"
+        );
+        assert_eq!(again.files_skipped, 0);
+        let third = index_project(&conn, &root, false).unwrap();
+        assert_eq!(third.files_skipped, 1, "and then skipped as before");
+        assert_eq!(third.files_indexed, 0);
     }
 
     /// Regression (#522): an incremental no-op re-index (all fingerprints
