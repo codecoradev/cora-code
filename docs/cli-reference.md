@@ -47,7 +47,7 @@ Complete command reference for the cora CLI.
 | `cora install --agents` `"cline,cursor"` | Install specific agents |
 | `cora install --dry-run` | Show what would be changed |
 | `cora install --force` | Overwrite existing cora entry |
-| `cora install --yes` | Install ALL detected agents (non-interactive) |
+| `cora install --yes` | Accepted for compatibility: `cora install` already installs every detected agent without asking |
 | `cora mcp` | Start the MCP server (22 tools, incl. agent-as-reviewer: `cora.review_prepare`/`review_finalize`, `cora.scan_prepare`/`scan_finalize`; no LLM key needed in cora). See [Review with your agent](./usage#review-with-your-agent-no-llm-setup) |
 | `claude mcp add cora -- cora mcp` | Register the MCP server with Claude Code (`cora install` only adds its `/cora-review` skill) |
 | `cora hook install` | Install pre-commit hook |

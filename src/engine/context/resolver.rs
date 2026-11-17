@@ -734,13 +734,6 @@ fn find_fn_in_file_cached(
     find_pattern_with_body(&content, &pattern, MAX_FN_LINES)
 }
 
-/// Generic function search (for languages without specific patterns).
-#[allow(dead_code)]
-fn find_fn_generic(path: &Path, name: &str) -> Option<(u32, u32)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    find_pattern_with_body(&content, &format!("fn {name}"), MAX_FN_LINES)
-}
-
 /// Cached version of `find_fn_generic`.
 fn find_fn_generic_cached(
     path: &Path,
@@ -749,13 +742,6 @@ fn find_fn_generic_cached(
 ) -> Option<(u32, u32)> {
     let content = get_file_cached(path, file_cache)?;
     find_pattern_with_body(&content, &format!("fn {name}"), MAX_FN_LINES)
-}
-
-/// Find a pattern (like `struct Foo`) and determine its extent.
-#[allow(dead_code)]
-fn find_pattern_in_file(path: &Path, pattern: &str) -> Option<(u32, u32)> {
-    let content = std::fs::read_to_string(path).ok()?;
-    find_pattern_with_body(&content, pattern, MAX_TYPE_LINES)
 }
 
 /// Cached version of `find_pattern_in_file`.
@@ -907,7 +893,7 @@ fn find_go_package_file(dir: &Path, import_path: &str) -> Option<ContextEntry> {
 /// never scanned, and is bounded by [`MAX_CALLER_FILES_SCAN`] files and
 /// [`MAX_CALLERS_PER_SYMBOL`] call-sites per symbol. Caller slices are tiny
 /// (the call line + 1 line of context) to stay token-economical.
-#[allow(dead_code)]
+#[cfg(test)]
 fn resolve_callers(
     defs: &[DefinedSymbol],
     config: &ContextConfig,

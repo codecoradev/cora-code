@@ -28,9 +28,6 @@ pub struct InstallOptions {
     pub dry_run: bool,
     /// Overwrite existing cora entry.
     pub force: bool,
-    /// Non-interactive mode.
-    #[allow(dead_code)]
-    pub yes: bool,
     /// Remove cora MCP entry (uninstall mode).
     pub remove: bool,
     /// Validate agent configs after install/remove.
@@ -190,58 +187,6 @@ fn install_agent(agent: &AgentInfo, opts: &InstallOptions) -> Result<String> {
                 uninstall_json_agent(&agent.config_path, opts.dry_run)
             } else {
                 install_json_agent(&agent.config_path, opts.force, opts.dry_run)
-            }
-        }
-        ConfigFormat::Yaml => {
-            use super::agent_config;
-            let mut config = agent_config::read_yaml_config(&agent.config_path)?;
-
-            if opts.remove {
-                if !agent_config::yaml_has_cora(&config) {
-                    return Ok(format!(
-                        "  {} {} — no cora entry found",
-                        "⏭ ".dimmed(),
-                        agent.config_path.display()
-                    ));
-                }
-                agent_config::yaml_remove_cora(&mut config);
-                if opts.dry_run {
-                    Ok(format!(
-                        "  {} {} — would remove cora MCP server entry",
-                        "🔍 ".cyan(),
-                        agent.config_path.display()
-                    ))
-                } else {
-                    agent_config::write_yaml_config(&agent.config_path, &config)?;
-                    Ok(format!(
-                        "  {} {} — cora MCP server entry removed",
-                        "✓ ".green(),
-                        agent.config_path.display()
-                    ))
-                }
-            } else {
-                if agent_config::yaml_has_cora(&config) && !opts.force {
-                    return Ok(format!(
-                        "  {} {} — cora entry already exists (use --force to overwrite)",
-                        "⏭ ".dimmed(),
-                        agent.config_path.display()
-                    ));
-                }
-                agent_config::yaml_add_cora(&mut config)?;
-                if opts.dry_run {
-                    Ok(format!(
-                        "  {} {} — would write cora MCP server entry",
-                        "🔍 ".cyan(),
-                        agent.config_path.display()
-                    ))
-                } else {
-                    agent_config::write_yaml_config(&agent.config_path, &config)?;
-                    Ok(format!(
-                        "  {} {} — cora MCP server entry added",
-                        "✓ ".green(),
-                        agent.config_path.display()
-                    ))
-                }
             }
         }
     }
@@ -426,13 +371,6 @@ pub fn execute_install(opts: &InstallOptions) -> Result<String> {
                         ));
                     }
                 }
-                ConfigFormat::Yaml => {
-                    lines.push(format!(
-                        "  {} {} — skipped (YAML validation not implemented)",
-                        "⏭ ".dimmed(),
-                        agent.config_path.display()
-                    ));
-                }
             }
         }
         if errors > 0 {
@@ -469,7 +407,6 @@ mod tests {
             agents: None,
             dry_run: false,
             force: false,
-            yes: true,
             remove: false,
             validate: false,
         }

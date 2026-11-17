@@ -40,7 +40,6 @@ pub enum ConfigSource<'a> {
     /// Project `.cora.yaml` only (MCP: no env/global/secrets).
     ProjectOnly,
     /// [`Self::ProjectOnly`] discovered from `start` instead of the cwd.
-    #[cfg_attr(not(test), allow(dead_code))]
     ProjectOnlyAt(&'a Path),
 }
 
@@ -69,7 +68,7 @@ pub fn load_project_only(start: &Path) -> Option<Config> {
 
 /// Result of [`configure`]: what was applied to the process.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), allow(dead_code))] // brain_mode/backend are the test seam
+#[cfg_attr(not(test), allow(dead_code))] // `brain_mode` and `backend` are the test seam
 pub struct Configured {
     /// `brain.embedding` string that was handed to `resolve_backend`.
     pub brain_mode: String,

@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::process::Command;
 
 use crate::error::CoraError;
@@ -181,17 +180,6 @@ fn parse_remote_url(url: &str) -> (String, String) {
     } else {
         ("unknown".to_string(), "unknown".to_string())
     }
-}
-
-/// Check if a path is inside a git worktree.
-///
-/// Kept for API completeness — useful for pre-commit hooks and future commands
-/// that need to guard against running outside a repository.
-#[allow(dead_code)]
-pub fn is_inside_git_repo(dir: Option<&Path>) -> bool {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let search_dir = dir.unwrap_or(&cwd);
-    Repository::discover(search_dir).is_ok()
 }
 
 #[cfg(test)]

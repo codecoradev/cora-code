@@ -36,7 +36,7 @@ impl Default for MemoryBackend {
 
 impl MemoryBackend {
     /// Create a new memory backend with the given namespace.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(namespace: &str) -> Self {
         Self {
             enabled: false,
@@ -135,7 +135,7 @@ impl MemoryBackend {
     /// Save false positive feedback to Uteke.
     ///
     /// Calls: `uteke remember "cora:{project}:fp:{issue_id}" --tags cora,false-positive`
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn save_feedback(&self, project: &str, issue_id: &str, feedback: &str) {
         if !self.enabled {
             return;

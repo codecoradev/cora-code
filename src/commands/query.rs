@@ -411,8 +411,8 @@ mod tests {
         (conn, pid)
     }
 
-    fn edge(caller: &str, callee: &str, line: u32) -> crate::index::CallEdge {
-        crate::index::CallEdge {
+    fn edge(caller: &str, callee: &str, line: u32) -> crate::index::graph::CallEdge {
+        crate::index::graph::CallEdge {
             caller: caller.into(),
             callee: callee.into(),
             file: "src/main.rs".into(),

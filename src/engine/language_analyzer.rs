@@ -28,7 +28,7 @@ pub fn build_language_context_from_chunks(chunks: &[diff_parser::FileChunk]) -> 
 }
 
 /// Build language-specific context string from raw diff text.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_language_context(diff_text: &str) -> String {
     let chunks = diff_parser::parse_diff(diff_text);
     let languages = detect_languages(&chunks);

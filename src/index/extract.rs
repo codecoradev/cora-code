@@ -501,25 +501,12 @@ fn extract_svelte(content: &str, file: &str, out: &mut Vec<ExtractedDef>) {
     }
 }
 
-/// Extract function call sites from source code.
+/// Regex-based call-site extraction with scope tracking.
 ///
-/// When the `tree-sitter` feature is enabled, uses AST-based extraction for
-/// supported languages. Falls back to regex-based scope tracking for others.
-#[allow(dead_code)]
+/// Used when the `tree-sitter` feature is off; with it, the AST extractor
+/// (`ast::extract`) records the calls.
+#[cfg(not(feature = "tree-sitter"))]
 pub fn extract_calls(content: &str, language: &str, file_path: &str) -> Vec<CallSite> {
-    #[cfg(feature = "tree-sitter")]
-    {
-        use super::ast;
-        if ast::get_language(language).is_some() || language == "svelte" {
-            let (_nodes, edges) = ast::extract(content, language, file_path);
-            return edges
-                .into_iter()
-                .filter(|e| e.kind == ast::EdgeKind::Calls)
-                .map(Into::into)
-                .collect();
-        }
-    }
-
     // Regex fallback
     use crate::engine::context::extraction as ctx_extract;
     use crate::engine::context::types::SymbolKind as CtxSymbolKind;
@@ -581,24 +568,6 @@ pub fn extract_calls(content: &str, language: &str, file_path: &str) -> Vec<Call
     }
 
     calls
-}
-
-/// Extract all graph edges from source code (calls, imports, implements, inherits).
-///
-/// Only available with the `tree-sitter` feature. Returns empty for unsupported languages.
-#[cfg(feature = "tree-sitter")]
-#[allow(dead_code)]
-pub fn extract_edges(
-    content: &str,
-    language: &str,
-    file_path: &str,
-) -> Vec<crate::index::ast::AstEdge> {
-    use super::ast;
-    if ast::get_language(language).is_some() || language == "svelte" {
-        let (_nodes, edges) = ast::extract(content, language, file_path);
-        return edges;
-    }
-    Vec::new()
 }
 
 /// Detect HTTP route definitions from source code using regex heuristics.
@@ -856,7 +825,6 @@ fn is_builtin(name: &str) -> bool {
 /// All extracted data from a single file (symbols + calls + kg edges).
 /// Used by bulk indexing to parse tree-sitter only once.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct ExtractedAll {
     pub symbols: Vec<ExtractedDef>,
     pub calls: Vec<CallSite>,
@@ -870,7 +838,6 @@ pub type KgEdge = crate::index::ast::AstEdge;
 /// A knowledge-graph edge stub when tree-sitter is disabled (never used).
 #[cfg(not(feature = "tree-sitter"))]
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct KgEdge {
     pub source: String,
     pub kind: String,

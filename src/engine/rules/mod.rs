@@ -6,9 +6,12 @@ pub mod types;
 
 use tracing::debug;
 
+#[cfg(test)]
 use crate::engine::diff_parser::{FileChunk, parse_diff};
 use crate::engine::rules::types::{CustomRule, RuleFinding, RulesConfig};
-use crate::engine::scan_input::{self, ScanFile};
+#[cfg(test)]
+use crate::engine::scan_input;
+use crate::engine::scan_input::ScanFile;
 use crate::engine::types::{ReviewIssue, Severity};
 
 /// Map severity to a numeric rank for sorting (Critical=4, Major=3, Minor=2, Info=1).
@@ -25,6 +28,7 @@ fn severity_rank(sev: Severity) -> u8 {
 /// chunks (diff adapter over [`run_rules_in`]).
 ///
 /// Returns findings capped by `config.max_findings`.
+#[cfg(test)]
 pub fn run_rules(chunks: &[FileChunk], config: &RulesConfig) -> Vec<RuleFinding> {
     run_rules_in(&scan_input::from_chunks(chunks), config)
 }
@@ -382,7 +386,7 @@ pub fn format_rule_context(findings: &[RuleFinding]) -> String {
 }
 
 /// Convenience: parse diff + run rules in one step.
-#[allow(dead_code)] // public API for future standalone usage
+#[cfg(test)]
 pub fn parse_and_run_rules(diff: &str, config: &RulesConfig) -> Vec<RuleFinding> {
     let chunks = parse_diff(diff);
     run_rules(&chunks, config)

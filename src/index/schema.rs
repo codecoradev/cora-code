@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// Current schema version.
-#[allow(dead_code)]
+#[cfg(test)]
 const SCHEMA_VERSION: i32 = 9;
 
 /// Serialises index opening (PRAGMAs + migrations) within a process: several
