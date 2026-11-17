@@ -44,7 +44,7 @@ Demand-gated — we build what people actually need. Track progress on [GitHub I
 ## v0.4 — Deterministic Engine Pipeline
 
 - [#116](https://github.com/codecoradev/cora-code/issues/116) Deterministic rule engine — 12 built-in rules — ✓ Done
-- [#115](https://github.com/codecoradev/cora-code/issues/115) File bundling — parallel per-bundle review — ✓ Done
+- [#115](https://github.com/codecoradev/cora-code/issues/115) File bundling — the grouping engine was written but never wired into review; removed in #792 (large diffs are chunked by a character budget instead, #733) — ✗ Removed
 - [#114](https://github.com/codecoradev/cora-code/issues/114) AST-based cross-file dependency extraction — ✓ Done
 - [#159](https://github.com/codecoradev/cora-code/issues/159) Hunk header regex panic fix + 5MB diff support — ✓ Done
 

@@ -137,10 +137,10 @@ pub struct ExtractedSymbol {
     /// The file path where the symbol was found.
     pub file: String,
     /// Line number in the file (1-indexed).
-    #[allow(dead_code)] // set, never read until bundling is wired (#792)
+    #[allow(dead_code)] // debugging information, not read yet
     pub line: u32,
     /// The raw text that matched (for debugging).
-    #[allow(dead_code)] // same (#792)
+    #[allow(dead_code)] // debugging information, not read yet
     pub raw: String,
 }
 
@@ -215,7 +215,7 @@ pub struct ContextChain {
     /// Formatted text to inject into the prompt.
     pub text: String,
     /// Build statistics.
-    #[allow(dead_code)] // set, never read until bundling is wired (#792)
+    #[allow(dead_code)] // build statistics for debugging, not read yet
     pub stats: ContextStats,
 }
 
