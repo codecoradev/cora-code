@@ -10,26 +10,28 @@ use super::symbols::{IndexedSymbol, SymbolKind};
 
 // ─── Rust ───
 
-static RE_RUST_FN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)").unwrap());
+static RE_RUST_FN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)")
+        .unwrap()
+});
 
 static RE_RUST_STRUCT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?struct\s+(\w+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)").unwrap());
 
 static RE_RUST_ENUM: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?enum\s+(\w+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?enum\s+(\w+)").unwrap());
 
 static RE_RUST_TRAIT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?trait\s+(\w+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?trait\s+(\w+)").unwrap());
 
 static RE_RUST_TYPE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?type\s+(\w+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?type\s+(\w+)").unwrap());
 
 static RE_RUST_CONST: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?(?:const|static)\s+(\w+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(\w+)").unwrap());
 
 static RE_RUST_MOD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*(?:pub\s+)?mod\s+(\w+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)").unwrap());
 
 // RE_RUST_IMPL removed — not needed for symbol definitions
 
@@ -277,7 +279,11 @@ fn extract_rust(line: &str, line_no: u32, file: &str, raw: &str, out: &mut Vec<E
     if let Some(cap) = RE_RUST_TYPE.captures(line) {
         out.push(def(cap, SymbolKind::TypeAlias, line_no, file, raw));
     }
-    if let Some(cap) = RE_RUST_CONST.captures(line) {
+    // `const fn name` is a function, not a constant called `fn`.
+    if let Some(cap) = RE_RUST_CONST
+        .captures(line)
+        .filter(|c| !matches!(&c[1], "fn" | "unsafe" | "async" | "extern"))
+    {
         out.push(def(cap, SymbolKind::Constant, line_no, file, raw));
     }
     if let Some(cap) = RE_RUST_MOD.captures(line) {
@@ -588,8 +594,8 @@ pub fn detect_routes(
     content: &str,
     language: &str,
     file_path: &str,
-) -> Vec<crate::index::ast::AstEdge> {
-    use crate::index::ast::{AstEdge, EdgeKind};
+) -> Vec<crate::index::edge::AstEdge> {
+    use crate::index::edge::{AstEdge, EdgeKind};
     use regex::Regex;
 
     let mut edges = Vec::new();
@@ -832,19 +838,7 @@ pub struct ExtractedAll {
 }
 
 /// A knowledge-graph edge (calls, imports, implements, inherits, etc.).
-#[cfg(feature = "tree-sitter")]
-pub type KgEdge = crate::index::ast::AstEdge;
-
-/// A knowledge-graph edge stub when tree-sitter is disabled (never used).
-#[cfg(not(feature = "tree-sitter"))]
-#[derive(Debug, Clone, Default)]
-pub struct KgEdge {
-    pub source: String,
-    pub kind: String,
-    pub target: String,
-    pub file: String,
-    pub line: u32,
-}
+pub type KgEdge = crate::index::edge::AstEdge;
 
 /// Extract everything from a file in a single pass.
 /// When tree-sitter is available, this parses the source only once and returns
@@ -858,13 +852,13 @@ pub fn extract_all(content: &str, language: &str, file_path: &str) -> ExtractedA
             let (nodes, edges) = ast::extract(content, language, file_path);
             let calls: Vec<CallSite> = edges
                 .iter()
-                .filter(|e| e.kind == ast::EdgeKind::Calls)
+                .filter(|e| e.kind == crate::index::edge::EdgeKind::Calls)
                 .cloned()
                 .map(Into::into)
                 .collect();
             let kg_edges: Vec<_> = edges
                 .into_iter()
-                .filter(|e| e.kind != ast::EdgeKind::Calls)
+                .filter(|e| e.kind != crate::index::edge::EdgeKind::Calls)
                 .collect();
             let symbols = nodes.into_iter().map(Into::into).collect();
             return ExtractedAll {
@@ -979,6 +973,49 @@ fn def(cap: regex::Captures, kind: SymbolKind, line: u32, file: &str, raw: &str)
 
 #[cfg(test)]
 mod tests {
+
+    /// #793: the regex path skipped `pub(crate)`, `pub(super)` and `const fn`, so a
+    /// build without Tree-sitter never indexed most Rust items.
+    #[test]
+    fn rust_regex_handles_restricted_visibility_and_const_fn() {
+        let mut out = Vec::new();
+        for (n, line) in [
+            "pub(crate) fn crate_only() {}",
+            "pub(super) fn parent_only() {}",
+            "pub(in crate::a) fn scoped() {}",
+            "pub const fn const_item() {}",
+            "const fn private_const() {}",
+            "pub(crate) struct Inner;",
+            "pub(crate) enum Mode { A }",
+            "pub(crate) trait Shape {}",
+            "pub(crate) type Alias = u8;",
+            "pub(crate) const LIMIT: u8 = 1;",
+            "pub(crate) mod util;",
+            "pub fn plain() {}",
+        ]
+        .iter()
+        .enumerate()
+        {
+            extract_rust(line, (n + 1) as u32, "x.rs", line, &mut out);
+        }
+        let names: Vec<&str> = out.iter().map(|d| d.name.as_str()).collect();
+        for want in [
+            "crate_only",
+            "parent_only",
+            "scoped",
+            "const_item",
+            "private_const",
+            "Inner",
+            "Mode",
+            "Shape",
+            "Alias",
+            "LIMIT",
+            "util",
+            "plain",
+        ] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+    }
     use super::*;
 
     #[test]

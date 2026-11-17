@@ -9,6 +9,7 @@ pub mod arch;
 mod ast;
 pub mod brain;
 mod dead_filters;
+mod edge;
 mod extract;
 pub mod graph;
 pub mod queries;
@@ -1174,11 +1175,18 @@ pub struct AuthService {
 
         index_project(&conn, root, false).unwrap();
         let pid = ensure_project(&conn, root).unwrap();
-        // Seed an edge row directly so the check holds without tree-sitter.
+        // Seed the rows directly, so the check does not depend on which extractor the
+        // build has (Tree-sitter or regex records calls differently).
         for f in ["keep.rs", "gone.rs"] {
             conn.execute(
                 "INSERT INTO edges (source, kind, target, file, line, project_id)
                  VALUES ('a', 'CALLS', 'b', ?1, 1, ?2)",
+                rusqlite::params![f, pid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO call_graph (caller, callee, file, line, project_id)
+                 VALUES ('a', 'b', ?1, 1, ?2)",
                 rusqlite::params![f, pid],
             )
             .unwrap();
