@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The build without Tree-sitter compiles again, and CI keeps it that way (#793).** `cargo build --no-default-features` (regex extraction only, documented in the README) failed because the edge types lived in the Tree-sitter module; they are shared now. Running its tests showed that the regex extractor skipped `pub(crate)`, `pub(super)` and `pub(in ..)` items and read `const fn name` as a constant called `fn`; both are fixed. CI lints and tests this configuration in the `Check` job.
+
 - **`cora dead-code`, `callers` and `impact` see functions passed as values and functions named in serde attributes (#802).** The Rust extractor recorded a call only for a `call_expression` and inside macros, so `.map(helper)`, `.and_then(Type::make)` and `#[serde(default = "default_true")]` made the function look unused. On this repository `cora dead-code` went from 43 findings, none of them dead code, to the 5 that are (the unwired bundling engine of #792), and `callers` now lists the function that passes another one as a value. A variable that merely has the name of a function (a parameter, a `let`, a pattern binding) is not recorded. The first `cora index` after the upgrade re-extracts every file once (#803).
 
 - **`cora index` re-extracts every file once after an extractor change (#803).** A file was skipped when its `mtime:size` matched, so an upgrade that improved an extractor (the Ruby nesting of #791, for example) never reached the files that had not changed, until someone ran `cora index --rebuild`. The fingerprint now carries an extractor version, so the first `cora index` after such an upgrade re-extracts all files once; later runs skip unchanged files as before.

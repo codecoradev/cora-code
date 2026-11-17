@@ -3,7 +3,7 @@
 // ! Provides proper AST-based symbol and edge extraction using tree-sitter.
 // ! Only compiled when the `tree-sitter` feature is enabled.
 
-use crate::index::extract::CallSite;
+use crate::index::edge::{AstEdge, EdgeKind};
 use crate::index::extract::ExtractedDef;
 use crate::index::symbols::SymbolKind;
 use regex::Regex;
@@ -43,64 +43,6 @@ impl From<&AstNode> for ExtractedDef {
 impl From<AstNode> for ExtractedDef {
     fn from(n: AstNode) -> Self {
         ExtractedDef::from(&n)
-    }
-}
-
-/// Edge type in the knowledge graph.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EdgeKind {
-    Calls,
-    Imports,
-    Implements,
-    Inherits,
-    Route,
-}
-
-impl EdgeKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Calls => "CALLS",
-            Self::Imports => "IMPORTS",
-            Self::Implements => "IMPLEMENTS",
-            Self::Inherits => "INHERITS",
-            Self::Route => "ROUTE",
-        }
-    }
-}
-
-/// An edge in the code graph.
-#[derive(Debug, Clone)]
-pub struct AstEdge {
-    pub source: String,
-    pub kind: EdgeKind,
-    pub target: String,
-    pub file: String,
-    pub line: u32,
-    /// For call edges: the type or module the callee was reached through
-    /// (`WebSearchTool` in `WebSearchTool::from_env()`, the enclosing impl type
-    /// for `self.m()` and `Self::m()`). `None` when it is not statically
-    /// obvious, which makes the edge ambiguous (#714).
-    pub qualifier: Option<String>,
-    /// For call edges: the impl type of the calling method, when it is one.
-    pub caller_type: Option<String>,
-}
-
-impl From<&AstEdge> for CallSite {
-    fn from(e: &AstEdge) -> Self {
-        Self {
-            caller: e.source.clone(),
-            callee: e.target.clone(),
-            file: e.file.clone(),
-            line: e.line,
-            qualifier: e.qualifier.clone(),
-            caller_type: e.caller_type.clone(),
-        }
-    }
-}
-
-impl From<AstEdge> for CallSite {
-    fn from(e: AstEdge) -> Self {
-        CallSite::from(&e)
     }
 }
 

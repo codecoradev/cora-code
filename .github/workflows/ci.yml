@@ -42,6 +42,12 @@ jobs:
       # The release build compiles the model in; keep that code path building.
       - name: Check the bundled-model build
         run: CORA_BUNDLED_MODEL_DIR="$PWD/tests/fixtures/tiny-model" cargo check --features tree-sitter,bundled-model
+      # The build without Tree-sitter (regex extraction only) is documented, and it
+      # had stopped compiling without anyone noticing (#793).
+      - name: Lint the build without Tree-sitter
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - name: Test the build without Tree-sitter
+        run: cargo test --no-default-features
 
   fmt:
     name: Format
