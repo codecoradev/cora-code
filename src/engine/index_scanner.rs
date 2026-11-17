@@ -229,6 +229,12 @@ pub fn scan_breaking_changes(
     // index is a false positive (#533).
     let added_defs = collect_added_definitions(chunks);
 
+    // Call sites this diff deletes. A caller whose call is removed by the same
+    // change is not broken by the removal (dead-code cleanup deletes a helper
+    // together with its only callers), although the index, which predates the
+    // change, still lists it.
+    let removed_lines = collect_removed_lines(chunks);
+
     // Patterns for public symbol removal across languages.
     // These are heuristic — not all removed lines match, but high-signal ones do.
     let removal_patterns: &[&str] = &[
@@ -289,6 +295,10 @@ pub fn scan_breaking_changes(
                         // Check if this symbol has callers in the index
                         if let Ok(callers) = graph::find_callers(conn, project_id, symbol_name, 10)
                         {
+                            let callers: Vec<_> = callers
+                                .into_iter()
+                                .filter(|c| !removed_lines.contains(&(c.file.clone(), c.line)))
+                                .collect();
                             if callers.is_empty() {
                                 continue;
                             }
@@ -324,6 +334,28 @@ pub fn scan_breaking_changes(
             }
         },
     )
+}
+
+/// `(file, old line number)` of every line the diff removes, across all chunks
+/// (a deleted file contributes all its lines). The file is the path as the
+/// index knows it, the pre-change one.
+fn collect_removed_lines(chunks: &[FileChunk]) -> HashSet<(String, u32)> {
+    let mut removed = HashSet::new();
+    for chunk in chunks {
+        let Some(file) = chunk.old_path.as_deref().or(chunk.new_path.as_deref()) else {
+            continue;
+        };
+        for hunk in &chunk.chunks {
+            for line in &hunk.lines {
+                if line.line_type == DiffLineType::Remove {
+                    if let Some(n) = line.old_line_no {
+                        removed.insert((file.to_string(), n));
+                    }
+                }
+            }
+        }
+    }
+    removed
 }
 
 /// Names of symbol definitions appearing on added lines across the whole diff.
@@ -591,6 +623,96 @@ mod tests {
                     .collect(),
             }],
         }
+    }
+
+    /// Like `chunk_lines`, with the old line number of each removed line, so a
+    /// call site can be matched against the index (which stores call-site lines).
+    fn chunk_numbered(path: &str, lines: &[(&str, &str, Option<u32>)]) -> FileChunk {
+        let mut chunk = chunk_lines(
+            path,
+            &lines.iter().map(|(m, c, _)| (*m, *c)).collect::<Vec<_>>(),
+        );
+        for (line, (_, _, old)) in chunk.chunks[0].lines.iter_mut().zip(lines) {
+            line.old_line_no = *old;
+        }
+        chunk
+    }
+
+    #[test]
+    fn callers_removed_by_the_same_diff_do_not_count() {
+        // Dead-code removal: the helper and its only caller go together. The
+        // index still lists the caller (it predates the change), but its call
+        // site is deleted too, so nothing breaks.
+        let bridge = index_with_callers("unused_helper", &[("only_caller", "src/app.rs", 20)]);
+        let chunks = vec![
+            chunk_numbered(
+                "src/util.rs",
+                &[("-", "pub fn unused_helper() {}", Some(5))],
+            ),
+            chunk_numbered(
+                "src/app.rs",
+                &[
+                    ("-", "fn only_caller() {", Some(19)),
+                    ("-", "    unused_helper();", Some(20)),
+                    ("-", "}", Some(21)),
+                ],
+            ),
+        ];
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
+        assert!(
+            findings.is_empty(),
+            "the only caller is deleted in the same diff, got: {:?}",
+            findings
+        );
+    }
+
+    #[test]
+    fn a_caller_that_stays_still_counts() {
+        let bridge = index_with_callers(
+            "shared_helper",
+            &[("gone", "src/app.rs", 20), ("stays", "src/other.rs", 8)],
+        );
+        let chunks = vec![
+            chunk_numbered(
+                "src/util.rs",
+                &[("-", "pub fn shared_helper() {}", Some(5))],
+            ),
+            chunk_numbered("src/app.rs", &[("-", "    shared_helper();", Some(20))]),
+        ];
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
+        assert_eq!(findings.len(), 1, "one caller remains: {:?}", findings);
+        assert!(
+            findings[0].title.contains("breaks 1 caller(s)"),
+            "{:?}",
+            findings[0].title
+        );
+        assert!(findings[0].body.contains("stays"), "{:?}", findings[0].body);
+        assert!(!findings[0].body.contains("gone"), "{:?}", findings[0].body);
+    }
+
+    #[test]
+    fn a_deleted_file_takes_its_callers_with_it() {
+        let bridge = index_with_callers("old_api", &[("legacy", "src/legacy.rs", 3)]);
+        let mut gone = chunk_numbered(
+            "src/legacy.rs",
+            &[
+                ("-", "fn legacy() {", Some(2)),
+                ("-", "    old_api();", Some(3)),
+                ("-", "}", Some(4)),
+            ],
+        );
+        gone.new_path = None;
+        gone.is_deleted = true;
+        let chunks = vec![
+            chunk_numbered("src/api.rs", &[("-", "pub fn old_api() {}", Some(9))]),
+            gone,
+        ];
+        let findings = scan_breaking_changes(&bridge, &chunks, 10, &[]);
+        assert!(
+            findings.is_empty(),
+            "the caller file is deleted: {:?}",
+            findings
+        );
     }
 
     #[test]
