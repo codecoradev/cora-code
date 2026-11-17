@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 440" role="img" aria-labelledby="t d">
+<title id="t">How Cora works</title>
+<desc id="d">Terminal, git hooks, CI and AI coding agents call cora, which runs a local code index, deterministic checks and a judge (your model or your agent) and returns review findings, a CI verdict and code search.</desc>
+<style>
+.bg{fill:#fcfcfb}
+.box{fill:#f1f0ec;stroke:#d6d4ce;stroke-width:1.5}
+.core{fill:#e9f1fc;stroke:#2a78d6;stroke-width:2}
+.inner{fill:#fcfcfb;stroke:#b9c9e3;stroke-width:1.2}
+.t1{font:600 15px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#0b0b0b}
+.t2{font:400 12.5px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#52514e}
+.tc{font:700 17px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#1d5fb4}
+.lbl{font:600 11px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:.08em;fill:#52514e}
+.val{font:700 13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#0b0b0b}
+.arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+.dash{stroke:#52514e;stroke-width:1.4;fill:none;stroke-dasharray:5 4}
+.head{fill:#52514e}
+.grid{stroke:#e2e1dc;stroke-width:1}
+.axis{stroke:#52514e;stroke-width:1.2}
+.bar{fill:#2a78d6}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19}
+.box{fill:#252523;stroke:#3a3a37}
+.core{fill:#17263a;stroke:#3987e5}
+.inner{fill:#1a1a19;stroke:#2f4666}
+.t1{fill:#f0efec}
+.t2{fill:#c3c2b7}
+.tc{fill:#7db2f0}
+.lbl{fill:#c3c2b7}
+.val{fill:#f0efec}
+.arrow{stroke:#c3c2b7}
+.dash{stroke:#c3c2b7}
+.head{fill:#c3c2b7}
+.grid{stroke:#33332f}
+.axis{stroke:#c3c2b7}
+.bar{fill:#3987e5}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="head"/></marker></defs>
+<rect width="960" height="440" rx="14" class="bg"/>
+<text x="40" y="36" class="lbl" text-anchor="start">USE IT FROM</text>
+<text x="480" y="36" class="lbl" text-anchor="middle">CORA, ON YOUR MACHINE</text>
+<text x="920" y="36" class="lbl" text-anchor="end">YOU GET</text>
+<rect x="40" y="56" width="240" height="70" rx="10" class="box"/>
+<text x="160.0" y="84" class="t1" text-anchor="middle">Terminal</text>
+<text x="160.0" y="106" class="t2" text-anchor="middle">cora review · cora commit</text>
+<path d="M282 91L338 91" class="arrow" marker-end="url(#ah)"/>
+<rect x="40" y="142" width="240" height="70" rx="10" class="box"/>
+<text x="160.0" y="170" class="t1" text-anchor="middle">Git hooks</text>
+<text x="160.0" y="192" class="t2" text-anchor="middle">review staged changes on commit</text>
+<path d="M282 177L338 177" class="arrow" marker-end="url(#ah)"/>
+<rect x="40" y="228" width="240" height="70" rx="10" class="box"/>
+<text x="160.0" y="256" class="t1" text-anchor="middle">CI / CD</text>
+<text x="160.0" y="278" class="t2" text-anchor="middle">PR review, SARIF, quality gate</text>
+<path d="M282 263L338 263" class="arrow" marker-end="url(#ah)"/>
+<rect x="40" y="314" width="240" height="70" rx="10" class="box"/>
+<text x="160.0" y="342" class="t1" text-anchor="middle">AI coding agents</text>
+<text x="160.0" y="364" class="t2" text-anchor="middle">hooks · MCP server · skills</text>
+<path d="M282 349L338 349" class="arrow" marker-end="url(#ah)"/>
+<rect x="340" y="50" width="280" height="338" rx="14" class="core"/>
+<text x="480" y="78" class="tc" text-anchor="middle">cora</text>
+<rect x="360" y="96" width="240" height="84" rx="8" class="inner"/>
+<text x="480.0" y="122" class="t1" text-anchor="middle">Code index</text>
+<text x="480.0" y="144" class="t2" text-anchor="middle">symbols · call graph</text>
+<text x="480.0" y="162" class="t2" text-anchor="middle">code embeddings (local model)</text>
+<rect x="360" y="192" width="240" height="84" rx="8" class="inner"/>
+<text x="480.0" y="218" class="t1" text-anchor="middle">Deterministic checks</text>
+<text x="480.0" y="240" class="t2" text-anchor="middle">rules · secrets · security</text>
+<text x="480.0" y="258" class="t2" text-anchor="middle">no LLM needed</text>
+<rect x="360" y="288" width="240" height="84" rx="8" class="inner"/>
+<text x="480.0" y="314" class="t1" text-anchor="middle">Judge</text>
+<text x="480.0" y="336" class="t2" text-anchor="middle">your LLM key, or your agent</text>
+<text x="480.0" y="354" class="t2" text-anchor="middle">findings validated by cora</text>
+<rect x="680" y="56" width="240" height="98" rx="10" class="box"/>
+<text x="800.0" y="94" class="t1" text-anchor="middle">Review findings</text>
+<text x="800.0" y="118" class="t2" text-anchor="middle">severity, file, line, fix hints</text>
+<path d="M622 105L678 105" class="arrow" marker-end="url(#ah)"/>
+<rect x="680" y="169" width="240" height="98" rx="10" class="box"/>
+<text x="800.0" y="207" class="t1" text-anchor="middle">CI verdict</text>
+<text x="800.0" y="231" class="t2" text-anchor="middle">quality gate · SARIF · comments</text>
+<path d="M622 218L678 218" class="arrow" marker-end="url(#ah)"/>
+<rect x="680" y="282" width="240" height="98" rx="10" class="box"/>
+<text x="800.0" y="320" class="t1" text-anchor="middle">Code search</text>
+<text x="800.0" y="344" class="t2" text-anchor="middle">brain · callers · impact · trace</text>
+<path d="M622 331L678 331" class="arrow" marker-end="url(#ah)"/>
+<text x="480" y="418" class="t2" text-anchor="middle">Runs on your machine. Bring your own model key, or use none and let your agent judge.</text>
+</svg>

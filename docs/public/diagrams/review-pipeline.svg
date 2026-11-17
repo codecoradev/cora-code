@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 430" role="img" aria-labelledby="t d">
+<title id="t">How a review runs</title>
+<desc id="d">A diff is filtered by the built-in ignores, then checked by deterministic rules and given code context from the index, judged by your model or your coding agent, validated and merged, and turned into a verdict with quality gate, SARIF and PR comments.</desc>
+<style>
+.bg{fill:#fcfcfb}
+.box{fill:#f1f0ec;stroke:#d6d4ce;stroke-width:1.5}
+.core{fill:#e9f1fc;stroke:#2a78d6;stroke-width:2}
+.inner{fill:#fcfcfb;stroke:#b9c9e3;stroke-width:1.2}
+.t1{font:600 17px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#0b0b0b}
+.t2{font:400 14px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#52514e}
+.tc{font:700 17px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#1d5fb4}
+.lbl{font:600 12px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;letter-spacing:.08em;fill:#52514e}
+.val{font:700 13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:#0b0b0b}
+.arrow{stroke:#52514e;stroke-width:1.6;fill:none}
+.dash{stroke:#52514e;stroke-width:1.4;fill:none;stroke-dasharray:5 4}
+.head{fill:#52514e}
+.grid{stroke:#e2e1dc;stroke-width:1}
+.axis{stroke:#52514e;stroke-width:1.2}
+.bar{fill:#2a78d6}
+@media (prefers-color-scheme:dark){
+.bg{fill:#1a1a19}
+.box{fill:#252523;stroke:#3a3a37}
+.core{fill:#17263a;stroke:#3987e5}
+.inner{fill:#1a1a19;stroke:#2f4666}
+.t1{fill:#f0efec}
+.t2{fill:#c3c2b7}
+.tc{fill:#7db2f0}
+.lbl{fill:#c3c2b7}
+.val{fill:#f0efec}
+.arrow{stroke:#c3c2b7}
+.dash{stroke:#c3c2b7}
+.head{fill:#c3c2b7}
+.grid{stroke:#33332f}
+.axis{stroke:#c3c2b7}
+.bar{fill:#3987e5}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="head"/></marker></defs>
+<rect width="760" height="430" rx="14" class="bg"/>
+<text x="25" y="40" class="lbl" text-anchor="start">STEP 1</text>
+<text x="275" y="40" class="lbl" text-anchor="start">STEP 2</text>
+<text x="525" y="40" class="lbl" text-anchor="start">STEP 3</text>
+<rect x="25" y="58" width="210" height="132" rx="10" class="box"/>
+<text x="130.0" y="96" class="t1" text-anchor="middle">Diff</text>
+<text x="130.0" y="128" class="t2" text-anchor="middle">staged · branch</text>
+<text x="130.0" y="150" class="t2" text-anchor="middle">commit · PR</text>
+<rect x="275" y="58" width="210" height="132" rx="10" class="box"/>
+<text x="380.0" y="96" class="t1" text-anchor="middle">Filter</text>
+<text x="380.0" y="128" class="t2" text-anchor="middle">built-in ignores:</text>
+<text x="380.0" y="150" class="t2" text-anchor="middle">node_modules, lockfiles,</text>
+<text x="380.0" y="172" class="t2" text-anchor="middle">minified files</text>
+<rect x="525" y="58" width="210" height="62" rx="10" class="box"/>
+<text x="630.0" y="84" class="t1" text-anchor="middle">Checks</text>
+<text x="630.0" y="106" class="t2" text-anchor="middle">rules · secrets · security</text>
+<rect x="525" y="128" width="210" height="62" rx="10" class="box"/>
+<text x="630.0" y="154" class="t1" text-anchor="middle">Context</text>
+<text x="630.0" y="176" class="t2" text-anchor="middle">callers · tests · similar code</text>
+<path d="M237 124.0L273 124.0" class="arrow" marker-end="url(#ah)"/>
+<path d="M487 124.0L523 124.0" class="arrow" marker-end="url(#ah)"/>
+<path d="M630.0 192L630.0 238" class="arrow" marker-end="url(#ah)"/>
+<text x="735" y="218" class="lbl" text-anchor="end">STEP 4</text>
+<rect x="525" y="240" width="210" height="132" rx="10" class="core"/>
+<text x="630.0" y="278" class="t1" text-anchor="middle">Judge</text>
+<text x="630.0" y="310" class="t2" text-anchor="middle">your model, or</text>
+<text x="630.0" y="332" class="t2" text-anchor="middle">your coding agent</text>
+<text x="485" y="218" class="lbl" text-anchor="end">STEP 5</text>
+<rect x="275" y="240" width="210" height="132" rx="10" class="box"/>
+<text x="380.0" y="278" class="t1" text-anchor="middle">Validate</text>
+<text x="380.0" y="310" class="t2" text-anchor="middle">drop unknown files</text>
+<text x="380.0" y="332" class="t2" text-anchor="middle">and lines, merge</text>
+<text x="380.0" y="354" class="t2" text-anchor="middle">duplicates</text>
+<text x="235" y="218" class="lbl" text-anchor="end">STEP 6</text>
+<rect x="25" y="240" width="210" height="132" rx="10" class="box"/>
+<text x="130.0" y="278" class="t1" text-anchor="middle">Verdict</text>
+<text x="130.0" y="310" class="t2" text-anchor="middle">quality gate</text>
+<text x="130.0" y="332" class="t2" text-anchor="middle">SARIF · PR comments</text>
+<path d="M523 306.0L487 306.0" class="arrow" marker-end="url(#ah)"/>
+<path d="M273 306.0L237 306.0" class="arrow" marker-end="url(#ah)"/>
+<text x="380" y="412" class="t2" text-anchor="middle">Checks and context need no LLM. The judge sees only the filtered diff and that context.</text>
+</svg>

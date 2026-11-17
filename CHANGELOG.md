@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A README and docs that are easier to read.** The README opens with a diagram of how cora works and a three-command quick start, groups the features (review, code intelligence, agents and CI), tucks upgrade and Gatekeeper details into a collapsed section and shows the timings as a chart next to the table. `docs/usage.md` shows how a review runs and `docs/agent-integration.md` how an agent uses cora, each with a diagram. The four SVG diagrams (`docs/public/diagrams/`) carry their own light and dark colors, a title and a description, and are checked by `tests/docs_drift.rs` (accessible, self-contained, used somewhere, and the chart matches the README table).
+
 ### Fixed
 
 - **Documentation corrected against the code (#782).** The README's quick install now uses `install.sh`, which verifies the SHA-256 checksum and the Sigstore signature (the script it named before did neither, and the `CORA_VERSION` pin in the examples never reached the installer); the License section says Apache-2.0; the global config directory is `~/.codecora/cora-code/` everywhere (it said `~/.cora/`); Tree-sitter is no longer called opt-in; language, rule and pattern counts, the Rust badge, the Homebrew claim, the download URL and the release flow in CONTRIBUTING were wrong or stale.

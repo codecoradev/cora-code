@@ -2,6 +2,8 @@
 
 An agent only searches your code when the model remembers it has a tool for it. `cora install` removes the guesswork: for each agent it adds a **prompt hook** (cora's search results are put in front of the model before it answers), the **MCP server** (so the model can go further: callers, impact, affected tests) and a short **skill**.
 
+![The agent sends your prompt through the cora hook, which adds matching code from the index; the model answers, and can call the cora MCP server for deeper questions.](/diagrams/agent-flow.svg)
+
 ```bash
 cora install --dry-run          # show what would change
 cora install                    # set up every detected agent
