@@ -19,7 +19,7 @@ jobs:
   cora-review:
     name: Cora Review
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       # Anthropic workload identity federation (organization secrets or variables).
       # When all four are set, the job exchanges its GitHub OIDC token for a
@@ -126,6 +126,8 @@ jobs:
           cora-base-url: ${{ env.ACCESS_TOKEN && 'https://api.anthropic.com/v1' || secrets.CORA_BASE_URL }}
           cora-model: ${{ env.ACCESS_TOKEN && (secrets.ANTHROPIC_MODEL || vars.ANTHROPIC_MODEL || 'claude-opus-5-5') || secrets.CORA_MODEL }}
 
+          review-timeout-seconds: ${{ secrets.CORA_REVIEW_TIMEOUT_SECONDS }}
+          max-attempts: ${{ secrets.CORA_MAX_ATTEMPTS }}
       # The review action only prints how many findings blocked the job; the
       # findings themselves go to Code Scanning. Print them here, also when the
       # action failed, so the log, the annotations and the job summary show what
